@@ -42,6 +42,15 @@ pub fn truncate_to_budget(
     (truncated, used, omitted)
 }
 
+pub fn omission_pointer(section: &str, filename: &str, omitted_tokens: usize) -> String {
+    let display_tokens = if omitted_tokens >= 1000 {
+        format!("~{:.1}k", omitted_tokens as f64 / 1000.0)
+    } else {
+        format!("~{}", omitted_tokens)
+    };
+    format!("<!-- {section} full content: .cxpak/{filename} ({display_tokens} tokens) -->")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +78,14 @@ mod tests {
         assert_eq!(result, content.to_string());
         assert_eq!(omitted, 0);
         assert!(used > 0);
+    }
+
+    #[test]
+    fn test_omission_pointer() {
+        let pointer = omission_pointer("signatures", "signatures.md", 39400);
+        assert!(pointer.contains(".cxpak/signatures.md"));
+        assert!(pointer.contains("~39.4k tokens"));
+        assert!(pointer.contains("full content"));
     }
 
     #[test]
