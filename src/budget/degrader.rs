@@ -42,6 +42,37 @@ pub fn truncate_to_budget(
     (truncated, used, omitted)
 }
 
+pub fn truncate_to_budget_with_pointer(
+    content: &str,
+    budget: usize,
+    counter: &crate::budget::counter::TokenCounter,
+    section_name: &str,
+    detail_filename: &str,
+) -> (String, usize, usize) {
+    let total_tokens = counter.count(content);
+    if total_tokens <= budget {
+        return (content.to_string(), total_tokens, 0);
+    }
+
+    let mut lines = Vec::new();
+    let mut used = 0;
+    for line in content.lines() {
+        let line_tokens = counter.count(line) + 1;
+        if used + line_tokens > budget.saturating_sub(50) {
+            break;
+        }
+        lines.push(line);
+        used += line_tokens;
+    }
+
+    let omitted = total_tokens - used;
+    let marker = omission_pointer(section_name, detail_filename, omitted);
+    let mut truncated = lines.join("\n");
+    truncated.push('\n');
+    truncated.push_str(&marker);
+    (truncated, used, omitted)
+}
+
 pub fn omission_pointer(section: &str, filename: &str, omitted_tokens: usize) -> String {
     let display_tokens = if omitted_tokens >= 1000 {
         format!("~{:.1}k", omitted_tokens as f64 / 1000.0)
@@ -86,6 +117,20 @@ mod tests {
         assert!(pointer.contains(".cxpak/signatures.md"));
         assert!(pointer.contains("~39.4k tokens"));
         assert!(pointer.contains("full content"));
+    }
+
+    #[test]
+    fn test_truncate_with_pointer() {
+        let counter = crate::budget::counter::TokenCounter::new();
+        let content = (0..100)
+            .map(|i| format!("this is line number {} with some padding text", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (result, _used, omitted) =
+            truncate_to_budget_with_pointer(&content, 10, &counter, "module map", "modules.md");
+        assert!(omitted > 0);
+        assert!(result.contains(".cxpak/modules.md"));
+        assert!(!result.contains("Use --tokens"));
     }
 
     #[test]
