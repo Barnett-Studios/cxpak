@@ -108,6 +108,38 @@ pub fn run(
         git_context: git_context.budgeted.clone(),
     };
 
+    // 4b. Write detail files in pack mode
+    if pack_mode {
+        let cxpak_dir = path.join(".cxpak");
+        std::fs::create_dir_all(&cxpak_dir)?;
+
+        let detail_sections: &[(&str, &SectionContent, &str)] = &[
+            ("Directory Tree", &directory_tree, "tree.md"),
+            ("Module / Component Map", &module_map, "modules.md"),
+            ("Dependency Graph", &dependency_graph, "dependencies.md"),
+            ("Key Files", &key_files, "key-files.md"),
+            ("Function / Type Signatures", &signatures, "signatures.md"),
+            ("Git Context", &git_context, "git.md"),
+        ];
+
+        for (title, section, filename) in detail_sections {
+            if section.was_truncated {
+                let rendered_detail = output::render_single_section(title, &section.full, format);
+                let detail_path = cxpak_dir.join(filename);
+                std::fs::write(&detail_path, &rendered_detail)?;
+                if verbose {
+                    eprintln!("cxpak: wrote {}", detail_path.display());
+                }
+            }
+        }
+
+        crate::util::ensure_gitignore_entry(path)?;
+
+        if verbose {
+            eprintln!("cxpak: pack mode — detail files in {}", cxpak_dir.display());
+        }
+    }
+
     // 5. Render to format
     let rendered = output::render(&sections, format);
 
