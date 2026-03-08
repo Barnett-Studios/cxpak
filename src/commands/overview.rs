@@ -89,7 +89,7 @@ pub fn run(
 
     let alloc = BudgetAllocation::allocate(token_budget);
 
-    let metadata = render_metadata(&index);
+    let metadata = render_metadata(&index, token_budget, pack_mode);
     let directory_tree = render_directory_tree(&index, alloc.directory_tree, &counter, pack_mode);
     let module_map = render_module_map(&index, alloc.module_map, &counter, pack_mode);
     let dependency_graph =
@@ -161,7 +161,7 @@ pub fn run(
     Ok(())
 }
 
-fn render_metadata(index: &CodebaseIndex) -> String {
+fn render_metadata(index: &CodebaseIndex, token_budget: usize, pack_mode: bool) -> String {
     let mut out = String::new();
 
     out.push_str(&format!("- **Files:** {}\n", index.total_files));
@@ -173,6 +173,16 @@ fn render_metadata(index: &CodebaseIndex) -> String {
         "- **Estimated tokens:** ~{}k\n",
         index.total_tokens / 1000
     ));
+
+    if pack_mode {
+        let budget_display = if token_budget >= 1000 {
+            format!("{}k", token_budget / 1000)
+        } else {
+            format!("{}", token_budget)
+        };
+        out.push_str(&format!("- **Token budget:** {}\n", budget_display));
+        out.push_str("- **Detail files:** `.cxpak/` (full untruncated analysis)\n");
+    }
 
     if !index.language_stats.is_empty() {
         out.push_str("- **Languages:**\n");

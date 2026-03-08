@@ -270,3 +270,30 @@ fn test_overview_contains_rust_symbols() {
         .success()
         .stdout(predicate::str::contains("main"));
 }
+
+#[test]
+fn test_pack_mode_metadata_has_budget_and_detail_info() {
+    let repo = make_large_temp_repo();
+
+    Command::cargo_bin("cxpak")
+        .unwrap()
+        .args(["overview", "--tokens", "500"])
+        .arg(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Token budget"))
+        .stdout(predicate::str::contains("Detail files"));
+}
+
+#[test]
+fn test_single_file_mode_no_detail_info() {
+    let repo = make_temp_repo();
+
+    Command::cargo_bin("cxpak")
+        .unwrap()
+        .args(["overview", "--tokens", "50k"])
+        .arg(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Detail files").not());
+}
