@@ -217,7 +217,13 @@ fn render_directory_tree(
     }
 
     let (budgeted, _, omitted) = if pack_mode {
-        degrader::truncate_to_budget_with_pointer(&full, budget, counter, "directory tree", "tree.md")
+        degrader::truncate_to_budget_with_pointer(
+            &full,
+            budget,
+            counter,
+            "directory tree",
+            "tree.md",
+        )
     } else {
         degrader::truncate_to_budget(&full, budget, counter, "directory tree")
     };
@@ -255,7 +261,13 @@ fn render_module_map(
     }
 
     let (budgeted, _, omitted) = if pack_mode {
-        degrader::truncate_to_budget_with_pointer(&full, budget, counter, "module map", "modules.md")
+        degrader::truncate_to_budget_with_pointer(
+            &full,
+            budget,
+            counter,
+            "module map",
+            "modules.md",
+        )
     } else {
         degrader::truncate_to_budget(&full, budget, counter, "module map")
     };
@@ -285,11 +297,7 @@ fn render_dependency_graph(
                 if imp.names.is_empty() {
                     full.push_str(&format!("- `{}`\n", imp.source));
                 } else {
-                    full.push_str(&format!(
-                        "- `{}` — {}\n",
-                        imp.source,
-                        imp.names.join(", ")
-                    ));
+                    full.push_str(&format!("- `{}` — {}\n", imp.source, imp.names.join(", ")));
                 }
             }
             full.push('\n');
@@ -338,6 +346,7 @@ fn render_key_files(
     // Generate budgeted content (existing logic, but with pointer markers in pack mode)
     let mut budgeted_out = String::new();
     let mut remaining = budget;
+    let mut was_truncated = false;
 
     for file in &key_files {
         let header = format!("### {}\n\n```\n", file.relative_path);
@@ -345,6 +354,7 @@ fn render_key_files(
         let header_tokens = counter.count(&header) + counter.count(footer);
 
         if remaining <= header_tokens {
+            was_truncated = true;
             if pack_mode {
                 budgeted_out.push_str(&degrader::omission_pointer(
                     &format!("key file: {}", file.relative_path),
@@ -363,7 +373,7 @@ fn render_key_files(
         }
 
         let content_budget = remaining - header_tokens;
-        let (content, used, _omitted) = if pack_mode {
+        let (content, used, omitted) = if pack_mode {
             degrader::truncate_to_budget_with_pointer(
                 &file.content,
                 content_budget,
@@ -380,14 +390,16 @@ fn render_key_files(
             )
         };
 
+        if omitted > 0 {
+            was_truncated = true;
+        }
+
         budgeted_out.push_str(&header);
         budgeted_out.push_str(&content);
         budgeted_out.push_str(footer);
 
         remaining = remaining.saturating_sub(used + header_tokens);
     }
-
-    let was_truncated = counter.count(&budgeted_out) < counter.count(&full);
 
     SectionContent {
         budgeted: budgeted_out,

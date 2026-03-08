@@ -18,28 +18,7 @@ pub fn truncate_to_budget(
     counter: &crate::budget::counter::TokenCounter,
     section_name: &str,
 ) -> (String, usize, usize) {
-    let total_tokens = counter.count(content);
-    if total_tokens <= budget {
-        return (content.to_string(), total_tokens, 0);
-    }
-
-    let mut lines = Vec::new();
-    let mut used = 0;
-    for line in content.lines() {
-        let line_tokens = counter.count(line) + 1;
-        if used + line_tokens > budget.saturating_sub(50) {
-            break;
-        }
-        lines.push(line);
-        used += line_tokens;
-    }
-
-    let omitted = total_tokens - used;
-    let marker = omission_marker(section_name, omitted, used + omitted + 500);
-    let mut truncated = lines.join("\n");
-    truncated.push('\n');
-    truncated.push_str(&marker);
-    (truncated, used, omitted)
+    truncate_to_budget_inner(content, budget, counter, section_name, None)
 }
 
 pub fn truncate_to_budget_with_pointer(
@@ -48,6 +27,16 @@ pub fn truncate_to_budget_with_pointer(
     counter: &crate::budget::counter::TokenCounter,
     section_name: &str,
     detail_filename: &str,
+) -> (String, usize, usize) {
+    truncate_to_budget_inner(content, budget, counter, section_name, Some(detail_filename))
+}
+
+fn truncate_to_budget_inner(
+    content: &str,
+    budget: usize,
+    counter: &crate::budget::counter::TokenCounter,
+    section_name: &str,
+    detail_filename: Option<&str>,
 ) -> (String, usize, usize) {
     let total_tokens = counter.count(content);
     if total_tokens <= budget {
@@ -66,7 +55,10 @@ pub fn truncate_to_budget_with_pointer(
     }
 
     let omitted = total_tokens - used;
-    let marker = omission_pointer(section_name, detail_filename, omitted);
+    let marker = match detail_filename {
+        Some(filename) => omission_pointer(section_name, filename, omitted),
+        None => omission_marker(section_name, omitted, used + omitted + 500),
+    };
     let mut truncated = lines.join("\n");
     truncated.push('\n');
     truncated.push_str(&marker);
