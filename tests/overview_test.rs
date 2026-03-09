@@ -283,3 +283,53 @@ fn test_single_file_mode_no_detail_info() {
         .success()
         .stdout(predicate::str::contains("Detail files").not());
 }
+
+#[test]
+fn test_stale_cxpak_cleaned_on_single_file_mode() {
+    let repo = make_temp_repo();
+
+    // Create stale .cxpak/ directory with a leftover file
+    let cxpak_dir = repo.path().join(".cxpak");
+    std::fs::create_dir_all(&cxpak_dir).unwrap();
+    std::fs::write(cxpak_dir.join("stale.md"), "stale content").unwrap();
+
+    // Run in single-file mode (repo fits in budget)
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "50k"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    // .cxpak/ should be cleaned up
+    assert!(
+        !cxpak_dir.exists(),
+        "stale .cxpak/ should be removed in single-file mode"
+    );
+}
+
+#[test]
+fn test_stale_cxpak_cleaned_on_pack_mode() {
+    let repo = make_large_temp_repo();
+
+    // Create stale file in .cxpak/
+    let cxpak_dir = repo.path().join(".cxpak");
+    std::fs::create_dir_all(&cxpak_dir).unwrap();
+    std::fs::write(cxpak_dir.join("stale.md"), "stale content").unwrap();
+
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "500"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    // stale.md should not exist (dir was cleaned before new files written)
+    assert!(
+        !cxpak_dir.join("stale.md").exists(),
+        "stale files should be cleaned"
+    );
+    // But new detail files should exist
+    assert!(
+        cxpak_dir.exists(),
+        ".cxpak/ should be recreated with fresh files"
+    );
+}

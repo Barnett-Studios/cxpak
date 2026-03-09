@@ -108,7 +108,13 @@ pub fn run(
         git_context: git_context.budgeted.clone(),
     };
 
-    // 4b. Write detail files in pack mode
+    // 4b. Clean stale .cxpak/ directory before any writes
+    let cxpak_dir = path.join(".cxpak");
+    if cxpak_dir.exists() {
+        std::fs::remove_dir_all(&cxpak_dir)?;
+    }
+
+    // Write detail files in pack mode
     if pack_mode {
         let cxpak_dir = path.join(".cxpak");
         std::fs::create_dir_all(&cxpak_dir)?;
