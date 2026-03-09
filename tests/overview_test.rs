@@ -385,6 +385,60 @@ fn test_pack_mode_xml_pointers_not_escaped() {
 }
 
 #[test]
+fn test_pack_mode_json_detail_file_content() {
+    let repo = make_large_temp_repo();
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "500", "--format", "json"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    let cxpak_dir = repo.path().join(".cxpak");
+    let mut found_json = false;
+    for entry in std::fs::read_dir(&cxpak_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "json") {
+            let content = std::fs::read_to_string(&path).unwrap();
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&content);
+            assert!(
+                parsed.is_ok(),
+                "detail file {} should be valid JSON: {:?}",
+                path.display(),
+                parsed.err()
+            );
+            found_json = true;
+        }
+    }
+    assert!(found_json, "no JSON detail files found in .cxpak/");
+}
+
+#[test]
+fn test_pack_mode_xml_detail_file_content() {
+    let repo = make_large_temp_repo();
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "500", "--format", "xml"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    let cxpak_dir = repo.path().join(".cxpak");
+    let mut found_xml = false;
+    for entry in std::fs::read_dir(&cxpak_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "xml") {
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                content.contains("<cxpak>"),
+                "detail file {} should have <cxpak> root element",
+                path.display()
+            );
+            found_xml = true;
+        }
+    }
+    assert!(found_xml, "no XML detail files found in .cxpak/");
+}
+
+#[test]
 fn test_stale_cxpak_cleaned_on_pack_mode() {
     let repo = make_large_temp_repo();
 
