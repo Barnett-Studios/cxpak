@@ -236,15 +236,6 @@ fn test_overview_not_git_repo() {
 }
 
 #[test]
-fn test_trace_not_yet_implemented() {
-    Command::new(assert_cmd::cargo_bin!("cxpak"))
-        .args(["trace", "--tokens", "50k", "main"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
-}
-
-#[test]
 fn test_overview_verbose_output() {
     let repo = make_temp_repo();
     Command::new(assert_cmd::cargo_bin!("cxpak"))

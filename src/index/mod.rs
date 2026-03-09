@@ -109,6 +109,38 @@ impl CodebaseIndex {
             .collect()
     }
 
+    /// Find all symbols whose name matches `target` (case-insensitive).
+    ///
+    /// Returns `(relative_path, symbol)` pairs across all indexed files.
+    pub fn find_symbol<'a>(&'a self, target: &str) -> Vec<(&'a str, &'a Symbol)> {
+        let target_lower = target.to_lowercase();
+        self.files
+            .iter()
+            .filter_map(|f| {
+                let tl = &target_lower;
+                f.parse_result.as_ref().map(|pr| {
+                    pr.symbols
+                        .iter()
+                        .filter(move |s| s.name.to_lowercase() == *tl)
+                        .map(move |s| (f.relative_path.as_str(), s))
+                })
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Find all files whose content contains `target` as a substring (case-insensitive).
+    ///
+    /// Returns the relative paths of matching files.
+    pub fn find_content_matches<'a>(&'a self, target: &str) -> Vec<&'a str> {
+        let target_lower = target.to_lowercase();
+        self.files
+            .iter()
+            .filter(|f| f.content.to_lowercase().contains(&target_lower))
+            .map(|f| f.relative_path.as_str())
+            .collect()
+    }
+
     pub fn is_key_file(path: &str) -> bool {
         let lower = path.to_lowercase();
         let filename = lower.rsplit('/').next().unwrap_or(&lower);
