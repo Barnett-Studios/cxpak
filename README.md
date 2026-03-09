@@ -20,7 +20,10 @@ cxpak overview --tokens 50k .
 cxpak overview --tokens 50k --out context.md .
 
 # Trace from a function/error, pack relevant code paths
-cxpak trace --tokens 50k "handle_request"
+cxpak trace --tokens 50k "handle_request" .
+
+# Trace with full dependency graph traversal
+cxpak trace --tokens 50k --all "MyError" /path/to/repo
 
 # Different output formats
 cxpak overview --tokens 50k --format json .
@@ -60,15 +63,17 @@ repo/
     git.md           # full git history
 ```
 
+Detail file extensions match `--format`: `.md` for markdown, `.json` for json, `.xml` for xml.
+
 The overview tells the LLM what exists. The detail files let it drill in on demand. `.cxpak/` is automatically added to `.gitignore`.
 
 If the repo fits within budget, you get a single file with everything — no `.cxpak/` directory needed.
 
 ## Supported Languages
 
-Rust, TypeScript, JavaScript, Python, Java, Go, C, C++
+Rust, TypeScript, JavaScript, Python, Java, Go, C, C++, Ruby, C#, Swift, Kotlin
 
-Tree-sitter grammars are compiled in. Language features can be toggled:
+Tree-sitter grammars are compiled in. All 12 languages are enabled by default. Language features can be toggled:
 
 ```bash
 # Only Rust and Python support
