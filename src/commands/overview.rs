@@ -17,6 +17,14 @@ struct SectionContent {
     was_truncated: bool,
 }
 
+fn detail_file_ext(format: &OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Markdown => "md",
+        OutputFormat::Xml => "xml",
+        OutputFormat::Json => "json",
+    }
+}
+
 pub fn run(
     path: &Path,
     token_budget: usize,
@@ -89,14 +97,50 @@ pub fn run(
 
     let alloc = BudgetAllocation::allocate(token_budget);
 
+    let ext = detail_file_ext(format);
     let metadata = render_metadata(&index, token_budget, pack_mode);
-    let directory_tree = render_directory_tree(&index, alloc.directory_tree, &counter, pack_mode);
-    let module_map = render_module_map(&index, alloc.module_map, &counter, pack_mode);
-    let dependency_graph =
-        render_dependency_graph(&index, alloc.dependency_graph, &counter, pack_mode);
-    let key_files = render_key_files(&index, alloc.key_files, &counter, pack_mode);
-    let signatures = render_signatures(&index, alloc.signatures, &counter, pack_mode);
-    let git_context = render_git_context(path, alloc.git_context, &counter, pack_mode);
+    let directory_tree = render_directory_tree(
+        &index,
+        alloc.directory_tree,
+        &counter,
+        pack_mode,
+        &format!("tree.{ext}"),
+    );
+    let module_map = render_module_map(
+        &index,
+        alloc.module_map,
+        &counter,
+        pack_mode,
+        &format!("modules.{ext}"),
+    );
+    let dependency_graph = render_dependency_graph(
+        &index,
+        alloc.dependency_graph,
+        &counter,
+        pack_mode,
+        &format!("dependencies.{ext}"),
+    );
+    let key_files = render_key_files(
+        &index,
+        alloc.key_files,
+        &counter,
+        pack_mode,
+        &format!("key-files.{ext}"),
+    );
+    let signatures = render_signatures(
+        &index,
+        alloc.signatures,
+        &counter,
+        pack_mode,
+        &format!("signatures.{ext}"),
+    );
+    let git_context = render_git_context(
+        path,
+        alloc.git_context,
+        &counter,
+        pack_mode,
+        &format!("git.{ext}"),
+    );
 
     let sections = OutputSections {
         metadata,
@@ -119,19 +163,31 @@ pub fn run(
         let cxpak_dir = path.join(".cxpak");
         std::fs::create_dir_all(&cxpak_dir)?;
 
-        let detail_sections: &[(&str, &SectionContent, &str)] = &[
-            ("Directory Tree", &directory_tree, "tree.md"),
-            ("Module / Component Map", &module_map, "modules.md"),
-            ("Dependency Graph", &dependency_graph, "dependencies.md"),
-            ("Key Files", &key_files, "key-files.md"),
-            ("Function / Type Signatures", &signatures, "signatures.md"),
-            ("Git Context", &git_context, "git.md"),
+        let detail_sections: &[(&str, &SectionContent, String)] = &[
+            ("Directory Tree", &directory_tree, format!("tree.{ext}")),
+            (
+                "Module / Component Map",
+                &module_map,
+                format!("modules.{ext}"),
+            ),
+            (
+                "Dependency Graph",
+                &dependency_graph,
+                format!("dependencies.{ext}"),
+            ),
+            ("Key Files", &key_files, format!("key-files.{ext}")),
+            (
+                "Function / Type Signatures",
+                &signatures,
+                format!("signatures.{ext}"),
+            ),
+            ("Git Context", &git_context, format!("git.{ext}")),
         ];
 
         for (title, section, filename) in detail_sections {
             if section.was_truncated {
                 let rendered_detail = output::render_single_section(title, &section.full, format);
-                let detail_path = cxpak_dir.join(filename);
+                let detail_path = cxpak_dir.join(filename.as_str());
                 std::fs::write(&detail_path, &rendered_detail)?;
                 if verbose {
                     eprintln!("cxpak: wrote {}", detail_path.display());
@@ -215,6 +271,7 @@ fn render_directory_tree(
     budget: usize,
     counter: &TokenCounter,
     pack_mode: bool,
+    detail_filename: &str,
 ) -> SectionContent {
     let mut full = String::new();
     for file in &index.files {
@@ -228,7 +285,7 @@ fn render_directory_tree(
             budget,
             counter,
             "directory tree",
-            "tree.md",
+            detail_filename,
         )
     } else {
         degrader::truncate_to_budget(&full, budget, counter, "directory tree")
@@ -246,6 +303,7 @@ fn render_module_map(
     budget: usize,
     counter: &TokenCounter,
     pack_mode: bool,
+    detail_filename: &str,
 ) -> SectionContent {
     let mut full = String::new();
 
@@ -272,7 +330,7 @@ fn render_module_map(
             budget,
             counter,
             "module map",
-            "modules.md",
+            detail_filename,
         )
     } else {
         degrader::truncate_to_budget(&full, budget, counter, "module map")
@@ -290,6 +348,7 @@ fn render_dependency_graph(
     budget: usize,
     counter: &TokenCounter,
     pack_mode: bool,
+    detail_filename: &str,
 ) -> SectionContent {
     let mut full = String::new();
 
@@ -316,7 +375,7 @@ fn render_dependency_graph(
             budget,
             counter,
             "dependency graph",
-            "dependencies.md",
+            detail_filename,
         )
     } else {
         degrader::truncate_to_budget(&full, budget, counter, "dependency graph")
@@ -334,6 +393,7 @@ fn render_key_files(
     budget: usize,
     counter: &TokenCounter,
     pack_mode: bool,
+    detail_filename: &str,
 ) -> SectionContent {
     let key_files: Vec<_> = index
         .files
@@ -364,7 +424,7 @@ fn render_key_files(
             if pack_mode {
                 budgeted_out.push_str(&degrader::omission_pointer(
                     &format!("key file: {}", file.relative_path),
-                    "key-files.md",
+                    detail_filename,
                     file.token_count,
                 ));
             } else {
@@ -385,7 +445,7 @@ fn render_key_files(
                 content_budget,
                 counter,
                 &format!("key file: {}", file.relative_path),
-                "key-files.md",
+                detail_filename,
             )
         } else {
             degrader::truncate_to_budget(
@@ -419,6 +479,7 @@ fn render_signatures(
     budget: usize,
     counter: &TokenCounter,
     pack_mode: bool,
+    detail_filename: &str,
 ) -> SectionContent {
     let mut full = String::new();
 
@@ -447,7 +508,7 @@ fn render_signatures(
             budget,
             counter,
             "signatures",
-            "signatures.md",
+            detail_filename,
         )
     } else {
         degrader::truncate_to_budget(&full, budget, counter, "signatures")
@@ -465,6 +526,7 @@ fn render_git_context(
     budget: usize,
     counter: &TokenCounter,
     pack_mode: bool,
+    detail_filename: &str,
 ) -> SectionContent {
     let ctx = match git::extract_git_context(path, 20) {
         Ok(ctx) => ctx,
@@ -504,7 +566,13 @@ fn render_git_context(
     }
 
     let (budgeted, _, omitted) = if pack_mode {
-        degrader::truncate_to_budget_with_pointer(&full, budget, counter, "git context", "git.md")
+        degrader::truncate_to_budget_with_pointer(
+            &full,
+            budget,
+            counter,
+            "git context",
+            detail_filename,
+        )
     } else {
         degrader::truncate_to_budget(&full, budget, counter, "git context")
     };

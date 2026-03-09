@@ -308,6 +308,57 @@ fn test_stale_cxpak_cleaned_on_single_file_mode() {
 }
 
 #[test]
+fn test_pack_mode_json_detail_file_extension() {
+    let repo = make_large_temp_repo();
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "500", "--format", "json"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    let cxpak_dir = repo.path().join(".cxpak");
+    // Should have .json files, not .md
+    let has_json = std::fs::read_dir(&cxpak_dir).unwrap().any(|e| {
+        e.unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "json")
+    });
+    assert!(
+        has_json,
+        "detail files should have .json extension when --format json"
+    );
+
+    // Should NOT have .md files
+    let has_md = std::fs::read_dir(&cxpak_dir)
+        .unwrap()
+        .any(|e| e.unwrap().path().extension().is_some_and(|ext| ext == "md"));
+    assert!(!has_md, "should not have .md files when --format json");
+}
+
+#[test]
+fn test_pack_mode_xml_detail_file_extension() {
+    let repo = make_large_temp_repo();
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "500", "--format", "xml"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    let cxpak_dir = repo.path().join(".cxpak");
+    let has_xml = std::fs::read_dir(&cxpak_dir).unwrap().any(|e| {
+        e.unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "xml")
+    });
+    assert!(
+        has_xml,
+        "detail files should have .xml extension when --format xml"
+    );
+}
+
+#[test]
 fn test_stale_cxpak_cleaned_on_pack_mode() {
     let repo = make_large_temp_repo();
 
