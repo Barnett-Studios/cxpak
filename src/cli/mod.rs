@@ -40,6 +40,8 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
         target: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
 }
 

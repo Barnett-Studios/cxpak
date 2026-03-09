@@ -43,6 +43,7 @@ fn main() {
             verbose,
             all,
             target,
+            path,
         } => {
             let token_budget = match parse_token_count(tokens) {
                 Ok(0) => {
@@ -55,7 +56,15 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            commands::trace::run(target, token_budget, format, out.as_deref(), *verbose, *all)
+            commands::trace::run(
+                path,
+                target,
+                token_budget,
+                format,
+                out.as_deref(),
+                *verbose,
+                *all,
+            )
         }
     };
 
