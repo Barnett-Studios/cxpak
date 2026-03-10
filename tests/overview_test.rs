@@ -500,6 +500,71 @@ fn test_cache_survives_stale_cleanup() {
 }
 
 #[test]
+fn test_clean_removes_cxpak_dir() {
+    let repo = make_large_temp_repo();
+
+    // First run to create .cxpak/
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "500"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    assert!(repo.path().join(".cxpak").exists());
+
+    // Clean should remove it
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["clean"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    assert!(
+        !repo.path().join(".cxpak").exists(),
+        ".cxpak/ should be deleted by clean"
+    );
+}
+
+#[test]
+fn test_clean_noop_when_no_cxpak() {
+    let repo = make_temp_repo();
+
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["clean"])
+        .arg(repo.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_clean_removes_cache_too() {
+    let repo = make_temp_repo();
+
+    // Run overview to create cache
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "50k"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    assert!(repo
+        .path()
+        .join(".cxpak")
+        .join("cache")
+        .join("cache.json")
+        .exists());
+
+    // Clean removes everything including cache
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["clean"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    assert!(!repo.path().join(".cxpak").exists());
+}
+
+#[test]
 fn test_stale_cxpak_cleaned_on_pack_mode() {
     let repo = make_large_temp_repo();
 

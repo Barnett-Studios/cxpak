@@ -17,6 +17,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match &cli.command {
+        Commands::Clean { path } => commands::clean::run(path),
         Commands::Overview {
             tokens,
             out,

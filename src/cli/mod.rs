@@ -27,6 +27,11 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Remove .cxpak/ directory (cache + output files)
+    Clean {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Trace from error/function, pack relevant code paths
     Trace {
         #[arg(long)]
