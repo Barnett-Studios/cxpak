@@ -146,3 +146,107 @@ fn test_trace_not_git_repo() {
         .failure()
         .stderr(predicate::str::contains("not a git repository"));
 }
+
+#[test]
+fn test_trace_xml_output() {
+    let repo = make_trace_repo();
+
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["trace", "--tokens", "50k", "--format", "xml", "compute"])
+        .current_dir(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<cxpak>"))
+        .stdout(predicate::str::contains("compute"));
+}
+
+#[test]
+fn test_trace_verbose_output() {
+    let repo = make_trace_repo();
+
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["trace", "--tokens", "50k", "--verbose", "compute"])
+        .current_dir(repo.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cxpak: scanning"))
+        .stderr(predicate::str::contains("cxpak: found"))
+        .stderr(predicate::str::contains("cxpak: parsed"));
+}
+
+#[test]
+fn test_trace_with_path_argument() {
+    let repo = make_trace_repo();
+
+    // Run from a different directory, passing repo path as positional arg
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["trace", "--tokens", "50k", "compute"])
+        .arg(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("compute"));
+}
+
+#[test]
+fn test_trace_small_budget_truncates() {
+    let repo = make_trace_repo();
+
+    // Very small budget should still succeed, just with truncated output
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["trace", "--tokens", "200", "compute"])
+        .current_dir(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("compute"));
+}
+
+#[test]
+fn test_trace_case_insensitive_symbol_match() {
+    let repo = make_trace_repo();
+
+    // "Compute" (uppercase C) should still find "compute"
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["trace", "--tokens", "50k", "Compute"])
+        .current_dir(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("compute"));
+}
+
+#[test]
+fn test_trace_shows_matched_file() {
+    let repo = make_trace_repo();
+
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["trace", "--tokens", "50k", "compute"])
+        .current_dir(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("lib.rs"));
+}
+
+#[test]
+fn test_trace_out_json_format() {
+    let repo = make_trace_repo();
+    let out_dir = TempDir::new().unwrap();
+    let out_file = out_dir.path().join("trace.json");
+
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args([
+            "trace",
+            "--tokens",
+            "50k",
+            "--format",
+            "json",
+            "--out",
+            out_file.to_str().unwrap(),
+            "compute",
+        ])
+        .current_dir(repo.path())
+        .assert()
+        .success();
+
+    let content = std::fs::read_to_string(&out_file).unwrap();
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&content);
+    assert!(parsed.is_ok(), "output file should be valid JSON");
+}
