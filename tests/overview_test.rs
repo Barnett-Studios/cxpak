@@ -140,7 +140,7 @@ fn test_pack_mode_gitignore_updated() {
 }
 
 #[test]
-fn test_single_file_mode_no_cxpak_dir() {
+fn test_single_file_mode_no_detail_files() {
     let repo = make_temp_repo();
 
     Command::new(assert_cmd::cargo_bin!("cxpak"))
@@ -150,9 +150,14 @@ fn test_single_file_mode_no_cxpak_dir() {
         .success();
 
     let cxpak_dir = repo.path().join(".cxpak");
+    // Cache is always written, but no detail files (tree.md, modules.md, etc.)
+    // should exist when the repo fits in the token budget.
+    let has_detail_files = cxpak_dir.join("modules.md").exists()
+        || cxpak_dir.join("signatures.md").exists()
+        || cxpak_dir.join("tree.md").exists();
     assert!(
-        !cxpak_dir.exists(),
-        ".cxpak/ should NOT exist when repo fits in budget"
+        !has_detail_files,
+        ".cxpak/ should NOT contain detail files when repo fits in budget"
     );
 }
 
@@ -300,10 +305,15 @@ fn test_stale_cxpak_cleaned_on_single_file_mode() {
         .assert()
         .success();
 
-    // .cxpak/ should be cleaned up
+    // Stale detail files should be cleaned up; cache subdirectory is preserved
     assert!(
-        !cxpak_dir.exists(),
-        "stale .cxpak/ should be removed in single-file mode"
+        !cxpak_dir.join("stale.md").exists(),
+        "stale files should be removed from .cxpak/"
+    );
+    // Cache subdirectory should exist (cache is always written)
+    assert!(
+        cxpak_dir.join("cache").exists(),
+        ".cxpak/cache/ should be present after run"
     );
 }
 
@@ -436,6 +446,57 @@ fn test_pack_mode_xml_detail_file_content() {
         }
     }
     assert!(found_xml, "no XML detail files found in .cxpak/");
+}
+
+#[test]
+fn test_cache_created_on_first_run() {
+    let repo = make_temp_repo();
+
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "50k"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    let cache_file = repo.path().join(".cxpak").join("cache").join("cache.json");
+    assert!(
+        cache_file.exists(),
+        "cache.json should be created after first run"
+    );
+
+    let content = std::fs::read_to_string(&cache_file).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert!(
+        !parsed["entries"].as_array().unwrap().is_empty(),
+        "cache should have entries"
+    );
+}
+
+#[test]
+fn test_cache_survives_stale_cleanup() {
+    let repo = make_large_temp_repo();
+
+    // First run creates cache + detail files
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "500"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    let cache_file = repo.path().join(".cxpak").join("cache").join("cache.json");
+    assert!(cache_file.exists(), "cache should exist after first run");
+
+    // Second run should clean detail files but preserve cache
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["overview", "--tokens", "500"])
+        .arg(repo.path())
+        .assert()
+        .success();
+
+    assert!(
+        cache_file.exists(),
+        "cache should survive stale cleanup between runs"
+    );
 }
 
 #[test]
