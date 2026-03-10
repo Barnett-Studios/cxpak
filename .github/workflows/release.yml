@@ -91,3 +91,73 @@ jobs:
       - run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          SHA_LINUX_X86=$(sha256sum artifacts/cxpak-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+          SHA_LINUX_ARM=$(sha256sum artifacts/cxpak-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+          SHA_MAC_X86=$(sha256sum artifacts/cxpak-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+          SHA_MAC_ARM=$(sha256sum artifacts/cxpak-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+
+          git clone https://x-access-token:${TAP_TOKEN}@github.com/lyubomir-bozhinov/homebrew-tap.git tap
+          cd tap
+          mkdir -p Formula
+
+          cat > Formula/cxpak.rb << 'RUBY'
+          class Cxpak < Formula
+            desc "Token-budgeted codebase context for LLMs"
+            homepage "https://github.com/lyubomir-bozhinov/cxpak"
+          RUBY
+
+          cat >> Formula/cxpak.rb << EOF
+            version "${VERSION}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/lyubomir-bozhinov/cxpak/releases/download/v${VERSION}/cxpak-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              else
+                url "https://github.com/lyubomir-bozhinov/cxpak/releases/download/v${VERSION}/cxpak-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X86}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/lyubomir-bozhinov/cxpak/releases/download/v${VERSION}/cxpak-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
+              else
+                url "https://github.com/lyubomir-bozhinov/cxpak/releases/download/v${VERSION}/cxpak-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install "cxpak"
+            end
+
+            test do
+              system "#{bin}/cxpak", "--help"
+            end
+          end
+          EOF
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add Formula/cxpak.rb
+          git diff --cached --quiet || git commit -m "Update cxpak to ${VERSION}"
+          git push
