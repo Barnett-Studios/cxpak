@@ -1,5 +1,6 @@
 use crate::budget::counter::TokenCounter;
 use crate::budget::degrader;
+use crate::cache::{CacheEntry, FileCache};
 use crate::cli::OutputFormat;
 use crate::index::graph::DependencyGraph;
 use crate::index::CodebaseIndex;
@@ -35,26 +36,68 @@ pub fn run(
         return Err("no source files found".into());
     }
 
-    // 2. Parse
+    // 2. Parse (cache-aware)
     if verbose {
         eprintln!("cxpak: parsing with tree-sitter");
     }
+    let cache_dir = path.join(".cxpak").join("cache");
+    let existing_cache = FileCache::load(&cache_dir);
+    let cache_map = existing_cache.as_map();
+
     let registry = LanguageRegistry::new();
     let mut parse_results = HashMap::new();
+    let mut new_cache_entries: Vec<CacheEntry> = Vec::new();
 
     for file in &files {
-        if let Some(lang_name) = &file.language {
-            if let Some(lang) = registry.get(lang_name) {
-                let source = std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
-                let mut parser = tree_sitter::Parser::new();
-                if parser.set_language(&lang.ts_language()).is_ok() {
-                    if let Some(tree) = parser.parse(&source, None) {
-                        let result = lang.extract(&source, &tree);
-                        parse_results.insert(file.relative_path.clone(), result);
+        let mtime = file_mtime(&file.absolute_path);
+        let size_bytes = file.size_bytes;
+
+        // Check for a valid cache hit
+        let cached_parse = if let Some(entry) = cache_map.get(file.relative_path.as_str()) {
+            if entry.mtime == mtime && entry.size_bytes == size_bytes {
+                Some((entry.parse_result.clone(), entry.token_count))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let parse_result = if let Some((pr, _token_count)) = cached_parse {
+            pr
+        } else {
+            // Cache miss — parse with tree-sitter
+            let mut result = None;
+            if let Some(lang_name) = &file.language {
+                if let Some(lang) = registry.get(lang_name) {
+                    let source = std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
+                    let mut parser = tree_sitter::Parser::new();
+                    if parser.set_language(&lang.ts_language()).is_ok() {
+                        if let Some(tree) = parser.parse(&source, None) {
+                            result = Some(lang.extract(&source, &tree));
+                        }
                     }
                 }
             }
+            result
+        };
+
+        if let Some(ref pr) = parse_result {
+            parse_results.insert(file.relative_path.clone(), pr.clone());
         }
+
+        new_cache_entries.push(CacheEntry {
+            relative_path: file.relative_path.clone(),
+            mtime,
+            size_bytes,
+            language: file.language.clone(),
+            // token_count will be filled after indexing; use cached value if available
+            token_count: cache_map
+                .get(file.relative_path.as_str())
+                .map(|e| e.token_count)
+                .unwrap_or(0),
+            parse_result,
+        });
     }
 
     if verbose {
@@ -71,10 +114,33 @@ pub fn run(
         );
     }
 
-    // 4. Build dependency graph
+    // 4. Save updated cache
+    {
+        let mut new_cache = FileCache::new();
+        // Update token_count from the index now that indexing is complete
+        for entry in new_cache_entries {
+            let token_count = index
+                .files
+                .iter()
+                .find(|f| f.relative_path == entry.relative_path)
+                .map(|f| f.token_count)
+                .unwrap_or(entry.token_count);
+            new_cache.entries.push(CacheEntry {
+                token_count,
+                ..entry
+            });
+        }
+        if let Err(e) = new_cache.save(&cache_dir) {
+            if verbose {
+                eprintln!("cxpak: warning: failed to save cache: {e}");
+            }
+        }
+    }
+
+    // 5. Build dependency graph
     let graph = build_dependency_graph(&index);
 
-    // 5. Find the target: symbol name first, then content match
+    // 6. Find the target: symbol name first, then content match
     let symbol_matches: Vec<_> = index.find_symbol(target);
     let matched_files: HashSet<&str> = if !symbol_matches.is_empty() {
         if verbose {
@@ -105,7 +171,7 @@ pub fn run(
         content_matches.into_iter().collect()
     };
 
-    // 6. Walk dependency graph from matched files
+    // 7. Walk dependency graph from matched files
     let relevant_paths: HashSet<String> = if all {
         // Full BFS in both directions
         let start: Vec<&str> = matched_files.iter().copied().collect();
@@ -131,7 +197,7 @@ pub fn run(
         );
     }
 
-    // 7. Build output sections
+    // 8. Build output sections
     let metadata = render_trace_metadata(target, &matched_files, relevant_paths.len());
     let source_code = render_symbol_source(
         &index,
@@ -155,7 +221,7 @@ pub fn run(
         git_context: String::new(),
     };
 
-    // 8. Render and output
+    // 9. Render and output
     let rendered = output::render(&sections, format);
 
     match out {
@@ -173,6 +239,15 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn file_mtime(path: &std::path::Path) -> i64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Build a `DependencyGraph` from the index by resolving import source paths to

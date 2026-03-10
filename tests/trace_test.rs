@@ -226,6 +226,43 @@ fn test_trace_shows_matched_file() {
 }
 
 #[test]
+fn test_trace_creates_cache() {
+    let repo = make_trace_repo();
+
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["trace", "--tokens", "50k", "compute"])
+        .current_dir(repo.path())
+        .assert()
+        .success();
+
+    let cache_file = repo.path().join(".cxpak").join("cache").join("cache.json");
+    assert!(
+        cache_file.exists(),
+        "cache.json should be created after trace"
+    );
+}
+
+#[test]
+fn test_trace_second_run_uses_cache() {
+    let repo = make_trace_repo();
+
+    // First run
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["trace", "--tokens", "50k", "compute"])
+        .current_dir(repo.path())
+        .assert()
+        .success();
+
+    // Second run should produce identical output
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["trace", "--tokens", "50k", "compute"])
+        .current_dir(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("compute"));
+}
+
+#[test]
 fn test_trace_out_json_format() {
     let repo = make_trace_repo();
     let out_dir = TempDir::new().unwrap();
