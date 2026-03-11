@@ -25,7 +25,10 @@ cargo install cxpak
 
 ### Add the Plugin
 
-Add this plugin to your Claude Code configuration. The plugin directory is `plugin/` within the cxpak repository.
+```
+/plugin marketplace add lyubomir-bozhinov/cxpak
+/plugin install cxpak
+```
 
 ## Skills (Auto-Invoked)
 

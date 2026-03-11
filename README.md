@@ -22,6 +22,35 @@ brew install cxpak
 cargo install cxpak
 ```
 
+## Claude Code Plugin
+
+cxpak ships as a Claude Code plugin — skills auto-trigger when you ask about codebase structure or changes, and slash commands give you direct control.
+
+**Install the plugin:**
+
+```
+/plugin marketplace add lyubomir-bozhinov/cxpak
+/plugin install cxpak
+```
+
+**Skills (auto-invoked):**
+
+| Skill | Triggers when you... |
+|-------|---------------------|
+| `codebase-context` | Ask about project structure, architecture, how components relate |
+| `diff-context` | Ask to review changes, prepare a PR description, understand what changed |
+
+**Commands (user-invoked):**
+
+| Command | Description |
+|---------|-------------|
+| `/cxpak:overview` | Generate a structured repo summary |
+| `/cxpak:trace <symbol>` | Trace a symbol through the dependency graph |
+| `/cxpak:diff` | Show changes with dependency context |
+| `/cxpak:clean` | Remove `.cxpak/` cache and output files |
+
+The plugin auto-downloads the cxpak binary if it's not already installed.
+
 ## Usage
 
 ```bash
