@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="${CXPAK_INSTALL_DIR:-${HOME}/.claude/plugins/cxpak/bin}"
+GITHUB_REPO="lyubomir-bozhinov/cxpak"
+DRY_RUN=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+    esac
+done
+
+# 1. Check PATH
+if command -v cxpak >/dev/null 2>&1; then
+    CXPAK_PATH="$(command -v cxpak)"
+    if [ "$DRY_RUN" = false ]; then
+        echo "$CXPAK_PATH"
+    else
+        echo "found on PATH: $CXPAK_PATH"
+    fi
+    exit 0
+fi
+
+# 2. Check cached install
+if [ -x "${INSTALL_DIR}/cxpak" ]; then
+    if [ "$DRY_RUN" = false ]; then
+        echo "${INSTALL_DIR}/cxpak"
+    else
+        echo "found cached: ${INSTALL_DIR}/cxpak"
+    fi
+    exit 0
+fi
+
+# 3. Detect platform
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+case "${OS}" in
+    Darwin)
+        case "${ARCH}" in
+            arm64)  TARGET="aarch64-apple-darwin" ;;
+            x86_64) TARGET="x86_64-apple-darwin" ;;
+            *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;;
+        esac
+        ;;
+    Linux)
+        case "${ARCH}" in
+            aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+            x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
+            *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;;
+        esac
+        ;;
+    *)
+        echo "Unsupported OS: ${OS}" >&2
+        exit 1
+        ;;
+esac
+
+TARBALL="cxpak-${TARGET}.tar.gz"
+
+# Dry run: just print what would be downloaded
+if [ "$DRY_RUN" = true ]; then
+    echo "would download: ${TARBALL} for ${TARGET}"
+    exit 0
+fi
+
+# 4. Download latest release
+echo "cxpak not found. Downloading..." >&2
+
+LATEST_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/${TARBALL}"
+
+mkdir -p "${INSTALL_DIR}"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+curl -fsSL "${LATEST_URL}" -o "${TMP_DIR}/${TARBALL}" 2>&1 >&2
+tar -xzf "${TMP_DIR}/${TARBALL}" -C "${TMP_DIR}" 2>&1 >&2
+cp "${TMP_DIR}/cxpak" "${INSTALL_DIR}/cxpak"
+chmod +x "${INSTALL_DIR}/cxpak"
+
+echo "Downloaded cxpak to ${INSTALL_DIR}/cxpak" >&2
+echo "${INSTALL_DIR}/cxpak"
