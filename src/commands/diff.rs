@@ -95,9 +95,12 @@ pub fn run(
     verbose: bool,
     all: bool,
     _focus: Option<&str>,
-    _timing: bool,
+    timing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let total_start = std::time::Instant::now();
+
     // 1. Extract git changes
+    let extract_start = std::time::Instant::now();
     if verbose {
         eprintln!("cxpak: extracting git changes in {}", path.display());
     }
@@ -110,11 +113,15 @@ pub fn run(
         return Ok(());
     }
 
+    if timing {
+        eprintln!("cxpak [timing]: extract    {:.1?}", extract_start.elapsed());
+    }
     if verbose {
         eprintln!("cxpak: {} changed file(s)", changes.len());
     }
 
     // 2. Scan repo
+    let scan_start = std::time::Instant::now();
     if verbose {
         eprintln!("cxpak: scanning {}", path.display());
     }
@@ -123,13 +130,21 @@ pub fn run(
     if verbose {
         eprintln!("cxpak: found {} files", files.len());
     }
+    if timing {
+        eprintln!("cxpak [timing]: scan       {:.1?}", scan_start.elapsed());
+    }
 
     let counter = TokenCounter::new();
 
     // 3. Parse with cache
+    let parse_start = std::time::Instant::now();
     let parse_results = crate::cache::parse::parse_with_cache(&files, path, &counter, verbose);
+    if timing {
+        eprintln!("cxpak [timing]: parse      {:.1?}", parse_start.elapsed());
+    }
 
     // 4. Build index
+    let index_start = std::time::Instant::now();
     let index = CodebaseIndex::build(files, parse_results, &counter);
     if verbose {
         eprintln!(
@@ -137,9 +152,16 @@ pub fn run(
             index.total_files, index.total_tokens
         );
     }
+    if timing {
+        eprintln!("cxpak [timing]: index      {:.1?}", index_start.elapsed());
+    }
 
     // 5. Build dependency graph
+    let graph_start = std::time::Instant::now();
     let graph = crate::commands::trace::build_dependency_graph(&index);
+    if timing {
+        eprintln!("cxpak [timing]: graph      {:.1?}", graph_start.elapsed());
+    }
 
     // 6. Determine the set of changed file paths (relative)
     let changed_paths: HashSet<String> = changes.iter().map(|c| c.path.clone()).collect();
@@ -173,6 +195,7 @@ pub fn run(
     }
 
     // 8. Build diff section text
+    let render_start = std::time::Instant::now();
     let mut full_diff = String::new();
     for change in &changes {
         full_diff.push_str(&format!(
@@ -209,6 +232,10 @@ pub fn run(
     };
 
     let rendered = output::render(&sections, format);
+    if timing {
+        eprintln!("cxpak [timing]: render     {:.1?}", render_start.elapsed());
+        eprintln!("cxpak [timing]: total      {:.1?}", total_start.elapsed());
+    }
 
     match out {
         Some(out_path) => {
