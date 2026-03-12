@@ -264,4 +264,90 @@ mod tests {
             assert_eq!(parts.len(), 3, "date '{}' missing dashes", commit.date);
         }
     }
+
+    #[test]
+    fn test_empty_repo_no_commits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _repo = git2::Repository::init(dir.path()).unwrap();
+        let result = extract_git_context(dir.path(), 100);
+        assert!(result.is_err(), "expected error for repo with no commits");
+    }
+
+    #[test]
+    fn test_single_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Alice", "alice@test.com").unwrap();
+        make_commit(&repo, &sig, "first", &[("hello.txt", "hi")], None);
+
+        let ctx = extract_git_context(dir.path(), 100).unwrap();
+        assert_eq!(ctx.commits.len(), 1);
+        assert_eq!(ctx.commits[0].message, "first");
+        assert_eq!(ctx.contributors.len(), 1);
+        assert_eq!(ctx.contributors[0].name, "Alice");
+    }
+
+    #[test]
+    fn test_max_commits_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "t@t.com").unwrap();
+        let c1 = make_commit(&repo, &sig, "c1", &[("a.txt", "1")], None);
+        let c2 = make_commit(&repo, &sig, "c2", &[("a.txt", "2")], Some(c1));
+        let _c3 = make_commit(&repo, &sig, "c3", &[("a.txt", "3")], Some(c2));
+
+        let ctx = extract_git_context(dir.path(), 2).unwrap();
+        assert_eq!(ctx.commits.len(), 2);
+        // First commit is always HEAD (c3). The second depends on git2's
+        // internal traversal when timestamps are identical, so we only
+        // assert the limit is respected.
+        assert_eq!(ctx.commits[0].message, "c3");
+    }
+
+    #[test]
+    fn test_format_date() {
+        assert_eq!(format_date(0), "1970-01-01");
+        assert_eq!(format_date(-1), "1970-01-01");
+        assert_eq!(format_date(1_700_000_000), "2023-11-14");
+    }
+
+    #[test]
+    fn test_multiple_contributors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let alice = git2::Signature::now("Alice", "alice@test.com").unwrap();
+        let bob = git2::Signature::now("Bob", "bob@test.com").unwrap();
+        let c1 = make_commit(&repo, &alice, "by alice", &[("a.txt", "a")], None);
+        let _c2 = make_commit(&repo, &bob, "by bob", &[("b.txt", "b")], Some(c1));
+
+        let ctx = extract_git_context(dir.path(), 100).unwrap();
+        assert_eq!(ctx.contributors.len(), 2);
+    }
+
+    #[test]
+    fn test_file_churn_sorted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "t@t.com").unwrap();
+        let c1 = make_commit(
+            &repo,
+            &sig,
+            "c1",
+            &[("hot.txt", "1"), ("cold.txt", "1")],
+            None,
+        );
+        let c2 = make_commit(&repo, &sig, "c2", &[("hot.txt", "2")], Some(c1));
+        let _c3 = make_commit(&repo, &sig, "c3", &[("hot.txt", "3")], Some(c2));
+
+        let ctx = extract_git_context(dir.path(), 100).unwrap();
+        assert_eq!(ctx.file_churn[0].path, "hot.txt");
+        assert_eq!(ctx.file_churn[0].commit_count, 3);
+    }
+
+    #[test]
+    fn test_not_a_git_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = extract_git_context(dir.path(), 100);
+        assert!(result.is_err());
+    }
 }

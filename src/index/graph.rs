@@ -64,3 +64,110 @@ impl DependencyGraph {
         visited
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_graph() {
+        let graph = DependencyGraph::new();
+        assert!(graph.edges.is_empty());
+        assert!(graph.dependents("any").is_empty());
+        assert!(graph.dependencies("any").is_none());
+    }
+
+    #[test]
+    fn test_add_edge() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        assert!(graph.edges.contains_key("a.rs"));
+        assert!(graph.edges["a.rs"].contains("b.rs"));
+    }
+
+    #[test]
+    fn test_dependents() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        graph.add_edge("c.rs", "b.rs");
+        let deps = graph.dependents("b.rs");
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains(&"a.rs"));
+        assert!(deps.contains(&"c.rs"));
+    }
+
+    #[test]
+    fn test_dependencies() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        graph.add_edge("a.rs", "c.rs");
+        let deps = graph.dependencies("a.rs").unwrap();
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains("b.rs"));
+        assert!(deps.contains("c.rs"));
+    }
+
+    #[test]
+    fn test_dependencies_none() {
+        let graph = DependencyGraph::new();
+        assert!(graph.dependencies("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_reachable_from_single() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        graph.add_edge("b.rs", "c.rs");
+        let reachable = graph.reachable_from(&["a.rs"]);
+        assert!(reachable.contains("a.rs"));
+        assert!(reachable.contains("b.rs"));
+        assert!(reachable.contains("c.rs"));
+    }
+
+    #[test]
+    fn test_reachable_from_reverse() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        let reachable = graph.reachable_from(&["b.rs"]);
+        assert!(reachable.contains("a.rs"));
+        assert!(reachable.contains("b.rs"));
+    }
+
+    #[test]
+    fn test_reachable_from_cycle() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        graph.add_edge("b.rs", "c.rs");
+        graph.add_edge("c.rs", "a.rs");
+        let reachable = graph.reachable_from(&["a.rs"]);
+        assert_eq!(reachable.len(), 3);
+    }
+
+    #[test]
+    fn test_reachable_from_disconnected() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        graph.add_edge("c.rs", "d.rs");
+        let reachable = graph.reachable_from(&["a.rs"]);
+        assert!(reachable.contains("a.rs"));
+        assert!(reachable.contains("b.rs"));
+        assert!(!reachable.contains("c.rs"));
+        assert!(!reachable.contains("d.rs"));
+    }
+
+    #[test]
+    fn test_reachable_from_empty_start() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        let reachable = graph.reachable_from(&[]);
+        assert!(reachable.is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_edges() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        graph.add_edge("a.rs", "b.rs");
+        assert_eq!(graph.edges["a.rs"].len(), 1);
+    }
+}

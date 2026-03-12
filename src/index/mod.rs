@@ -186,4 +186,177 @@ mod tests {
         assert!(!CodebaseIndex::is_key_file("src/utils/helper.rs"));
         assert!(!CodebaseIndex::is_key_file("tests/test_foo.py"));
     }
+
+    #[test]
+    fn test_find_symbol_case_insensitive() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "pub fn MyFunc() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "test.rs".into(),
+            absolute_path: file_path,
+            language: Some("rust".into()),
+            size_bytes: 18,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "test.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "MyFunc".into(),
+                    kind: crate::parser::language::SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn MyFunc()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+
+        let matches = index.find_symbol("myfunc");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1.name, "MyFunc");
+
+        let no_match = index.find_symbol("nonexistent");
+        assert!(no_match.is_empty());
+    }
+
+    #[test]
+    fn test_find_content_matches() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn hello_world() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "test.rs".into(),
+            absolute_path: file_path,
+            language: Some("rust".into()),
+            size_bytes: 20,
+        }];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+
+        let matches = index.find_content_matches("hello_world");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0], "test.rs");
+
+        let no_match = index.find_content_matches("xyz_not_found");
+        assert!(no_match.is_empty());
+    }
+
+    #[test]
+    fn test_all_public_symbols() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "pub fn foo() {} fn bar() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "test.rs".into(),
+            absolute_path: file_path,
+            language: Some("rust".into()),
+            size_bytes: 27,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "test.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "foo".into(),
+                        kind: crate::parser::language::SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn foo()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "bar".into(),
+                        kind: crate::parser::language::SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn bar()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let public = index.all_public_symbols();
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].1.name, "foo");
+    }
+
+    #[test]
+    fn test_all_imports() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "use std::io;").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "test.rs".into(),
+            absolute_path: file_path,
+            language: Some("rust".into()),
+            size_bytes: 12,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "test.rs".into(),
+            ParseResult {
+                symbols: vec![],
+                imports: vec![Import {
+                    source: "std::io".into(),
+                    names: vec!["io".into()],
+                }],
+                exports: vec![],
+            },
+        );
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let imports = index.all_imports();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].1.source, "std::io");
+    }
+
+    #[test]
+    fn test_language_stats() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp1 = dir.path().join("a.rs");
+        let fp2 = dir.path().join("b.rs");
+        let fp3 = dir.path().join("c.py");
+        std::fs::write(&fp1, "fn a() {}").unwrap();
+        std::fs::write(&fp2, "fn b() {}").unwrap();
+        std::fs::write(&fp3, "def c(): pass").unwrap();
+        let files = vec![
+            ScannedFile {
+                relative_path: "a.rs".into(),
+                absolute_path: fp1,
+                language: Some("rust".into()),
+                size_bytes: 9,
+            },
+            ScannedFile {
+                relative_path: "b.rs".into(),
+                absolute_path: fp2,
+                language: Some("rust".into()),
+                size_bytes: 9,
+            },
+            ScannedFile {
+                relative_path: "c.py".into(),
+                absolute_path: fp3,
+                language: Some("python".into()),
+                size_bytes: 13,
+            },
+        ];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        assert_eq!(index.language_stats["rust"].file_count, 2);
+        assert_eq!(index.language_stats["python"].file_count, 1);
+        assert_eq!(index.total_files, 3);
+    }
 }
