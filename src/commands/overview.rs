@@ -3,7 +3,9 @@ use crate::budget::degrader;
 use crate::budget::BudgetAllocation;
 use crate::cache::{CacheEntry, FileCache};
 use crate::cli::OutputFormat;
+use crate::commands::trace::build_dependency_graph;
 use crate::git;
+use crate::index::ranking;
 use crate::index::CodebaseIndex;
 use crate::output::{self, OutputSections};
 use crate::scanner::Scanner;
@@ -51,7 +53,28 @@ pub fn run(
     let parse_results = crate::cache::parse::parse_with_cache(&files, path, &counter, verbose);
 
     // 3. Index
-    let index = CodebaseIndex::build(files, parse_results, &counter);
+    let mut index = CodebaseIndex::build(files, parse_results, &counter);
+
+    // 3b. Rank files by importance and sort so high-value files get budget first
+    let graph = build_dependency_graph(&index);
+    let git_ctx = git::extract_git_context(path, 20).ok();
+    let file_paths: Vec<String> = index
+        .files
+        .iter()
+        .map(|f| f.relative_path.clone())
+        .collect();
+    let scores = ranking::rank_files(&file_paths, &graph, git_ctx.as_ref());
+
+    // Build path→score map and sort index.files by descending composite score
+    let score_map: std::collections::HashMap<&str, f64> = scores
+        .iter()
+        .map(|s| (s.path.as_str(), s.composite))
+        .collect();
+    index.files.sort_by(|a, b| {
+        let sa = score_map.get(a.relative_path.as_str()).unwrap_or(&0.0);
+        let sb = score_map.get(b.relative_path.as_str()).unwrap_or(&0.0);
+        sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     if verbose {
         eprintln!(
