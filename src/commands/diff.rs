@@ -1,6 +1,8 @@
 use crate::budget::counter::TokenCounter;
 use crate::budget::degrader;
 use crate::cli::OutputFormat;
+use crate::git;
+use crate::index::ranking;
 use crate::index::CodebaseIndex;
 use crate::output::{self, OutputSections};
 use crate::scanner::Scanner;
@@ -94,7 +96,7 @@ pub fn run(
     out: Option<&Path>,
     verbose: bool,
     all: bool,
-    _focus: Option<&str>,
+    focus: Option<&str>,
     timing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_start = std::time::Instant::now();
@@ -145,7 +147,7 @@ pub fn run(
 
     // 4. Build index
     let index_start = std::time::Instant::now();
-    let index = CodebaseIndex::build(files, parse_results, &counter);
+    let mut index = CodebaseIndex::build(files, parse_results, &counter);
     if verbose {
         eprintln!(
             "cxpak: indexed {} files, ~{} tokens total",
@@ -162,6 +164,29 @@ pub fn run(
     if timing {
         eprintln!("cxpak [timing]: graph      {:.1?}", graph_start.elapsed());
     }
+
+    // 5b. Rank files and apply focus
+    let git_ctx = git::extract_git_context(path, 20).ok();
+    let file_paths: Vec<String> = index
+        .files
+        .iter()
+        .map(|f| f.relative_path.clone())
+        .collect();
+    let mut scores = ranking::rank_files(&file_paths, &graph, git_ctx.as_ref());
+    if let Some(focus_path) = focus {
+        ranking::apply_focus(&mut scores, focus_path, &graph);
+    }
+
+    // Sort index files by score so higher-ranked context files get budget priority
+    let score_map: std::collections::HashMap<&str, f64> = scores
+        .iter()
+        .map(|s| (s.path.as_str(), s.composite))
+        .collect();
+    index.files.sort_by(|a, b| {
+        let sa = score_map.get(a.relative_path.as_str()).unwrap_or(&0.0);
+        let sb = score_map.get(b.relative_path.as_str()).unwrap_or(&0.0);
+        sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // 6. Determine the set of changed file paths (relative)
     let changed_paths: HashSet<String> = changes.iter().map(|c| c.path.clone()).collect();

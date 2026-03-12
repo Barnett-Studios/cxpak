@@ -8,6 +8,7 @@ use crate::scanner::Scanner;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
+use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -19,11 +20,13 @@ pub fn run(
     verbose: bool,
     all: bool,
     _focus: Option<&str>,
-    _timing: bool,
+    timing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let counter = TokenCounter::new();
+    let total_start = Instant::now();
 
     // 1. Scan
+    let scan_start = Instant::now();
     if verbose {
         eprintln!("cxpak: scanning {}", path.display());
     }
@@ -32,15 +35,23 @@ pub fn run(
     if verbose {
         eprintln!("cxpak: found {} files", files.len());
     }
+    if timing {
+        eprintln!("cxpak [timing]: scan       {:.1?}", scan_start.elapsed());
+    }
 
     if files.is_empty() {
         return Err("no source files found".into());
     }
 
     // 2. Parse (cache-aware)
+    let parse_start = Instant::now();
     let parse_results = crate::cache::parse::parse_with_cache(&files, path, &counter, verbose);
+    if timing {
+        eprintln!("cxpak [timing]: parse      {:.1?}", parse_start.elapsed());
+    }
 
     // 3. Index
+    let index_start = Instant::now();
     let index = CodebaseIndex::build(files, parse_results, &counter);
 
     if verbose {
@@ -48,6 +59,9 @@ pub fn run(
             "cxpak: indexed {} files, ~{} tokens total",
             index.total_files, index.total_tokens
         );
+    }
+    if timing {
+        eprintln!("cxpak [timing]: index      {:.1?}", index_start.elapsed());
     }
 
     // 4. Refresh the cache with accurate post-index token counts.
@@ -75,9 +89,14 @@ pub fn run(
     }
 
     // 5. Build dependency graph
+    let graph_start = Instant::now();
     let graph = build_dependency_graph(&index);
+    if timing {
+        eprintln!("cxpak [timing]: graph      {:.1?}", graph_start.elapsed());
+    }
 
     // 6. Find the target: symbol name first, then content match
+    let search_start = Instant::now();
     let symbol_matches: Vec<_> = index.find_symbol(target);
     let matched_files: HashSet<&str> = if !symbol_matches.is_empty() {
         if verbose {
@@ -133,8 +152,12 @@ pub fn run(
             relevant_paths.len()
         );
     }
+    if timing {
+        eprintln!("cxpak [timing]: search     {:.1?}", search_start.elapsed());
+    }
 
     // 8. Build output sections
+    let render_start = Instant::now();
     let metadata = render_trace_metadata(target, &matched_files, relevant_paths.len());
     let source_code = render_symbol_source(
         &index,
@@ -159,7 +182,13 @@ pub fn run(
     };
 
     // 9. Render and output
+    if timing {
+        eprintln!("cxpak [timing]: render     {:.1?}", render_start.elapsed());
+    }
     let rendered = output::render(&sections, format);
+    if timing {
+        eprintln!("cxpak [timing]: total      {:.1?}", total_start.elapsed());
+    }
 
     match out {
         Some(out_path) => {
