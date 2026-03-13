@@ -26,6 +26,7 @@ fn main() {
             all,
             git_ref,
             focus,
+            since,
             timing,
             path,
         } => {
@@ -40,9 +41,20 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let effective_git_ref = match (git_ref, since) {
+                (Some(_), _) => git_ref.clone(),
+                (None, Some(since_expr)) => match commands::diff::resolve_since(path, since_expr) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                (None, None) => None,
+            };
             commands::diff::run(
                 path,
-                git_ref.as_deref(),
+                effective_git_ref.as_deref(),
                 token_budget,
                 format,
                 out.as_deref(),

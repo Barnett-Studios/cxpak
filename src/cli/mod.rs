@@ -16,7 +16,7 @@ pub struct Cli {
 pub enum Commands {
     /// Structured repo summary within a token budget
     Overview {
-        #[arg(long)]
+        #[arg(long, default_value = "50k")]
         tokens: String,
         #[arg(long)]
         out: Option<PathBuf>,
@@ -40,7 +40,7 @@ pub enum Commands {
     },
     /// Show token-budgeted change summary with dependency context
     Diff {
-        #[arg(long)]
+        #[arg(long, default_value = "50k")]
         tokens: String,
         #[arg(long)]
         out: Option<PathBuf>,
@@ -56,6 +56,9 @@ pub enum Commands {
         /// Boost files under this path prefix in the ranking
         #[arg(long)]
         focus: Option<String>,
+        /// Time expression for --since (e.g. "1d", "1 week", "yesterday")
+        #[arg(long)]
+        since: Option<String>,
         /// Print pipeline stage durations to stderr
         #[arg(long)]
         timing: bool,
@@ -64,7 +67,7 @@ pub enum Commands {
     },
     /// Trace from error/function, pack relevant code paths
     Trace {
-        #[arg(long)]
+        #[arg(long, default_value = "50k")]
         tokens: String,
         #[arg(long)]
         out: Option<PathBuf>,

@@ -16,14 +16,17 @@ impl DependencyGraph {
             .entry(from.to_string())
             .or_default()
             .insert(to.to_string());
+        self.reverse_edges
+            .entry(to.to_string())
+            .or_default()
+            .insert(from.to_string());
     }
 
     pub fn dependents(&self, path: &str) -> Vec<&str> {
-        self.edges
-            .iter()
-            .filter(|(_, deps)| deps.contains(path))
-            .map(|(k, _)| k.as_str())
-            .collect()
+        self.reverse_edges
+            .get(path)
+            .map(|set| set.iter().map(String::as_str).collect())
+            .unwrap_or_default()
     }
 
     pub fn dependencies(&self, path: &str) -> Option<&HashSet<String>> {
@@ -55,9 +58,11 @@ impl DependencyGraph {
             }
 
             // Follow incoming edges (files that import `current`)
-            for (importer, deps) in &self.edges {
-                if deps.contains(&current) && visited.insert(importer.clone()) {
-                    queue.push_back(importer.clone());
+            if let Some(importers) = self.reverse_edges.get(&current) {
+                for importer in importers {
+                    if visited.insert(importer.clone()) {
+                        queue.push_back(importer.clone());
+                    }
                 }
             }
         }

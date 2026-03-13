@@ -15,9 +15,92 @@ use std::path::Path;
 /// Accepted forms: "1 day", "2 days", "1d", "3h", "1 hour", "3 hours",
 /// "1 week", "2 weeks", "1w", "1 month", "2 months", "yesterday".
 /// Returns `Err` for empty, zero-valued, or unrecognised input.
-#[allow(dead_code)]
-pub fn parse_time_expression(_expr: &str) -> Result<std::time::Duration, String> {
-    unimplemented!("parse_time_expression is not yet implemented")
+pub fn parse_time_expression(expr: &str) -> Result<std::time::Duration, String> {
+    let expr = expr.trim().to_lowercase();
+    if expr.is_empty() {
+        return Err("empty time expression".to_string());
+    }
+    if expr == "yesterday" {
+        return Ok(std::time::Duration::from_secs(86400));
+    }
+
+    // Try compact form: "3d", "1h", "2w" — only when the prefix is purely digits.
+    let try_compact =
+        |suffix: char, secs_per: u64| -> Option<Result<std::time::Duration, String>> {
+            let num_str = expr.strip_suffix(suffix)?;
+            // Guard: the remaining characters must all be ASCII digits (pure number).
+            if !num_str.chars().all(|c| c.is_ascii_digit()) || num_str.is_empty() {
+                return None;
+            }
+            let n: u64 = match num_str.parse() {
+                Ok(v) => v,
+                Err(_) => return Some(Err(format!("invalid time expression: {expr}"))),
+            };
+            if n == 0 {
+                return Some(Err("time expression must be > 0".to_string()));
+            }
+            Some(Ok(std::time::Duration::from_secs(n * secs_per)))
+        };
+
+    if let Some(result) = try_compact('d', 86400) {
+        return result;
+    }
+    if let Some(result) = try_compact('h', 3600) {
+        return result;
+    }
+    if let Some(result) = try_compact('w', 604800) {
+        return result;
+    }
+
+    // Try long form: "1 day", "2 days", "1 hour", etc.
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    if parts.len() == 2 {
+        let n: u64 = parts[0]
+            .parse()
+            .map_err(|_| format!("invalid time expression: {expr}"))?;
+        if n == 0 {
+            return Err("time expression must be > 0".to_string());
+        }
+        let unit = parts[1];
+        let secs_per = match unit {
+            "day" | "days" => 86400,
+            "hour" | "hours" => 3600,
+            "week" | "weeks" => 604800,
+            "month" | "months" => 2592000,
+            _ => return Err(format!("unknown time unit: {unit}")),
+        };
+        return Ok(std::time::Duration::from_secs(n * secs_per));
+    }
+
+    Err(format!("invalid time expression: {expr}"))
+}
+
+/// Convert a `--since` expression into a git ref string.
+/// Uses `git log --since` to find the oldest commit within the time window,
+/// then returns its parent as the diff base.
+pub fn resolve_since(repo_path: &std::path::Path, since_expr: &str) -> Result<String, String> {
+    let duration = parse_time_expression(since_expr)?;
+    let secs = duration.as_secs();
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo_path.to_string_lossy(),
+            "log",
+            "--all",
+            "--format=%H",
+            &format!("--since={secs} seconds ago"),
+        ])
+        .output()
+        .map_err(|e| format!("git log failed: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hashes: Vec<&str> = stdout.lines().collect();
+    if hashes.is_empty() {
+        return Err(format!("no commits found in the last {since_expr}"));
+    }
+    // The last hash in the list is the oldest commit in the time window.
+    // We want its parent as the diff base.
+    let oldest = hashes.last().unwrap();
+    Ok(format!("{oldest}~1"))
 }
 
 /// A single file's changes from a git diff.
