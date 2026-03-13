@@ -26,14 +26,16 @@ fn file_mtime(path: &Path) -> i64 {
 /// 3. On a cache miss, parses the file with tree-sitter and records the result.
 /// 4. Saves the updated cache back to disk.
 ///
-/// Returns a `HashMap` mapping `relative_path → ParseResult` for every file
-/// that could be parsed.
+/// Returns a tuple of:
+/// - A `HashMap` mapping `relative_path → ParseResult` for every file that could be parsed.
+/// - A `HashMap` mapping `relative_path → file contents` for files read from disk on a
+///   cache miss (so callers can avoid re-reading files that were already read here).
 pub fn parse_with_cache(
     files: &[ScannedFile],
     repo_root: &Path,
     counter: &TokenCounter,
     verbose: bool,
-) -> HashMap<String, ParseResult> {
+) -> (HashMap<String, ParseResult>, HashMap<String, String>) {
     if verbose {
         eprintln!("cxpak: parsing with tree-sitter");
     }
@@ -48,7 +50,11 @@ pub fn parse_with_cache(
     // cache map (shared read-only), creates its own tree-sitter Parser, and
     // reads source from disk. Results are collected and then assembled
     // sequentially below.
-    let per_file_results: Vec<(Option<ParseResult>, CacheEntry)> = files
+    //
+    // The tuple carries an `Option<String>` for the source that was read on a
+    // cache miss so that callers can avoid re-reading files that we already
+    // read here.
+    let per_file_results: Vec<(Option<ParseResult>, CacheEntry, Option<String>)> = files
         .par_iter()
         .map(|file| {
             let mtime = file_mtime(&file.absolute_path);
@@ -65,12 +71,14 @@ pub fn parse_with_cache(
                 None
             };
 
-            let parse_result = if let Some((pr, _token_count)) = cached_parse {
-                pr
+            let (parse_result, source_opt) = if let Some((pr, _token_count)) = cached_parse {
+                // Cache hit — no disk read needed.
+                (pr, None)
             } else {
                 // Cache miss — parse with tree-sitter. Each thread creates its
                 // own Parser so there is no shared mutable state.
                 let mut result = None;
+                let mut source_read: Option<String> = None;
                 if let Some(lang_name) = &file.language {
                     if let Some(lang) = registry.get(lang_name) {
                         let source =
@@ -81,9 +89,10 @@ pub fn parse_with_cache(
                                 result = Some(lang.extract(&source, &tree));
                             }
                         }
+                        source_read = Some(source);
                     }
                 }
-                result
+                (result, source_read)
             };
 
             // Preserve the cached token_count; it will be updated by the
@@ -102,16 +111,20 @@ pub fn parse_with_cache(
                 parse_result: parse_result.clone(),
             };
 
-            (parse_result, cache_entry)
+            (parse_result, cache_entry, source_opt)
         })
         .collect();
 
     // Assemble results sequentially from the parallel output.
     let mut parse_results: HashMap<String, ParseResult> = HashMap::new();
+    let mut content_map: HashMap<String, String> = HashMap::new();
     let mut new_cache_entries: Vec<CacheEntry> = Vec::new();
-    for (pr_opt, cache_entry) in per_file_results {
+    for (pr_opt, cache_entry, source_opt) in per_file_results {
         if let Some(ref pr) = pr_opt {
             parse_results.insert(cache_entry.relative_path.clone(), pr.clone());
+        }
+        if let Some(src) = source_opt {
+            content_map.insert(cache_entry.relative_path.clone(), src);
         }
         new_cache_entries.push(cache_entry);
     }
@@ -157,7 +170,7 @@ pub fn parse_with_cache(
         }
     }
 
-    parse_results
+    (parse_results, content_map)
 }
 
 #[cfg(test)]
@@ -205,7 +218,7 @@ mod tests {
         let files = scan_files(&root);
         assert!(!files.is_empty(), "expected at least one scanned file");
 
-        parse_with_cache(&files, &root, &counter, false);
+        let (_parse_results, _content_map) = parse_with_cache(&files, &root, &counter, false);
 
         let cache_file = root.join(".cxpak").join("cache").join("cache.json");
         assert!(
@@ -224,7 +237,7 @@ mod tests {
         let counter = TokenCounter::new();
 
         let files = scan_files(&root);
-        let results = parse_with_cache(&files, &root, &counter, false);
+        let (results, _content_map) = parse_with_cache(&files, &root, &counter, false);
 
         // At least one parseable Rust file should appear in the map.
         assert!(
@@ -248,7 +261,7 @@ mod tests {
         let files = scan_files(&root);
 
         // First call — populates the cache.
-        let results_first = parse_with_cache(&files, &root, &counter, false);
+        let (results_first, _) = parse_with_cache(&files, &root, &counter, false);
 
         // Verify cache exists.
         let cache_file = root.join(".cxpak").join("cache").join("cache.json");
@@ -258,7 +271,7 @@ mod tests {
         let cache_before = fs::read_to_string(&cache_file).unwrap();
 
         // Second call — should hit the cache.
-        let results_second = parse_with_cache(&files, &root, &counter, false);
+        let (results_second, _) = parse_with_cache(&files, &root, &counter, false);
 
         // Both calls should return the same symbol names.
         let symbols_first: Vec<String> = results_first
@@ -293,7 +306,7 @@ mod tests {
         let counter = TokenCounter::new();
 
         let files = scan_files(&root);
-        let results_first = parse_with_cache(&files, &root, &counter, false);
+        let (results_first, _) = parse_with_cache(&files, &root, &counter, false);
 
         let first_symbols: Vec<String> = results_first
             .values()
@@ -313,7 +326,7 @@ mod tests {
 
         // Re-scan so ScannedFile reflects new size.
         let files_updated = scan_files(&root);
-        let results_second = parse_with_cache(&files_updated, &root, &counter, false);
+        let (results_second, _) = parse_with_cache(&files_updated, &root, &counter, false);
 
         let second_symbols: Vec<String> = results_second
             .values()
@@ -383,7 +396,7 @@ mod tests {
             scanned.len()
         );
 
-        let results = parse_with_cache(&scanned, &root, &counter, false);
+        let (results, _content_map) = parse_with_cache(&scanned, &root, &counter, false);
 
         // All five files should appear in the results map.
         assert_eq!(

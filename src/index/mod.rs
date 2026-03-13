@@ -153,11 +153,51 @@ impl CodebaseIndex {
         counter: &TokenCounter,
         content: HashMap<String, String>,
     ) -> Self {
-        // Stub: content map is intentionally ignored so that the accompanying test
-        // can assert that this method is NOT yet doing the right thing.  Task 4 will
-        // replace this body with an implementation that actually uses `content`.
-        let _ = content;
-        Self::build(files, parse_results, counter)
+        let mut language_stats: HashMap<String, LanguageStats> = HashMap::new();
+        let mut indexed_files = Vec::new();
+        let mut total_tokens = 0usize;
+        let mut total_bytes = 0u64;
+
+        for file in &files {
+            let file_content = content
+                .get(&file.relative_path)
+                .cloned()
+                .unwrap_or_else(|| {
+                    std::fs::read_to_string(&file.absolute_path).unwrap_or_default()
+                });
+            let token_count = counter.count_or_zero(&file_content);
+            total_tokens += token_count;
+            total_bytes += file.size_bytes;
+
+            if let Some(lang) = &file.language {
+                let stats = language_stats.entry(lang.clone()).or_insert(LanguageStats {
+                    file_count: 0,
+                    total_bytes: 0,
+                    total_tokens: 0,
+                });
+                stats.file_count += 1;
+                stats.total_bytes += file.size_bytes;
+                stats.total_tokens += token_count;
+            }
+
+            let parse_result = parse_results.get(&file.relative_path).cloned();
+            indexed_files.push(IndexedFile {
+                relative_path: file.relative_path.clone(),
+                language: file.language.clone(),
+                size_bytes: file.size_bytes,
+                token_count,
+                parse_result,
+                content: file_content,
+            });
+        }
+
+        Self {
+            total_files: indexed_files.len(),
+            total_bytes,
+            total_tokens,
+            files: indexed_files,
+            language_stats,
+        }
     }
 
     pub fn is_key_file(path: &str) -> bool {

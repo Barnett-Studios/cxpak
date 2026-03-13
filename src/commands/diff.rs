@@ -233,14 +233,15 @@ pub fn run(
 
     // 3. Parse with cache
     let parse_start = std::time::Instant::now();
-    let parse_results = crate::cache::parse::parse_with_cache(&files, path, &counter, verbose);
+    let (parse_results, content_map) =
+        crate::cache::parse::parse_with_cache(&files, path, &counter, verbose);
     if timing {
         eprintln!("cxpak [timing]: parse      {:.1?}", parse_start.elapsed());
     }
 
     // 4. Build index
     let index_start = std::time::Instant::now();
-    let mut index = CodebaseIndex::build(files, parse_results, &counter);
+    let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
     if verbose {
         eprintln!(
             "cxpak: indexed {} files, ~{} tokens total",
