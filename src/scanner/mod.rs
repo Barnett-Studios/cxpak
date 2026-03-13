@@ -141,7 +141,7 @@ impl Scanner {
 }
 
 /// Detect a programming language from a file's extension.
-fn detect_language(path: &Path) -> Option<String> {
+pub fn detect_language(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_string_lossy().to_lowercase();
     let lang = match ext.as_str() {
         "rs" => "rust",

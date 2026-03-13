@@ -65,6 +65,18 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Watch for file changes and keep index hot
+    #[cfg(feature = "daemon")]
+    Watch {
+        #[arg(long, default_value = "50k")]
+        tokens: String,
+        #[arg(long, default_value = "markdown")]
+        format: OutputFormat,
+        #[arg(long)]
+        verbose: bool,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Trace from error/function, pack relevant code paths
     Trace {
         #[arg(long, default_value = "50k")]

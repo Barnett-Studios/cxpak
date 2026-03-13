@@ -3,6 +3,8 @@ mod commands;
 
 pub mod budget;
 pub mod cache;
+#[cfg(feature = "daemon")]
+pub mod daemon;
 pub mod git;
 pub mod index;
 pub mod output;
@@ -18,6 +20,26 @@ fn main() {
 
     let result = match &cli.command {
         Commands::Clean { path } => commands::clean::run(path),
+        #[cfg(feature = "daemon")]
+        Commands::Watch {
+            tokens,
+            format,
+            verbose,
+            path,
+        } => {
+            let token_budget = match parse_token_count(tokens) {
+                Ok(0) => {
+                    eprintln!("Error: --tokens must be greater than 0");
+                    std::process::exit(1);
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            commands::watch::run(path, token_budget, format, *verbose)
+        }
         Commands::Diff {
             tokens,
             out,
