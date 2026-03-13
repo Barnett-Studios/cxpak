@@ -1,6 +1,8 @@
 pub mod budget;
 pub mod cache;
 pub mod cli;
+#[cfg(feature = "daemon")]
+pub mod daemon;
 pub mod git;
 pub mod index;
 pub mod output;
