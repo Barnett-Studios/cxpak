@@ -200,6 +200,81 @@ impl CodebaseIndex {
         }
     }
 
+    /// Insert or update a single file in the index.
+    ///
+    /// If a file with the same `relative_path` already exists, it is replaced.
+    /// Language stats and totals are recomputed.
+    pub fn upsert_file(
+        &mut self,
+        relative_path: &str,
+        language: Option<&str>,
+        content: &str,
+        parse_result: Option<ParseResult>,
+        counter: &TokenCounter,
+    ) {
+        // Remove old entry if it exists (adjusts stats)
+        self.remove_file(relative_path);
+
+        let token_count = counter.count_or_zero(content);
+        let size_bytes = content.len() as u64;
+
+        if let Some(lang) = language {
+            let stats = self
+                .language_stats
+                .entry(lang.to_string())
+                .or_insert(LanguageStats {
+                    file_count: 0,
+                    total_bytes: 0,
+                    total_tokens: 0,
+                });
+            stats.file_count += 1;
+            stats.total_bytes += size_bytes;
+            stats.total_tokens += token_count;
+        }
+
+        self.total_tokens += token_count;
+        self.total_bytes += size_bytes;
+
+        self.files.push(IndexedFile {
+            relative_path: relative_path.to_string(),
+            language: language.map(|s| s.to_string()),
+            size_bytes,
+            token_count,
+            parse_result,
+            content: content.to_string(),
+        });
+
+        self.total_files = self.files.len();
+    }
+
+    /// Remove a file from the index by relative path.
+    ///
+    /// Adjusts language stats and totals. No-op if the file is not present.
+    pub fn remove_file(&mut self, relative_path: &str) {
+        if let Some(pos) = self
+            .files
+            .iter()
+            .position(|f| f.relative_path == relative_path)
+        {
+            let removed = self.files.swap_remove(pos);
+            self.total_tokens = self.total_tokens.saturating_sub(removed.token_count);
+            self.total_bytes = self.total_bytes.saturating_sub(removed.size_bytes);
+
+            if let Some(lang) = &removed.language {
+                if let Some(stats) = self.language_stats.get_mut(lang) {
+                    stats.file_count = stats.file_count.saturating_sub(1);
+                    stats.total_bytes = stats.total_bytes.saturating_sub(removed.size_bytes);
+                    stats.total_tokens = stats.total_tokens.saturating_sub(removed.token_count);
+                    if stats.file_count == 0 {
+                        self.language_stats.remove(lang);
+                    }
+                }
+            }
+
+            self.total_files = self.files.len();
+        }
+    }
+
     pub fn is_key_file(path: &str) -> bool {
         let lower = path.to_lowercase();
         let filename = lower.rsplit('/').next().unwrap_or(&lower);
@@ -417,6 +492,142 @@ mod tests {
         assert_eq!(index.language_stats["rust"].file_count, 2);
         assert_eq!(index.language_stats["python"].file_count, 1);
         assert_eq!(index.total_files, 3);
+    }
+
+    #[test]
+    fn test_upsert_file_adds_new() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 9,
+        }];
+        let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        assert_eq!(index.files.len(), 1);
+
+        index.upsert_file("b.rs", Some("rust"), "fn b() {}", None, &counter);
+        assert_eq!(index.files.len(), 2);
+        assert_eq!(index.total_files, 2);
+        let b = index
+            .files
+            .iter()
+            .find(|f| f.relative_path == "b.rs")
+            .unwrap();
+        assert!(b.content.contains("fn b()"));
+    }
+
+    #[test]
+    fn test_upsert_file_updates_existing() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 9,
+        }];
+        let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
+
+        index.upsert_file(
+            "a.rs",
+            Some("rust"),
+            "fn a_v2() { /* updated */ }",
+            None,
+            &counter,
+        );
+        assert_eq!(index.files.len(), 1);
+        assert!(index.files[0].content.contains("a_v2"));
+    }
+
+    #[test]
+    fn test_remove_file() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp1 = dir.path().join("a.rs");
+        let fp2 = dir.path().join("b.rs");
+        std::fs::write(&fp1, "fn a() {}").unwrap();
+        std::fs::write(&fp2, "fn b() {}").unwrap();
+        let files = vec![
+            ScannedFile {
+                relative_path: "a.rs".into(),
+                absolute_path: fp1,
+                language: Some("rust".into()),
+                size_bytes: 9,
+            },
+            ScannedFile {
+                relative_path: "b.rs".into(),
+                absolute_path: fp2,
+                language: Some("rust".into()),
+                size_bytes: 9,
+            },
+        ];
+        let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        assert_eq!(index.files.len(), 2);
+
+        index.remove_file("a.rs");
+        assert_eq!(index.files.len(), 1);
+        assert_eq!(index.total_files, 1);
+        assert_eq!(index.files[0].relative_path, "b.rs");
+    }
+
+    #[test]
+    fn test_remove_file_adjusts_language_stats() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp1 = dir.path().join("a.rs");
+        let fp2 = dir.path().join("b.py");
+        std::fs::write(&fp1, "fn a() {}").unwrap();
+        std::fs::write(&fp2, "def b(): pass").unwrap();
+        let files = vec![
+            ScannedFile {
+                relative_path: "a.rs".into(),
+                absolute_path: fp1,
+                language: Some("rust".into()),
+                size_bytes: 9,
+            },
+            ScannedFile {
+                relative_path: "b.py".into(),
+                absolute_path: fp2,
+                language: Some("python".into()),
+                size_bytes: 13,
+            },
+        ];
+        let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        assert!(index.language_stats.contains_key("rust"));
+        assert!(index.language_stats.contains_key("python"));
+
+        index.remove_file("a.rs");
+        // rust stats should be removed entirely (0 files)
+        assert!(!index.language_stats.contains_key("rust"));
+        assert!(index.language_stats.contains_key("python"));
+    }
+
+    #[test]
+    fn test_remove_nonexistent_is_noop() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 9,
+        }];
+        let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let orig_tokens = index.total_tokens;
+        let orig_bytes = index.total_bytes;
+
+        index.remove_file("nonexistent.rs");
+        assert_eq!(index.files.len(), 1);
+        assert_eq!(index.total_tokens, orig_tokens);
+        assert_eq!(index.total_bytes, orig_bytes);
     }
 
     /// This test is intentionally FAILING until Task 4 implements `build_with_content`
