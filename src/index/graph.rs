@@ -33,6 +33,23 @@ impl DependencyGraph {
         self.edges.get(path)
     }
 
+    /// Remove all outgoing edges from `source` and clean up corresponding reverse edges.
+    ///
+    /// Used during incremental re-indexing: call this before re-adding the new
+    /// edges from a freshly parsed file.
+    pub fn remove_edges_for(&mut self, source: &str) {
+        if let Some(targets) = self.edges.remove(source) {
+            for target in &targets {
+                if let Some(rev) = self.reverse_edges.get_mut(target.as_str()) {
+                    rev.remove(source);
+                    if rev.is_empty() {
+                        self.reverse_edges.remove(target.as_str());
+                    }
+                }
+            }
+        }
+    }
+
     /// BFS from `start_files`, following edges in both directions.
     ///
     /// Returns the set of all reachable file paths, including the start files
@@ -188,6 +205,50 @@ mod tests {
         assert!(graph.reverse_edges.get("b.rs").unwrap().contains("c.rs"));
         assert!(graph.reverse_edges.get("d.rs").unwrap().contains("a.rs"));
         assert_eq!(graph.reverse_edges.get("b.rs").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_remove_edges_for_file() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        graph.add_edge("a.rs", "c.rs");
+        graph.add_edge("d.rs", "b.rs");
+
+        graph.remove_edges_for("a.rs");
+
+        // a.rs edges should be gone
+        assert!(!graph.edges.contains_key("a.rs"));
+        // b.rs should only have d.rs as dependent now
+        let b_deps = graph.dependents("b.rs");
+        assert_eq!(b_deps.len(), 1);
+        assert!(b_deps.contains(&"d.rs"));
+        // c.rs should have no dependents
+        assert!(graph.dependents("c.rs").is_empty());
+    }
+
+    #[test]
+    fn test_remove_edges_for_nonexistent() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        graph.remove_edges_for("z.rs"); // no-op
+        assert_eq!(graph.edges["a.rs"].len(), 1);
+    }
+
+    #[test]
+    fn test_remove_and_readd_edges() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs");
+        graph.add_edge("a.rs", "c.rs");
+
+        // Simulate re-parse: remove old, add new
+        graph.remove_edges_for("a.rs");
+        graph.add_edge("a.rs", "d.rs");
+
+        assert_eq!(graph.edges["a.rs"].len(), 1);
+        assert!(graph.edges["a.rs"].contains("d.rs"));
+        assert!(graph.dependents("b.rs").is_empty());
+        assert!(graph.dependents("c.rs").is_empty());
+        assert_eq!(graph.dependents("d.rs"), vec!["a.rs"]);
     }
 
     #[test]
