@@ -2,7 +2,7 @@
 set -euo pipefail
 
 INSTALL_DIR="${CXPAK_INSTALL_DIR:-${HOME}/.claude/plugins/cxpak/bin}"
-GITHUB_REPO="lyubomir-bozhinov/cxpak"
+GITHUB_REPO="Barnett-Studios/cxpak"
 DRY_RUN=false
 
 for arg in "$@"; do

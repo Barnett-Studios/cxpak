@@ -3,9 +3,9 @@
   "description": "Structured codebase context for Claude Code, powered by cxpak",
   "version": "0.6.1",
   "author": {
-    "name": "Lyubomir Bozhinov"
+    "name": "Barnett Studios"
   },
-  "homepage": "https://github.com/lyubomir-bozhinov/cxpak",
-  "repository": "https://github.com/lyubomir-bozhinov/cxpak",
+  "homepage": "https://github.com/Barnett-Studios/cxpak",
+  "repository": "https://github.com/Barnett-Studios/cxpak",
   "license": "MIT"
 }

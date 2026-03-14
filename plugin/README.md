@@ -1,6 +1,6 @@
 # cxpak — Claude Code Plugin
 
-Structured codebase context for Claude Code, powered by [cxpak](https://github.com/lyubomir-bozhinov/cxpak).
+Structured codebase context for Claude Code, powered by [cxpak](https://github.com/Barnett-Studios/cxpak).
 
 ## What It Does
 
@@ -16,7 +16,7 @@ cxpak is auto-downloaded on first use if not already installed. To install manua
 
 ```bash
 # Via Homebrew
-brew tap lyubomir-bozhinov/tap
+brew tap Barnett-Studios/tap
 brew install cxpak
 
 # Via cargo
@@ -26,7 +26,7 @@ cargo install cxpak
 ### Add the Plugin
 
 ```
-/plugin marketplace add lyubomir-bozhinov/cxpak
+/plugin marketplace add Barnett-Studios/cxpak
 /plugin install cxpak
 ```
 

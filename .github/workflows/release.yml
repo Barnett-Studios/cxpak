@@ -113,14 +113,14 @@ jobs:
           SHA_MAC_X86=$(sha256sum artifacts/cxpak-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
           SHA_MAC_ARM=$(sha256sum artifacts/cxpak-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
 
-          git clone https://x-access-token:${TAP_TOKEN}@github.com/lyubomir-bozhinov/homebrew-tap.git tap
+          git clone https://x-access-token:${TAP_TOKEN}@github.com/Barnett-Studios/homebrew-tap.git tap
           cd tap
           mkdir -p Formula
 
           cat > Formula/cxpak.rb << 'RUBY'
           class Cxpak < Formula
             desc "Token-budgeted codebase context for LLMs"
-            homepage "https://github.com/lyubomir-bozhinov/cxpak"
+            homepage "https://github.com/Barnett-Studios/cxpak"
           RUBY
 
           cat >> Formula/cxpak.rb << EOF
@@ -128,20 +128,20 @@ jobs:
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/lyubomir-bozhinov/cxpak/releases/download/v${VERSION}/cxpak-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/Barnett-Studios/cxpak/releases/download/v${VERSION}/cxpak-aarch64-apple-darwin.tar.gz"
                 sha256 "${SHA_MAC_ARM}"
               else
-                url "https://github.com/lyubomir-bozhinov/cxpak/releases/download/v${VERSION}/cxpak-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/Barnett-Studios/cxpak/releases/download/v${VERSION}/cxpak-x86_64-apple-darwin.tar.gz"
                 sha256 "${SHA_MAC_X86}"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "https://github.com/lyubomir-bozhinov/cxpak/releases/download/v${VERSION}/cxpak-aarch64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/Barnett-Studios/cxpak/releases/download/v${VERSION}/cxpak-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "${SHA_LINUX_ARM}"
               else
-                url "https://github.com/lyubomir-bozhinov/cxpak/releases/download/v${VERSION}/cxpak-x86_64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/Barnett-Studios/cxpak/releases/download/v${VERSION}/cxpak-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "${SHA_LINUX_X86}"
               end
             end

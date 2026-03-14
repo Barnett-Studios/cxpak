@@ -1,7 +1,7 @@
 # cxpak
 
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange.svg)
-![CI](https://github.com/lyubomir-bozhinov/cxpak/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/Barnett-Studios/cxpak/actions/workflows/ci.yml/badge.svg)
 ![Crates.io](https://img.shields.io/crates/v/cxpak)
 ![Downloads](https://img.shields.io/crates/d/cxpak)
 ![Homebrew](https://img.shields.io/badge/Homebrew-tap-blue.svg)
@@ -15,7 +15,7 @@ A Rust CLI that indexes codebases using tree-sitter and produces token-budgeted 
 
 ```bash
 # Via Homebrew (macOS/Linux)
-brew tap lyubomir-bozhinov/tap
+brew tap Barnett-Studios/tap
 brew install cxpak
 
 # Via cargo
@@ -29,7 +29,7 @@ cxpak ships as a Claude Code plugin — skills auto-trigger when you ask about c
 **Install the plugin:**
 
 ```
-/plugin marketplace add lyubomir-bozhinov/cxpak
+/plugin marketplace add Barnett-Studios/cxpak
 /plugin install cxpak
 ```
 
@@ -149,10 +149,6 @@ MIT
 
 ---
 
-## About Me
+## About
 
-I build things — products, teams, systems… occasionally IKEA furniture (with mixed results). I've led engineering in everything from scrappy startups to big enterprises, but what I really love is turning ideas into real, useful tech.
-
-I'm into mentoring, scaling systems, and solving problems that make people say "well, that's impossible."
-
-Thanks for stopping by!
+Built and maintained by Barnett Studios — building products, teams, and systems that last. Part-time technical leadership for startups and scale-ups.
