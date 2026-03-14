@@ -266,6 +266,259 @@ async fn trace_handler(
     })))
 }
 
+// --- MCP server mode (JSON-RPC over stdio) ---
+
+pub fn run_mcp(
+    path: &Path,
+    _token_budget: usize,
+    _verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let counter = TokenCounter::new();
+    let registry = LanguageRegistry::new();
+
+    let scanner = Scanner::new(path)?;
+    let files = scanner.scan()?;
+
+    let mut parse_results = HashMap::new();
+    let mut content_map = HashMap::new();
+    for file in &files {
+        let source = std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
+        if let Some(lang_name) = &file.language {
+            if let Some(lang) = registry.get(lang_name) {
+                let ts_lang = lang.ts_language();
+                let mut parser = tree_sitter::Parser::new();
+                parser.set_language(&ts_lang).ok();
+                if let Some(tree) = parser.parse(&source, None) {
+                    let result = lang.extract(&source, &tree);
+                    parse_results.insert(file.relative_path.clone(), result);
+                }
+            }
+        }
+        content_map.insert(file.relative_path.clone(), source);
+    }
+
+    let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+
+    eprintln!(
+        "cxpak: MCP server ready ({} files indexed, {} tokens)",
+        index.total_files, index.total_tokens
+    );
+
+    mcp_stdio_loop(&index)
+}
+
+fn mcp_stdio_loop(index: &CodebaseIndex) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{self, BufRead, Write};
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let id = request.get("id").cloned();
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+        let response = match method {
+            "initialize" => mcp_response(
+                id,
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "cxpak",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            ),
+            "notifications/initialized" => continue, // no response for notifications
+            "tools/list" => mcp_response(
+                id,
+                json!({
+                    "tools": [
+                        {
+                            "name": "cxpak_overview",
+                            "description": "Get a structured overview of the codebase",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "tokens": {
+                                        "type": "string",
+                                        "description": "Token budget (e.g. '50k', '100k')",
+                                        "default": "50k"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_trace",
+                            "description": "Trace a symbol through the codebase dependency graph",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "target": {
+                                        "type": "string",
+                                        "description": "Symbol or text to trace"
+                                    },
+                                    "tokens": {
+                                        "type": "string",
+                                        "description": "Token budget",
+                                        "default": "50k"
+                                    }
+                                },
+                                "required": ["target"]
+                            }
+                        },
+                        {
+                            "name": "cxpak_stats",
+                            "description": "Get index statistics (file count, tokens, languages)",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {}
+                            }
+                        }
+                    ]
+                }),
+            ),
+            "tools/call" => {
+                let params = request.get("params").cloned().unwrap_or(json!({}));
+                let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                handle_tool_call(id, tool_name, &arguments, index)
+            }
+            _ => mcp_error_response(id, -32601, "Method not found"),
+        };
+
+        let mut out = stdout.lock();
+        serde_json::to_writer(&mut out, &response)?;
+        out.write_all(b"\n")?;
+        out.flush()?;
+    }
+
+    Ok(())
+}
+
+fn handle_tool_call(
+    id: Option<Value>,
+    tool_name: &str,
+    args: &Value,
+    index: &CodebaseIndex,
+) -> Value {
+    match tool_name {
+        "cxpak_stats" => {
+            let languages: Vec<Value> = index
+                .language_stats
+                .iter()
+                .map(|(lang, stats)| {
+                    json!({"language": lang, "files": stats.file_count, "tokens": stats.total_tokens})
+                })
+                .collect();
+
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&json!({
+                    "files": index.total_files,
+                    "tokens": index.total_tokens,
+                    "languages": languages,
+                }))
+                .unwrap_or_default(),
+            )
+        }
+        "cxpak_overview" => {
+            let languages: Vec<Value> = index
+                .language_stats
+                .iter()
+                .map(|(lang, stats)| {
+                    json!({"language": lang, "files": stats.file_count, "tokens": stats.total_tokens})
+                })
+                .collect();
+
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&json!({
+                    "total_files": index.total_files,
+                    "total_tokens": index.total_tokens,
+                    "languages": languages,
+                }))
+                .unwrap_or_default(),
+            )
+        }
+        "cxpak_trace" => {
+            let target = args.get("target").and_then(|t| t.as_str()).unwrap_or("");
+            if target.is_empty() {
+                return mcp_tool_result(id, "Error: 'target' argument is required");
+            }
+
+            let symbol_matches = index.find_symbol(target);
+            let content_matches = if symbol_matches.is_empty() {
+                index.find_content_matches(target)
+            } else {
+                vec![]
+            };
+
+            let found = !symbol_matches.is_empty() || !content_matches.is_empty();
+
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&json!({
+                    "target": target,
+                    "found": found,
+                    "symbol_matches": symbol_matches.len(),
+                    "content_matches": content_matches.len(),
+                    "total_files": index.total_files,
+                }))
+                .unwrap_or_default(),
+            )
+        }
+        _ => mcp_response(
+            id,
+            json!({
+                "content": [{"type": "text", "text": format!("Unknown tool: {tool_name}")}],
+                "isError": true
+            }),
+        ),
+    }
+}
+
+fn mcp_response(id: Option<Value>, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
+fn mcp_tool_result(id: Option<Value>, text: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{"type": "text", "text": text}]
+        }
+    })
+}
+
+fn mcp_error_response(id: Option<Value>, code: i32, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +582,31 @@ mod tests {
             .and_then(|t| crate::cli::parse_token_count(t).ok())
             .unwrap_or(50_000);
         assert_eq!(budget, 50_000);
+    }
+
+    #[test]
+    fn test_mcp_response_structure() {
+        let resp = mcp_response(Some(json!(1)), json!({"status": "ok"}));
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 1);
+        assert_eq!(resp["result"]["status"], "ok");
+    }
+
+    #[test]
+    fn test_mcp_tool_result_structure() {
+        let resp = mcp_tool_result(Some(json!(2)), "hello world");
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 2);
+        assert_eq!(resp["result"]["content"][0]["type"], "text");
+        assert_eq!(resp["result"]["content"][0]["text"], "hello world");
+    }
+
+    #[test]
+    fn test_mcp_error_response_structure() {
+        let resp = mcp_error_response(Some(json!(3)), -32601, "Method not found");
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 3);
+        assert_eq!(resp["error"]["code"], -32601);
+        assert_eq!(resp["error"]["message"], "Method not found");
     }
 }

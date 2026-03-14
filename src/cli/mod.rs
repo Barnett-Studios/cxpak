@@ -74,6 +74,9 @@ pub enum Commands {
         tokens: String,
         #[arg(long)]
         verbose: bool,
+        /// Run as MCP server over stdio instead of HTTP
+        #[arg(long)]
+        mcp: bool,
         #[arg(default_value = ".")]
         path: PathBuf,
     },

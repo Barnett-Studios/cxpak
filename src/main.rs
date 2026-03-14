@@ -25,6 +25,7 @@ fn main() {
             port,
             tokens,
             verbose,
+            mcp,
             path,
         } => {
             let token_budget = match parse_token_count(tokens) {
@@ -38,7 +39,11 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            commands::serve::run(path, *port, token_budget, *verbose)
+            if *mcp {
+                commands::serve::run_mcp(path, token_budget, *verbose)
+            } else {
+                commands::serve::run(path, *port, token_budget, *verbose)
+            }
         }
         #[cfg(feature = "daemon")]
         Commands::Watch {
