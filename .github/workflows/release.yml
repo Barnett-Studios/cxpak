@@ -50,7 +50,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --features daemon --target ${{ matrix.target }}
 
       - name: Package
         run: |
