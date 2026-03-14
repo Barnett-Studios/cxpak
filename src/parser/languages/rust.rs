@@ -763,4 +763,22 @@ trait InternalHelper {
         assert_eq!(enums[0].visibility, Visibility::Private);
         assert!(result.exports.is_empty());
     }
+
+    #[test]
+    fn test_trait_method_without_body() {
+        // Trait method declaration has no block body → covers fallback paths in
+        // extract_fn_signature (line 46) and extract_fn_body (line 58)
+        let source = "pub trait Greeter {\n    fn greet(&self) -> String;\n}\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = RustLanguage;
+        let result = lang.extract(source, &tree);
+        // The trait should be extracted
+        let traits: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Trait)
+            .collect();
+        assert!(!traits.is_empty());
+    }
 }

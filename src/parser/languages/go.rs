@@ -571,4 +571,34 @@ type Reader interface {
         assert!(!funcs.is_empty());
         assert_eq!(funcs[0].visibility, Visibility::Private);
     }
+
+    #[test]
+    fn test_private_type_declaration() {
+        // Lowercase struct name — covers Visibility::Private branch for type_declaration (line 224)
+        let source = "package main\n\ntype myStruct struct {\n\tx int\n}\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = GoLanguage;
+        let result = lang.extract(source, &tree);
+        let structs: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Struct)
+            .collect();
+        assert!(!structs.is_empty());
+        assert_eq!(structs[0].visibility, Visibility::Private);
+        assert_eq!(structs[0].name, "myStruct");
+    }
+
+    #[test]
+    fn test_function_without_body() {
+        // Interface method declaration has no body — covers fallback paths (lines 48, 59)
+        let source = "package main\n\ntype Doer interface {\n\tDo()\n}\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = GoLanguage;
+        let result = lang.extract(source, &tree);
+        // The interface should be extracted as a type
+        assert!(!result.symbols.is_empty());
+    }
 }

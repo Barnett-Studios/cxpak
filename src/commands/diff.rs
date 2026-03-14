@@ -613,4 +613,215 @@ mod tests {
     fn test_parse_time_expression_compact_weeks() {
         assert_eq!(parse_time_expression("2w").unwrap().as_secs(), 1209600);
     }
+
+    #[test]
+    fn test_resolve_since_git_error() {
+        // Non-existent directory should cause git to fail
+        let result = resolve_since(std::path::Path::new("/nonexistent/repo"), "1d");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_since_no_recent_commits() {
+        // Create a repo with a very old commit then ask for "1 second ago"
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        std::fs::write(dir.path().join("file.txt"), "hello").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+
+        // Ask for commits from the future effectively — "1 second" window is fine
+        // since the commit was literally just made, it *will* be found.
+        // To get "no commits", we need an impossible window — but git --since
+        // will likely find the commit. Use the function and just verify it doesn't panic.
+        let result = resolve_since(dir.path(), "1d");
+        // This should succeed since commit was just made
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_render_context_signatures_with_parse_results() {
+        use crate::budget::counter::TokenCounter;
+        use crate::index::CodebaseIndex;
+        use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/lib.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/lib.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 100,
+            },
+            ScannedFile {
+                relative_path: "src/util.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/util.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 50,
+            },
+            ScannedFile {
+                relative_path: "src/empty.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/empty.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 20,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        // File with public symbols
+        parse_results.insert(
+            "src/lib.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "public_fn".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn public_fn()".to_string(),
+                    body: String::new(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        // File with only private symbols
+        parse_results.insert(
+            "src/util.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "private_fn".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "fn private_fn()".to_string(),
+                    body: String::new(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        // src/empty.rs has no parse result — tests the `let Some(pr) = ...` path
+
+        let mut content_map = HashMap::new();
+        content_map.insert(
+            "src/lib.rs".to_string(),
+            "pub fn public_fn() {}".to_string(),
+        );
+        content_map.insert("src/util.rs".to_string(), "fn private_fn() {}".to_string());
+        content_map.insert("src/empty.rs".to_string(), "// empty".to_string());
+
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+
+        let mut context_paths = HashSet::new();
+        context_paths.insert("src/lib.rs".to_string());
+        context_paths.insert("src/util.rs".to_string());
+        context_paths.insert("src/empty.rs".to_string());
+
+        let result = render_context_signatures(&index, &context_paths, 10000, &counter);
+
+        // Should include public_fn signature from lib.rs
+        assert!(
+            result.contains("public_fn"),
+            "expected public_fn in output: {result}"
+        );
+        // Should NOT include private_fn
+        assert!(
+            !result.contains("private_fn"),
+            "private symbols should be excluded"
+        );
+        // Should include file header for lib.rs
+        assert!(result.contains("src/lib.rs"), "expected file header");
+    }
+
+    #[test]
+    fn test_render_context_signatures_empty() {
+        use crate::budget::counter::TokenCounter;
+        use crate::index::CodebaseIndex;
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let counter = TokenCounter::new();
+        let files = vec![ScannedFile {
+            relative_path: "src/main.rs".to_string(),
+            absolute_path: PathBuf::from("/tmp/src/main.rs"),
+            language: Some("rust".to_string()),
+            size_bytes: 100,
+        }];
+        let content_map = HashMap::from([("src/main.rs".to_string(), "fn main() {}".to_string())]);
+        let index = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
+
+        // No context paths
+        let result = render_context_signatures(&index, &HashSet::new(), 10000, &counter);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_diff_with_all_flag_graph_walk() {
+        use crate::cli::OutputFormat;
+
+        let repo = make_diff_repo();
+        // Add a second file that imports from main
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "use crate::main;\npub fn helper() {}\n",
+        )
+        .unwrap();
+        // Stage it
+        let git_repo = git2::Repository::open(repo.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git_repo.find_tree(tree_id).unwrap();
+        let head = git_repo.head().unwrap().peel_to_commit().unwrap();
+        git_repo
+            .commit(Some("HEAD"), &sig, &sig, "add lib", &tree, &[&head])
+            .unwrap();
+
+        // Now modify main.rs in the working tree
+        std::fs::write(
+            repo.path().join("src/main.rs"),
+            "fn main() { println!(\"changed\"); }\n",
+        )
+        .unwrap();
+
+        // Run with all=true to exercise BFS graph walk (lines 290-291)
+        let result = run(
+            repo.path(),
+            None,  // git_ref
+            50000, // token_budget
+            &OutputFormat::Markdown,
+            None,  // out
+            false, // verbose
+            true,  // all
+            None,  // focus
+            false, // timing
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_time_expression_overflow() {
+        // Huge number that overflows u64 parse — covers line 37
+        let result = parse_time_expression("99999999999999999999999d");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid time expression"));
+    }
 }

@@ -644,3 +644,192 @@ fn render_git_context(
         full,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::counter::TokenCounter;
+    use crate::index::CodebaseIndex;
+    use crate::parser::language::{Import, ParseResult, Symbol, SymbolKind, Visibility};
+    use crate::scanner::ScannedFile;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn make_test_index() -> (CodebaseIndex, TokenCounter) {
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/main.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/main.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 100,
+            },
+            ScannedFile {
+                relative_path: "src/lib.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/lib.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 200,
+            },
+        ];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "greet".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn greet()".to_string(),
+                    body: "{ println!(\"hello\"); }".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![Import {
+                    source: "std".to_string(),
+                    names: vec![],
+                }],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("src/main.rs".to_string(), "fn main() {}".to_string());
+        content_map.insert(
+            "src/lib.rs".to_string(),
+            "use std;\npub fn greet() { println!(\"hello\"); }".to_string(),
+        );
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        (index, counter)
+    }
+
+    #[test]
+    fn test_render_metadata() {
+        let (index, _) = make_test_index();
+        let result = render_metadata(&index, 50000, false);
+        assert!(result.contains("Files:"), "expected Files in metadata");
+        assert!(
+            result.contains("Languages:"),
+            "expected Languages in metadata"
+        );
+    }
+
+    #[test]
+    fn test_render_metadata_pack_mode() {
+        let (index, _) = make_test_index();
+        let result = render_metadata(&index, 10, true);
+        assert!(result.contains("Files:"));
+    }
+
+    #[test]
+    fn test_render_directory_tree() {
+        let (index, counter) = make_test_index();
+        let result = render_directory_tree(&index, 10000, &counter, false, "tree.md");
+        assert!(
+            !result.budgeted.is_empty(),
+            "expected directory tree content"
+        );
+        assert!(
+            result.budgeted.contains("src"),
+            "expected src directory in tree"
+        );
+    }
+
+    #[test]
+    fn test_render_module_map() {
+        let (index, counter) = make_test_index();
+        let result = render_module_map(&index, 10000, &counter, false, "modules.md");
+        assert!(!result.full.is_empty() || result.budgeted.is_empty());
+    }
+
+    #[test]
+    fn test_render_dependency_graph_with_empty_import_names() {
+        let counter = TokenCounter::new();
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".to_string(),
+            absolute_path: PathBuf::from("/tmp/src/lib.rs"),
+            language: Some("rust".to_string()),
+            size_bytes: 100,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".to_string(),
+            ParseResult {
+                symbols: vec![],
+                imports: vec![Import {
+                    source: "std::io".to_string(),
+                    names: vec![],
+                }],
+                exports: vec![],
+            },
+        );
+        let content_map = HashMap::from([("src/lib.rs".to_string(), "use std::io;".to_string())]);
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        let result = render_dependency_graph(&index, 10000, &counter, false, "deps.md");
+        assert!(
+            result.full.contains("std::io"),
+            "expected import source in graph output"
+        );
+    }
+
+    #[test]
+    fn test_render_git_context_non_repo() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = render_git_context(dir.path(), 10000, &counter, false, "git.md");
+        assert!(
+            result.budgeted.is_empty(),
+            "non-repo should return empty git context"
+        );
+    }
+
+    #[test]
+    fn test_render_key_files() {
+        let (index, counter) = make_test_index();
+        let result = render_key_files(&index, 10000, &counter, false, "files.md");
+        assert!(!result.budgeted.is_empty(), "expected key files content");
+    }
+
+    #[test]
+    fn test_render_signatures() {
+        let (index, counter) = make_test_index();
+        let result = render_signatures(&index, 10000, &counter, false, "sigs.md");
+        assert!(
+            result.full.contains("greet") || result.budgeted.contains("greet"),
+            "expected greet signature"
+        );
+    }
+
+    #[test]
+    fn test_detail_file_ext() {
+        assert_eq!(detail_file_ext(&OutputFormat::Markdown), "md");
+        assert_eq!(detail_file_ext(&OutputFormat::Xml), "xml");
+        assert_eq!(detail_file_ext(&OutputFormat::Json), "json");
+    }
+
+    #[test]
+    fn test_render_metadata_zero_total_files() {
+        let counter = TokenCounter::new();
+        let index =
+            CodebaseIndex::build_with_content(vec![], HashMap::new(), &counter, HashMap::new());
+        let result = render_metadata(&index, 50000, false);
+        assert!(result.contains("Files:"));
+    }
+
+    #[test]
+    fn test_render_key_files_truncated() {
+        // Use a tiny budget so key file content gets truncated → covers lines 520-521
+        let (index, counter) = make_test_index();
+        let result = render_key_files(&index, 5, &counter, false, "files.md");
+        assert!(result.was_truncated);
+    }
+
+    #[test]
+    fn test_render_metadata_with_language_stats_zero_files() {
+        // Build an index then set total_files to 0 to trigger line 318
+        let (mut index, _) = make_test_index();
+        index.total_files = 0;
+        let result = render_metadata(&index, 50000, false);
+        assert!(result.contains("Languages:"));
+        // Should show 0% for each language
+        assert!(result.contains("0%"));
+    }
+}

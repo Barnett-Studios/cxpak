@@ -303,6 +303,7 @@ dependencies = [
  "tempfile",
  "tiktoken-rs",
  "tokio",
+ "tower",
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-c-sharp",

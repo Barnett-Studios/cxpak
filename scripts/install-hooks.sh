@@ -19,7 +19,13 @@ if ! cargo clippy --all-targets -- -D warnings 2>/dev/null; then
     exit 1
 fi
 
-echo "✅ Pre-commit checks passed"
+# Tests
+if ! cargo test --quiet 2>/dev/null; then
+    echo "❌ Tests failed. Fix failing tests."
+    exit 1
+fi
+
+echo "✅ Pre-commit checks passed (coverage enforced in CI at 90%)"
 HOOK
 
 chmod +x "$HOOK_DIR/pre-commit"

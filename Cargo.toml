@@ -38,6 +38,7 @@ tokio = { version = "1", features = ["full"], optional = true }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = ["lang-rust", "lang-typescript", "lang-javascript", "lang-java", "lang-python", "lang-go", "lang-c", "lang-cpp", "lang-ruby", "lang-csharp", "lang-swift", "lang-kotlin"]

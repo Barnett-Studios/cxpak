@@ -440,4 +440,21 @@ mod tests {
         let result = lang.extract(source, &tree);
         assert!(!result.symbols.is_empty());
     }
+
+    #[test]
+    fn test_private_class_declaration() {
+        // Non-exported class → Visibility::Private (covers line 178)
+        let source = "class InternalHelper {\n  constructor() {}\n  help() {}\n}\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = JavaScriptLanguage;
+        let result = lang.extract(source, &tree);
+        let classes: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(!classes.is_empty());
+        assert_eq!(classes[0].visibility, Visibility::Private);
+    }
 }

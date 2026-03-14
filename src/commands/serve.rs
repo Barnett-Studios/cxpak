@@ -1,5 +1,6 @@
 use crate::budget::counter::TokenCounter;
-use crate::daemon::watcher::{FileChange, FileWatcher};
+use crate::commands::watch::{apply_incremental_update, classify_changes};
+use crate::daemon::watcher::FileWatcher;
 use crate::index::CodebaseIndex;
 use crate::parser::LanguageRegistry;
 use crate::scanner::Scanner;
@@ -19,16 +20,11 @@ use std::time::Duration;
 
 type SharedIndex = Arc<RwLock<CodebaseIndex>>;
 
-pub fn run(
-    path: &Path,
-    port: u16,
-    _token_budget: usize,
-    _verbose: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// Scan and parse all files in a path, returning a fully built CodebaseIndex.
+pub(crate) fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
     let counter = TokenCounter::new();
     let registry = LanguageRegistry::new();
 
-    // Initial full build (same pattern as watch.rs)
     let scanner = Scanner::new(path)?;
     let files = scanner.scan()?;
 
@@ -50,7 +46,31 @@ pub fn run(
         content_map.insert(file.relative_path.clone(), source);
     }
 
-    let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+    Ok(CodebaseIndex::build_with_content(
+        files,
+        parse_results,
+        &counter,
+        content_map,
+    ))
+}
+
+/// Build the axum Router for the HTTP server.
+fn build_router(shared: SharedIndex) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/stats", get(stats_handler))
+        .route("/overview", get(overview_handler))
+        .route("/trace", get(trace_handler))
+        .with_state(shared)
+}
+
+pub fn run(
+    path: &Path,
+    port: u16,
+    _token_budget: usize,
+    _verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let index = build_index(path)?;
 
     eprintln!(
         "cxpak: serving {} ({} files indexed, {} tokens) on port {}",
@@ -62,12 +82,10 @@ pub fn run(
 
     let shared = Arc::new(RwLock::new(index));
 
-    // Background watcher thread — uses std::thread since FileWatcher uses std::sync::mpsc
+    // Background watcher thread
     let watcher_path = path.to_path_buf();
     let watcher_index = Arc::clone(&shared);
     std::thread::spawn(move || {
-        let counter = TokenCounter::new();
-        let registry = LanguageRegistry::new();
         let watcher = match FileWatcher::new(&watcher_path) {
             Ok(w) => w,
             Err(e) => {
@@ -81,83 +99,13 @@ pub fn run(
                 let mut changes = vec![first];
                 std::thread::sleep(Duration::from_millis(50));
                 changes.extend(watcher.drain());
-
-                let mut modified_paths = std::collections::HashSet::new();
-                let mut removed_paths = std::collections::HashSet::new();
-
-                for change in changes {
-                    match change {
-                        FileChange::Created(p) | FileChange::Modified(p) => {
-                            if let Ok(rel) = p.strip_prefix(&watcher_path) {
-                                modified_paths.insert(rel.to_string_lossy().to_string());
-                            }
-                        }
-                        FileChange::Removed(p) => {
-                            if let Ok(rel) = p.strip_prefix(&watcher_path) {
-                                removed_paths.insert(rel.to_string_lossy().to_string());
-                            }
-                        }
-                    }
-                }
-
-                let mut update_count = 0;
-
-                if let Ok(mut idx) = watcher_index.write() {
-                    for rel_path in &removed_paths {
-                        idx.remove_file(rel_path);
-                        update_count += 1;
-                    }
-
-                    for rel_path in &modified_paths {
-                        if removed_paths.contains(rel_path) {
-                            continue;
-                        }
-                        let abs_path = watcher_path.join(rel_path);
-                        if let Ok(content) = std::fs::read_to_string(&abs_path) {
-                            let lang_name = crate::scanner::detect_language(Path::new(rel_path));
-                            let parse_result = lang_name.as_deref().and_then(|ln| {
-                                registry.get(ln).and_then(|lang| {
-                                    let ts_lang = lang.ts_language();
-                                    let mut parser = tree_sitter::Parser::new();
-                                    parser.set_language(&ts_lang).ok()?;
-                                    let tree = parser.parse(&content, None)?;
-                                    Some(lang.extract(&content, &tree))
-                                })
-                            });
-
-                            idx.upsert_file(
-                                rel_path,
-                                lang_name.as_deref(),
-                                &content,
-                                parse_result,
-                                &counter,
-                            );
-                            update_count += 1;
-                        }
-                    }
-                }
-
-                if update_count > 0 {
-                    if let Ok(idx) = watcher_index.read() {
-                        eprintln!(
-                            "cxpak: updated {} file(s), {} files / {} tokens total",
-                            update_count, idx.total_files, idx.total_tokens
-                        );
-                    }
-                }
+                process_watcher_changes(&changes, &watcher_path, &watcher_index);
             }
         }
     });
 
-    // Build axum router with shared state
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/stats", get(stats_handler))
-        .route("/overview", get(overview_handler))
-        .route("/trace", get(trace_handler))
-        .with_state(shared);
+    let app = build_router(shared);
 
-    // Run the async HTTP server using a fresh tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
@@ -273,31 +221,7 @@ pub fn run_mcp(
     _token_budget: usize,
     _verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let counter = TokenCounter::new();
-    let registry = LanguageRegistry::new();
-
-    let scanner = Scanner::new(path)?;
-    let files = scanner.scan()?;
-
-    let mut parse_results = HashMap::new();
-    let mut content_map = HashMap::new();
-    for file in &files {
-        let source = std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
-        if let Some(lang_name) = &file.language {
-            if let Some(lang) = registry.get(lang_name) {
-                let ts_lang = lang.ts_language();
-                let mut parser = tree_sitter::Parser::new();
-                parser.set_language(&ts_lang).ok();
-                if let Some(tree) = parser.parse(&source, None) {
-                    let result = lang.extract(&source, &tree);
-                    parse_results.insert(file.relative_path.clone(), result);
-                }
-            }
-        }
-        content_map.insert(file.relative_path.clone(), source);
-    }
-
-    let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+    let index = build_index(path)?;
 
     eprintln!(
         "cxpak: MCP server ready ({} files indexed, {} tokens)",
@@ -308,12 +232,17 @@ pub fn run_mcp(
 }
 
 fn mcp_stdio_loop(index: &CodebaseIndex) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{self, BufRead, Write};
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    mcp_stdio_loop_with_io(index, stdin.lock(), &mut stdout.lock())
+}
 
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-
-    for line in stdin.lock().lines() {
+fn mcp_stdio_loop_with_io(
+    index: &CodebaseIndex,
+    reader: impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for line in reader.lines() {
         let line = line?;
         if line.is_empty() {
             continue;
@@ -399,10 +328,9 @@ fn mcp_stdio_loop(index: &CodebaseIndex) -> Result<(), Box<dyn std::error::Error
             _ => mcp_error_response(id, -32601, "Method not found"),
         };
 
-        let mut out = stdout.lock();
-        serde_json::to_writer(&mut out, &response)?;
-        out.write_all(b"\n")?;
-        out.flush()?;
+        serde_json::to_writer(&mut *writer, &response)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
     }
 
     Ok(())
@@ -508,6 +436,26 @@ fn mcp_tool_result(id: Option<Value>, text: &str) -> Value {
     })
 }
 
+/// Process a batch of watcher changes, updating the shared index.
+fn process_watcher_changes(
+    changes: &[crate::daemon::watcher::FileChange],
+    base_path: &Path,
+    shared: &SharedIndex,
+) {
+    let (modified_paths, removed_paths) = classify_changes(changes, base_path);
+
+    if let Ok(mut idx) = shared.write() {
+        let update_count =
+            apply_incremental_update(&mut idx, base_path, &modified_paths, &removed_paths);
+        if update_count > 0 {
+            eprintln!(
+                "cxpak: updated {} file(s), {} files / {} tokens total",
+                update_count, idx.total_files, idx.total_tokens
+            );
+        }
+    }
+}
+
 fn mcp_error_response(id: Option<Value>, code: i32, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -522,6 +470,60 @@ fn mcp_error_response(id: Option<Value>, code: i32, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::counter::TokenCounter;
+    use crate::index::CodebaseIndex;
+    use crate::scanner::ScannedFile;
+    use tower::ServiceExt;
+
+    /// Build a minimal CodebaseIndex for testing handlers.
+    fn make_test_index() -> CodebaseIndex {
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/main.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/main.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 100,
+            },
+            ScannedFile {
+                relative_path: "src/lib.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/lib.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 50,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
+        parse_results.insert(
+            "src/main.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "main".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn main()".to_string(),
+                    body: "fn main() {}".to_string(),
+                    start_line: 1,
+                    end_line: 5,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let mut content_map = HashMap::new();
+        content_map.insert("src/main.rs".to_string(), "fn main() {}".to_string());
+        content_map.insert("src/lib.rs".to_string(), "pub fn hello() {}".to_string());
+
+        CodebaseIndex::build_with_content(files, parse_results, &counter, content_map)
+    }
+
+    fn make_shared_index() -> SharedIndex {
+        Arc::new(RwLock::new(make_test_index()))
+    }
+
+    // --- Health handler ---
 
     #[test]
     fn test_health_handler_returns_ok() {
@@ -529,6 +531,392 @@ mod tests {
         let result = rt.block_on(health_handler());
         assert_eq!(result.0["status"], "ok");
     }
+
+    // --- Stats handler ---
+
+    #[test]
+    fn test_stats_handler_returns_index_stats() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let result = rt.block_on(stats_handler(State(shared))).unwrap();
+        assert_eq!(result.0["files"], 2);
+        assert!(result.0["tokens"].as_u64().unwrap() > 0);
+        assert!(result.0["languages"].as_u64().unwrap() >= 1);
+    }
+
+    // --- Overview handler ---
+
+    #[test]
+    fn test_overview_handler_defaults() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = OverviewParams {
+            tokens: None,
+            format: None,
+        };
+        let result = rt
+            .block_on(overview_handler(State(shared), Query(params)))
+            .unwrap();
+        assert_eq!(result.0["format"], "json");
+        assert_eq!(result.0["token_budget"], 50_000);
+        assert_eq!(result.0["total_files"], 2);
+        assert!(result.0["languages"].as_array().is_some());
+    }
+
+    #[test]
+    fn test_overview_handler_custom_params() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = OverviewParams {
+            tokens: Some("100k".to_string()),
+            format: Some("markdown".to_string()),
+        };
+        let result = rt
+            .block_on(overview_handler(State(shared), Query(params)))
+            .unwrap();
+        assert_eq!(result.0["format"], "markdown");
+        assert_eq!(result.0["token_budget"], 100_000);
+    }
+
+    #[test]
+    fn test_overview_handler_invalid_tokens_uses_default() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = OverviewParams {
+            tokens: Some("not_a_number".to_string()),
+            format: None,
+        };
+        let result = rt
+            .block_on(overview_handler(State(shared), Query(params)))
+            .unwrap();
+        assert_eq!(result.0["token_budget"], 50_000);
+    }
+
+    #[test]
+    fn test_overview_handler_languages_array() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = OverviewParams {
+            tokens: None,
+            format: None,
+        };
+        let result = rt
+            .block_on(overview_handler(State(shared), Query(params)))
+            .unwrap();
+        let langs = result.0["languages"].as_array().unwrap();
+        assert!(!langs.is_empty());
+        let first = &langs[0];
+        assert!(first["language"].is_string());
+        assert!(first["files"].is_number());
+        assert!(first["tokens"].is_number());
+    }
+
+    // --- Trace handler ---
+
+    #[test]
+    fn test_trace_handler_missing_target() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = TraceParams {
+            target: None,
+            tokens: None,
+        };
+        let result = rt
+            .block_on(trace_handler(State(shared), Query(params)))
+            .unwrap();
+        assert_eq!(
+            result.0["error"],
+            "missing required query parameter: target"
+        );
+    }
+
+    #[test]
+    fn test_trace_handler_empty_target() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = TraceParams {
+            target: Some("".to_string()),
+            tokens: None,
+        };
+        let result = rt
+            .block_on(trace_handler(State(shared), Query(params)))
+            .unwrap();
+        assert_eq!(
+            result.0["error"],
+            "missing required query parameter: target"
+        );
+    }
+
+    #[test]
+    fn test_trace_handler_symbol_found() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = TraceParams {
+            target: Some("main".to_string()),
+            tokens: None,
+        };
+        let result = rt
+            .block_on(trace_handler(State(shared), Query(params)))
+            .unwrap();
+        assert_eq!(result.0["target"], "main");
+        assert_eq!(result.0["found"], true);
+        assert_eq!(result.0["token_budget"], 50_000);
+    }
+
+    #[test]
+    fn test_trace_handler_content_match() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = TraceParams {
+            target: Some("hello".to_string()),
+            tokens: None,
+        };
+        let result = rt
+            .block_on(trace_handler(State(shared), Query(params)))
+            .unwrap();
+        assert_eq!(result.0["target"], "hello");
+        assert_eq!(result.0["found"], true);
+    }
+
+    #[test]
+    fn test_trace_handler_not_found() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = TraceParams {
+            target: Some("nonexistent_xyz".to_string()),
+            tokens: None,
+        };
+        let result = rt
+            .block_on(trace_handler(State(shared), Query(params)))
+            .unwrap();
+        assert_eq!(result.0["target"], "nonexistent_xyz");
+        assert_eq!(result.0["found"], false);
+    }
+
+    #[test]
+    fn test_trace_handler_custom_tokens() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = TraceParams {
+            target: Some("main".to_string()),
+            tokens: Some("10k".to_string()),
+        };
+        let result = rt
+            .block_on(trace_handler(State(shared), Query(params)))
+            .unwrap();
+        assert_eq!(result.0["token_budget"], 10_000);
+    }
+
+    // --- handle_tool_call ---
+
+    #[test]
+    fn test_handle_tool_call_stats() {
+        let index = make_test_index();
+        let resp = handle_tool_call(Some(json!(1)), "cxpak_stats", &json!({}), &index);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["files"], 2);
+        assert!(parsed["tokens"].as_u64().unwrap() > 0);
+        assert!(parsed["languages"].as_array().is_some());
+    }
+
+    #[test]
+    fn test_handle_tool_call_overview() {
+        let index = make_test_index();
+        let resp = handle_tool_call(Some(json!(2)), "cxpak_overview", &json!({}), &index);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["total_files"], 2);
+        assert!(parsed["languages"].as_array().is_some());
+    }
+
+    #[test]
+    fn test_handle_tool_call_trace_found() {
+        let index = make_test_index();
+        let resp = handle_tool_call(
+            Some(json!(3)),
+            "cxpak_trace",
+            &json!({"target": "main"}),
+            &index,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["target"], "main");
+        assert_eq!(parsed["found"], true);
+        assert!(parsed["symbol_matches"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn test_handle_tool_call_trace_content_fallback() {
+        let index = make_test_index();
+        let resp = handle_tool_call(
+            Some(json!(4)),
+            "cxpak_trace",
+            &json!({"target": "hello"}),
+            &index,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["found"], true);
+        assert!(parsed["content_matches"].as_u64().unwrap() > 0);
+        assert_eq!(parsed["symbol_matches"], 0);
+    }
+
+    #[test]
+    fn test_handle_tool_call_trace_not_found() {
+        let index = make_test_index();
+        let resp = handle_tool_call(
+            Some(json!(5)),
+            "cxpak_trace",
+            &json!({"target": "nonexistent_xyz"}),
+            &index,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["found"], false);
+    }
+
+    #[test]
+    fn test_handle_tool_call_trace_empty_target() {
+        let index = make_test_index();
+        let resp = handle_tool_call(
+            Some(json!(6)),
+            "cxpak_trace",
+            &json!({"target": ""}),
+            &index,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("required"));
+    }
+
+    #[test]
+    fn test_handle_tool_call_trace_missing_target_arg() {
+        let index = make_test_index();
+        let resp = handle_tool_call(Some(json!(7)), "cxpak_trace", &json!({}), &index);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("required"));
+    }
+
+    #[test]
+    fn test_handle_tool_call_unknown_tool() {
+        let index = make_test_index();
+        let resp = handle_tool_call(Some(json!(8)), "unknown_tool", &json!({}), &index);
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Unknown tool"));
+    }
+
+    // --- MCP stdio loop ---
+
+    #[test]
+    fn test_mcp_stdio_loop_initialize() {
+        let index = make_test_index();
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let input = format!("{input}\n");
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        let line = String::from_utf8(output).unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["result"]["serverInfo"]["name"], "cxpak");
+    }
+
+    #[test]
+    fn test_mcp_stdio_loop_tools_list() {
+        let index = make_test_index();
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let input = format!("{input}\n");
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        let line = String::from_utf8(output).unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+    }
+
+    #[test]
+    fn test_mcp_stdio_loop_tool_call() {
+        let index = make_test_index();
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_stats","arguments":{}}}"#;
+        let input = format!("{input}\n");
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        let line = String::from_utf8(output).unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["files"], 2);
+    }
+
+    #[test]
+    fn test_mcp_stdio_loop_unknown_method() {
+        let index = make_test_index();
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"unknown/method","params":{}}"#;
+        let input = format!("{input}\n");
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        let line = String::from_utf8(output).unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn test_mcp_stdio_loop_notification_skipped() {
+        let index = make_test_index();
+        // notifications/initialized should produce no output
+        let input = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+        let input = format!("{input}\n");
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_stdio_loop_empty_lines_skipped() {
+        let index = make_test_index();
+        let input = "\n\n\n".to_string();
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_stdio_loop_invalid_json_skipped() {
+        let index = make_test_index();
+        let input = "not json\n".to_string();
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_stdio_loop_multiple_messages() {
+        let index = make_test_index();
+        let input = format!(
+            "{}\n{}\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        );
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = text.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        let resp1: Value = serde_json::from_str(lines[0]).unwrap();
+        let resp2: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(resp1["id"], 1);
+        assert_eq!(resp2["id"], 2);
+    }
+
+    // --- Param struct tests (kept) ---
 
     #[test]
     fn test_overview_params_defaults() {
@@ -584,12 +972,21 @@ mod tests {
         assert_eq!(budget, 50_000);
     }
 
+    // --- MCP helper function tests ---
+
     #[test]
     fn test_mcp_response_structure() {
         let resp = mcp_response(Some(json!(1)), json!({"status": "ok"}));
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["status"], "ok");
+    }
+
+    #[test]
+    fn test_mcp_response_null_id() {
+        let resp = mcp_response(None, json!({"status": "ok"}));
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert!(resp["id"].is_null());
     }
 
     #[test]
@@ -608,5 +1005,368 @@ mod tests {
         assert_eq!(resp["id"], 3);
         assert_eq!(resp["error"]["code"], -32601);
         assert_eq!(resp["error"]["message"], "Method not found");
+    }
+
+    // --- build_index ---
+
+    #[test]
+    fn test_build_index_from_temp_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Initialize a git repo (build_index requires Scanner which needs git)
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let index = build_index(dir.path()).unwrap();
+        assert_eq!(index.total_files, 1);
+        assert!(index.total_tokens > 0);
+    }
+
+    #[test]
+    fn test_build_index_empty_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+
+        let index = build_index(dir.path()).unwrap();
+        assert_eq!(index.total_files, 0);
+        assert_eq!(index.total_tokens, 0);
+    }
+
+    #[test]
+    fn test_build_index_not_a_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = build_index(dir.path());
+        assert!(result.is_err());
+    }
+
+    // --- build_router ---
+
+    #[test]
+    fn test_build_router_creates_router() {
+        let shared = make_shared_index();
+        let _router = build_router(shared);
+        // Router created without panic = success
+    }
+
+    // --- Axum integration (in-process HTTP) ---
+
+    #[test]
+    fn test_axum_health_endpoint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared);
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/health")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["status"], "ok");
+        });
+    }
+
+    #[test]
+    fn test_axum_stats_endpoint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared);
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/stats")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["files"], 2);
+        });
+    }
+
+    #[test]
+    fn test_axum_overview_endpoint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared);
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/overview?tokens=10k&format=xml")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["format"], "xml");
+            assert_eq!(json["token_budget"], 10_000);
+        });
+    }
+
+    #[test]
+    fn test_axum_trace_endpoint_found() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared);
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/trace?target=main")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["found"], true);
+        });
+    }
+
+    #[test]
+    fn test_axum_trace_endpoint_not_found() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared);
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/trace?target=nonexistent_xyz")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["found"], false);
+        });
+    }
+
+    #[test]
+    fn test_axum_trace_endpoint_missing_target() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared);
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/trace")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert!(json["error"].as_str().unwrap().contains("missing"));
+        });
+    }
+
+    #[test]
+    fn test_axum_404_unknown_route() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared);
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/nonexistent")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        });
+    }
+
+    // --- process_watcher_changes ---
+
+    #[test]
+    fn test_process_watcher_changes_modify() {
+        use crate::daemon::watcher::FileChange;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn updated() {}").unwrap();
+
+        let shared = make_shared_index();
+        let changes = vec![FileChange::Modified(file_path)];
+
+        process_watcher_changes(&changes, dir.path(), &shared);
+
+        let idx = shared.read().unwrap();
+        // Original index had 2 files; the modified file wasn't one of them,
+        // so it gets added as a new file (upsert)
+        assert!(idx.total_files >= 2);
+    }
+
+    #[test]
+    fn test_process_watcher_changes_remove() {
+        use crate::daemon::watcher::FileChange;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = make_shared_index();
+
+        // Remove a file that exists in the index
+        let changes = vec![FileChange::Removed(dir.path().join("src/main.rs"))];
+
+        process_watcher_changes(&changes, dir.path(), &shared);
+
+        let idx = shared.read().unwrap();
+        assert_eq!(idx.total_files, 1); // Was 2, now 1
+    }
+
+    #[test]
+    fn test_process_watcher_changes_create() {
+        use crate::daemon::watcher::FileChange;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("new.rs");
+        std::fs::write(&file_path, "fn brand_new() {}").unwrap();
+
+        let shared = make_shared_index();
+
+        let changes = vec![FileChange::Created(file_path)];
+        process_watcher_changes(&changes, dir.path(), &shared);
+
+        let idx = shared.read().unwrap();
+        assert_eq!(idx.total_files, 3); // Was 2, added 1
+    }
+
+    #[test]
+    fn test_process_watcher_changes_mixed() {
+        use crate::daemon::watcher::FileChange;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let new_file = dir.path().join("added.rs");
+        std::fs::write(&new_file, "fn added() {}").unwrap();
+
+        let shared = make_shared_index();
+
+        let changes = vec![
+            FileChange::Created(new_file),
+            FileChange::Removed(dir.path().join("src/lib.rs")),
+        ];
+        process_watcher_changes(&changes, dir.path(), &shared);
+
+        let idx = shared.read().unwrap();
+        // 2 original - 1 removed + 1 added = 2
+        assert_eq!(idx.total_files, 2);
+    }
+
+    #[test]
+    fn test_process_watcher_changes_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = make_shared_index();
+
+        process_watcher_changes(&[], dir.path(), &shared);
+
+        let idx = shared.read().unwrap();
+        assert_eq!(idx.total_files, 2); // Unchanged
+    }
+
+    #[test]
+    fn test_process_watcher_changes_outside_base_ignored() {
+        use crate::daemon::watcher::FileChange;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = make_shared_index();
+
+        // File outside base path should be ignored
+        let changes = vec![FileChange::Created(std::path::PathBuf::from(
+            "/other/path/file.rs",
+        ))];
+        process_watcher_changes(&changes, dir.path(), &shared);
+
+        let idx = shared.read().unwrap();
+        assert_eq!(idx.total_files, 2); // Unchanged
+    }
+
+    // --- Poisoned lock error path ---
+
+    #[test]
+    fn test_stats_handler_poisoned_lock() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+
+        // Poison the lock by panicking while holding a write guard
+        let shared2 = Arc::clone(&shared);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared2.write().unwrap();
+            panic!("intentional panic to poison lock");
+        }));
+
+        let result = rt.block_on(stats_handler(State(shared)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trace_handler_poisoned_lock() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+
+        let shared2 = Arc::clone(&shared);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared2.write().unwrap();
+            panic!("intentional panic to poison lock");
+        }));
+
+        let params = TraceParams {
+            target: Some("main".to_string()),
+            tokens: None,
+        };
+        let result = rt.block_on(trace_handler(State(shared), Query(params)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_overview_handler_poisoned_lock() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+
+        let shared2 = Arc::clone(&shared);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared2.write().unwrap();
+            panic!("intentional panic to poison lock");
+        }));
+
+        let params = OverviewParams {
+            tokens: None,
+            format: None,
+        };
+        let result = rt.block_on(overview_handler(State(shared), Query(params)));
+        assert!(result.is_err());
     }
 }

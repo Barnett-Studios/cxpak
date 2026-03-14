@@ -438,3 +438,187 @@ fn render_dependency_subgraph(
         degrader::truncate_to_budget(&full, budget, counter, "dependency subgraph");
     budgeted
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::counter::TokenCounter;
+    use crate::index::CodebaseIndex;
+    use crate::parser::language::{Import, ParseResult, Symbol, SymbolKind, Visibility};
+    use crate::scanner::ScannedFile;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn make_trace_index() -> CodebaseIndex {
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/main.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/main.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 50,
+            },
+            ScannedFile {
+                relative_path: "src/lib.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/lib.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 80,
+            },
+            ScannedFile {
+                relative_path: "src/util.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/util.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 40,
+            },
+        ];
+        let mut parse_map = HashMap::new();
+        parse_map.insert(
+            "src/main.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "main".to_string(),
+                    kind: SymbolKind::Function,
+                    signature: "fn main()".to_string(),
+                    body: "println!(\"hello\");".to_string(),
+                    visibility: Visibility::Public,
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![Import {
+                    source: "src/lib".to_string(),
+                    names: vec!["run".to_string()],
+                }],
+                exports: vec![],
+            },
+        );
+        parse_map.insert(
+            "src/lib.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "run".to_string(),
+                    kind: SymbolKind::Function,
+                    signature: "pub fn run()".to_string(),
+                    body: "do_stuff();".to_string(),
+                    visibility: Visibility::Public,
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![Import {
+                    source: "src/util".to_string(),
+                    names: vec![],
+                }],
+                exports: vec![],
+            },
+        );
+        // util.rs: no parse result (tests the `continue` path)
+        let mut content_map = HashMap::new();
+        content_map.insert(
+            "src/main.rs".to_string(),
+            "fn main() { run(); }".to_string(),
+        );
+        content_map.insert(
+            "src/lib.rs".to_string(),
+            "pub fn run() { do_stuff(); }".to_string(),
+        );
+        content_map.insert("src/util.rs".to_string(), "fn helper() {}".to_string());
+        CodebaseIndex::build_with_content(files, parse_map, &counter, content_map)
+    }
+
+    #[test]
+    fn test_render_trace_metadata() {
+        let mut matched = HashSet::new();
+        matched.insert("src/main.rs");
+        matched.insert("src/lib.rs");
+        let result = render_trace_metadata("my_func", &matched, 5);
+        assert!(result.contains("**Target:** `my_func`"));
+        assert!(result.contains("**Matched in:** 2 file(s)"));
+        assert!(result.contains("`src/main.rs`"));
+        assert!(result.contains("**Relevant files (dependency subgraph):** 5"));
+    }
+
+    #[test]
+    fn test_render_symbol_source_with_symbols() {
+        let counter = TokenCounter::new();
+        let index = make_trace_index();
+        let sym = &index.files[0].parse_result.as_ref().unwrap().symbols[0];
+        let matches = vec![("src/main.rs", sym)];
+        let matched_files: HashSet<&str> = ["src/main.rs"].into_iter().collect();
+        let result = render_symbol_source(&index, &matches, &matched_files, 50000, &counter);
+        assert!(result.contains("### src/main.rs"));
+        assert!(result.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_render_symbol_source_fallback_full_content() {
+        let counter = TokenCounter::new();
+        let index = make_trace_index();
+        // No symbol matches → falls back to full file content
+        let matched_files: HashSet<&str> = ["src/util.rs"].into_iter().collect();
+        let result = render_symbol_source(&index, &[], &matched_files, 50000, &counter);
+        assert!(result.contains("### src/util.rs"));
+        assert!(result.contains("fn helper()"));
+    }
+
+    #[test]
+    fn test_render_relevant_signatures() {
+        let counter = TokenCounter::new();
+        let index = make_trace_index();
+        // Only lib.rs is in relevant_paths (has public symbols)
+        let relevant: HashSet<String> = ["src/lib.rs".to_string()].into_iter().collect();
+        let result = render_relevant_signatures(&index, &relevant, 50000, &counter);
+        assert!(result.contains("### src/lib.rs"));
+        assert!(result.contains("pub fn run()"));
+    }
+
+    #[test]
+    fn test_render_relevant_signatures_no_parse_result() {
+        let counter = TokenCounter::new();
+        let index = make_trace_index();
+        // util.rs has no parse_result → hits the `continue` at line 362
+        let relevant: HashSet<String> = ["src/util.rs".to_string()].into_iter().collect();
+        let result = render_relevant_signatures(&index, &relevant, 50000, &counter);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_render_dependency_subgraph_with_named_imports() {
+        let counter = TokenCounter::new();
+        let index = make_trace_index();
+        // main.rs imports src/lib with names ["run"], lib.rs imports src/util with empty names
+        let relevant: HashSet<String> = [
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "src/util.rs".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let result = render_dependency_subgraph(&index, &relevant, 50000, &counter);
+        // main.rs → src/lib resolves to src/lib.rs which is in relevant
+        assert!(result.contains("**src/main.rs** imports:"));
+        assert!(result.contains("- `src/lib` — run"));
+        // lib.rs → src/util with empty names
+        assert!(result.contains("**src/lib.rs** imports:"));
+        assert!(result.contains("- `src/util`"));
+    }
+
+    #[test]
+    fn test_render_dependency_subgraph_no_parse_result() {
+        let counter = TokenCounter::new();
+        let index = make_trace_index();
+        // util.rs has no parse result → hits `continue` at line 399
+        let relevant: HashSet<String> = ["src/util.rs".to_string()].into_iter().collect();
+        let result = render_dependency_subgraph(&index, &relevant, 50000, &counter);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_render_dependency_subgraph_no_relevant_imports() {
+        let counter = TokenCounter::new();
+        let index = make_trace_index();
+        // Only main.rs in relevant, but its import (src/lib) won't resolve since lib.rs isn't relevant
+        let relevant: HashSet<String> = ["src/main.rs".to_string()].into_iter().collect();
+        let result = render_dependency_subgraph(&index, &relevant, 50000, &counter);
+        // main.rs imports src/lib, but src/lib.rs is NOT in relevant → no imports shown
+        assert!(result.is_empty());
+    }
+}

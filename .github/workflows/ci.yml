@@ -49,3 +49,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --verbose
+
+  coverage:
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Check coverage (90% minimum)
+        run: |
+          OUTPUT=$(cargo tarpaulin --skip-clean 2>&1)
+          echo "$OUTPUT"
+          COVERAGE=$(echo "$OUTPUT" | grep -oP '[\d.]+(?=% coverage)' | tail -1)
+          echo "Coverage: ${COVERAGE}%"
+          if [ "$(echo "$COVERAGE < 90" | bc -l)" -eq 1 ]; then
+            echo "❌ Coverage ${COVERAGE}% is below 90% threshold"
+            exit 1
+          fi
+          echo "✅ Coverage ${COVERAGE}% meets 90% threshold"
