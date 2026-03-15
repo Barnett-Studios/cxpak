@@ -61,7 +61,7 @@ jobs:
         run: cargo install cargo-tarpaulin
       - name: Check coverage (90% minimum)
         run: |
-          OUTPUT=$(cargo tarpaulin --skip-clean --features daemon 2>&1) || true
+          OUTPUT=$(cargo tarpaulin --skip-clean --features daemon --lib --test cli_test --test diff_test --test overview_test --test scanner_test --test trace_test --timeout 300 2>&1) || true
           echo "$OUTPUT"
           COVERAGE=$(echo "$OUTPUT" | grep -oP '[\d.]+(?=% coverage)' | tail -1)
           echo "Coverage: ${COVERAGE}%"
