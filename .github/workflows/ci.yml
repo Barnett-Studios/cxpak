@@ -39,7 +39,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features daemon -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -61,10 +61,14 @@ jobs:
         run: cargo install cargo-tarpaulin
       - name: Check coverage (90% minimum)
         run: |
-          OUTPUT=$(cargo tarpaulin --skip-clean --features daemon 2>&1)
+          OUTPUT=$(cargo tarpaulin --skip-clean --features daemon 2>&1) || true
           echo "$OUTPUT"
           COVERAGE=$(echo "$OUTPUT" | grep -oP '[\d.]+(?=% coverage)' | tail -1)
           echo "Coverage: ${COVERAGE}%"
+          if [ -z "$COVERAGE" ]; then
+            echo "❌ Could not determine coverage from tarpaulin output"
+            exit 1
+          fi
           if [ "$(echo "$COVERAGE < 90" | bc -l)" -eq 1 ]; then
             echo "❌ Coverage ${COVERAGE}% is below 90% threshold"
             exit 1
