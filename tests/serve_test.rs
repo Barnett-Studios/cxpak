@@ -473,12 +473,13 @@ mod serve_tests {
 
         assert_eq!(response["id"], 2);
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_overview"));
         assert!(tool_names.contains(&"cxpak_trace"));
         assert!(tool_names.contains(&"cxpak_stats"));
+        assert!(tool_names.contains(&"cxpak_diff"));
 
         child.kill().ok();
         child.wait().ok();
@@ -792,7 +793,17 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // Send an initialize request to confirm server is running
+        // (more reliable than sleeping)
+        mcp_exchange(
+            &mut child,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            }),
+        );
 
         child.kill().ok();
         let output = child.wait_with_output().unwrap();

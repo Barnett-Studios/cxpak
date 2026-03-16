@@ -54,14 +54,39 @@ pub(crate) fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::err
     ))
 }
 
+type SharedPath = Arc<std::path::PathBuf>;
+
+#[derive(Clone)]
+struct AppState {
+    index: SharedIndex,
+    repo_path: SharedPath,
+}
+
+impl axum::extract::FromRef<AppState> for SharedIndex {
+    fn from_ref(state: &AppState) -> Self {
+        state.index.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for SharedPath {
+    fn from_ref(state: &AppState) -> Self {
+        state.repo_path.clone()
+    }
+}
+
 /// Build the axum Router for the HTTP server.
-fn build_router(shared: SharedIndex) -> Router {
+fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
+    let state = AppState {
+        index: shared,
+        repo_path,
+    };
     Router::new()
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
         .route("/overview", get(overview_handler))
         .route("/trace", get(trace_handler))
-        .with_state(shared)
+        .route("/diff", get(diff_handler))
+        .with_state(state)
 }
 
 pub fn run(
@@ -81,6 +106,7 @@ pub fn run(
     );
 
     let shared = Arc::new(RwLock::new(index));
+    let shared_path = Arc::new(path.to_path_buf());
 
     // Background watcher thread
     let watcher_path = path.to_path_buf();
@@ -104,7 +130,7 @@ pub fn run(
         }
     });
 
-    let app = build_router(shared);
+    let app = build_router(shared, shared_path);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -214,6 +240,43 @@ async fn trace_handler(
     })))
 }
 
+#[derive(Deserialize)]
+struct DiffParams {
+    git_ref: Option<String>,
+    tokens: Option<String>,
+}
+
+async fn diff_handler(
+    State(repo_path): State<SharedPath>,
+    Query(params): Query<DiffParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let git_ref = params.git_ref.as_deref();
+    let _token_budget = params
+        .tokens
+        .as_deref()
+        .and_then(|t| crate::cli::parse_token_count(t).ok())
+        .unwrap_or(50_000);
+
+    let changes = crate::commands::diff::extract_changes(&repo_path, git_ref)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let files: Vec<Value> = changes
+        .iter()
+        .map(|c| {
+            json!({
+                "path": c.path,
+                "diff": c.diff_text,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "git_ref": git_ref.unwrap_or("working tree"),
+        "changed_files": changes.len(),
+        "files": files,
+    })))
+}
+
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(
@@ -228,16 +291,20 @@ pub fn run_mcp(
         index.total_files, index.total_tokens
     );
 
-    mcp_stdio_loop(&index)
+    mcp_stdio_loop(path, &index)
 }
 
-fn mcp_stdio_loop(index: &CodebaseIndex) -> Result<(), Box<dyn std::error::Error>> {
+fn mcp_stdio_loop(
+    repo_path: &Path,
+    index: &CodebaseIndex,
+) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    mcp_stdio_loop_with_io(index, stdin.lock(), &mut stdout.lock())
+    mcp_stdio_loop_with_io(repo_path, index, stdin.lock(), &mut stdout.lock())
 }
 
 fn mcp_stdio_loop_with_io(
+    repo_path: &Path,
     index: &CodebaseIndex,
     reader: impl std::io::BufRead,
     writer: &mut impl std::io::Write,
@@ -309,6 +376,24 @@ fn mcp_stdio_loop_with_io(
                             }
                         },
                         {
+                            "name": "cxpak_diff",
+                            "description": "Show changes with dependency context",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "git_ref": {
+                                        "type": "string",
+                                        "description": "Git ref to diff against (e.g. 'main', 'HEAD~1'). Omit to diff working tree vs HEAD."
+                                    },
+                                    "tokens": {
+                                        "type": "string",
+                                        "description": "Token budget",
+                                        "default": "50k"
+                                    }
+                                }
+                            }
+                        },
+                        {
                             "name": "cxpak_stats",
                             "description": "Get index statistics (file count, tokens, languages)",
                             "inputSchema": {
@@ -323,7 +408,7 @@ fn mcp_stdio_loop_with_io(
                 let params = request.get("params").cloned().unwrap_or(json!({}));
                 let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                handle_tool_call(id, tool_name, &arguments, index)
+                handle_tool_call(id, tool_name, &arguments, index, repo_path)
             }
             _ => mcp_error_response(id, -32601, "Method not found"),
         };
@@ -341,6 +426,7 @@ fn handle_tool_call(
     tool_name: &str,
     args: &Value,
     index: &CodebaseIndex,
+    repo_path: &Path,
 ) -> Value {
     match tool_name {
         "cxpak_stats" => {
@@ -407,6 +493,39 @@ fn handle_tool_call(
                 }))
                 .unwrap_or_default(),
             )
+        }
+        "cxpak_diff" => {
+            let git_ref = args.get("git_ref").and_then(|r| r.as_str());
+            let _token_budget = args
+                .get("tokens")
+                .and_then(|t| t.as_str())
+                .and_then(|t| crate::cli::parse_token_count(t).ok())
+                .unwrap_or(50_000);
+
+            match crate::commands::diff::extract_changes(repo_path, git_ref) {
+                Ok(changes) => {
+                    let files: Vec<Value> = changes
+                        .iter()
+                        .map(|c| {
+                            json!({
+                                "path": c.path,
+                                "diff": c.diff_text,
+                            })
+                        })
+                        .collect();
+
+                    mcp_tool_result(
+                        id,
+                        &serde_json::to_string_pretty(&json!({
+                            "git_ref": git_ref.unwrap_or("working tree"),
+                            "changed_files": changes.len(),
+                            "files": files,
+                        }))
+                        .unwrap_or_default(),
+                    )
+                }
+                Err(e) => mcp_tool_result(id, &format!("Error: {e}")),
+            }
         }
         _ => mcp_response(
             id,
@@ -712,7 +831,13 @@ mod tests {
     #[test]
     fn test_handle_tool_call_stats() {
         let index = make_test_index();
-        let resp = handle_tool_call(Some(json!(1)), "cxpak_stats", &json!({}), &index);
+        let resp = handle_tool_call(
+            Some(json!(1)),
+            "cxpak_stats",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+        );
         assert_eq!(resp["jsonrpc"], "2.0");
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -724,7 +849,13 @@ mod tests {
     #[test]
     fn test_handle_tool_call_overview() {
         let index = make_test_index();
-        let resp = handle_tool_call(Some(json!(2)), "cxpak_overview", &json!({}), &index);
+        let resp = handle_tool_call(
+            Some(json!(2)),
+            "cxpak_overview",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+        );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["total_files"], 2);
@@ -739,6 +870,7 @@ mod tests {
             "cxpak_trace",
             &json!({"target": "main"}),
             &index,
+            Path::new("/tmp"),
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -755,6 +887,7 @@ mod tests {
             "cxpak_trace",
             &json!({"target": "hello"}),
             &index,
+            Path::new("/tmp"),
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -771,6 +904,7 @@ mod tests {
             "cxpak_trace",
             &json!({"target": "nonexistent_xyz"}),
             &index,
+            Path::new("/tmp"),
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -785,6 +919,7 @@ mod tests {
             "cxpak_trace",
             &json!({"target": ""}),
             &index,
+            Path::new("/tmp"),
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("required"));
@@ -793,7 +928,13 @@ mod tests {
     #[test]
     fn test_handle_tool_call_trace_missing_target_arg() {
         let index = make_test_index();
-        let resp = handle_tool_call(Some(json!(7)), "cxpak_trace", &json!({}), &index);
+        let resp = handle_tool_call(
+            Some(json!(7)),
+            "cxpak_trace",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+        );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("required"));
     }
@@ -801,7 +942,13 @@ mod tests {
     #[test]
     fn test_handle_tool_call_unknown_tool() {
         let index = make_test_index();
-        let resp = handle_tool_call(Some(json!(8)), "unknown_tool", &json!({}), &index);
+        let resp = handle_tool_call(
+            Some(json!(8)),
+            "unknown_tool",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+        );
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Unknown tool"));
@@ -816,7 +963,7 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "cxpak");
@@ -829,11 +976,11 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
     }
 
     #[test]
@@ -843,7 +990,7 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -858,7 +1005,7 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(resp["error"]["code"], -32601);
@@ -872,7 +1019,7 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
         assert!(output.is_empty());
     }
 
@@ -882,7 +1029,7 @@ mod tests {
         let input = "\n\n\n".to_string();
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
         assert!(output.is_empty());
     }
 
@@ -892,7 +1039,7 @@ mod tests {
         let input = "not json\n".to_string();
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
         assert!(output.is_empty());
     }
 
@@ -906,7 +1053,7 @@ mod tests {
         );
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(&index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
         let lines: Vec<&str> = text.trim().split('\n').collect();
         assert_eq!(lines.len(), 2);
@@ -1043,7 +1190,8 @@ mod tests {
     #[test]
     fn test_build_router_creates_router() {
         let shared = make_shared_index();
-        let _router = build_router(shared);
+        let repo_path = Arc::new(std::path::PathBuf::from("/tmp"));
+        let _router = build_router(shared, repo_path);
         // Router created without panic = success
     }
 
@@ -1054,7 +1202,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared);
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -1078,7 +1226,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared);
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -1102,7 +1250,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared);
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -1127,7 +1275,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared);
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -1151,7 +1299,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared);
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -1174,7 +1322,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared);
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -1197,7 +1345,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared);
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
