@@ -1,7 +1,7 @@
 {
   "name": "cxpak",
   "description": "Structured codebase context for Claude Code, powered by cxpak",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "author": {
     "name": "Barnett Studios"
   },
