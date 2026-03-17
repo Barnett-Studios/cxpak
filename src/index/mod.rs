@@ -37,11 +37,10 @@ pub struct LanguageStats {
 fn compute_term_frequencies(content: &str) -> HashMap<String, u32> {
     let mut counts: HashMap<String, u32> = HashMap::new();
     for word in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        let lower = word.to_lowercase();
-        if lower.len() < 2 {
+        if word.len() < 2 {
             continue;
         }
-        for part in split_identifier(&lower) {
+        for part in split_identifier(word) {
             if part.len() >= 2 {
                 *counts.entry(part).or_insert(0) += 1;
             }
@@ -788,6 +787,38 @@ mod tests {
         assert!(index.term_frequencies.contains_key("a.rs"));
         index.remove_file("a.rs");
         assert!(!index.term_frequencies.contains_key("a.rs"));
+    }
+
+    #[test]
+    fn test_term_frequencies_camel_case_splitting() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("api.rs");
+        std::fs::write(&fp, "fn handleRequest() { getResponse(); }").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "api.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 40,
+        }];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let tf = index.term_frequencies.get("api.rs").unwrap();
+        assert!(
+            tf.get("handle").unwrap_or(&0) > &0,
+            "should split handleRequest into handle"
+        );
+        assert!(
+            tf.get("request").unwrap_or(&0) > &0,
+            "should split handleRequest into request"
+        );
+        assert!(
+            tf.get("get").unwrap_or(&0) > &0,
+            "should split getResponse into get"
+        );
+        assert!(
+            tf.get("response").unwrap_or(&0) > &0,
+            "should split getResponse into response"
+        );
     }
 
     /// This test is intentionally FAILING until Task 4 implements `build_with_content`
