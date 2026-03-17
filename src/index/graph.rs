@@ -1,3 +1,4 @@
+use super::CodebaseIndex;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Default)]
@@ -86,6 +87,52 @@ impl DependencyGraph {
 
         visited
     }
+}
+
+/// Build a `DependencyGraph` from the index by resolving import source paths to
+/// indexed file paths.  We do a best-effort match: convert the module path
+/// (e.g. `crate::scanner`) to a file path (e.g. `src/scanner/mod.rs` or
+/// `src/scanner.rs`) and look up whether such a file exists.
+pub fn build_dependency_graph(index: &CodebaseIndex) -> DependencyGraph {
+    let all_paths: HashSet<&str> = index
+        .files
+        .iter()
+        .map(|f| f.relative_path.as_str())
+        .collect();
+
+    let mut graph = DependencyGraph::new();
+
+    for file in &index.files {
+        let Some(pr) = &file.parse_result else {
+            continue;
+        };
+
+        for import in &pr.imports {
+            // Try to resolve the import source to an actual file in the index.
+            // We convert path separators and try common file extensions.
+            let candidate_base = import.source.replace("::", "/").replace('.', "/");
+            let candidates = [
+                format!("{candidate_base}.rs"),
+                format!("{candidate_base}/mod.rs"),
+                format!("src/{candidate_base}.rs"),
+                format!("src/{candidate_base}/mod.rs"),
+                format!("{candidate_base}.ts"),
+                format!("{candidate_base}.js"),
+                format!("{candidate_base}.py"),
+                format!("{candidate_base}.go"),
+                format!("{candidate_base}.java"),
+            ];
+
+            for candidate in &candidates {
+                if all_paths.contains(candidate.as_str()) {
+                    graph.add_edge(&file.relative_path, candidate);
+                    break;
+                }
+            }
+        }
+    }
+
+    graph
 }
 
 #[cfg(test)]

@@ -254,7 +254,7 @@ pub fn run(
 
     // 5. Build dependency graph
     let graph_start = std::time::Instant::now();
-    let graph = crate::commands::trace::build_dependency_graph(&index);
+    let graph = crate::index::graph::build_dependency_graph(&index);
     if timing {
         eprintln!("cxpak [timing]: graph      {:.1?}", graph_start.elapsed());
     }
