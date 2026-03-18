@@ -14,6 +14,7 @@ pub struct Symbol {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SymbolKind {
+    // Existing
     Function,
     Struct,
     Enum,
@@ -23,6 +24,24 @@ pub enum SymbolKind {
     Method,
     Constant,
     TypeAlias,
+    // Tier 2 structural units
+    Selector,
+    Mixin,
+    Variable,
+    Heading,
+    Section,
+    Key,
+    Table,
+    Block,
+    Target,
+    Rule,
+    Element,
+    Message,
+    Service,
+    Query,
+    Mutation,
+    Type,
+    Instruction,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
