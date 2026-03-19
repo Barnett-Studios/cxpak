@@ -20,6 +20,10 @@ use std::time::Duration;
 
 type SharedIndex = Arc<RwLock<CodebaseIndex>>;
 
+fn matches_focus(path: &str, focus: Option<&str>) -> bool {
+    focus.map_or(true, |f| path.starts_with(f))
+}
+
 /// Scan and parse all files in a path, returning a fully built CodebaseIndex.
 pub(crate) fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
     let counter = TokenCounter::new();
@@ -86,6 +90,7 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
         .route("/overview", get(overview_handler))
         .route("/trace", get(trace_handler))
         .route("/diff", get(diff_handler))
+        .route("/search", axum::routing::post(search_handler))
         .with_state(state)
 }
 
@@ -277,6 +282,80 @@ async fn diff_handler(
     })))
 }
 
+#[derive(Deserialize)]
+struct SearchParams {
+    pattern: String,
+    limit: Option<usize>,
+    focus: Option<String>,
+    context_lines: Option<usize>,
+}
+
+async fn search_handler(
+    State(index): State<SharedIndex>,
+    Json(params): Json<SearchParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if params.pattern.is_empty() {
+        return Ok(Json(
+            json!({"error": "pattern is required and must not be empty"}),
+        ));
+    }
+
+    let re = match regex::Regex::new(&params.pattern) {
+        Ok(r) => r,
+        Err(e) => return Ok(Json(json!({"error": format!("invalid regex: {e}")}))),
+    };
+
+    let limit = params.limit.unwrap_or(20);
+    let focus = params.focus.as_deref();
+    let context_lines = params.context_lines.unwrap_or(2);
+
+    let mut matches_vec = vec![];
+    let mut total_matches = 0usize;
+    let mut files_searched = 0usize;
+
+    for file in &idx.files {
+        if !matches_focus(&file.relative_path, focus) {
+            continue;
+        }
+        if file.content.is_empty() {
+            continue;
+        }
+        files_searched += 1;
+
+        let lines: Vec<&str> = file.content.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if re.is_match(line) {
+                total_matches += 1;
+                if matches_vec.len() < limit {
+                    let start = i.saturating_sub(context_lines);
+                    let end = (i + context_lines + 1).min(lines.len());
+                    let ctx_before: Vec<&str> = lines[start..i].to_vec();
+                    let ctx_after: Vec<&str> = lines[(i + 1)..end].to_vec();
+                    matches_vec.push(json!({
+                        "path": &file.relative_path,
+                        "line": i + 1,
+                        "content": line,
+                        "context_before": ctx_before,
+                        "context_after": ctx_after,
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "pattern": params.pattern,
+        "matches": matches_vec,
+        "total_matches": total_matches,
+        "files_searched": files_searched,
+        "truncated": total_matches > limit,
+    })))
+}
+
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -354,7 +433,8 @@ fn mcp_stdio_loop_with_io(
                                         "type": "string",
                                         "description": "Token budget (e.g. '50k', '100k')",
                                         "default": "50k"
-                                    }
+                                    },
+                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
                                 }
                             }
                         },
@@ -372,7 +452,8 @@ fn mcp_stdio_loop_with_io(
                                         "type": "string",
                                         "description": "Token budget",
                                         "default": "50k"
-                                    }
+                                    },
+                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
                                 },
                                 "required": ["target"]
                             }
@@ -391,7 +472,8 @@ fn mcp_stdio_loop_with_io(
                                         "type": "string",
                                         "description": "Token budget",
                                         "default": "50k"
-                                    }
+                                    },
+                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
                                 }
                             }
                         },
@@ -400,7 +482,9 @@ fn mcp_stdio_loop_with_io(
                             "description": "Get index statistics (file count, tokens, languages)",
                             "inputSchema": {
                                 "type": "object",
-                                "properties": {}
+                                "properties": {
+                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
+                                }
                             }
                         },
                         {
@@ -410,7 +494,8 @@ fn mcp_stdio_loop_with_io(
                                 "type": "object",
                                 "properties": {
                                     "task": { "type": "string", "description": "Natural language task description" },
-                                    "limit": { "type": "number", "description": "Maximum number of candidates to return (default 15)" }
+                                    "limit": { "type": "number", "description": "Maximum number of candidates to return (default 15)" },
+                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
                                 },
                                 "required": ["task"]
                             }
@@ -423,9 +508,24 @@ fn mcp_stdio_loop_with_io(
                                 "properties": {
                                     "files": { "type": "array", "items": { "type": "string" }, "description": "File paths to include" },
                                     "tokens": { "type": "string", "description": "Token budget (e.g. '30k', '50k')", "default": "50k" },
-                                    "include_dependencies": { "type": "boolean", "description": "Include 1-hop dependencies", "default": false }
+                                    "include_dependencies": { "type": "boolean", "description": "Include 1-hop dependencies", "default": false },
+                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
                                 },
                                 "required": ["files"]
+                            }
+                        },
+                        {
+                            "name": "cxpak_search",
+                            "description": "Search codebase content with regex patterns. Returns matching lines with surrounding context.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "pattern": { "type": "string", "description": "Regex pattern to search for" },
+                                    "limit": { "type": "number", "description": "Maximum number of matches to return (default 20)", "default": 20 },
+                                    "focus": { "type": "string", "description": "Path prefix to scope search (e.g. 'src/api/')" },
+                                    "context_lines": { "type": "number", "description": "Lines of context before and after each match (default 2)", "default": 2 }
+                                },
+                                "required": ["pattern"]
                             }
                         }
                     ]
@@ -457,48 +557,120 @@ fn handle_tool_call(
 ) -> Value {
     match tool_name {
         "cxpak_stats" => {
-            let languages: Vec<Value> = index
-                .language_stats
-                .iter()
-                .map(|(lang, stats)| {
-                    json!({"language": lang, "files": stats.file_count, "tokens": stats.total_tokens})
-                })
-                .collect();
+            let focus = args.get("focus").and_then(|f| f.as_str());
 
-            mcp_tool_result(
-                id,
-                &serde_json::to_string_pretty(&json!({
-                    "files": index.total_files,
-                    "tokens": index.total_tokens,
-                    "languages": languages,
-                }))
-                .unwrap_or_default(),
-            )
+            if focus.is_some() {
+                // Recompute stats from files matching focus
+                let mut lang_counts: HashMap<String, (usize, usize)> = HashMap::new();
+                let mut total_files = 0usize;
+                let mut total_tokens = 0usize;
+                for file in &index.files {
+                    if !matches_focus(&file.relative_path, focus) {
+                        continue;
+                    }
+                    total_files += 1;
+                    total_tokens += file.token_count;
+                    if let Some(ref lang) = file.language {
+                        let entry = lang_counts.entry(lang.clone()).or_insert((0, 0));
+                        entry.0 += 1;
+                        entry.1 += file.token_count;
+                    }
+                }
+                let languages: Vec<Value> = lang_counts
+                    .iter()
+                    .map(|(lang, (fc, tc))| json!({"language": lang, "files": fc, "tokens": tc}))
+                    .collect();
+
+                mcp_tool_result(
+                    id,
+                    &serde_json::to_string_pretty(&json!({
+                        "files": total_files,
+                        "tokens": total_tokens,
+                        "languages": languages,
+                        "focus": focus,
+                    }))
+                    .unwrap_or_default(),
+                )
+            } else {
+                let languages: Vec<Value> = index
+                    .language_stats
+                    .iter()
+                    .map(|(lang, stats)| {
+                        json!({"language": lang, "files": stats.file_count, "tokens": stats.total_tokens})
+                    })
+                    .collect();
+
+                mcp_tool_result(
+                    id,
+                    &serde_json::to_string_pretty(&json!({
+                        "files": index.total_files,
+                        "tokens": index.total_tokens,
+                        "languages": languages,
+                    }))
+                    .unwrap_or_default(),
+                )
+            }
         }
         "cxpak_overview" => {
-            let languages: Vec<Value> = index
-                .language_stats
-                .iter()
-                .map(|(lang, stats)| {
-                    json!({"language": lang, "files": stats.file_count, "tokens": stats.total_tokens})
-                })
-                .collect();
+            let focus = args.get("focus").and_then(|f| f.as_str());
 
-            mcp_tool_result(
-                id,
-                &serde_json::to_string_pretty(&json!({
-                    "total_files": index.total_files,
-                    "total_tokens": index.total_tokens,
-                    "languages": languages,
-                }))
-                .unwrap_or_default(),
-            )
+            if focus.is_some() {
+                let mut lang_counts: HashMap<String, (usize, usize)> = HashMap::new();
+                let mut total_files = 0usize;
+                let mut total_tokens = 0usize;
+                for file in &index.files {
+                    if !matches_focus(&file.relative_path, focus) {
+                        continue;
+                    }
+                    total_files += 1;
+                    total_tokens += file.token_count;
+                    if let Some(ref lang) = file.language {
+                        let entry = lang_counts.entry(lang.clone()).or_insert((0, 0));
+                        entry.0 += 1;
+                        entry.1 += file.token_count;
+                    }
+                }
+                let languages: Vec<Value> = lang_counts
+                    .iter()
+                    .map(|(lang, (fc, tc))| json!({"language": lang, "files": fc, "tokens": tc}))
+                    .collect();
+
+                mcp_tool_result(
+                    id,
+                    &serde_json::to_string_pretty(&json!({
+                        "total_files": total_files,
+                        "total_tokens": total_tokens,
+                        "languages": languages,
+                        "focus": focus,
+                    }))
+                    .unwrap_or_default(),
+                )
+            } else {
+                let languages: Vec<Value> = index
+                    .language_stats
+                    .iter()
+                    .map(|(lang, stats)| {
+                        json!({"language": lang, "files": stats.file_count, "tokens": stats.total_tokens})
+                    })
+                    .collect();
+
+                mcp_tool_result(
+                    id,
+                    &serde_json::to_string_pretty(&json!({
+                        "total_files": index.total_files,
+                        "total_tokens": index.total_tokens,
+                        "languages": languages,
+                    }))
+                    .unwrap_or_default(),
+                )
+            }
         }
         "cxpak_trace" => {
             let target = args.get("target").and_then(|t| t.as_str()).unwrap_or("");
             if target.is_empty() {
                 return mcp_tool_result(id, "Error: 'target' argument is required");
             }
+            let focus = args.get("focus").and_then(|f| f.as_str());
 
             let symbol_matches = index.find_symbol(target);
             let content_matches = if symbol_matches.is_empty() {
@@ -509,20 +681,25 @@ fn handle_tool_call(
 
             let found = !symbol_matches.is_empty() || !content_matches.is_empty();
 
+            let mut result = json!({
+                "target": target,
+                "found": found,
+                "symbol_matches": symbol_matches.len(),
+                "content_matches": content_matches.len(),
+                "total_files": index.total_files,
+            });
+            if let Some(f) = focus {
+                result["focus"] = json!(f);
+            }
+
             mcp_tool_result(
                 id,
-                &serde_json::to_string_pretty(&json!({
-                    "target": target,
-                    "found": found,
-                    "symbol_matches": symbol_matches.len(),
-                    "content_matches": content_matches.len(),
-                    "total_files": index.total_files,
-                }))
-                .unwrap_or_default(),
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
         "cxpak_diff" => {
             let git_ref = args.get("git_ref").and_then(|r| r.as_str());
+            let focus = args.get("focus").and_then(|f| f.as_str());
             let _token_budget = args
                 .get("tokens")
                 .and_then(|t| t.as_str())
@@ -531,7 +708,12 @@ fn handle_tool_call(
 
             match crate::commands::diff::extract_changes(repo_path, git_ref) {
                 Ok(changes) => {
-                    let files: Vec<Value> = changes
+                    let filtered: Vec<&crate::commands::diff::FileChange> = changes
+                        .iter()
+                        .filter(|c| matches_focus(&c.path, focus))
+                        .collect();
+
+                    let files: Vec<Value> = filtered
                         .iter()
                         .map(|c| {
                             json!({
@@ -541,14 +723,18 @@ fn handle_tool_call(
                         })
                         .collect();
 
+                    let mut result = json!({
+                        "git_ref": git_ref.unwrap_or("working tree"),
+                        "changed_files": filtered.len(),
+                        "files": files,
+                    });
+                    if let Some(f) = focus {
+                        result["focus"] = json!(f);
+                    }
+
                     mcp_tool_result(
                         id,
-                        &serde_json::to_string_pretty(&json!({
-                            "git_ref": git_ref.unwrap_or("working tree"),
-                            "changed_files": changes.len(),
-                            "files": files,
-                        }))
-                        .unwrap_or_default(),
+                        &serde_json::to_string_pretty(&result).unwrap_or_default(),
                     )
                 }
                 Err(e) => mcp_tool_result(id, &format!("Error: {e}")),
@@ -563,6 +749,7 @@ fn handle_tool_call(
                 );
             }
             let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(15) as usize;
+            let focus = args.get("focus").and_then(|f| f.as_str());
 
             let scorer = crate::relevance::MultiSignalScorer::new();
             let all_scored = scorer.score_all(task, index);
@@ -576,6 +763,7 @@ fn handle_tool_call(
             );
             let candidates: Vec<Value> = seeds
                 .iter()
+                .filter(|s| matches_focus(&s.path, focus))
                 .map(|s| {
                     let deps: Vec<&str> = graph
                         .dependencies(&s.path)
@@ -636,6 +824,7 @@ fn handle_tool_call(
                 .get("include_dependencies")
                 .and_then(|d| d.as_bool())
                 .unwrap_or(false);
+            let focus = args.get("focus").and_then(|f| f.as_str());
 
             // Build a lookup map from path -> index position for O(1) access
             let index_map: HashMap<&str, usize> = index
@@ -654,6 +843,9 @@ fn handle_tool_call(
             };
 
             for path in &files {
+                if !matches_focus(path, focus) {
+                    continue;
+                }
                 if seen.insert(path.clone()) {
                     target_files.push((path.clone(), "selected"));
                 }
@@ -708,6 +900,72 @@ fn handle_tool_call(
                     "files": packed,
                     "omitted": omitted,
                     "not_found": not_found,
+                }))
+                .unwrap_or_default(),
+            )
+        }
+        "cxpak_search" => {
+            let pattern = args.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
+            if pattern.is_empty() {
+                return mcp_tool_result(
+                    id,
+                    "Error: 'pattern' argument is required and must not be empty",
+                );
+            }
+            let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let context_lines = args
+                .get("context_lines")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(2) as usize;
+
+            let re = match regex::Regex::new(pattern) {
+                Ok(r) => r,
+                Err(e) => return mcp_tool_result(id, &format!("Error: invalid regex: {e}")),
+            };
+
+            let mut matches_vec = vec![];
+            let mut total_matches = 0usize;
+            let mut files_searched = 0usize;
+
+            for file in &index.files {
+                if !matches_focus(&file.relative_path, focus) {
+                    continue;
+                }
+                if file.content.is_empty() {
+                    continue;
+                }
+                files_searched += 1;
+
+                let lines: Vec<&str> = file.content.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    if re.is_match(line) {
+                        total_matches += 1;
+                        if matches_vec.len() < limit {
+                            let start = i.saturating_sub(context_lines);
+                            let end = (i + context_lines + 1).min(lines.len());
+                            let ctx_before: Vec<&str> = lines[start..i].to_vec();
+                            let ctx_after: Vec<&str> = lines[(i + 1)..end].to_vec();
+                            matches_vec.push(json!({
+                                "path": &file.relative_path,
+                                "line": i + 1,
+                                "content": line,
+                                "context_before": ctx_before,
+                                "context_after": ctx_after,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&json!({
+                    "pattern": pattern,
+                    "matches": matches_vec,
+                    "total_matches": total_matches,
+                    "files_searched": files_searched,
+                    "truncated": total_matches > limit,
                 }))
                 .unwrap_or_default(),
             )
@@ -1165,7 +1423,7 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
     }
 
     #[test]
@@ -1715,7 +1973,11 @@ mod tests {
         mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6, "should have 6 tools (4 existing + 2 new)");
+        assert_eq!(
+            tools.len(),
+            7,
+            "should have 7 tools (4 existing + 2 v0.9 + 1 search)"
+        );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_context_for_task"));
         assert!(tool_names.contains(&"cxpak_pack_context"));
@@ -1934,5 +2196,206 @@ mod tests {
                 "packed file should have content"
             );
         }
+    }
+
+    // --- cxpak_search MCP tool ---
+
+    #[test]
+    fn test_mcp_search_happy_path() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"fn main"}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(result["pattern"], "fn main");
+        assert!(result["total_matches"].as_u64().unwrap() > 0);
+        assert!(result["files_searched"].as_u64().unwrap() > 0);
+        let matches = result["matches"].as_array().unwrap();
+        assert!(!matches.is_empty());
+        assert!(matches[0]["path"].as_str().is_some());
+        assert!(matches[0]["line"].as_u64().unwrap() > 0);
+        assert!(matches[0]["content"].as_str().unwrap().contains("fn main"));
+    }
+
+    #[test]
+    fn test_mcp_search_no_matches() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"zzz_nonexistent_pattern_zzz"}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(result["total_matches"].as_u64().unwrap(), 0);
+        assert!(result["matches"].as_array().unwrap().is_empty());
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[test]
+    fn test_mcp_search_invalid_regex() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"[invalid"}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("invalid regex"));
+    }
+
+    #[test]
+    fn test_mcp_search_with_focus() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        // Search with focus on src/main.rs path prefix — should only find matches there
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"fn","focus":"src/main"}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        // All matches should be in files starting with "src/main"
+        let matches = result["matches"].as_array().unwrap();
+        for m in matches {
+            assert!(
+                m["path"].as_str().unwrap().starts_with("src/main"),
+                "match path should start with focus prefix"
+            );
+        }
+        assert_eq!(result["files_searched"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_mcp_search_with_limit() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        // "fn" appears in both files; limit to 1
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"fn","limit":1}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1, "should respect limit of 1");
+        // total_matches may be > 1 since both files have "fn"
+        assert!(result["total_matches"].as_u64().unwrap() >= 1);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn test_mcp_search_empty_pattern() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":""}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            content.contains("Error") || content.contains("error"),
+            "empty pattern should return error"
+        );
+    }
+
+    // --- focus on existing tools ---
+
+    #[test]
+    fn test_mcp_overview_with_focus() {
+        let index = make_test_index();
+        let resp = handle_tool_call(
+            Some(json!(1)),
+            "cxpak_overview",
+            &json!({"focus": "src/main"}),
+            &index,
+            Path::new("/tmp"),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        // Focus on "src/main" should only include src/main.rs (1 file)
+        assert_eq!(parsed["total_files"], 1);
+        assert_eq!(parsed["focus"], "src/main");
+        let langs = parsed["languages"].as_array().unwrap();
+        assert_eq!(langs.len(), 1);
+    }
+
+    #[test]
+    fn test_mcp_stats_with_focus() {
+        let index = make_test_index();
+        let resp = handle_tool_call(
+            Some(json!(1)),
+            "cxpak_stats",
+            &json!({"focus": "src/lib"}),
+            &index,
+            Path::new("/tmp"),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        // Focus on "src/lib" should only include src/lib.rs (1 file)
+        assert_eq!(parsed["files"], 1);
+        assert_eq!(parsed["focus"], "src/lib");
+    }
+
+    #[test]
+    fn test_mcp_stats_with_focus_no_match() {
+        let index = make_test_index();
+        let resp = handle_tool_call(
+            Some(json!(1)),
+            "cxpak_stats",
+            &json!({"focus": "nonexistent/"}),
+            &index,
+            Path::new("/tmp"),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["files"], 0);
+        assert_eq!(parsed["tokens"], 0);
+    }
+
+    #[test]
+    fn test_mcp_tools_list_includes_search() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(
+            tool_names.contains(&"cxpak_search"),
+            "tools/list should include cxpak_search"
+        );
+        // Verify all tools have focus property
+        for tool in tools {
+            let props = tool["inputSchema"]["properties"].as_object().unwrap();
+            assert!(
+                props.contains_key("focus"),
+                "tool {} should have focus property",
+                tool["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_matches_focus_utility() {
+        assert!(matches_focus("src/main.rs", None));
+        assert!(matches_focus("src/main.rs", Some("src/")));
+        assert!(matches_focus("src/main.rs", Some("src/main")));
+        assert!(!matches_focus("src/main.rs", Some("tests/")));
+        assert!(!matches_focus("lib/foo.rs", Some("src/")));
+        assert!(matches_focus("", Some("")));
+        assert!(matches_focus("anything", Some("")));
     }
 }
