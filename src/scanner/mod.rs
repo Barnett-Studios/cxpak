@@ -187,7 +187,6 @@ pub fn detect_language(path: &Path) -> Option<String> {
         "lua" => "lua",
         "ex" | "exs" => "elixir",
         "zig" => "zig",
-        "pl" | "pm" => "perl",
         "hs" => "haskell",
         "groovy" | "gradle" => "groovy",
         "m" | "mm" => "objc",
@@ -195,7 +194,6 @@ pub fn detect_language(path: &Path) -> Option<String> {
         "jl" => "julia",
         "ml" => "ocaml",
         "mli" => "ocaml_interface",
-        "sql" => "sql",
         // New Tier 2
         "css" => "css",
         "scss" => "scss",
@@ -362,8 +360,6 @@ mod tests {
             ("mix.ex", "elixir"),
             ("test.exs", "elixir"),
             ("main.zig", "zig"),
-            ("script.pl", "perl"),
-            ("Module.pm", "perl"),
             ("Main.hs", "haskell"),
             ("build.groovy", "groovy"),
             ("build.gradle", "groovy"),
@@ -374,7 +370,6 @@ mod tests {
             ("solver.jl", "julia"),
             ("parser.ml", "ocaml"),
             ("parser.mli", "ocaml_interface"),
-            ("schema.sql", "sql"),
         ];
         for (filename, expected) in cases {
             let result = detect_language(Path::new(filename));
