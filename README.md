@@ -125,7 +125,7 @@ When running `cxpak serve`, these endpoints are available:
 
 ### MCP Server
 
-When running `cxpak serve --mcp`, cxpak speaks [Model Context Protocol](https://modelcontextprotocol.io/) over stdin/stdout. It exposes four tools:
+When running `cxpak serve --mcp`, cxpak speaks [Model Context Protocol](https://modelcontextprotocol.io/) over stdin/stdout. It exposes seven tools (all support a `focus` path prefix parameter):
 
 | Tool | Description |
 |------|-------------|
@@ -133,6 +133,9 @@ When running `cxpak serve --mcp`, cxpak speaks [Model Context Protocol](https://
 | `cxpak_trace` | Trace a symbol through dependencies |
 | `cxpak_stats` | Language stats and token counts |
 | `cxpak_diff` | Show changes with dependency context |
+| `cxpak_context_for_task` | Score and rank files by relevance to a task |
+| `cxpak_pack_context` | Pack selected files into a token-budgeted bundle |
+| `cxpak_search` | Regex search with context lines |
 
 ## What You Get
 
@@ -183,11 +186,16 @@ To clear the cache and all output files:
 cxpak clean .
 ```
 
-## Supported Languages
+## Supported Languages (40)
 
-Rust, TypeScript, JavaScript, Python, Java, Go, C, C++, Ruby, C#, Swift, Kotlin
+**Tier 1 — Full extraction** (functions, classes, methods, imports, exports):
+Rust, TypeScript, JavaScript, Python, Java, Go, C, C++, Ruby, C#, Swift, Kotlin,
+Bash, PHP, Dart, Scala, Lua, Elixir, Zig, Haskell, Groovy, Objective-C, R, Julia, OCaml, MATLAB
 
-Tree-sitter grammars are compiled in. All 12 languages are enabled by default. Language features can be toggled:
+**Tier 2 — Structural extraction** (selectors, headings, keys, blocks, targets, etc.):
+CSS, SCSS, Markdown, JSON, YAML, TOML, Dockerfile, HCL/Terraform, Protobuf, Svelte, Makefile, HTML, GraphQL, XML
+
+Tree-sitter grammars are compiled in. All 40 languages are enabled by default. Language features can be toggled:
 
 ```bash
 # Only Rust and Python support

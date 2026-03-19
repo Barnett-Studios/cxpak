@@ -1,6 +1,6 @@
 [package]
 name = "cxpak"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Spends CPU cycles so you don't spend tokens. The LLM gets a briefing packet instead of a flashlight in a dark room."
 license = "MIT"
