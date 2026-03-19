@@ -188,7 +188,7 @@ fn language_detection_rust() {
 }
 
 #[test]
-fn language_detection_none_for_markdown() {
+fn language_detection_markdown() {
     let root = fixture_root();
     ensure_git_dir(&root);
 
@@ -201,7 +201,8 @@ fn language_detection_none_for_markdown() {
         .expect("README.md should be in scan results");
 
     assert_eq!(
-        readme.language, None,
-        "README.md should have language == None"
+        readme.language.as_deref(),
+        Some("markdown"),
+        "README.md should be detected as 'markdown'"
     );
 }

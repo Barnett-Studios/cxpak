@@ -140,10 +140,33 @@ impl Scanner {
     }
 }
 
-/// Detect a programming language from a file's extension.
+/// Detect a programming language from a file's name or extension.
 pub fn detect_language(path: &Path) -> Option<String> {
-    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    // First: check by filename (for extensionless files like Dockerfile, Makefile)
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let lang = match name {
+            "Dockerfile" | "Makefile" | "GNUmakefile" => match name {
+                "Dockerfile" => Some("dockerfile"),
+                _ => Some("makefile"),
+            },
+            _ if name.starts_with("Dockerfile.") => Some("dockerfile"),
+            _ => None,
+        };
+        if let Some(l) = lang {
+            return Some(l.to_string());
+        }
+    }
+
+    // Case-sensitive check first (only .R needs this)
+    let raw_ext = path.extension()?.to_string_lossy();
+    if raw_ext.as_ref() == "R" {
+        return Some("r".to_string());
+    }
+
+    // Then: check by extension (lowercased)
+    let ext = raw_ext.to_lowercase();
     let lang = match ext.as_str() {
+        // Existing languages
         "rs" => "rust",
         "ts" | "tsx" => "typescript",
         "js" | "jsx" | "mjs" | "cjs" => "javascript",
@@ -156,6 +179,37 @@ pub fn detect_language(path: &Path) -> Option<String> {
         "cs" => "csharp",
         "swift" => "swift",
         "kt" | "kts" => "kotlin",
+        // New Tier 1
+        "sh" | "bash" => "bash",
+        "php" => "php",
+        "dart" => "dart",
+        "scala" | "sc" => "scala",
+        "lua" => "lua",
+        "ex" | "exs" => "elixir",
+        "zig" => "zig",
+        "pl" | "pm" => "perl",
+        "hs" => "haskell",
+        "groovy" | "gradle" => "groovy",
+        "m" | "mm" => "objc",
+        "r" => "r",
+        "jl" => "julia",
+        "ml" => "ocaml",
+        "mli" => "ocaml_interface",
+        "sql" => "sql",
+        // New Tier 2
+        "css" => "css",
+        "scss" => "scss",
+        "md" | "mdx" => "markdown",
+        "json" => "json",
+        "yml" | "yaml" => "yaml",
+        "toml" => "toml",
+        "hcl" | "tf" | "tfvars" => "hcl",
+        "proto" => "proto",
+        "svelte" => "svelte",
+        "mk" => "makefile",
+        "html" | "htm" => "html",
+        "graphql" | "gql" => "graphql",
+        "xml" | "xsd" | "xsl" | "svg" => "xml",
         _ => return None,
     };
     Some(lang.to_string())
@@ -221,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_language_all_extensions() {
+    fn test_detect_language_existing_extensions() {
         let cases = vec![
             ("foo.rs", Some("rust")),
             ("foo.ts", Some("typescript")),
@@ -246,8 +300,6 @@ mod tests {
             ("foo.kt", Some("kotlin")),
             ("foo.kts", Some("kotlin")),
             ("foo.txt", None),
-            ("foo.md", None),
-            ("foo", None),
         ];
         for (filename, expected) in cases {
             let result = detect_language(Path::new(filename));
@@ -259,6 +311,132 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_detect_dockerfile() {
+        assert_eq!(
+            detect_language(Path::new("Dockerfile")),
+            Some("dockerfile".to_string())
+        );
+        assert_eq!(
+            detect_language(Path::new("Dockerfile.prod")),
+            Some("dockerfile".to_string())
+        );
+        assert_eq!(
+            detect_language(Path::new("src/Dockerfile")),
+            Some("dockerfile".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_makefile() {
+        assert_eq!(
+            detect_language(Path::new("Makefile")),
+            Some("makefile".to_string())
+        );
+        assert_eq!(
+            detect_language(Path::new("GNUmakefile")),
+            Some("makefile".to_string())
+        );
+        assert_eq!(
+            detect_language(Path::new("build/Makefile")),
+            Some("makefile".to_string())
+        );
+        assert_eq!(
+            detect_language(Path::new("rules.mk")),
+            Some("makefile".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_new_tier1_extensions() {
+        let cases = vec![
+            ("script.sh", "bash"),
+            ("script.bash", "bash"),
+            ("index.php", "php"),
+            ("main.dart", "dart"),
+            ("App.scala", "scala"),
+            ("build.sc", "scala"),
+            ("init.lua", "lua"),
+            ("mix.ex", "elixir"),
+            ("test.exs", "elixir"),
+            ("main.zig", "zig"),
+            ("script.pl", "perl"),
+            ("Module.pm", "perl"),
+            ("Main.hs", "haskell"),
+            ("build.groovy", "groovy"),
+            ("build.gradle", "groovy"),
+            ("ViewController.m", "objc"),
+            ("ViewController.mm", "objc"),
+            ("analysis.r", "r"),
+            ("analysis.R", "r"),
+            ("solver.jl", "julia"),
+            ("parser.ml", "ocaml"),
+            ("parser.mli", "ocaml_interface"),
+            ("schema.sql", "sql"),
+        ];
+        for (filename, expected) in cases {
+            let result = detect_language(Path::new(filename));
+            assert_eq!(
+                result.as_deref(),
+                Some(expected),
+                "detect_language({filename}) = {:?}, expected Some({expected:?})",
+                result,
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_new_tier2_extensions() {
+        let cases = vec![
+            ("style.css", "css"),
+            ("style.scss", "scss"),
+            ("README.md", "markdown"),
+            ("page.mdx", "markdown"),
+            ("config.json", "json"),
+            ("config.yml", "yaml"),
+            ("config.yaml", "yaml"),
+            ("Cargo.toml", "toml"),
+            ("main.tf", "hcl"),
+            ("vars.tfvars", "hcl"),
+            ("config.hcl", "hcl"),
+            ("service.proto", "proto"),
+            ("App.svelte", "svelte"),
+            ("index.html", "html"),
+            ("index.htm", "html"),
+            ("schema.graphql", "graphql"),
+            ("schema.gql", "graphql"),
+            ("config.xml", "xml"),
+            ("schema.xsd", "xml"),
+            ("transform.xsl", "xml"),
+            ("icon.svg", "xml"),
+        ];
+        for (filename, expected) in cases {
+            let result = detect_language(Path::new(filename));
+            assert_eq!(
+                result.as_deref(),
+                Some(expected),
+                "detect_language({filename}) = {:?}, expected Some({expected:?})",
+                result,
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_matlab_extension_maps_to_objc() {
+        // .m defaults to objc, not matlab (known ambiguity — objc wins unconditionally)
+        assert_eq!(
+            detect_language(Path::new("script.m")),
+            Some("objc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_unknown_returns_none() {
+        assert_eq!(detect_language(Path::new("foo.txt")), None);
+        assert_eq!(detect_language(Path::new("foo.unknown")), None);
+        assert_eq!(detect_language(Path::new("foo")), None);
     }
 
     #[test]
