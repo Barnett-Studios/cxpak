@@ -2,6 +2,7 @@ pub mod seed;
 pub mod signals;
 
 use crate::index::CodebaseIndex;
+use std::collections::HashSet;
 
 /// Result of scoring a single file against a query.
 #[derive(Debug, Clone)]
@@ -28,6 +29,7 @@ pub trait RelevanceScorer: Send + Sync {
 /// Combines multiple weighted signals into a single score.
 pub struct MultiSignalScorer {
     pub weights: SignalWeights,
+    pub expanded_tokens: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,11 +63,20 @@ impl MultiSignalScorer {
     pub fn new() -> Self {
         Self {
             weights: SignalWeights::default(),
+            expanded_tokens: None,
         }
     }
 
     pub fn with_weights(weights: SignalWeights) -> Self {
-        Self { weights }
+        Self {
+            weights,
+            expanded_tokens: None,
+        }
+    }
+
+    pub fn with_expansion(mut self, tokens: HashSet<String>) -> Self {
+        self.expanded_tokens = Some(tokens);
+        self
     }
 
     /// Score all files in the index against the query.
@@ -81,11 +92,12 @@ impl MultiSignalScorer {
 impl RelevanceScorer for MultiSignalScorer {
     fn score(&self, query: &str, file_path: &str, index: &CodebaseIndex) -> ScoredFile {
         let w = &self.weights;
+        let expanded = self.expanded_tokens.as_ref();
 
         let path_sig = signals::path_similarity(query, file_path);
-        let symbol_sig = signals::symbol_match(query, file_path, index);
+        let symbol_sig = signals::symbol_match(query, file_path, index, expanded);
         let import_sig = signals::import_proximity(file_path, index);
-        let tf_sig = signals::term_frequency(query, file_path, index);
+        let tf_sig = signals::term_frequency(query, file_path, index, expanded);
         let recency_sig = SignalResult {
             name: "recency_boost",
             score: 0.5, // neutral — no git history in index

@@ -61,7 +61,12 @@ pub fn path_similarity(query: &str, file_path: &str) -> SignalResult {
 }
 
 /// SymbolMatch: Fuzzy match query terms against function/struct/class names in file.
-pub fn symbol_match(query: &str, file_path: &str, index: &CodebaseIndex) -> SignalResult {
+pub fn symbol_match(
+    query: &str,
+    file_path: &str,
+    index: &CodebaseIndex,
+    expanded_tokens: Option<&HashSet<String>>,
+) -> SignalResult {
     let file = match index.files.iter().find(|f| f.relative_path == file_path) {
         Some(f) => f,
         None => {
@@ -92,7 +97,14 @@ pub fn symbol_match(query: &str, file_path: &str, index: &CodebaseIndex) -> Sign
         };
     }
 
-    let query_tokens = tokenize(query);
+    let owned_tokens;
+    let query_tokens = match expanded_tokens {
+        Some(tokens) => tokens,
+        None => {
+            owned_tokens = tokenize(query);
+            &owned_tokens
+        }
+    };
     if query_tokens.is_empty() {
         return SignalResult {
             name: "symbol_match",
@@ -208,7 +220,12 @@ pub fn import_proximity(file_path: &str, index: &CodebaseIndex) -> SignalResult 
 }
 
 /// TermFrequency: Lightweight TF of query terms in file content.
-pub fn term_frequency(query: &str, file_path: &str, index: &CodebaseIndex) -> SignalResult {
+pub fn term_frequency(
+    query: &str,
+    file_path: &str,
+    index: &CodebaseIndex,
+    expanded_tokens: Option<&HashSet<String>>,
+) -> SignalResult {
     let tf_map = match index.term_frequencies.get(file_path) {
         Some(m) => m,
         None => {
@@ -228,7 +245,14 @@ pub fn term_frequency(query: &str, file_path: &str, index: &CodebaseIndex) -> Si
         };
     }
 
-    let query_tokens = tokenize(query);
+    let owned_tokens;
+    let query_tokens = match expanded_tokens {
+        Some(tokens) => tokens,
+        None => {
+            owned_tokens = tokenize(query);
+            &owned_tokens
+        }
+    };
     if query_tokens.is_empty() {
         return SignalResult {
             name: "term_frequency",
@@ -248,7 +272,7 @@ pub fn term_frequency(query: &str, file_path: &str, index: &CodebaseIndex) -> Si
 
     let mut matched_count: u32 = 0;
     let mut matched_terms = Vec::new();
-    for token in &query_tokens {
+    for token in query_tokens {
         if let Some(&count) = tf_map.get(token.as_str()) {
             matched_count += count;
             matched_terms.push(format!("{}={}", token, count));
@@ -358,7 +382,7 @@ mod tests {
     #[test]
     fn test_symbol_match_exact_hit() {
         let index = make_symbol_index();
-        let result = symbol_match("handle_api_request", "handler.rs", &index);
+        let result = symbol_match("handle_api_request", "handler.rs", &index, None);
         assert!(
             result.score > 0.8,
             "exact symbol match should be high: {}",
@@ -369,7 +393,7 @@ mod tests {
     #[test]
     fn test_symbol_match_fuzzy() {
         let index = make_symbol_index();
-        let result = symbol_match("api request", "handler.rs", &index);
+        let result = symbol_match("api request", "handler.rs", &index, None);
         assert!(
             result.score > 0.3,
             "fuzzy match should score mid-range: {}",
@@ -380,7 +404,7 @@ mod tests {
     #[test]
     fn test_symbol_match_no_match() {
         let index = make_symbol_index();
-        let result = symbol_match("database migration", "handler.rs", &index);
+        let result = symbol_match("database migration", "handler.rs", &index, None);
         assert!(
             result.score < 0.2,
             "no match should be low: {}",
@@ -391,7 +415,7 @@ mod tests {
     #[test]
     fn test_symbol_match_case_insensitive() {
         let index = make_symbol_index();
-        let result = symbol_match("Handle_API_Request", "handler.rs", &index);
+        let result = symbol_match("Handle_API_Request", "handler.rs", &index, None);
         assert!(result.score > 0.5);
     }
 
@@ -408,7 +432,7 @@ mod tests {
             size_bytes: 13,
         }];
         let index = CodebaseIndex::build(files, HashMap::new(), &counter);
-        let result = symbol_match("anything", "empty.rs", &index);
+        let result = symbol_match("anything", "empty.rs", &index, None);
         assert_eq!(result.score, 0.0);
     }
 
@@ -493,7 +517,7 @@ mod tests {
             size_bytes: 62,
         }];
         let index = CodebaseIndex::build(files, HashMap::new(), &counter);
-        let result = term_frequency("rate limit", "rate.rs", &index);
+        let result = term_frequency("rate limit", "rate.rs", &index, None);
         assert!(
             result.score > 0.5,
             "high term frequency should score high: {}",
@@ -514,7 +538,7 @@ mod tests {
             size_bytes: 20,
         }];
         let index = CodebaseIndex::build(files, HashMap::new(), &counter);
-        let result = term_frequency("database migration", "unrelated.rs", &index);
+        let result = term_frequency("database migration", "unrelated.rs", &index, None);
         assert_eq!(result.score, 0.0);
     }
 
@@ -522,7 +546,7 @@ mod tests {
     fn test_term_frequency_nonexistent_file() {
         let counter = TokenCounter::new();
         let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
-        let result = term_frequency("test", "nonexistent.rs", &index);
+        let result = term_frequency("test", "nonexistent.rs", &index, None);
         assert_eq!(result.score, 0.0);
     }
 
