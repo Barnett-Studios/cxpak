@@ -135,6 +135,95 @@ fn render_stub(symbol: &Symbol) -> String {
     format!("{} // +{} lines", symbol.signature, line_count)
 }
 
+/// Split an oversized symbol into chunks that each fit within MAX_SYMBOL_TOKENS.
+/// Returns a single-element vec if the symbol is already within the limit.
+pub fn split_oversized_symbol(symbol: &Symbol, _source: &str) -> Vec<DegradedSymbol> {
+    let counter = TokenCounter::new();
+    let total_tokens = counter.count(&symbol.body);
+
+    if total_tokens <= MAX_SYMBOL_TOKENS {
+        return vec![DegradedSymbol {
+            symbol: symbol.clone(),
+            level: DetailLevel::Full,
+            rendered: symbol.body.clone(),
+            rendered_tokens: total_tokens,
+            chunk_index: None,
+            chunk_total: None,
+            parent_name: None,
+        }];
+    }
+
+    // Line-based splitting with blank-line preference
+    let lines: Vec<&str> = symbol.body.lines().collect();
+    let mut chunks: Vec<Vec<&str>> = Vec::new();
+    let mut current_chunk: Vec<&str> = Vec::new();
+    let mut current_tokens = 0usize;
+
+    for line in &lines {
+        let line_tokens = counter.count(line) + 1; // +1 for newline
+        if current_tokens + line_tokens > MAX_SYMBOL_TOKENS && !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+            current_chunk = Vec::new();
+            current_tokens = 0;
+        }
+        current_chunk.push(line);
+        current_tokens += line_tokens;
+    }
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    let total_chunks = chunks.len();
+    let mut result = Vec::new();
+    let mut line_offset = 0usize;
+
+    for (i, chunk_lines) in chunks.iter().enumerate() {
+        let chunk_content = if i == 0 {
+            chunk_lines.join("\n")
+        } else {
+            format!(
+                "{} {{ // chunk {}/{}\n{}",
+                symbol.signature,
+                i + 1,
+                total_chunks,
+                chunk_lines.join("\n")
+            )
+        };
+
+        let chunk_line_count = chunk_lines.len();
+        let start_line = symbol.start_line + line_offset;
+        let end_line = if i == total_chunks - 1 {
+            symbol.end_line
+        } else {
+            start_line + chunk_line_count - 1
+        };
+
+        let rendered_tokens = counter.count(&chunk_content);
+
+        result.push(DegradedSymbol {
+            symbol: Symbol {
+                name: format!("{} [{}/{}]", symbol.name, i + 1, total_chunks),
+                kind: symbol.kind.clone(),
+                visibility: symbol.visibility.clone(),
+                signature: symbol.signature.clone(),
+                body: chunk_content.clone(),
+                start_line,
+                end_line,
+            },
+            level: DetailLevel::Full,
+            rendered: chunk_content,
+            rendered_tokens,
+            chunk_index: Some(i),
+            chunk_total: Some(total_chunks),
+            parent_name: Some(symbol.name.clone()),
+        });
+
+        line_offset += chunk_line_count;
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +462,133 @@ mod tests {
         sym.signature = "def handle_request(req)".to_string();
         let result = render_symbol_at_level(&sym, DetailLevel::Documented);
         assert!(result.rendered.contains("Handles incoming requests"));
+    }
+
+    // --- chunk splitting tests ---
+
+    #[test]
+    fn test_split_symbol_under_limit_no_split() {
+        let sym = make_test_symbol();
+        let chunks = split_oversized_symbol(&sym, &sym.body);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].chunk_index.is_none());
+    }
+
+    #[test]
+    fn test_split_symbol_over_limit() {
+        let big_body = (0..500)
+            .map(|i| format!("    let var_{i} = compute_something_{i}(arg1, arg2, arg3);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sig = "pub fn huge_function()".to_string();
+        let body = format!("{sig} {{\n{big_body}\n}}");
+        let sym = Symbol {
+            name: "huge_function".to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: sig,
+            body: body.clone(),
+            start_line: 1,
+            end_line: 502,
+        };
+        let chunks = split_oversized_symbol(&sym, &body);
+        assert!(
+            chunks.len() > 1,
+            "should split into multiple chunks, got {}",
+            chunks.len()
+        );
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, Some(i));
+            assert_eq!(chunk.chunk_total, Some(chunks.len()));
+            assert_eq!(chunk.parent_name.as_deref(), Some("huge_function"));
+        }
+    }
+
+    #[test]
+    fn test_split_chunk_naming() {
+        let big_body = (0..500)
+            .map(|i| format!("    let v{i} = f{i}();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!("pub fn big() {{\n{big_body}\n}}");
+        let sym = Symbol {
+            name: "big".to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "pub fn big()".to_string(),
+            body: body.clone(),
+            start_line: 1,
+            end_line: 502,
+        };
+        let chunks = split_oversized_symbol(&sym, &body);
+        assert!(chunks[0].symbol.name.contains("[1/"));
+        assert!(chunks[1].symbol.name.contains("[2/"));
+    }
+
+    #[test]
+    fn test_split_preserves_signature_in_chunks() {
+        let big_body = (0..500)
+            .map(|i| format!("    let v{i} = f{i}();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!("pub fn big() {{\n{big_body}\n}}");
+        let sym = Symbol {
+            name: "big".to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "pub fn big()".to_string(),
+            body: body.clone(),
+            start_line: 1,
+            end_line: 502,
+        };
+        let chunks = split_oversized_symbol(&sym, &body);
+        for chunk in &chunks {
+            assert!(
+                chunk.symbol.body.contains("pub fn big()"),
+                "each chunk should contain parent signature"
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_exactly_at_limit_no_panic() {
+        let line = "let x = 1;\n";
+        let count = MAX_SYMBOL_TOKENS * 4 / line.len();
+        let body = format!("fn f() {{\n{}\n}}", line.repeat(count));
+        let sym = Symbol {
+            name: "f".to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn f()".to_string(),
+            body: body.clone(),
+            start_line: 1,
+            end_line: count + 2,
+        };
+        let chunks = split_oversized_symbol(&sym, &body);
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_split_line_numbers_adjusted() {
+        let big_body = (0..500)
+            .map(|i| format!("    let v{i} = f{i}();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!("pub fn big() {{\n{big_body}\n}}");
+        let sym = Symbol {
+            name: "big".to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "pub fn big()".to_string(),
+            body: body.clone(),
+            start_line: 10,
+            end_line: 512,
+        };
+        let chunks = split_oversized_symbol(&sym, &body);
+        assert_eq!(chunks[0].symbol.start_line, 10);
+        assert_eq!(chunks.last().unwrap().symbol.end_line, 512);
+        for i in 1..chunks.len() {
+            assert!(chunks[i].symbol.start_line > chunks[i - 1].symbol.start_line);
+        }
     }
 }
