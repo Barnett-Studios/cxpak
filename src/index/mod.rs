@@ -3,9 +3,10 @@ pub mod ranking;
 pub mod symbols;
 
 use crate::budget::counter::TokenCounter;
+use crate::context_quality::expansion::Domain;
 use crate::parser::language::{Import, ParseResult, Symbol, Visibility};
 use crate::scanner::ScannedFile;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub struct CodebaseIndex {
@@ -15,6 +16,7 @@ pub struct CodebaseIndex {
     pub total_bytes: u64,
     pub total_tokens: usize,
     pub term_frequencies: HashMap<String, HashMap<String, u32>>,
+    pub domains: HashSet<Domain>,
 }
 
 #[derive(Debug)]
@@ -118,6 +120,8 @@ impl CodebaseIndex {
             });
         }
 
+        let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
+
         Self {
             total_files: indexed_files.len(),
             total_bytes,
@@ -125,6 +129,7 @@ impl CodebaseIndex {
             files: indexed_files,
             language_stats,
             term_frequencies,
+            domains,
         }
     }
 
@@ -244,6 +249,8 @@ impl CodebaseIndex {
             });
         }
 
+        let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
+
         Self {
             total_files: indexed_files.len(),
             total_bytes,
@@ -251,6 +258,7 @@ impl CodebaseIndex {
             files: indexed_files,
             language_stats,
             term_frequencies,
+            domains,
         }
     }
 
