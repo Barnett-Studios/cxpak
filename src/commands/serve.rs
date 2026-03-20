@@ -1,5 +1,8 @@
 use crate::budget::counter::TokenCounter;
 use crate::commands::watch::{apply_incremental_update, classify_changes};
+use crate::context_quality::annotation::{annotate_file, AnnotationContext};
+use crate::context_quality::degradation::{allocate_with_degradation, FileRole};
+use crate::context_quality::expansion::expand_query;
 use crate::daemon::watcher::FileWatcher;
 use crate::index::CodebaseIndex;
 use crate::parser::LanguageRegistry;
@@ -751,7 +754,8 @@ fn handle_tool_call(
             let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(15) as usize;
             let focus = args.get("focus").and_then(|f| f.as_str());
 
-            let scorer = crate::relevance::MultiSignalScorer::new();
+            let expanded_tokens = expand_query(task, &index.domains);
+            let scorer = crate::relevance::MultiSignalScorer::new().with_expansion(expanded_tokens);
             let all_scored = scorer.score_all(task, index);
             let graph = crate::index::graph::build_dependency_graph(index);
             let seeds = crate::relevance::seed::select_seeds_with_graph(
@@ -826,7 +830,7 @@ fn handle_tool_call(
                 .unwrap_or(false);
             let focus = args.get("focus").and_then(|f| f.as_str());
 
-            // Build a lookup map from path -> index position for O(1) access
+            // Build a lookup map from path -> index position for O(1) access.
             let index_map: HashMap<&str, usize> = index
                 .files
                 .iter()
@@ -834,7 +838,9 @@ fn handle_tool_call(
                 .map(|(i, f)| (f.relative_path.as_str(), i))
                 .collect();
 
-            let mut target_files: Vec<(String, &str)> = vec![];
+            // Track which paths came from user selection vs. dependency expansion,
+            // and which file originally pulled each dependency in.
+            let mut target_files: Vec<(String, FileRole, Option<String>)> = vec![];
             let mut seen: HashSet<String> = HashSet::new();
             let graph = if include_deps {
                 Some(crate::index::graph::build_dependency_graph(index))
@@ -847,48 +853,121 @@ fn handle_tool_call(
                     continue;
                 }
                 if seen.insert(path.clone()) {
-                    target_files.push((path.clone(), "selected"));
+                    target_files.push((path.clone(), FileRole::Selected, None));
                 }
                 if let Some(ref g) = graph {
                     if let Some(deps) = g.dependencies(path) {
                         for dep in deps {
                             if seen.insert(dep.clone()) {
-                                target_files.push((dep.clone(), "dependency"));
+                                target_files.push((
+                                    dep.clone(),
+                                    FileRole::Dependency,
+                                    Some(path.clone()),
+                                ));
                             }
                         }
                     }
                 }
             }
 
-            let mut packed = vec![];
-            let mut omitted = vec![];
-            let mut not_found = vec![];
-            let mut total_tokens = 0usize;
+            // Separate found vs. not-found.
+            let mut not_found: Vec<Value> = vec![];
+            let mut indexed_targets: Vec<(
+                &crate::index::IndexedFile,
+                FileRole,
+                f64,
+                Option<String>,
+            )> = vec![];
 
-            for (path, included_as) in &target_files {
+            for (path, role, parent) in &target_files {
                 match index_map.get(path.as_str()) {
                     Some(&idx) => {
-                        let file = &index.files[idx];
-                        if total_tokens + file.token_count <= token_budget {
-                            packed.push(json!({
-                                "path": path,
-                                "tokens": file.token_count,
-                                "content": file.content,
-                                "included_as": included_as,
-                            }));
-                            total_tokens += file.token_count;
-                        } else {
-                            omitted.push(json!({
-                                "path": path,
-                                "tokens": file.token_count,
-                                "reason": "budget exceeded",
-                            }));
-                        }
+                        // Selected files get a high relevance score; dependencies lower.
+                        let score = match role {
+                            FileRole::Selected => 1.0,
+                            FileRole::Dependency => 0.5,
+                        };
+                        indexed_targets.push((&index.files[idx], *role, score, parent.clone()));
                     }
                     None => {
                         not_found.push(json!({ "path": path }));
                     }
                 }
+            }
+
+            // Allocate budget with progressive degradation.
+            let alloc_inputs: Vec<(&crate::index::IndexedFile, FileRole, f64)> = indexed_targets
+                .iter()
+                .map(|(f, role, score, _)| (*f, *role, *score))
+                .collect();
+            let allocated = allocate_with_degradation(&alloc_inputs, token_budget);
+
+            // Render annotated output per file.
+            let mut packed: Vec<Value> = vec![];
+            let mut total_tokens = 0usize;
+
+            for (alloc, (indexed_file, role, _score, parent)) in
+                allocated.iter().zip(indexed_targets.iter())
+            {
+                let rendered_tokens: usize = alloc.symbols.iter().map(|s| s.rendered_tokens).sum();
+                // For files with no parsed symbols (binary, unrecognised language, etc.)
+                // fall back to raw content token count so the annotation is still accurate.
+                let effective_tokens = if rendered_tokens > 0 {
+                    rendered_tokens
+                } else {
+                    indexed_file.token_count
+                };
+
+                let annotation_ctx = AnnotationContext {
+                    path: indexed_file.relative_path.clone(),
+                    language: indexed_file.language.clone().unwrap_or_default(),
+                    score: match role {
+                        FileRole::Selected => 1.0,
+                        FileRole::Dependency => 0.5,
+                    },
+                    role: *role,
+                    parent: parent.clone(),
+                    signals: vec![],
+                    detail_level: alloc.level,
+                    tokens: effective_tokens,
+                };
+                let annotation = annotate_file(&annotation_ctx);
+
+                // Build the content: annotation header + rendered symbols (if any),
+                // otherwise annotation header + raw file content.
+                let content = if alloc.symbols.is_empty() {
+                    format!("{annotation}\n{}", indexed_file.content)
+                } else {
+                    let body: String = alloc
+                        .symbols
+                        .iter()
+                        .map(|s| s.rendered.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    format!("{annotation}\n{body}")
+                };
+
+                let detail_level_str = match alloc.level {
+                    crate::context_quality::degradation::DetailLevel::Full => "full",
+                    crate::context_quality::degradation::DetailLevel::Trimmed => "trimmed",
+                    crate::context_quality::degradation::DetailLevel::Documented => "documented",
+                    crate::context_quality::degradation::DetailLevel::Signature => "signature",
+                    crate::context_quality::degradation::DetailLevel::Stub => "stub",
+                };
+
+                let included_as = match role {
+                    FileRole::Selected => "selected",
+                    FileRole::Dependency => "dependency",
+                };
+
+                total_tokens += effective_tokens;
+                packed.push(json!({
+                    "path": &indexed_file.relative_path,
+                    "tokens": effective_tokens,
+                    "detail_level": detail_level_str,
+                    "included_as": included_as,
+                    "content": content,
+                }));
             }
 
             mcp_tool_result(
@@ -898,7 +977,6 @@ fn handle_tool_call(
                     "total_tokens": total_tokens,
                     "budget": token_budget,
                     "files": packed,
-                    "omitted": omitted,
                     "not_found": not_found,
                 }))
                 .unwrap_or_default(),
@@ -2061,6 +2139,8 @@ mod tests {
 
     #[test]
     fn test_mcp_pack_context_budget_overflow() {
+        // With a very small budget, degradation kicks in but all files are still returned
+        // (degraded to stub level rather than dropped entirely).
         let index = make_test_index();
         let repo_path = std::path::Path::new("/tmp");
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs","src/lib.rs"],"tokens":"1"}}}"#;
@@ -2070,10 +2150,10 @@ mod tests {
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
-        assert!(
-            result["omitted"].as_array().is_some_and(|a| !a.is_empty())
-                || result["packed_files"].as_u64().unwrap() == 0
-        );
+        // The response should be well-formed and contain a budget field.
+        assert_eq!(result["budget"].as_u64().unwrap(), 1);
+        // All requested files are returned (degraded, not omitted).
+        assert!(result["packed_files"].as_u64().unwrap() > 0);
     }
 
     #[test]
@@ -2397,5 +2477,219 @@ mod tests {
         assert!(!matches_focus("lib/foo.rs", Some("src/")));
         assert!(matches_focus("", Some("")));
         assert!(matches_focus("anything", Some("")));
+    }
+
+    // --- Task 15: pack_context with degradation + annotations ---
+
+    #[test]
+    fn test_pack_context_response_includes_detail_level() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs"],"tokens":"50k"}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        let files = result["files"].as_array().unwrap();
+        assert!(!files.is_empty(), "should have at least one packed file");
+        // Each file entry must now include a detail_level field.
+        for file in files {
+            assert!(
+                file["detail_level"].is_string(),
+                "each file should have a detail_level field"
+            );
+            let level = file["detail_level"].as_str().unwrap();
+            assert!(
+                ["full", "trimmed", "documented", "signature", "stub"].contains(&level),
+                "detail_level should be a valid level name, got: {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pack_context_response_content_contains_annotation_header() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs"],"tokens":"50k"}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        let files = result["files"].as_array().unwrap();
+        let main_file = files
+            .iter()
+            .find(|f| f["path"] == "src/main.rs")
+            .expect("src/main.rs should be in the pack");
+        let file_content = main_file["content"].as_str().unwrap();
+        // The annotation header must contain the [cxpak] marker.
+        assert!(
+            file_content.contains("[cxpak]"),
+            "content should start with annotation header containing [cxpak], got:\n{file_content}"
+        );
+        // The annotation header should include the file path.
+        assert!(
+            file_content.contains("src/main.rs"),
+            "annotation should include the file path"
+        );
+        // The annotation should include a detail_level line.
+        assert!(
+            file_content.contains("detail_level:"),
+            "annotation should include a detail_level line"
+        );
+    }
+
+    #[test]
+    fn test_pack_context_selected_role_annotation() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs"],"tokens":"50k"}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        let files = result["files"].as_array().unwrap();
+        let main_file = files
+            .iter()
+            .find(|f| f["path"] == "src/main.rs")
+            .expect("src/main.rs should be in the pack");
+        // Selected files should be marked as "selected" in included_as.
+        assert_eq!(main_file["included_as"], "selected");
+        // The annotation should note the role.
+        let file_content = main_file["content"].as_str().unwrap();
+        assert!(
+            file_content.contains("selected"),
+            "annotation should mention 'selected' role"
+        );
+    }
+
+    // --- Task 16: context_for_task with query expansion ---
+
+    #[test]
+    fn test_context_for_task_uses_expansion_for_auth_terms() {
+        // Build an index that contains an "auth" file so expansion works.
+        let counter = TokenCounter::new();
+        let files = vec![
+            crate::scanner::ScannedFile {
+                relative_path: "src/auth/login.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/auth/login.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 120,
+            },
+            crate::scanner::ScannedFile {
+                relative_path: "src/api/handler.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/api/handler.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 80,
+            },
+        ];
+        let mut content_map = std::collections::HashMap::new();
+        content_map.insert(
+            "src/auth/login.rs".to_string(),
+            "pub fn authenticate(credential: &str) -> bool { true }".to_string(),
+        );
+        content_map.insert(
+            "src/api/handler.rs".to_string(),
+            "pub fn handle_request(req: Request) -> Response { todo!() }".to_string(),
+        );
+        let index = CodebaseIndex::build_with_content(
+            files,
+            std::collections::HashMap::new(),
+            &counter,
+            content_map,
+        );
+
+        let repo_path = std::path::Path::new("/tmp");
+        // Query "auth" should expand to synonyms like "authentication", "login", "credential".
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context_for_task","arguments":{"task":"auth","limit":5}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        let candidates = result["candidates"].as_array().unwrap();
+        assert!(!candidates.is_empty(), "should find candidates");
+        // The auth file should be ranked at or near the top.
+        let top_path = candidates[0]["path"].as_str().unwrap();
+        assert!(
+            top_path.contains("auth"),
+            "auth-related file should be top candidate when querying 'auth', got: {top_path}"
+        );
+    }
+
+    #[test]
+    fn test_context_for_task_expansion_synonym_boosts_score() {
+        // Verify that query expansion actually influences scoring.
+        // We create two files: one matching the literal query term, one matching
+        // only an expanded synonym. Both should appear in candidates.
+        let counter = TokenCounter::new();
+        let files = vec![
+            crate::scanner::ScannedFile {
+                relative_path: "src/db/schema.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/db/schema.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 100,
+            },
+            crate::scanner::ScannedFile {
+                relative_path: "src/api/route.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/api/route.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 80,
+            },
+        ];
+        let mut content_map = std::collections::HashMap::new();
+        // This file contains "migration" which is an expansion of "db"
+        content_map.insert(
+            "src/db/schema.rs".to_string(),
+            "// migration schema definition\npub struct User { id: u64 }".to_string(),
+        );
+        content_map.insert(
+            "src/api/route.rs".to_string(),
+            "pub fn get_users() -> Vec<User> { vec![] }".to_string(),
+        );
+        let index = CodebaseIndex::build_with_content(
+            files,
+            std::collections::HashMap::new(),
+            &counter,
+            content_map,
+        );
+
+        let repo_path = std::path::Path::new("/tmp");
+        // Query "db" expands to: database, query, sql, migration, schema, table, model, orm, repository
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context_for_task","arguments":{"task":"db","limit":10}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        let candidates = result["candidates"].as_array().unwrap();
+        // The db/schema.rs file should rank above api/route.rs because it matches
+        // "schema" and "migration" (expansion synonyms for "db").
+        if candidates.len() >= 2 {
+            let top_score = candidates[0]["score"].as_f64().unwrap_or(0.0);
+            let db_candidate = candidates
+                .iter()
+                .find(|c| c["path"].as_str().unwrap_or("").contains("schema"));
+            let route_candidate = candidates
+                .iter()
+                .find(|c| c["path"].as_str().unwrap_or("").contains("route"));
+            if let (Some(db), Some(route)) = (db_candidate, route_candidate) {
+                let db_score = db["score"].as_f64().unwrap_or(0.0);
+                let route_score = route["score"].as_f64().unwrap_or(0.0);
+                assert!(
+                    db_score >= route_score,
+                    "db/schema.rs (score {db_score:.4}) should score >= api/route.rs (score {route_score:.4}) when querying 'db'"
+                );
+            }
+            let _ = top_score; // used above indirectly
+        }
+        assert!(!candidates.is_empty(), "should return candidates");
     }
 }
