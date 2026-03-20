@@ -224,10 +224,179 @@ pub fn split_oversized_symbol(symbol: &Symbol, _source: &str) -> Vec<DegradedSym
     result
 }
 
+/// Result of budget allocation for a single file.
+pub struct AllocatedFile {
+    pub path: String,
+    pub level: DetailLevel,
+    pub symbols: Vec<DegradedSymbol>,
+}
+
+/// Allocate a token budget across files using progressive degradation.
+///
+/// Each entry in `files` is `(&IndexedFile, FileRole, relevance_score)`.
+/// Returns an allocation per file: path, chosen detail level, and rendered symbols.
+pub fn allocate_with_degradation(
+    files: &[(&crate::index::IndexedFile, FileRole, f64)],
+    budget: usize,
+) -> Vec<AllocatedFile> {
+    if files.is_empty() {
+        return vec![];
+    }
+
+    let n = files.len();
+
+    // Fast path: check if raw token counts fit the budget
+    let raw_total: usize = files.iter().map(|(f, _, _)| f.token_count).sum();
+    if raw_total <= budget {
+        return files
+            .iter()
+            .map(|(f, _role, _score)| {
+                let symbols = f
+                    .parse_result
+                    .as_ref()
+                    .map(|pr| {
+                        pr.symbols
+                            .iter()
+                            .map(|s| render_symbol_at_level(s, DetailLevel::Full))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                AllocatedFile {
+                    path: f.relative_path.clone(),
+                    level: DetailLevel::Full,
+                    symbols,
+                }
+            })
+            .collect();
+    }
+
+    // Build per-file metadata
+    let mut roles: Vec<FileRole> = Vec::with_capacity(n);
+    let mut priorities: Vec<f64> = Vec::with_capacity(n);
+    let mut all_symbols: Vec<Vec<Symbol>> = Vec::with_capacity(n);
+    let mut current_levels: Vec<DetailLevel> = Vec::with_capacity(n);
+
+    for (f, role, score) in files {
+        let symbols: Vec<Symbol> = f
+            .parse_result
+            .as_ref()
+            .map(|pr| pr.symbols.clone())
+            .unwrap_or_default();
+        let cp = file_concept_priority(&symbols);
+        let priority = score * 0.7 + cp * 0.3;
+        roles.push(*role);
+        priorities.push(priority);
+        all_symbols.push(symbols);
+        current_levels.push(DetailLevel::Full);
+    }
+
+    // Render all at Full
+    let mut rendered: Vec<Vec<DegradedSymbol>> = all_symbols
+        .iter()
+        .map(|syms| {
+            syms.iter()
+                .map(|s| render_symbol_at_level(s, DetailLevel::Full))
+                .collect()
+        })
+        .collect();
+
+    let compute_total = |r: &[Vec<DegradedSymbol>]| -> usize {
+        r.iter()
+            .map(|syms| syms.iter().map(|s| s.rendered_tokens).sum::<usize>())
+            .sum()
+    };
+
+    if compute_total(&rendered) <= budget {
+        return files
+            .iter()
+            .zip(rendered)
+            .map(|((f, _, _), syms)| AllocatedFile {
+                path: f.relative_path.clone(),
+                level: DetailLevel::Full,
+                symbols: syms,
+            })
+            .collect();
+    }
+
+    let levels = [
+        DetailLevel::Trimmed,
+        DetailLevel::Documented,
+        DetailLevel::Signature,
+        DetailLevel::Stub,
+    ];
+
+    // Phase 1: Degrade dependencies (lowest priority first)
+    let mut dep_indices: Vec<usize> = (0..n)
+        .filter(|&i| roles[i] == FileRole::Dependency)
+        .collect();
+    dep_indices.sort_by(|&a, &b| priorities[a].partial_cmp(&priorities[b]).unwrap());
+
+    for &idx in &dep_indices {
+        for &level in &levels {
+            current_levels[idx] = level;
+            rendered[idx] = all_symbols[idx]
+                .iter()
+                .map(|s| render_symbol_at_level(s, level))
+                .collect();
+            if compute_total(&rendered) <= budget {
+                return build_allocated(files, &current_levels, rendered);
+            }
+        }
+    }
+
+    // Phase 2: Degrade selected files (lowest priority first, never below Documented)
+    let mut sel_indices: Vec<usize> = (0..n).filter(|&i| roles[i] == FileRole::Selected).collect();
+    sel_indices.sort_by(|&a, &b| priorities[a].partial_cmp(&priorities[b]).unwrap());
+
+    for &idx in &sel_indices {
+        for &level in &levels[..2] {
+            // Trimmed, Documented only
+            current_levels[idx] = level;
+            rendered[idx] = all_symbols[idx]
+                .iter()
+                .map(|s| render_symbol_at_level(s, level))
+                .collect();
+            if compute_total(&rendered) <= budget {
+                return build_allocated(files, &current_levels, rendered);
+            }
+        }
+    }
+
+    // Phase 3: Drop dependencies entirely (lowest priority first)
+    for &idx in &dep_indices {
+        rendered[idx] = vec![];
+        current_levels[idx] = DetailLevel::Stub;
+        if compute_total(&rendered) <= budget {
+            return build_allocated(files, &current_levels, rendered);
+        }
+    }
+
+    // If still over budget, return what we have at minimum levels
+    build_allocated(files, &current_levels, rendered)
+}
+
+fn build_allocated(
+    files: &[(&crate::index::IndexedFile, FileRole, f64)],
+    levels: &[DetailLevel],
+    rendered: Vec<Vec<DegradedSymbol>>,
+) -> Vec<AllocatedFile> {
+    files
+        .iter()
+        .zip(levels.iter())
+        .zip(rendered)
+        .map(|(((f, _, _), &level), syms)| AllocatedFile {
+            path: f.relative_path.clone(),
+            level,
+            symbols: syms,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::language::Visibility;
+    use crate::index::IndexedFile;
+    use crate::parser::language::{ParseResult, Visibility};
 
     fn make_fn_symbol(name: &str, tokens: usize) -> Symbol {
         Symbol {
@@ -590,5 +759,93 @@ mod tests {
         for i in 1..chunks.len() {
             assert!(chunks[i].symbol.start_line > chunks[i - 1].symbol.start_line);
         }
+    }
+
+    // --- allocate_with_degradation tests ---
+
+    fn make_indexed_file(path: &str, tokens: usize, symbols: Vec<Symbol>) -> IndexedFile {
+        IndexedFile {
+            relative_path: path.to_string(),
+            language: Some("rust".to_string()),
+            size_bytes: (tokens * 4) as u64,
+            token_count: tokens,
+            parse_result: Some(ParseResult {
+                symbols,
+                imports: vec![],
+                exports: vec![],
+            }),
+            content: "x ".repeat(tokens),
+        }
+    }
+
+    #[test]
+    fn test_allocate_fits_at_level0() {
+        let file = make_indexed_file("a.rs", 100, vec![make_fn_symbol("a", 100)]);
+        let files = vec![(&file, FileRole::Selected, 0.8)];
+        let result = allocate_with_degradation(&files, 1000);
+        assert_eq!(result[0].level, DetailLevel::Full);
+    }
+
+    #[test]
+    fn test_allocate_degrades_lowest_score() {
+        let high_file = make_indexed_file("high.rs", 600, vec![make_fn_symbol("high", 600)]);
+        let low_file = make_indexed_file("low.rs", 600, vec![make_fn_symbol("low", 600)]);
+        let files = vec![
+            (&high_file, FileRole::Selected, 0.9),
+            (&low_file, FileRole::Dependency, 0.3),
+        ];
+        let result = allocate_with_degradation(&files, 800);
+        let high = result.iter().find(|r| r.path == "high.rs").unwrap();
+        let low = result.iter().find(|r| r.path == "low.rs").unwrap();
+        assert!(
+            high.level < low.level,
+            "high-scored should be at better (lower) detail level"
+        );
+    }
+
+    #[test]
+    fn test_allocate_selected_never_below_documented() {
+        let file = make_indexed_file("sel.rs", 5000, vec![make_fn_symbol("sel", 5000)]);
+        let files = vec![(&file, FileRole::Selected, 0.5)];
+        let result = allocate_with_degradation(&files, 100);
+        let sel = result.iter().find(|r| r.path == "sel.rs").unwrap();
+        assert!(
+            sel.level <= DetailLevel::Documented,
+            "selected file should not degrade below Documented, got {:?}",
+            sel.level
+        );
+    }
+
+    #[test]
+    fn test_allocate_dependency_can_be_dropped() {
+        let sel_file = make_indexed_file("sel.rs", 500, vec![make_fn_symbol("sel", 500)]);
+        let dep_file = make_indexed_file("dep.rs", 500, vec![make_fn_symbol("dep", 500)]);
+        let files = vec![
+            (&sel_file, FileRole::Selected, 0.9),
+            (&dep_file, FileRole::Dependency, 0.1),
+        ];
+        let result = allocate_with_degradation(&files, 300);
+        // dep.rs may be dropped entirely (empty symbols) or at Stub
+        let dep = result.iter().find(|r| r.path == "dep.rs");
+        if let Some(d) = dep {
+            assert!(d.symbols.is_empty() || d.level == DetailLevel::Stub);
+        }
+        // sel.rs should still be present
+        assert!(result.iter().any(|r| r.path == "sel.rs"));
+    }
+
+    #[test]
+    fn test_allocate_empty_files() {
+        let files: Vec<(&IndexedFile, FileRole, f64)> = vec![];
+        let result = allocate_with_degradation(&files, 1000);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_allocate_single_file_exact_budget() {
+        let file = make_indexed_file("exact.rs", 1000, vec![make_fn_symbol("exact", 1000)]);
+        let files = vec![(&file, FileRole::Selected, 0.8)];
+        let result = allocate_with_degradation(&files, 1000);
+        assert_eq!(result[0].level, DetailLevel::Full);
     }
 }
