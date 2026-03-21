@@ -10,3 +10,4 @@ pub mod output;
 pub mod parser;
 pub mod relevance;
 pub mod scanner;
+pub mod schema;
