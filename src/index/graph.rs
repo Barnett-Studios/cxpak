@@ -101,12 +101,13 @@ impl DependencyGraph {
 /// (e.g. `crate::scanner`) to a file path (e.g. `src/scanner/mod.rs` or
 /// `src/scanner.rs`) and look up whether such a file exists.
 ///
-/// The optional `schema` parameter is reserved for future schema-aware edge
-/// injection (Task 13: build_schema_edges). For now it is accepted but unused;
-/// all edges produced here are `EdgeType::Import`.
+/// The optional `schema` parameter enables schema-aware edge injection via
+/// `build_schema_edges` (Task 13).  When present, FK, ORM, embedded-SQL,
+/// migration-sequence, view-reference and function-reference edges are added
+/// in addition to the import edges derived from parse results.
 pub fn build_dependency_graph(
     index: &CodebaseIndex,
-    _schema: Option<&crate::schema::SchemaIndex>,
+    schema: Option<&crate::schema::SchemaIndex>,
 ) -> DependencyGraph {
     let all_paths: HashSet<&str> = index
         .files
@@ -146,8 +147,13 @@ pub fn build_dependency_graph(
         }
     }
 
-    // TODO (Task 13): inject schema-aware edges via build_schema_edges(index, schema_index)
-    // when schema is Some.
+    // Inject schema-aware edges when a schema index is available.
+    if let Some(schema_index) = schema {
+        let schema_edges = crate::schema::link::build_schema_edges(index, schema_index);
+        for (from, to, edge_type) in schema_edges {
+            graph.add_edge(&from, &to, edge_type);
+        }
+    }
 
     graph
 }

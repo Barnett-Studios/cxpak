@@ -848,6 +848,100 @@ fn try_generic_migrations(
 }
 
 // ---------------------------------------------------------------------------
+// Task 11: SchemaIndex orchestrator
+// ---------------------------------------------------------------------------
+
+/// Build a `SchemaIndex` by orchestrating all detection passes over the
+/// provided `CodebaseIndex`.  Returns `None` when nothing schema-related is
+/// found so callers can keep `index.schema = None` for plain code repos.
+pub fn build_schema_index(
+    index: &crate::index::CodebaseIndex,
+) -> Option<crate::schema::SchemaIndex> {
+    let mut schema = crate::schema::SchemaIndex::empty();
+
+    // 1. Extract SQL schemas from SQL/CQL files
+    for file in &index.files {
+        let lang = file.language.as_deref().unwrap_or("");
+        if lang == "sql" || file.relative_path.ends_with(".cql") {
+            if let Some(pr) = &file.parse_result {
+                for symbol in &pr.symbols {
+                    match symbol.kind {
+                        crate::parser::language::SymbolKind::Table => {
+                            let table = crate::schema::extract::extract_table_schema(
+                                &symbol.body,
+                                &symbol.name,
+                                &file.relative_path,
+                                symbol.start_line,
+                            );
+                            schema.tables.insert(symbol.name.clone(), table);
+                        }
+                        crate::parser::language::SymbolKind::Query => {
+                            let view = crate::schema::extract::extract_view_schema(
+                                &symbol.body,
+                                &symbol.name,
+                                &file.relative_path,
+                            );
+                            schema.views.insert(symbol.name.clone(), view);
+                        }
+                        crate::parser::language::SymbolKind::Function => {
+                            let func = crate::schema::extract::extract_function_schema(
+                                &symbol.body,
+                                &symbol.name,
+                                &file.relative_path,
+                            );
+                            schema.functions.insert(symbol.name.clone(), func);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Detect ORM models
+    let orm_models = detect_orm_models(index);
+    for model in orm_models {
+        schema.orm_models.insert(model.class_name.clone(), model);
+    }
+
+    // 3. Detect migrations
+    schema.migrations = detect_migrations(index);
+
+    // 4. Detect Terraform DB resources
+    detect_terraform_schemas(index, &mut schema);
+
+    // 5. Enrich Prisma models with field detail from extract
+    for file in &index.files {
+        if file.language.as_deref() == Some("prisma") {
+            if let Some(pr) = &file.parse_result {
+                for symbol in &pr.symbols {
+                    if symbol.kind == crate::parser::language::SymbolKind::Struct {
+                        let enriched = crate::schema::extract::extract_prisma_schema(
+                            &symbol.body,
+                            &symbol.name,
+                            &file.relative_path,
+                            symbol.start_line,
+                        );
+                        // Merge: update existing ORM entry with enriched fields
+                        if let Some(existing) = schema.orm_models.get_mut(&symbol.name) {
+                            existing.fields = enriched.fields;
+                        } else {
+                            schema.orm_models.insert(symbol.name.clone(), enriched);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if schema.is_empty() {
+        None
+    } else {
+        Some(schema)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

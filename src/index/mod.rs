@@ -124,7 +124,7 @@ impl CodebaseIndex {
 
         let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
 
-        Self {
+        let mut index = Self {
             total_files: indexed_files.len(),
             total_bytes,
             total_tokens,
@@ -133,7 +133,9 @@ impl CodebaseIndex {
             term_frequencies,
             domains,
             schema: None,
-        }
+        };
+        index.schema = crate::schema::detect::build_schema_index(&index);
+        index
     }
 
     pub fn all_public_symbols(&self) -> Vec<(&str, &Symbol)> {
@@ -254,7 +256,7 @@ impl CodebaseIndex {
 
         let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
 
-        Self {
+        let mut index = Self {
             total_files: indexed_files.len(),
             total_bytes,
             total_tokens,
@@ -263,7 +265,9 @@ impl CodebaseIndex {
             term_frequencies,
             domains,
             schema: None,
-        }
+        };
+        index.schema = crate::schema::detect::build_schema_index(&index);
+        index
     }
 
     /// Insert or update a single file in the index.
