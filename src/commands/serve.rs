@@ -5,6 +5,7 @@ use crate::context_quality::degradation::{allocate_with_degradation, FileRole};
 use crate::context_quality::expansion::{expand_query, Domain};
 use crate::daemon::watcher::FileWatcher;
 use crate::index::CodebaseIndex;
+use crate::intelligence::api_surface::extract_api_surface;
 use crate::parser::LanguageRegistry;
 use crate::scanner::Scanner;
 use crate::schema::EdgeType;
@@ -98,6 +99,8 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
         .route("/trace", get(trace_handler))
         .route("/diff", get(diff_handler))
         .route("/search", axum::routing::post(search_handler))
+        .route("/blast_radius", axum::routing::post(blast_radius_handler))
+        .route("/api_surface", get(api_surface_handler))
         .with_state(state)
 }
 
@@ -363,6 +366,74 @@ async fn search_handler(
     })))
 }
 
+#[derive(Deserialize)]
+struct BlastRadiusParams {
+    files: Vec<String>,
+    depth: Option<usize>,
+    focus: Option<String>,
+}
+
+async fn blast_radius_handler(
+    State(index): State<SharedIndex>,
+    Json(params): Json<BlastRadiusParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if params.files.is_empty() {
+        return Ok(Json(
+            json!({"error": "files is required and must not be empty"}),
+        ));
+    }
+
+    let files: Vec<&str> = params.files.iter().map(|s| s.as_str()).collect();
+    let depth = params.depth.unwrap_or(3);
+    let focus = params.focus.as_deref();
+
+    let result = crate::intelligence::blast_radius::compute_blast_radius(
+        &files,
+        &idx.graph,
+        &idx.pagerank,
+        &idx.test_map,
+        depth,
+        focus,
+    );
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_else(
+        |_| json!({"error": "serialisation failed"}),
+    )))
+}
+
+#[derive(Deserialize)]
+struct ApiSurfaceParams {
+    focus: Option<String>,
+    include: Option<String>,
+    tokens: Option<String>,
+}
+
+async fn api_surface_handler(
+    State(index): State<SharedIndex>,
+    Query(params): Query<ApiSurfaceParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let focus = params.focus.as_deref();
+    let include = params.include.as_deref().unwrap_or("all");
+    let token_budget = params
+        .tokens
+        .as_deref()
+        .and_then(|t| crate::cli::parse_token_count(t).ok())
+        .unwrap_or(20_000);
+
+    let surface = extract_api_surface(&idx, focus, include, token_budget);
+    Ok(Json(serde_json::to_value(&surface).unwrap_or_else(
+        |_| json!({"error": "serialisation failed"}),
+    )))
+}
+
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -516,6 +587,7 @@ fn mcp_stdio_loop_with_io(
                                     "files": { "type": "array", "items": { "type": "string" }, "description": "File paths to include" },
                                     "tokens": { "type": "string", "description": "Token budget (e.g. '30k', '50k')", "default": "50k" },
                                     "include_dependencies": { "type": "boolean", "description": "Include 1-hop dependencies", "default": false },
+                                    "include_tests": { "type": "boolean", "description": "Auto-include test files for packed source files (default true)", "default": true },
                                     "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
                                 },
                                 "required": ["files"]
@@ -533,6 +605,31 @@ fn mcp_stdio_loop_with_io(
                                     "context_lines": { "type": "number", "description": "Lines of context before and after each match (default 2)", "default": 2 }
                                 },
                                 "required": ["pattern"]
+                            }
+                        },
+                        {
+                            "name": "cxpak_blast_radius",
+                            "description": "Analyze the impact of changing specified files. Returns affected files categorized by impact type with risk scores.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "files": { "type": "array", "items": { "type": "string" }, "description": "File paths that are changing" },
+                                    "depth": { "type": "number", "description": "Max dependency hops to follow (default 3)", "default": 3 },
+                                    "focus": { "type": "string", "description": "Path prefix to scope results" }
+                                },
+                                "required": ["files"]
+                            }
+                        },
+                        {
+                            "name": "cxpak_api_surface",
+                            "description": "Extract the public API surface: public symbols with signatures, HTTP routes, gRPC services, GraphQL types.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "focus": { "type": "string", "description": "Path prefix to scope" },
+                                    "include": { "type": "string", "description": "What to include: 'all', 'symbols', 'routes' (default 'all')", "default": "all" },
+                                    "tokens": { "type": "string", "description": "Token budget (default '20k')", "default": "20k" }
+                                }
                             }
                         }
                     ]
@@ -845,6 +942,10 @@ fn handle_tool_call(
                 .get("include_dependencies")
                 .and_then(|d| d.as_bool())
                 .unwrap_or(false);
+            let include_tests = args
+                .get("include_tests")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             let focus = args.get("focus").and_then(|f| f.as_str());
 
             // Build a lookup map from path -> index position for O(1) access.
@@ -873,7 +974,7 @@ fn handle_tool_call(
                 if seen.insert(path.clone()) {
                     target_files.push((path.clone(), FileRole::Selected, None, None));
                 }
-                if let Some(ref g) = graph {
+                if let Some(g) = &graph {
                     if let Some(deps) = g.dependencies(path) {
                         for dep in deps {
                             if seen.insert(dep.target.clone()) {
@@ -887,6 +988,36 @@ fn handle_tool_call(
                         }
                     }
                 }
+            }
+
+            // Auto-include test files for selected source files.
+            if include_tests {
+                let test_additions: Vec<(String, FileRole, Option<String>, Option<EdgeType>)> =
+                    target_files
+                        .iter()
+                        .filter(|(_, role, _, _)| matches!(role, FileRole::Selected))
+                        .filter_map(|(path, _, _, _)| {
+                            index.test_map.get(path).map(|tests| {
+                                tests
+                                    .iter()
+                                    .filter_map(|t| {
+                                        if seen.insert(t.path.clone()) {
+                                            Some((
+                                                t.path.clone(),
+                                                FileRole::Dependency,
+                                                Some(path.clone()),
+                                                None,
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .flatten()
+                        .collect();
+                target_files.extend(test_additions);
             }
 
             // Separate found vs. not-found.
@@ -1093,6 +1224,51 @@ fn handle_tool_call(
                     "truncated": total_matches > limit,
                 }))
                 .unwrap_or_default(),
+            )
+        }
+        "cxpak_blast_radius" => {
+            let files: Vec<&str> = args
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            if files.is_empty() {
+                return mcp_tool_result(
+                    id,
+                    "Error: 'files' argument is required and must not be empty",
+                );
+            }
+            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+            let focus = args.get("focus").and_then(|v| v.as_str());
+            let result = crate::intelligence::blast_radius::compute_blast_radius(
+                &files,
+                &index.graph,
+                &index.pagerank,
+                &index.test_map,
+                depth,
+                focus,
+            );
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
+        "cxpak_api_surface" => {
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let include = args
+                .get("include")
+                .and_then(|v| v.as_str())
+                .unwrap_or("all");
+            let token_budget = args
+                .get("tokens")
+                .and_then(|t| t.as_str())
+                .and_then(|t| crate::cli::parse_token_count(t).ok())
+                .unwrap_or(20_000);
+
+            let surface = extract_api_surface(index, focus, include, token_budget);
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&surface).unwrap_or_default(),
             )
         }
         _ => mcp_response(
@@ -1548,7 +1724,7 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 9);
     }
 
     #[test]
@@ -1629,6 +1805,164 @@ mod tests {
         let resp2: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(resp1["id"], 1);
         assert_eq!(resp2["id"], 2);
+    }
+
+    // --- blast_radius MCP round-trip ---
+
+    #[test]
+    fn test_mcp_blast_radius_round_trip() {
+        // Build an index with two files where main.rs imports lib.rs, so
+        // blast_radius can find a real direct dependent.
+        let counter = crate::budget::counter::TokenCounter::new();
+        use crate::parser::language::{Import, ParseResult};
+
+        let files = vec![
+            crate::scanner::ScannedFile {
+                relative_path: "src/lib.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/lib.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 50,
+            },
+            crate::scanner::ScannedFile {
+                relative_path: "src/main.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/main.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 100,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/main.rs".to_string(),
+            ParseResult {
+                symbols: vec![],
+                // main.rs imports lib.rs ("src::lib" resolves to src/lib.rs)
+                imports: vec![Import {
+                    source: "src::lib".to_string(),
+                    names: vec![],
+                }],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "src/lib.rs".to_string(),
+            ParseResult {
+                symbols: vec![],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let mut content_map = HashMap::new();
+        content_map.insert("src/lib.rs".to_string(), "pub fn helper() {}".to_string());
+        content_map.insert("src/main.rs".to_string(), "fn main() {}".to_string());
+
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+
+        // MCP round-trip: call cxpak_blast_radius for src/lib.rs
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","#,
+            r#""params":{"name":"cxpak_blast_radius","arguments":{"files":["src/lib.rs"],"depth":3}}}"#
+        );
+        let input = format!("{input}\n");
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+
+        let line = String::from_utf8(output).unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 42);
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+
+        assert!(
+            parsed["changed_files"].as_array().is_some(),
+            "result must have changed_files"
+        );
+        assert!(
+            parsed["total_affected"].is_number(),
+            "result must have total_affected"
+        );
+        assert!(
+            parsed["categories"].is_object(),
+            "result must have categories"
+        );
+        assert!(
+            parsed["risk_summary"].is_object(),
+            "result must have risk_summary"
+        );
+
+        // src/main.rs imports src/lib.rs -> should appear as a direct dependent
+        let direct = parsed["categories"]["direct_dependents"]
+            .as_array()
+            .expect("direct_dependents must be an array");
+        let main_rs = direct.iter().find(|f| f["path"] == "src/main.rs");
+        assert!(
+            main_rs.is_some(),
+            "src/main.rs should appear as a direct dependent of src/lib.rs"
+        );
+    }
+
+    // --- blast_radius HTTP endpoint ---
+
+    #[test]
+    fn test_axum_blast_radius_endpoint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let body = serde_json::to_vec(&json!({"files": ["src/main.rs"]})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/blast_radius")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(json["changed_files"].as_array().is_some());
+            assert!(json["total_affected"].is_number());
+            assert!(json["categories"].is_object());
+            assert!(json["risk_summary"].is_object());
+        });
+    }
+
+    #[test]
+    fn test_axum_blast_radius_empty_files_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let body = serde_json::to_vec(&json!({"files": []})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/blast_radius")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(json["error"].as_str().is_some());
+        });
     }
 
     // --- Param struct tests (kept) ---
@@ -2100,8 +2434,8 @@ mod tests {
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            7,
-            "should have 7 tools (4 existing + 2 v0.9 + 1 search)"
+            9,
+            "should have 9 tools (4 existing + 2 v0.9 + 1 search + 1 blast_radius + 1 api_surface)"
         );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_context_for_task"));
@@ -2612,6 +2946,157 @@ mod tests {
         assert!(
             file_content.contains("selected"),
             "annotation should mention 'selected' role"
+        );
+    }
+
+    // --- Task 10: include_tests in pack_context ---
+
+    #[test]
+    fn test_pack_context_include_tests_true_auto_includes_test_files() {
+        // Build an index with a source file and its corresponding test file.
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/util.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/util.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 50,
+            },
+            ScannedFile {
+                relative_path: "tests/util_test.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/tests/util_test.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 60,
+            },
+        ];
+        let mut content_map = HashMap::new();
+        content_map.insert(
+            "src/util.rs".to_string(),
+            "pub fn add(a: u32, b: u32) -> u32 { a + b }".to_string(),
+        );
+        content_map.insert(
+            "tests/util_test.rs".to_string(),
+            "use crate::util; #[test] fn test_add() { assert_eq!(util::add(1,2),3); }".to_string(),
+        );
+
+        use crate::parser::language::{Import, ParseResult as PR};
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "tests/util_test.rs".to_string(),
+            PR {
+                symbols: vec![],
+                imports: vec![Import {
+                    source: "crate::util".to_string(),
+                    names: vec![],
+                }],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        let repo_path = std::path::Path::new("/tmp");
+
+        // include_tests defaults to true, so test file should be auto-included.
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/util.rs"],"tokens":"50k","include_tests":true}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        let file_paths: Vec<&str> = result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert!(
+            file_paths.contains(&"src/util.rs"),
+            "selected source file must be present"
+        );
+        assert!(
+            file_paths.contains(&"tests/util_test.rs"),
+            "test file should be auto-included when include_tests=true, got paths: {file_paths:?}"
+        );
+        // The test file should be marked as a dependency.
+        let test_entry = result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "tests/util_test.rs")
+            .expect("tests/util_test.rs must be in packed files");
+        assert_eq!(
+            test_entry["included_as"], "dependency",
+            "auto-included test file should have included_as=dependency"
+        );
+    }
+
+    #[test]
+    fn test_pack_context_include_tests_false_does_not_include_test_files() {
+        // Same setup as above but with include_tests=false.
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/util.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/util.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 50,
+            },
+            ScannedFile {
+                relative_path: "tests/util_test.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/tests/util_test.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 60,
+            },
+        ];
+        let mut content_map = HashMap::new();
+        content_map.insert(
+            "src/util.rs".to_string(),
+            "pub fn add(a: u32, b: u32) -> u32 { a + b }".to_string(),
+        );
+        content_map.insert(
+            "tests/util_test.rs".to_string(),
+            "use crate::util; #[test] fn test_add() { assert_eq!(util::add(1,2),3); }".to_string(),
+        );
+
+        use crate::parser::language::{Import, ParseResult as PR};
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "tests/util_test.rs".to_string(),
+            PR {
+                symbols: vec![],
+                imports: vec![Import {
+                    source: "crate::util".to_string(),
+                    names: vec![],
+                }],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        let repo_path = std::path::Path::new("/tmp");
+
+        // include_tests=false — test file must NOT be auto-included.
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/util.rs"],"tokens":"50k","include_tests":false}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        let file_paths: Vec<&str> = result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert!(
+            file_paths.contains(&"src/util.rs"),
+            "selected source file must be present"
+        );
+        assert!(
+            !file_paths.contains(&"tests/util_test.rs"),
+            "test file must NOT be included when include_tests=false, got paths: {file_paths:?}"
         );
     }
 

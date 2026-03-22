@@ -146,6 +146,12 @@ impl CodebaseIndex {
         index.graph =
             crate::index::graph::build_dependency_graph(&index.files, index.schema.as_ref());
         index.pagerank = crate::intelligence::pagerank::compute_pagerank(&index.graph, 0.85, 100);
+        let all_paths: std::collections::HashSet<String> = index
+            .files
+            .iter()
+            .map(|f| f.relative_path.clone())
+            .collect();
+        index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
         index
     }
 
@@ -284,6 +290,12 @@ impl CodebaseIndex {
         index.graph =
             crate::index::graph::build_dependency_graph(&index.files, index.schema.as_ref());
         index.pagerank = crate::intelligence::pagerank::compute_pagerank(&index.graph, 0.85, 100);
+        let all_paths: std::collections::HashSet<String> = index
+            .files
+            .iter()
+            .map(|f| f.relative_path.clone())
+            .collect();
+        index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
         index
     }
 
