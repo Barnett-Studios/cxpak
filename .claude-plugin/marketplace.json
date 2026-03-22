@@ -8,7 +8,7 @@
       "name": "cxpak",
       "source": "./plugin",
       "description": "Structured codebase context for Claude Code, powered by cxpak",
-      "version": "0.11.0"
+      "version": "0.12.0"
     }
   ]
 }
