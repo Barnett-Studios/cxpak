@@ -13,14 +13,15 @@ Pre-commit hooks enforce fmt + clippy + tests. CI enforces 90% coverage via tarp
 
 ## Architecture
 
-Pipeline: **Scanner → Parser → Index → Budget → Context Quality → Output**
+Pipeline: **Scanner → Parser → Schema → Index → Budget → Context Quality → Output**
 
 1. **Scanner** (`src/scanner/`) — walks git-tracked files, detects language from extension
 2. **Parser** (`src/parser/`) — tree-sitter extraction of symbols, imports, exports per language
-3. **Index** (`src/index/`) — builds `CodebaseIndex` with token counts, language stats, dependency graph, detected domains
-4. **Budget** (`src/budget/`) — allocates token budget across sections, truncates with omission markers
-5. **Context Quality** (`src/context_quality/`) — progressive degradation, query expansion, context annotations
-6. **Output** (`src/output/`) — renders to markdown, JSON, or XML
+3. **Schema** (`src/schema/`) — detects and indexes the data layer; builds `SchemaIndex` with table/view/ORM/migration metadata; injects typed edges into the dependency graph
+4. **Index** (`src/index/`) — builds `CodebaseIndex` with token counts, language stats, typed dependency graph, detected domains, and optional `SchemaIndex`
+5. **Budget** (`src/budget/`) — allocates token budget across sections, truncates with omission markers
+6. **Context Quality** (`src/context_quality/`) — progressive degradation, query expansion, context annotations
+7. **Output** (`src/output/`) — renders to markdown, JSON, or XML
 
 ## Commands
 
@@ -48,6 +49,18 @@ Detail file extensions match `--format` (`.md`, `.json`, `.xml`).
 
 Finds target via `index.find_symbol()` (case-insensitive), falls back to `find_content_matches()`.
 Walks `DependencyGraph` — 1-hop default, full BFS with `--all`.
+Non-import edges are rendered with `(via: edge_type)` in the dependency subgraph output.
+
+### Schema Module
+
+`src/schema/` detects and indexes the data layer:
+
+- **`mod.rs`** — `SchemaIndex` (tables, views, functions, orm_models, migrations), `EdgeType` (9 variants: Import, ForeignKey, ViewReference, TriggerTarget, IndexTarget, FunctionReference, EmbeddedSql, OrmModel, MigrationSequence), `TypedEdge`
+- **`detect.rs`** — file-pattern heuristics for recognizing SQL schema files, migration directories, ORM model files
+- **`extract.rs`** — parses SQL DDL, Prisma schemas, and ORM class definitions to extract table/column/FK metadata
+- **`link.rs`** — `build_schema_edges()` converts `SchemaIndex` into typed graph edges; `detect_embedded_sql()` finds inline SQL in application code
+
+`build_dependency_graph()` in `src/index/graph.rs` accepts `Option<&SchemaIndex>` and calls `build_schema_edges()` to inject schema-aware edges alongside the standard Import edges derived from parse results.
 
 ### Context Quality Module
 

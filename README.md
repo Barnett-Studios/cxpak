@@ -165,6 +165,40 @@ cxpak applies intelligent context management to maximize the usefulness of every
 
 **Chunk Splitting** — Symbols exceeding 4000 tokens are split into labeled chunks (e.g., `handler [1/3]`) that degrade independently. Each chunk carries the parent signature for context.
 
+## Data Layer Awareness
+
+cxpak understands the data layer of your codebase and uses that knowledge to build richer dependency graphs.
+
+**Schema Detection** — SQL (`CREATE TABLE`, `CREATE VIEW`, stored procedures), Prisma schema files, and other database DSLs are parsed to extract table definitions, column names, foreign key references, and view dependencies.
+
+**ORM Detection** — Django models, SQLAlchemy mapped classes, TypeORM entities, and ActiveRecord models are recognized and linked to their underlying table definitions.
+
+**Typed Dependency Graph** — Every edge in the dependency graph carries one of 9 semantic types:
+
+| Edge Type | Meaning |
+|-----------|---------|
+| `import` | Standard language import / require |
+| `foreign_key` | Table FK reference to another table file |
+| `view_reference` | SQL view references a source table |
+| `trigger_target` | Trigger defined on a table |
+| `index_target` | Index defined on a table |
+| `function_reference` | Stored function references a table |
+| `embedded_sql` | Application code contains inline SQL referencing a table |
+| `orm_model` | ORM model class maps to a table file |
+| `migration_sequence` | Migration file depends on its predecessor |
+
+Non-import edges are surfaced in the dependency graph output and in pack context annotations:
+
+```
+// score: 0.82 | role: dependency | parent: src/api/orders.py (via: embedded_sql)
+```
+
+**Migration Support** — Migration sequences are detected for Rails, Alembic, Flyway, Django, Knex, Prisma, and Drizzle. Each migration is linked to its predecessor so cxpak can trace the full migration chain.
+
+**Embedded SQL Linking** — When application code (Python, TypeScript, Rust, etc.) contains inline SQL strings that reference known tables, cxpak creates `embedded_sql` edges connecting those files to the table definition files. This means `context_for_task` and `pack_context` will automatically pull in relevant schema files when you ask about database-related tasks.
+
+**Schema-Aware Query Expansion** — When the Database domain is detected, table names and column names from the schema index are added as expansion terms. Queries for "orders" or "user_id" will match files that reference those identifiers even if the query term doesn't appear literally in the file path or symbol names.
+
 ## Pack Mode
 
 When a repo exceeds the token budget, cxpak automatically switches to **pack mode**:
