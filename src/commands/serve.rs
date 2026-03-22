@@ -25,7 +25,10 @@ use std::time::Duration;
 type SharedIndex = Arc<RwLock<CodebaseIndex>>;
 
 fn matches_focus(path: &str, focus: Option<&str>) -> bool {
-    focus.is_none_or(|f| path.starts_with(f))
+    match focus {
+        Some(f) => path.starts_with(f),
+        None => true,
+    }
 }
 
 /// Scan and parse all files in a path, returning a fully built CodebaseIndex.
@@ -890,14 +893,15 @@ fn handle_tool_call(
             }
 
             // Separate found vs. not-found.
-            let mut not_found: Vec<Value> = vec![];
-            let mut indexed_targets: Vec<(
-                &crate::index::IndexedFile,
+            type PackTarget<'a> = (
+                &'a crate::index::IndexedFile,
                 FileRole,
                 f64,
                 Option<String>,
                 Option<EdgeType>,
-            )> = vec![];
+            );
+            let mut not_found: Vec<Value> = vec![];
+            let mut indexed_targets: Vec<PackTarget<'_>> = vec![];
 
             for (path, role, parent, edge_type) in &target_files {
                 match index_map.get(path.as_str()) {
