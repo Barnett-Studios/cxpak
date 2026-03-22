@@ -976,6 +976,7 @@ mod tests {
     // Helper: build a CodebaseIndex from a list of IndexedFile (no disk access)
     fn make_index(files: Vec<IndexedFile>) -> CodebaseIndex {
         use std::collections::{HashMap, HashSet};
+        let graph = crate::index::graph::build_dependency_graph(&files, None);
         CodebaseIndex {
             total_files: files.len(),
             total_bytes: files.iter().map(|f| f.size_bytes).sum(),
@@ -984,6 +985,9 @@ mod tests {
             term_frequencies: HashMap::new(),
             domains: HashSet::new(),
             schema: None,
+            graph,
+            pagerank: HashMap::new(),
+            test_map: HashMap::new(),
             files,
         }
     }

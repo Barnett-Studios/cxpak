@@ -1,5 +1,5 @@
 use super::ScoredFile;
-use crate::index::graph::{build_dependency_graph, DependencyGraph};
+use crate::index::graph::DependencyGraph;
 use crate::index::CodebaseIndex;
 use std::collections::HashMap;
 
@@ -58,7 +58,9 @@ pub fn select_seeds_with_graph(
     let graph = match prebuilt_graph {
         Some(g) => g,
         None => {
-            owned_graph = build_dependency_graph(index, None);
+            // Fallback: should not be reached — callers pass prebuilt index.graph
+            owned_graph =
+                crate::index::graph::build_dependency_graph(&index.files, index.schema.as_ref());
             &owned_graph
         }
     };

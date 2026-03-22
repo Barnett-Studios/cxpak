@@ -4,6 +4,8 @@ pub mod symbols;
 
 use crate::budget::counter::TokenCounter;
 use crate::context_quality::expansion::Domain;
+use crate::index::graph::DependencyGraph;
+use crate::intelligence::test_map::TestFileRef;
 use crate::parser::language::{Import, ParseResult, Symbol, Visibility};
 use crate::scanner::ScannedFile;
 use crate::schema::SchemaIndex;
@@ -19,6 +21,9 @@ pub struct CodebaseIndex {
     pub term_frequencies: HashMap<String, HashMap<String, u32>>,
     pub domains: HashSet<Domain>,
     pub schema: Option<SchemaIndex>,
+    pub graph: DependencyGraph,
+    pub pagerank: HashMap<String, f64>,
+    pub test_map: HashMap<String, Vec<TestFileRef>>,
 }
 
 #[derive(Debug)]
@@ -133,8 +138,13 @@ impl CodebaseIndex {
             term_frequencies,
             domains,
             schema: None,
+            graph: DependencyGraph::new(),
+            pagerank: HashMap::new(),
+            test_map: HashMap::new(),
         };
         index.schema = crate::schema::detect::build_schema_index(&index);
+        index.graph =
+            crate::index::graph::build_dependency_graph(&index.files, index.schema.as_ref());
         index
     }
 
@@ -265,9 +275,22 @@ impl CodebaseIndex {
             term_frequencies,
             domains,
             schema: None,
+            graph: DependencyGraph::new(),
+            pagerank: HashMap::new(),
+            test_map: HashMap::new(),
         };
         index.schema = crate::schema::detect::build_schema_index(&index);
+        index.graph =
+            crate::index::graph::build_dependency_graph(&index.files, index.schema.as_ref());
         index
+    }
+
+    /// Rebuild the cached dependency graph from current files and schema.
+    ///
+    /// Call this after mutating `schema` post-construction to ensure the graph
+    /// includes schema-aware edges.
+    pub fn rebuild_graph(&mut self) {
+        self.graph = crate::index::graph::build_dependency_graph(&self.files, self.schema.as_ref());
     }
 
     /// Insert or update a single file in the index.

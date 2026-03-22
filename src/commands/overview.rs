@@ -4,7 +4,7 @@ use crate::budget::BudgetAllocation;
 use crate::cache::{CacheEntry, FileCache};
 use crate::cli::OutputFormat;
 use crate::git;
-use crate::index::graph::{build_dependency_graph, DependencyGraph};
+use crate::index::graph::DependencyGraph;
 use crate::index::ranking;
 use crate::index::CodebaseIndex;
 use crate::output::{self, OutputSections};
@@ -70,16 +70,15 @@ pub fn run(
     let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
 
     // 3b. Rank files by importance and sort so high-value files get budget first
-    let graph = build_dependency_graph(&index, index.schema.as_ref());
     let git_ctx = git::extract_git_context(path, 20).ok();
     let file_paths: Vec<String> = index
         .files
         .iter()
         .map(|f| f.relative_path.clone())
         .collect();
-    let mut scores = ranking::rank_files(&file_paths, &graph, git_ctx.as_ref());
+    let mut scores = ranking::rank_files(&file_paths, &index.graph, git_ctx.as_ref());
     if let Some(focus_path) = focus {
-        ranking::apply_focus(&mut scores, focus_path, &graph);
+        ranking::apply_focus(&mut scores, focus_path, &index.graph);
     }
 
     // Build path→score map and sort index.files by descending composite score
@@ -135,7 +134,7 @@ pub fn run(
     );
     let dependency_graph = render_dependency_graph(
         &index,
-        &graph,
+        &index.graph,
         alloc.dependency_graph,
         &counter,
         pack_mode,

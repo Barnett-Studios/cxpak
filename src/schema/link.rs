@@ -131,7 +131,7 @@ pub fn detect_embedded_sql(content: &str) -> Vec<EmbeddedSqlRef> {
 /// - ORM model file → table definition file
 /// - Migration sequence (each migration → its predecessor)
 pub fn build_schema_edges(
-    index: &crate::index::CodebaseIndex,
+    files: &[crate::index::IndexedFile],
     schema_index: &crate::schema::SchemaIndex,
 ) -> Vec<(String, String, EdgeType)> {
     let mut edges = Vec::new();
@@ -180,7 +180,7 @@ pub fn build_schema_edges(
     }
 
     // Embedded SQL edges (scan all files)
-    for file in &index.files {
+    for file in files {
         let lang = file.language.as_deref().unwrap_or("");
         // Skip SQL files themselves (they define tables, not embed SQL)
         if lang == "sql" {
@@ -305,18 +305,8 @@ mod tests {
         }
     }
 
-    fn make_codebase_index(files: Vec<IndexedFile>) -> crate::index::CodebaseIndex {
-        use std::collections::{HashMap, HashSet};
-        crate::index::CodebaseIndex {
-            total_files: files.len(),
-            total_bytes: files.iter().map(|f| f.size_bytes).sum(),
-            total_tokens: 0,
-            language_stats: HashMap::new(),
-            term_frequencies: HashMap::new(),
-            domains: HashSet::new(),
-            schema: None,
-            files,
-        }
+    fn make_file_list(files: Vec<IndexedFile>) -> Vec<IndexedFile> {
+        files
     }
 
     fn make_table(name: &str, file_path: &str, columns: Vec<ColumnSchema>) -> TableSchema {
@@ -492,8 +482,8 @@ mod tests {
         schema.tables.insert("users".to_string(), users_table);
         schema.tables.insert("orders".to_string(), orders_table);
 
-        let index = make_codebase_index(vec![]);
-        let edges = build_schema_edges(&index, &schema);
+        let files = make_file_list(vec![]);
+        let edges = build_schema_edges(&files, &schema);
 
         assert!(
             edges
@@ -523,8 +513,8 @@ mod tests {
             "#,
         );
 
-        let index = make_codebase_index(vec![rust_file]);
-        let edges = build_schema_edges(&index, &schema);
+        let files = make_file_list(vec![rust_file]);
+        let edges = build_schema_edges(&files, &schema);
 
         assert!(
             edges.iter().any(|(from, to, etype)| from == "src/repo.rs"
@@ -562,8 +552,8 @@ mod tests {
         let mut schema = SchemaIndex::empty();
         schema.migrations.push(chain);
 
-        let index = make_codebase_index(vec![]);
-        let edges = build_schema_edges(&index, &schema);
+        let files = make_file_list(vec![]);
+        let edges = build_schema_edges(&files, &schema);
 
         // 002 → 001, 003 → 002
         assert!(
@@ -602,8 +592,8 @@ mod tests {
             },
         );
 
-        let index = make_codebase_index(vec![]);
-        let edges = build_schema_edges(&index, &schema);
+        let files = make_file_list(vec![]);
+        let edges = build_schema_edges(&files, &schema);
 
         assert!(
             edges.iter().any(|(from, to, etype)| from == "app/models.py"
@@ -632,8 +622,8 @@ mod tests {
         schema.tables.insert("table_a".to_string(), table_a);
         schema.tables.insert("table_b".to_string(), table_b);
 
-        let index = make_codebase_index(vec![]);
-        let edges = build_schema_edges(&index, &schema);
+        let files = make_file_list(vec![]);
+        let edges = build_schema_edges(&files, &schema);
 
         // Both FK edges should appear
         assert!(
@@ -666,8 +656,8 @@ mod tests {
             "SELECT * FROM users WHERE id = 1;",
         );
 
-        let index = make_codebase_index(vec![sql_file]);
-        let edges = build_schema_edges(&index, &schema);
+        let files = make_file_list(vec![sql_file]);
+        let edges = build_schema_edges(&files, &schema);
 
         // No EmbeddedSql edges should come from .sql files
         assert!(
@@ -689,8 +679,8 @@ mod tests {
         let sym = make_symbol_with_body(r#"SELECT id, total FROM orders WHERE user_id = $1"#);
         let ts_file = make_indexed_file("src/orders.ts", Some("typescript"), "", vec![sym]);
 
-        let index = make_codebase_index(vec![ts_file]);
-        let edges = build_schema_edges(&index, &schema);
+        let files = make_file_list(vec![ts_file]);
+        let edges = build_schema_edges(&files, &schema);
 
         assert!(
             edges.iter().any(|(from, to, etype)| from == "src/orders.ts"

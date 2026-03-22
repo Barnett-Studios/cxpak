@@ -252,9 +252,8 @@ pub fn run(
         eprintln!("cxpak [timing]: index      {:.1?}", index_start.elapsed());
     }
 
-    // 5. Build dependency graph
+    // 5. Graph is cached on index
     let graph_start = std::time::Instant::now();
-    let graph = crate::index::graph::build_dependency_graph(&index, index.schema.as_ref());
     if timing {
         eprintln!("cxpak [timing]: graph      {:.1?}", graph_start.elapsed());
     }
@@ -266,9 +265,9 @@ pub fn run(
         .iter()
         .map(|f| f.relative_path.clone())
         .collect();
-    let mut scores = ranking::rank_files(&file_paths, &graph, git_ctx.as_ref());
+    let mut scores = ranking::rank_files(&file_paths, &index.graph, git_ctx.as_ref());
     if let Some(focus_path) = focus {
-        ranking::apply_focus(&mut scores, focus_path, &graph);
+        ranking::apply_focus(&mut scores, focus_path, &index.graph);
     }
 
     // Sort index files by score so higher-ranked context files get budget priority
@@ -288,14 +287,14 @@ pub fn run(
     // 7. Walk graph from changed files: 1-hop or full BFS
     let relevant_paths: HashSet<String> = if all {
         let start: Vec<&str> = changed_paths.iter().map(String::as_str).collect();
-        graph.reachable_from(&start)
+        index.graph.reachable_from(&start)
     } else {
         let mut one_hop: HashSet<String> = changed_paths.clone();
         for file in &changed_paths {
-            if let Some(deps) = graph.dependencies(file) {
+            if let Some(deps) = index.graph.dependencies(file) {
                 one_hop.extend(deps.iter().map(|e| e.target.clone()));
             }
-            for dep in graph.dependents(file) {
+            for dep in index.graph.dependents(file) {
                 one_hop.insert(dep.target.to_string());
             }
         }

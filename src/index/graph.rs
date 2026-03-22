@@ -1,4 +1,4 @@
-use super::CodebaseIndex;
+use super::IndexedFile;
 use crate::schema::{EdgeType, TypedEdge};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -96,28 +96,24 @@ impl DependencyGraph {
     }
 }
 
-/// Build a `DependencyGraph` from the index by resolving import source paths to
-/// indexed file paths.  We do a best-effort match: convert the module path
+/// Build a `DependencyGraph` from indexed files by resolving import source paths
+/// to indexed file paths.  We do a best-effort match: convert the module path
 /// (e.g. `crate::scanner`) to a file path (e.g. `src/scanner/mod.rs` or
 /// `src/scanner.rs`) and look up whether such a file exists.
 ///
 /// The optional `schema` parameter enables schema-aware edge injection via
-/// `build_schema_edges` (Task 13).  When present, FK, ORM, embedded-SQL,
+/// `build_schema_edges`.  When present, FK, ORM, embedded-SQL,
 /// migration-sequence, view-reference and function-reference edges are added
 /// in addition to the import edges derived from parse results.
 pub fn build_dependency_graph(
-    index: &CodebaseIndex,
+    files: &[IndexedFile],
     schema: Option<&crate::schema::SchemaIndex>,
 ) -> DependencyGraph {
-    let all_paths: HashSet<&str> = index
-        .files
-        .iter()
-        .map(|f| f.relative_path.as_str())
-        .collect();
+    let all_paths: HashSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
 
     let mut graph = DependencyGraph::new();
 
-    for file in &index.files {
+    for file in files {
         let Some(pr) = &file.parse_result else {
             continue;
         };
@@ -149,7 +145,7 @@ pub fn build_dependency_graph(
 
     // Inject schema-aware edges when a schema index is available.
     if let Some(schema_index) = schema {
-        let schema_edges = crate::schema::link::build_schema_edges(index, schema_index);
+        let schema_edges = crate::schema::link::build_schema_edges(files, schema_index);
         for (from, to, edge_type) in schema_edges {
             graph.add_edge(&from, &to, edge_type);
         }

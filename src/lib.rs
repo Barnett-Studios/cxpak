@@ -6,6 +6,7 @@ pub mod context_quality;
 pub mod daemon;
 pub mod git;
 pub mod index;
+pub mod intelligence;
 pub mod output;
 pub mod parser;
 pub mod relevance;

@@ -2,7 +2,7 @@ use crate::budget::counter::TokenCounter;
 use crate::budget::degrader;
 use crate::cli::OutputFormat;
 use crate::git;
-use crate::index::graph::{build_dependency_graph, DependencyGraph};
+use crate::index::graph::DependencyGraph;
 use crate::index::ranking;
 use crate::index::CodebaseIndex;
 use crate::output::{self, OutputSections};
@@ -92,9 +92,8 @@ pub fn run(
         }
     }
 
-    // 5. Build dependency graph
+    // 5. Graph is cached on index
     let graph_start = Instant::now();
-    let graph = build_dependency_graph(&index, index.schema.as_ref());
     if timing {
         eprintln!("cxpak [timing]: graph      {:.1?}", graph_start.elapsed());
     }
@@ -106,9 +105,9 @@ pub fn run(
         .iter()
         .map(|f| f.relative_path.clone())
         .collect();
-    let mut scores = ranking::rank_files(&file_paths, &graph, git_ctx.as_ref());
+    let mut scores = ranking::rank_files(&file_paths, &index.graph, git_ctx.as_ref());
     if let Some(focus_path) = focus {
-        ranking::apply_focus(&mut scores, focus_path, &graph);
+        ranking::apply_focus(&mut scores, focus_path, &index.graph);
     }
 
     // Build path→score map for ordering relevant files by importance
@@ -156,6 +155,7 @@ pub fn run(
     };
 
     // 7. Walk dependency graph from matched files
+    let graph = &index.graph;
     let relevant_paths: HashSet<String> = if all {
         // Full BFS in both directions
         let start: Vec<&str> = matched_files.iter().copied().collect();
@@ -197,7 +197,7 @@ pub fn run(
     let signatures =
         render_relevant_signatures(&index, &relevant_paths, token_budget / 4, &counter);
     let dep_subgraph =
-        render_dependency_subgraph(&index, &graph, &relevant_paths, token_budget / 8, &counter);
+        render_dependency_subgraph(&index, graph, &relevant_paths, token_budget / 8, &counter);
 
     let sections = OutputSections {
         metadata,

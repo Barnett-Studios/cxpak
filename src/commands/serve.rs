@@ -774,19 +774,19 @@ fn handle_tool_call(
             }
             let scorer = crate::relevance::MultiSignalScorer::new().with_expansion(expanded_tokens);
             let all_scored = scorer.score_all(task, index);
-            let graph = crate::index::graph::build_dependency_graph(index, index.schema.as_ref());
             let seeds = crate::relevance::seed::select_seeds_with_graph(
                 &all_scored,
                 index,
                 crate::relevance::seed::SEED_THRESHOLD,
                 limit,
-                Some(&graph),
+                Some(&index.graph),
             );
             let candidates: Vec<Value> = seeds
                 .iter()
                 .filter(|s| matches_focus(&s.path, focus))
                 .map(|s| {
-                    let deps: Vec<&str> = graph
+                    let deps: Vec<&str> = index
+                        .graph
                         .dependencies(&s.path)
                         .map(|d| d.iter().map(|e| e.target.as_str()).collect())
                         .unwrap_or_default();
@@ -861,10 +861,7 @@ fn handle_tool_call(
                 vec![];
             let mut seen: HashSet<String> = HashSet::new();
             let graph = if include_deps {
-                Some(crate::index::graph::build_dependency_graph(
-                    index,
-                    index.schema.as_ref(),
-                ))
+                Some(&index.graph)
             } else {
                 None
             };
@@ -2817,13 +2814,14 @@ mod tests {
         let mut index =
             CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
         index.schema = Some(schema);
+        index.rebuild_graph();
         index
     }
 
     #[test]
     fn test_pipeline_sql_repo_produces_fk_edges() {
         let index = make_sql_index_with_fk();
-        let graph = crate::index::graph::build_dependency_graph(&index, index.schema.as_ref());
+        let graph = &index.graph;
 
         // orders.sql → users.sql via ForeignKey
         let deps = graph
@@ -2889,8 +2887,9 @@ mod tests {
         let mut index =
             CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
         index.schema = Some(schema);
+        index.rebuild_graph();
 
-        let graph = crate::index::graph::build_dependency_graph(&index, index.schema.as_ref());
+        let graph = &index.graph;
         let deps = graph
             .dependencies("api/orders.py")
             .expect("api/orders.py should have deps");
@@ -2974,8 +2973,9 @@ mod tests {
         let mut index =
             CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
         index.schema = Some(schema);
+        index.rebuild_graph();
 
-        let graph = crate::index::graph::build_dependency_graph(&index, index.schema.as_ref());
+        let graph = &index.graph;
         let deps = graph
             .dependencies("app/models.py")
             .expect("app/models.py should have deps");
