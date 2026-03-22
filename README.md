@@ -22,16 +22,95 @@ brew install cxpak
 cargo install cxpak
 ```
 
-## Claude Code Plugin
+## How to Use cxpak
 
-cxpak ships as a Claude Code plugin — skills auto-trigger when you ask about codebase structure or changes, and slash commands give you direct control.
+There are four ways to use cxpak, from simplest to most powerful:
 
-**Install the plugin:**
+### 1. CLI (no setup required)
+
+Run cxpak directly on any git repo:
+
+```bash
+# Structured repo summary within a token budget
+cxpak overview --tokens 50k .
+
+# Trace a symbol through the dependency graph
+cxpak trace --tokens 50k "handle_request" .
+
+# Show changes with dependency context
+cxpak diff --tokens 50k .
+
+# More options
+cxpak overview --tokens 50k --out context.md .       # Write to file
+cxpak overview --tokens 50k --focus src/api .         # Focus on a directory
+cxpak overview --tokens 50k --format json .           # JSON or XML output
+cxpak trace --tokens 50k --all "MyError" .            # Full graph traversal
+cxpak diff --tokens 50k --git-ref main .              # Diff against a branch
+cxpak diff --tokens 50k --since "1 week" .            # Diff by time range
+cxpak overview --tokens 50k --timing .                # Show pipeline timing
+cxpak clean .                                         # Clear cache
+```
+
+### 2. MCP Server (for Claude Code, Cursor, and other AI tools)
+
+Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 7 codebase tools — including relevance scoring, query expansion, and schema-aware context packing.
+
+**Claude Code** — add to `.claude/settings.json` in your project (or `~/.claude/settings.json` globally):
+
+```json
+{
+  "mcpServers": {
+    "cxpak": {
+      "command": "cxpak",
+      "args": ["serve", "--mcp", "."]
+    }
+  }
+}
+```
+
+**Cursor** — add to `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "cxpak": {
+      "command": "cxpak",
+      "args": ["serve", "--mcp", "."]
+    }
+  }
+}
+```
+
+**Any MCP client** — run `cxpak serve --mcp .` over stdio. It speaks JSON-RPC 2.0.
+
+Once configured, your AI tool can call these tools:
+
+| Tool | Description |
+|------|-------------|
+| `cxpak_overview` | Structured repo summary |
+| `cxpak_trace` | Trace a symbol through dependencies |
+| `cxpak_stats` | Language stats and token counts |
+| `cxpak_diff` | Show changes with dependency context |
+| `cxpak_context_for_task` | Score and rank files by relevance to a task |
+| `cxpak_pack_context` | Pack selected files into a token-budgeted bundle |
+| `cxpak_search` | Regex search with context lines |
+
+All tools support a `focus` path prefix parameter to scope results.
+
+> **Note:** The MCP server requires the `daemon` feature. Install with `cargo install cxpak --features daemon` or use Homebrew (includes daemon support by default).
+
+### 3. Claude Code Plugin (auto-triggers + slash commands)
+
+The plugin wraps cxpak as skills and slash commands. Skills auto-trigger when Claude detects relevant questions; slash commands give you direct control.
+
+**Install:**
 
 ```
 /plugin marketplace add Barnett-Studios/cxpak
 /plugin install cxpak
 ```
+
+The plugin auto-downloads the cxpak binary if it's not already installed.
 
 **Skills (auto-invoked):**
 
@@ -49,71 +128,21 @@ cxpak ships as a Claude Code plugin — skills auto-trigger when you ask about c
 | `/cxpak:diff` | Show changes with dependency context |
 | `/cxpak:clean` | Remove `.cxpak/` cache and output files |
 
-The plugin auto-downloads the cxpak binary if it's not already installed.
+### 4. HTTP Server (for custom integrations)
 
-## Usage
-
-```bash
-# Structured repo summary within a token budget
-cxpak overview --tokens 50k .
-
-# Write output to a file
-cxpak overview --tokens 50k --out context.md .
-
-# Focus on a specific directory (boosts ranking)
-cxpak overview --tokens 50k --focus src/api .
-
-# Trace from a function/error, pack relevant code paths
-cxpak trace --tokens 50k "handle_request" .
-
-# Trace with full dependency graph traversal
-cxpak trace --tokens 50k --all "MyError" /path/to/repo
-
-# Different output formats
-cxpak overview --tokens 50k --format json .
-cxpak overview --tokens 50k --format xml .
-
-# Show changes with dependency context (vs working tree)
-cxpak diff --tokens 50k .
-
-# Diff against a specific ref
-cxpak diff --tokens 50k --git-ref main .
-
-# Diff by time range
-cxpak diff --tokens 50k --since "1 week" .
-
-# Full dependency graph context
-cxpak diff --tokens 50k --all .
-
-# Print pipeline timing info
-cxpak overview --tokens 50k --timing .
-
-# Clean cache and output files
-cxpak clean .
-```
-
-## Daemon Mode
-
-With the `daemon` feature flag, cxpak can run as a persistent server with a hot index that updates on file changes.
+Run cxpak as a persistent HTTP server with a hot index:
 
 ```bash
 # Install with daemon support
 cargo install cxpak --features daemon
 
-# Watch for file changes and keep index hot
-cxpak watch .
-
 # Start HTTP server (default port 3000)
 cxpak serve .
 cxpak serve --port 8080 .
 
-# Start as MCP server over stdio
-cxpak serve --mcp .
+# Watch for file changes and keep index hot
+cxpak watch .
 ```
-
-### HTTP API
-
-When running `cxpak serve`, these endpoints are available:
 
 | Endpoint | Description |
 |----------|-------------|
@@ -122,20 +151,6 @@ When running `cxpak serve`, these endpoints are available:
 | `GET /overview?tokens=50000` | Structured repo summary |
 | `GET /trace?target=handle_request` | Trace a symbol through dependencies |
 | `GET /diff?git_ref=HEAD~1` | Show changes with dependency context |
-
-### MCP Server
-
-When running `cxpak serve --mcp`, cxpak speaks [Model Context Protocol](https://modelcontextprotocol.io/) over stdin/stdout. It exposes seven tools (all support a `focus` path prefix parameter):
-
-| Tool | Description |
-|------|-------------|
-| `cxpak_overview` | Structured repo summary |
-| `cxpak_trace` | Trace a symbol through dependencies |
-| `cxpak_stats` | Language stats and token counts |
-| `cxpak_diff` | Show changes with dependency context |
-| `cxpak_context_for_task` | Score and rank files by relevance to a task |
-| `cxpak_pack_context` | Pack selected files into a token-budgeted bundle |
-| `cxpak_search` | Regex search with context lines |
 
 ## What You Get
 
