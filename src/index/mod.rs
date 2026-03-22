@@ -145,6 +145,7 @@ impl CodebaseIndex {
         index.schema = crate::schema::detect::build_schema_index(&index);
         index.graph =
             crate::index::graph::build_dependency_graph(&index.files, index.schema.as_ref());
+        index.pagerank = crate::intelligence::pagerank::compute_pagerank(&index.graph, 0.85, 100);
         index
     }
 
@@ -282,6 +283,7 @@ impl CodebaseIndex {
         index.schema = crate::schema::detect::build_schema_index(&index);
         index.graph =
             crate::index::graph::build_dependency_graph(&index.files, index.schema.as_ref());
+        index.pagerank = crate::intelligence::pagerank::compute_pagerank(&index.graph, 0.85, 100);
         index
     }
 

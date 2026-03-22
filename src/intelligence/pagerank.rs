@@ -167,22 +167,53 @@ pub fn compute_pagerank(
 
 /// Build inverted index: symbol_name → set of files containing it.
 /// Used for O(1) cross-reference lookups in symbol_importance().
+///
+/// Iterates over each file's term_frequencies and inverts the mapping so that
+/// every term (lowercased) maps to the set of file paths that contain it.
 pub fn build_symbol_cross_refs(
-    _term_frequencies: &HashMap<String, HashMap<String, u32>>,
+    term_frequencies: &HashMap<String, HashMap<String, u32>>,
 ) -> HashMap<String, HashSet<String>> {
-    HashMap::new() // Stub — implemented in Task 4
+    let mut cross_refs: HashMap<String, HashSet<String>> = HashMap::new();
+    for (file_path, terms) in term_frequencies {
+        for term in terms.keys() {
+            cross_refs
+                .entry(term.clone())
+                .or_default()
+                .insert(file_path.clone());
+        }
+    }
+    cross_refs
 }
 
 /// Compute importance score for a single symbol.
 /// importance = file_pagerank * symbol_weight
-/// where symbol_weight is 1.0 (public+referenced), 0.7 (public), or 0.3 (private).
+/// where symbol_weight is:
+///   1.0 — public AND referenced in at least one other file
+///   0.7 — public but not referenced elsewhere
+///   0.3 — private
 pub fn symbol_importance(
-    _symbol: &crate::parser::language::Symbol,
-    _file_pagerank: f64,
-    _cross_refs: &HashMap<String, HashSet<String>>,
-    _file_path: &str,
+    symbol: &crate::parser::language::Symbol,
+    file_pagerank: f64,
+    cross_refs: &HashMap<String, HashSet<String>>,
+    file_path: &str,
 ) -> f64 {
-    0.0 // Stub — implemented in Task 4
+    use crate::parser::language::Visibility;
+    let weight = match symbol.visibility {
+        Visibility::Public => {
+            let name_lower = symbol.name.to_lowercase();
+            let referenced_elsewhere = cross_refs
+                .get(&name_lower)
+                .map(|files| files.iter().any(|f| f != file_path))
+                .unwrap_or(false);
+            if referenced_elsewhere {
+                1.0
+            } else {
+                0.7
+            }
+        }
+        Visibility::Private => 0.3,
+    };
+    file_pagerank * weight
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,6 +223,7 @@ pub fn symbol_importance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::language::{Symbol, SymbolKind, Visibility};
     use crate::schema::EdgeType;
 
     const DAMPING: f64 = 0.85;
@@ -469,5 +501,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── helpers for cross-ref / symbol importance tests ───────────────────────
+
+    fn make_symbol(name: &str, visibility: Visibility) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            visibility,
+            signature: format!("pub fn {}()", name),
+            body: "{}".to_string(),
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    fn term_freq(pairs: &[(&str, u32)]) -> HashMap<String, u32> {
+        pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect()
+    }
+
+    // ── test_build_symbol_cross_refs ──────────────────────────────────────────
+
+    #[test]
+    fn test_build_symbol_cross_refs() {
+        let mut tf: HashMap<String, HashMap<String, u32>> = HashMap::new();
+        tf.insert(
+            "a.rs".to_string(),
+            term_freq(&[("connect", 3), ("query", 1)]),
+        );
+        tf.insert(
+            "b.rs".to_string(),
+            term_freq(&[("connect", 1), ("render", 2)]),
+        );
+        tf.insert("c.rs".to_string(), term_freq(&[("render", 1)]));
+
+        let refs = build_symbol_cross_refs(&tf);
+
+        // "connect" appears in both a.rs and b.rs
+        let connect_files = refs
+            .get("connect")
+            .expect("connect should be in cross_refs");
+        assert!(
+            connect_files.contains("a.rs"),
+            "connect should reference a.rs"
+        );
+        assert!(
+            connect_files.contains("b.rs"),
+            "connect should reference b.rs"
+        );
+        assert!(
+            !connect_files.contains("c.rs"),
+            "connect should not reference c.rs"
+        );
+
+        // "render" appears in b.rs and c.rs
+        let render_files = refs.get("render").expect("render should be in cross_refs");
+        assert!(
+            render_files.contains("b.rs"),
+            "render should reference b.rs"
+        );
+        assert!(
+            render_files.contains("c.rs"),
+            "render should reference c.rs"
+        );
+        assert!(
+            !render_files.contains("a.rs"),
+            "render should not reference a.rs"
+        );
+
+        // "query" appears only in a.rs
+        let query_files = refs.get("query").expect("query should be in cross_refs");
+        assert_eq!(query_files.len(), 1);
+        assert!(query_files.contains("a.rs"));
+    }
+
+    // ── test_symbol_importance_public_referenced ──────────────────────────────
+
+    #[test]
+    fn test_symbol_importance_public_referenced() {
+        // Symbol "connect" is public and appears in a.rs and b.rs
+        let mut tf: HashMap<String, HashMap<String, u32>> = HashMap::new();
+        tf.insert("a.rs".to_string(), term_freq(&[("connect", 3)]));
+        tf.insert("b.rs".to_string(), term_freq(&[("connect", 1)]));
+        let refs = build_symbol_cross_refs(&tf);
+
+        let sym = make_symbol("connect", Visibility::Public);
+        // file_pagerank = 0.8, referenced in b.rs (other file), so weight = 1.0
+        let importance = symbol_importance(&sym, 0.8, &refs, "a.rs");
+        assert!(
+            (importance - 0.8).abs() < 1e-9,
+            "public+referenced: expected 0.8 * 1.0 = 0.8, got {importance}"
+        );
+    }
+
+    // ── test_symbol_importance_public_unreferenced ────────────────────────────
+
+    #[test]
+    fn test_symbol_importance_public_unreferenced() {
+        // Symbol "unique_fn" is public but only appears in a.rs itself
+        let mut tf: HashMap<String, HashMap<String, u32>> = HashMap::new();
+        tf.insert("a.rs".to_string(), term_freq(&[("unique", 1)]));
+        let refs = build_symbol_cross_refs(&tf);
+
+        let sym = make_symbol("unique_fn", Visibility::Public);
+        // "unique_fn" lowercased → "unique_fn"; not in cross_refs at all → unreferenced
+        let importance = symbol_importance(&sym, 0.8, &refs, "a.rs");
+        assert!(
+            (importance - 0.56).abs() < 1e-9,
+            "public+unreferenced: expected 0.8 * 0.7 = 0.56, got {importance}"
+        );
+    }
+
+    // ── test_symbol_importance_private ───────────────────────────────────────
+
+    #[test]
+    fn test_symbol_importance_private() {
+        let refs: HashMap<String, HashSet<String>> = HashMap::new();
+        let sym = make_symbol("internal_helper", Visibility::Private);
+        let importance = symbol_importance(&sym, 0.8, &refs, "a.rs");
+        assert!(
+            (importance - 0.24).abs() < 1e-9,
+            "private: expected 0.8 * 0.3 = 0.24, got {importance}"
+        );
     }
 }

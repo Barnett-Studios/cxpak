@@ -1,6 +1,6 @@
 use crate::index::CodebaseIndex;
 use crate::relevance::SignalResult;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Tokenize a string into lowercase parts split on non-alphanumeric chars and underscores.
 /// Also includes the lowercased whole word to handle all-caps identifiers (e.g., "API" -> "api").
@@ -294,6 +294,19 @@ pub fn term_frequency(
         name: "term_frequency",
         score,
         detail: format!("tf={:.3}, terms: {}", score, matched_terms.join(", ")),
+    }
+}
+
+/// PageRank: file-level importance score from the dependency graph.
+///
+/// Returns the pre-computed PageRank score for `file_path` from the index,
+/// or 0.0 if the file is not present in the PageRank map.
+pub fn pagerank_signal(file_path: &str, pagerank: &HashMap<String, f64>) -> SignalResult {
+    let score = pagerank.get(file_path).copied().unwrap_or(0.0);
+    SignalResult {
+        name: "pagerank",
+        score,
+        detail: format!("pagerank={:.4}", score),
     }
 }
 
@@ -691,6 +704,41 @@ mod tests {
             result_ware.score <= 0.5,
             "ware.rs should not match 'middleware' by substring: {}",
             result_ware.score
+        );
+    }
+
+    // --- pagerank_signal tests ---
+
+    #[test]
+    fn test_pagerank_signal_found() {
+        let mut pr = HashMap::new();
+        pr.insert("src/lib.rs".to_string(), 0.7531);
+        pr.insert("src/main.rs".to_string(), 1.0);
+
+        let result = pagerank_signal("src/lib.rs", &pr);
+        assert_eq!(result.name, "pagerank");
+        assert!(
+            (result.score - 0.7531).abs() < 1e-9,
+            "expected 0.7531, got {}",
+            result.score
+        );
+        assert!(
+            result.detail.contains("0.7531"),
+            "detail: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn test_pagerank_signal_not_found() {
+        let pr: HashMap<String, f64> = HashMap::new();
+        let result = pagerank_signal("nonexistent.rs", &pr);
+        assert_eq!(result.name, "pagerank");
+        assert_eq!(result.score, 0.0, "missing file should return 0.0");
+        assert!(
+            result.detail.contains("0.0000"),
+            "detail: {}",
+            result.detail
         );
     }
 }

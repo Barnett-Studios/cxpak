@@ -927,7 +927,8 @@ fn handle_tool_call(
                 .iter()
                 .map(|(f, role, score, _, _)| (*f, *role, *score))
                 .collect();
-            let allocated = allocate_with_degradation(&alloc_inputs, token_budget);
+            let allocated =
+                allocate_with_degradation(&alloc_inputs, token_budget, Some(&index.pagerank));
 
             // Render annotated output per file.
             let mut packed: Vec<Value> = vec![];

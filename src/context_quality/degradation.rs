@@ -2,6 +2,7 @@
 
 use crate::budget::counter::TokenCounter;
 use crate::parser::language::{Symbol, SymbolKind};
+use std::collections::HashMap;
 
 pub const MAX_SYMBOL_TOKENS: usize = 4000;
 
@@ -235,9 +236,16 @@ pub struct AllocatedFile {
 ///
 /// Each entry in `files` is `(&IndexedFile, FileRole, relevance_score)`.
 /// Returns an allocation per file: path, chosen detail level, and rendered symbols.
+///
+/// When `pagerank` is `Some`, priority is computed as:
+///   `priority = score * 0.6 + cp * 0.2 + pr * 0.2`
+///
+/// When `pagerank` is `None` (backwards compat):
+///   `priority = score * 0.7 + cp * 0.3`
 pub fn allocate_with_degradation(
     files: &[(&crate::index::IndexedFile, FileRole, f64)],
     budget: usize,
+    pagerank: Option<&HashMap<String, f64>>,
 ) -> Vec<AllocatedFile> {
     if files.is_empty() {
         return vec![];
@@ -283,7 +291,13 @@ pub fn allocate_with_degradation(
             .map(|pr| pr.symbols.clone())
             .unwrap_or_default();
         let cp = file_concept_priority(&symbols);
-        let priority = score * 0.7 + cp * 0.3;
+        let priority = match pagerank {
+            Some(pr_map) => {
+                let pr = pr_map.get(f.relative_path.as_str()).copied().unwrap_or(0.0);
+                score * 0.6 + cp * 0.2 + pr * 0.2
+            }
+            None => score * 0.7 + cp * 0.3,
+        };
         roles.push(*role);
         priorities.push(priority);
         all_symbols.push(symbols);
@@ -782,7 +796,7 @@ mod tests {
     fn test_allocate_fits_at_level0() {
         let file = make_indexed_file("a.rs", 100, vec![make_fn_symbol("a", 100)]);
         let files = vec![(&file, FileRole::Selected, 0.8)];
-        let result = allocate_with_degradation(&files, 1000);
+        let result = allocate_with_degradation(&files, 1000, None);
         assert_eq!(result[0].level, DetailLevel::Full);
     }
 
@@ -794,7 +808,7 @@ mod tests {
             (&high_file, FileRole::Selected, 0.9),
             (&low_file, FileRole::Dependency, 0.3),
         ];
-        let result = allocate_with_degradation(&files, 800);
+        let result = allocate_with_degradation(&files, 800, None);
         let high = result.iter().find(|r| r.path == "high.rs").unwrap();
         let low = result.iter().find(|r| r.path == "low.rs").unwrap();
         assert!(
@@ -807,7 +821,7 @@ mod tests {
     fn test_allocate_selected_never_below_documented() {
         let file = make_indexed_file("sel.rs", 5000, vec![make_fn_symbol("sel", 5000)]);
         let files = vec![(&file, FileRole::Selected, 0.5)];
-        let result = allocate_with_degradation(&files, 100);
+        let result = allocate_with_degradation(&files, 100, None);
         let sel = result.iter().find(|r| r.path == "sel.rs").unwrap();
         assert!(
             sel.level <= DetailLevel::Documented,
@@ -824,7 +838,7 @@ mod tests {
             (&sel_file, FileRole::Selected, 0.9),
             (&dep_file, FileRole::Dependency, 0.1),
         ];
-        let result = allocate_with_degradation(&files, 300);
+        let result = allocate_with_degradation(&files, 300, None);
         // dep.rs may be dropped entirely (empty symbols) or at Stub
         let dep = result.iter().find(|r| r.path == "dep.rs");
         if let Some(d) = dep {
@@ -837,7 +851,7 @@ mod tests {
     #[test]
     fn test_allocate_empty_files() {
         let files: Vec<(&IndexedFile, FileRole, f64)> = vec![];
-        let result = allocate_with_degradation(&files, 1000);
+        let result = allocate_with_degradation(&files, 1000, None);
         assert!(result.is_empty());
     }
 
@@ -845,7 +859,40 @@ mod tests {
     fn test_allocate_single_file_exact_budget() {
         let file = make_indexed_file("exact.rs", 1000, vec![make_fn_symbol("exact", 1000)]);
         let files = vec![(&file, FileRole::Selected, 0.8)];
-        let result = allocate_with_degradation(&files, 1000);
+        let result = allocate_with_degradation(&files, 1000, None);
         assert_eq!(result[0].level, DetailLevel::Full);
+    }
+
+    // --- pagerank-aware allocation test ---
+
+    #[test]
+    fn test_allocate_pagerank_higher_gets_higher_priority() {
+        // Two files competing for a tight budget: same relevance score but
+        // different PageRank scores.  The higher-PageRank file should receive
+        // a better (lower) detail level than the lower-PageRank file.
+        let high_pr_file = make_indexed_file("hub.rs", 600, vec![make_fn_symbol("hub_fn", 600)]);
+        let low_pr_file = make_indexed_file("leaf.rs", 600, vec![make_fn_symbol("leaf_fn", 600)]);
+
+        let files = vec![
+            (&high_pr_file, FileRole::Dependency, 0.5),
+            (&low_pr_file, FileRole::Dependency, 0.5),
+        ];
+
+        let mut pagerank = HashMap::new();
+        pagerank.insert("hub.rs".to_string(), 1.0); // high PageRank
+        pagerank.insert("leaf.rs".to_string(), 0.1); // low PageRank
+
+        // Budget is tight enough that both cannot stay at Full detail.
+        let result = allocate_with_degradation(&files, 800, Some(&pagerank));
+
+        let hub = result.iter().find(|r| r.path == "hub.rs").unwrap();
+        let leaf = result.iter().find(|r| r.path == "leaf.rs").unwrap();
+
+        assert!(
+            hub.level <= leaf.level,
+            "hub.rs (high PageRank) should be at same or better detail level than leaf.rs (low PageRank): hub={:?}, leaf={:?}",
+            hub.level,
+            leaf.level
+        );
     }
 }

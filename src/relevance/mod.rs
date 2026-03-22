@@ -39,16 +39,18 @@ pub struct SignalWeights {
     pub import_proximity: f64,
     pub term_frequency: f64,
     pub recency_boost: f64,
+    pub pagerank: f64,
 }
 
 impl Default for SignalWeights {
     fn default() -> Self {
         Self {
-            path_similarity: 0.22,
-            symbol_match: 0.38,
-            import_proximity: 0.17,
-            term_frequency: 0.23,
-            recency_boost: 0.0, // no git history in index yet; weight redistributed
+            path_similarity: 0.18,
+            symbol_match: 0.32,
+            import_proximity: 0.14,
+            term_frequency: 0.19,
+            recency_boost: 0.00, // no git history in index yet; weight redistributed
+            pagerank: 0.17,
         }
     }
 }
@@ -103,12 +105,14 @@ impl RelevanceScorer for MultiSignalScorer {
             score: 0.5, // neutral — no git history in index
             detail: "no git history available".to_string(),
         };
+        let pr_sig = signals::pagerank_signal(file_path, &index.pagerank);
 
         let combined = w.path_similarity * path_sig.score
             + w.symbol_match * symbol_sig.score
             + w.import_proximity * import_sig.score
             + w.term_frequency * tf_sig.score
-            + w.recency_boost * recency_sig.score;
+            + w.recency_boost * recency_sig.score
+            + w.pagerank * pr_sig.score;
 
         // Clamp to 0.0–1.0
         let score = combined.clamp(0.0, 1.0);
@@ -123,7 +127,14 @@ impl RelevanceScorer for MultiSignalScorer {
         ScoredFile {
             path: file_path.to_string(),
             score,
-            signals: vec![path_sig, symbol_sig, import_sig, tf_sig, recency_sig],
+            signals: vec![
+                path_sig,
+                symbol_sig,
+                import_sig,
+                tf_sig,
+                recency_sig,
+                pr_sig,
+            ],
             token_count,
         }
     }
@@ -212,7 +223,7 @@ mod tests {
         let scorer = MultiSignalScorer::new();
         let result = scorer.score("api request handler", "src/api/mod.rs", &index);
         assert!(result.score >= 0.0 && result.score <= 1.0);
-        assert_eq!(result.signals.len(), 5);
+        assert_eq!(result.signals.len(), 6);
         assert_eq!(result.path, "src/api/mod.rs");
     }
 
@@ -245,7 +256,8 @@ mod tests {
             + w.symbol_match
             + w.import_proximity
             + w.term_frequency
-            + w.recency_boost;
+            + w.recency_boost
+            + w.pagerank;
         assert!(
             (sum - 1.0).abs() < 0.001,
             "Weights should sum to 1.0, got {sum}"
@@ -261,6 +273,7 @@ mod tests {
             import_proximity: 0.0,
             term_frequency: 0.0,
             recency_boost: 0.0,
+            pagerank: 0.0,
         });
         let result = scorer.score("api", "src/api/mod.rs", &index);
         // Only path_similarity contributes
