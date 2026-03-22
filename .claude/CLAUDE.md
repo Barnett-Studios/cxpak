@@ -13,7 +13,7 @@ Pre-commit hooks enforce fmt + clippy + tests. CI enforces 90% coverage via tarp
 
 ## Architecture
 
-Pipeline: **Scanner → Parser → Schema → Index → Budget → Context Quality → Output**
+Pipeline: **Scanner → Parser → Schema → Index → Budget → Context Quality → Intelligence → Output**
 
 1. **Scanner** (`src/scanner/`) — walks git-tracked files, detects language from extension
 2. **Parser** (`src/parser/`) — tree-sitter extraction of symbols, imports, exports per language
@@ -21,7 +21,8 @@ Pipeline: **Scanner → Parser → Schema → Index → Budget → Context Quali
 4. **Index** (`src/index/`) — builds `CodebaseIndex` with token counts, language stats, typed dependency graph, detected domains, and optional `SchemaIndex`
 5. **Budget** (`src/budget/`) — allocates token budget across sections, truncates with omission markers
 6. **Context Quality** (`src/context_quality/`) — progressive degradation, query expansion, context annotations
-7. **Output** (`src/output/`) — renders to markdown, JSON, or XML
+7. **Intelligence** (`src/intelligence/`) — PageRank file importance, blast radius analysis, API surface extraction, test file mapping
+8. **Output** (`src/output/`) — renders to markdown, JSON, or XML
 
 ## Commands
 
@@ -71,6 +72,17 @@ Non-import edges are rendered with `(via: edge_type)` in the dependency subgraph
 - **`annotation.rs`** — `comment_syntax()` (per-language comment prefix/suffix), `annotate_file()` (generates `[cxpak]` header with score, role, signals, detail level)
 
 `allocate_with_degradation()` takes `&[(&IndexedFile, FileRole, f64)]` — references, not owned. Selected files never degrade below Documented; dependencies can be dropped.
+
+### Intelligence Module
+
+`src/intelligence/` provides graph-based intelligence features:
+
+- **`pagerank.rs`** — `compute_pagerank()` (iterative PageRank over the dependency graph), `build_symbol_cross_refs()` (cross-file symbol reference map), `symbol_importance()` (file_pagerank × symbol_weight: 1.0 public+referenced, 0.7 public, 0.3 private)
+- **`blast_radius.rs`** — `compute_blast_radius()` (BFS from changed files, categorizes into direct_dependents, transitive_dependents, test_files, schema_dependents), `compute_risk()` (hop_decay × edge_weight × pagerank × test_penalty, clamped to [0,1])
+- **`api_surface.rs`** — `extract_api_surface()` (public symbols sorted by PageRank, token-budgeted), `detect_routes()` (HTTP route extraction for 12 frameworks: Express, Actix, Axum, Flask, Django, FastAPI, Spring, Gin, Echo, Fiber, Rails, Phoenix), gRPC service and GraphQL type extraction
+- **`test_map.rs`** — `build_test_map()` (source→test file mapping via naming conventions for 6 languages: Rust, TypeScript/JavaScript, Python, Java, Go, Ruby, plus catch-all; supplemented by import analysis)
+
+PageRank scores feed into relevance scoring (signal #6, weight 0.17) and degradation priority (0.6 × pagerank + 0.2 × concept_priority + 0.2 × file_role).
 
 ## Supported Languages (42)
 

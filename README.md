@@ -53,7 +53,7 @@ cxpak clean .                                         # Clear cache
 
 ### 2. MCP Server (for Claude Code, Cursor, and other AI tools)
 
-Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 7 codebase tools — including relevance scoring, query expansion, and schema-aware context packing.
+Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 9 codebase tools — including relevance scoring, query expansion, and schema-aware context packing.
 
 **Claude Code** — add to `.mcp.json` in your project root (or `~/.claude/.mcp.json` globally):
 
@@ -96,6 +96,8 @@ Once configured, your AI tool can call these tools:
 | `cxpak_context_for_task` | Score and rank files by relevance to a task |
 | `cxpak_pack_context` | Pack selected files into a token-budgeted bundle |
 | `cxpak_search` | Regex search with context lines |
+| `cxpak_blast_radius` | Analyze change impact with risk scores |
+| `cxpak_api_surface` | Extract public API surface |
 
 All tools support a `focus` path prefix parameter to scope results.
 
@@ -215,6 +217,18 @@ Non-import edges are surfaced in the dependency graph output and in pack context
 **Embedded SQL Linking** — When application code (Python, TypeScript, Rust, etc.) contains inline SQL strings that reference known tables, cxpak creates `embedded_sql` edges connecting those files to the table definition files. This means `context_for_task` and `pack_context` will automatically pull in relevant schema files when you ask about database-related tasks.
 
 **Schema-Aware Query Expansion** — When the Database domain is detected, table names and column names from the schema index are added as expansion terms. Queries for "orders" or "user_id" will match files that reference those identifiers even if the query term doesn't appear literally in the file path or symbol names.
+
+## Intelligence
+
+cxpak v0.13.0 adds graph-based intelligence features that go beyond static analysis.
+
+**PageRank File Importance** — Every file in the dependency graph is scored 0.0–1.0 using PageRank over the import graph. Files that are transitively imported by many others rank higher. PageRank is used as signal #6 in relevance scoring (weight 0.17) and drives degradation priority via the formula `0.6 × pagerank + 0.2 × concept_priority + 0.2 × file_role`. Symbol-level importance is computed as `file_pagerank × symbol_weight`, where symbol_weight is 1.0 (public + referenced), 0.7 (public), or 0.3 (private).
+
+**Blast Radius Analysis** — The `cxpak_blast_radius` MCP tool takes a set of changed files and returns categorized affected files: `direct_dependents`, `transitive_dependents`, `test_files`, and `schema_dependents`, each with a risk score. Risk is calculated as `hop_decay × edge_weight × pagerank × test_penalty`, clamped to [0, 1]. This tells you which parts of the codebase are most likely to break when you change a file.
+
+**API Surface Extraction** — The `cxpak_api_surface` MCP tool extracts the public API of a codebase: public symbols sorted by PageRank, HTTP routes (12 frameworks including Express, Actix, Axum, Flask, Django, FastAPI, Spring, Gin, Echo, Fiber, Rails, and Phoenix), gRPC services, and GraphQL types. Output is token-budgeted.
+
+**Test File Mapping** — cxpak automatically maps source files to their test files using naming conventions for 6 languages (Rust, TypeScript/JavaScript, Python, Java, Go, Ruby) plus a catch-all pattern, supplemented by import analysis. The `pack_context` tool auto-includes test files when the `include_tests` parameter is set. Blast radius uses the test map to populate the `test_files` category.
 
 ## Pack Mode
 
