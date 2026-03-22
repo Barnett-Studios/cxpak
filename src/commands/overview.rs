@@ -4,11 +4,12 @@ use crate::budget::BudgetAllocation;
 use crate::cache::{CacheEntry, FileCache};
 use crate::cli::OutputFormat;
 use crate::git;
-use crate::index::graph::build_dependency_graph;
+use crate::index::graph::{build_dependency_graph, DependencyGraph};
 use crate::index::ranking;
 use crate::index::CodebaseIndex;
 use crate::output::{self, OutputSections};
 use crate::scanner::Scanner;
+use crate::schema::EdgeType;
 use std::io::Write;
 use std::path::Path;
 
@@ -134,6 +135,7 @@ pub fn run(
     );
     let dependency_graph = render_dependency_graph(
         &index,
+        &graph,
         alloc.dependency_graph,
         &counter,
         pack_mode,
@@ -406,6 +408,7 @@ fn render_module_map(
 
 fn render_dependency_graph(
     index: &CodebaseIndex,
+    graph: &DependencyGraph,
     budget: usize,
     counter: &TokenCounter,
     pack_mode: bool,
@@ -414,20 +417,43 @@ fn render_dependency_graph(
     let mut full = String::new();
 
     for file in &index.files {
-        if let Some(pr) = &file.parse_result {
-            if pr.imports.is_empty() {
-                continue;
-            }
-            full.push_str(&format!("**{}** imports:\n", file.relative_path));
-            for imp in &pr.imports {
-                if imp.names.is_empty() {
-                    full.push_str(&format!("- `{}`\n", imp.source));
-                } else {
-                    full.push_str(&format!("- `{}` — {}\n", imp.source, imp.names.join(", ")));
+        // Collect typed outgoing edges for this file, sorted for deterministic output.
+        let edges: Vec<_> = graph
+            .dependencies(&file.relative_path)
+            .map(|deps| {
+                let mut v: Vec<_> = deps.iter().collect();
+                v.sort_by(|a, b| a.target.cmp(&b.target));
+                v
+            })
+            .unwrap_or_default();
+
+        if edges.is_empty() {
+            continue;
+        }
+
+        full.push_str(&format!("**{}** imports:\n", file.relative_path));
+        for edge in edges {
+            match &edge.edge_type {
+                EdgeType::Import => {
+                    full.push_str(&format!("- {}\n", edge.target));
+                }
+                et => {
+                    let label = match et {
+                        EdgeType::ForeignKey => "foreign_key",
+                        EdgeType::ViewReference => "view_reference",
+                        EdgeType::TriggerTarget => "trigger_target",
+                        EdgeType::IndexTarget => "index_target",
+                        EdgeType::FunctionReference => "function_reference",
+                        EdgeType::EmbeddedSql => "embedded_sql",
+                        EdgeType::OrmModel => "orm_model",
+                        EdgeType::MigrationSequence => "migration_sequence",
+                        EdgeType::Import => unreachable!(),
+                    };
+                    full.push_str(&format!("- {} ({})\n", edge.target, label));
                 }
             }
-            full.push('\n');
         }
+        full.push('\n');
     }
 
     let (budgeted, _, omitted) = if pack_mode {
@@ -649,9 +675,11 @@ fn render_git_context(
 mod tests {
     use super::*;
     use crate::budget::counter::TokenCounter;
+    use crate::index::graph::DependencyGraph;
     use crate::index::CodebaseIndex;
     use crate::parser::language::{Import, ParseResult, Symbol, SymbolKind, Visibility};
     use crate::scanner::ScannedFile;
+    use crate::schema::EdgeType;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -741,32 +769,92 @@ mod tests {
     }
 
     #[test]
-    fn test_render_dependency_graph_with_empty_import_names() {
+    fn test_render_dependency_graph_with_import_edge() {
         let counter = TokenCounter::new();
-        let files = vec![ScannedFile {
-            relative_path: "src/lib.rs".to_string(),
-            absolute_path: PathBuf::from("/tmp/src/lib.rs"),
-            language: Some("rust".to_string()),
-            size_bytes: 100,
-        }];
-        let mut parse_results = HashMap::new();
-        parse_results.insert(
-            "src/lib.rs".to_string(),
-            ParseResult {
-                symbols: vec![],
-                imports: vec![Import {
-                    source: "std::io".to_string(),
-                    names: vec![],
-                }],
-                exports: vec![],
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/lib.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/lib.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 100,
             },
-        );
-        let content_map = HashMap::from([("src/lib.rs".to_string(), "use std::io;".to_string())]);
+            ScannedFile {
+                relative_path: "src/util.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/src/util.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 50,
+            },
+        ];
+        let parse_results = HashMap::new();
+        let content_map = HashMap::from([
+            ("src/lib.rs".to_string(), "use util;".to_string()),
+            ("src/util.rs".to_string(), "fn helper() {}".to_string()),
+        ]);
         let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
-        let result = render_dependency_graph(&index, 10000, &counter, false, "deps.md");
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("src/lib.rs", "src/util.rs", EdgeType::Import);
+        let result = render_dependency_graph(&index, &graph, 10000, &counter, false, "deps.md");
         assert!(
-            result.full.contains("std::io"),
-            "expected import source in graph output"
+            result.full.contains("src/util.rs"),
+            "expected import target in graph output"
+        );
+        // Import edges should not show the type label
+        assert!(
+            !result.full.contains("(import)"),
+            "import edges should not show type label"
+        );
+    }
+
+    #[test]
+    fn test_render_dependency_graph_with_schema_edge() {
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "api/orders.py".to_string(),
+                absolute_path: PathBuf::from("/tmp/api/orders.py"),
+                language: Some("python".to_string()),
+                size_bytes: 100,
+            },
+            ScannedFile {
+                relative_path: "schema/tables.sql".to_string(),
+                absolute_path: PathBuf::from("/tmp/schema/tables.sql"),
+                language: Some("sql".to_string()),
+                size_bytes: 200,
+            },
+        ];
+        let parse_results = HashMap::new();
+        let content_map = HashMap::from([
+            (
+                "api/orders.py".to_string(),
+                "SELECT * FROM orders".to_string(),
+            ),
+            (
+                "schema/tables.sql".to_string(),
+                "CREATE TABLE orders (id INT);".to_string(),
+            ),
+        ]);
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("api/orders.py", "schema/tables.sql", EdgeType::EmbeddedSql);
+        let result = render_dependency_graph(&index, &graph, 10000, &counter, false, "deps.md");
+        assert!(
+            result.full.contains("embedded_sql"),
+            "expected edge type label in graph output"
+        );
+        assert!(
+            result.full.contains("schema/tables.sql"),
+            "expected target in graph output"
+        );
+    }
+
+    #[test]
+    fn test_render_dependency_graph_empty() {
+        let (index, counter) = make_test_index();
+        let graph = DependencyGraph::new();
+        let result = render_dependency_graph(&index, &graph, 10000, &counter, false, "deps.md");
+        assert!(
+            result.full.is_empty(),
+            "empty graph should produce no output"
         );
     }
 
