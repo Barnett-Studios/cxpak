@@ -103,7 +103,7 @@ Once configured, your AI tool can call these tools:
 
 All tools support a `focus` path prefix parameter to scope results.
 
-> **Note:** The MCP server requires the `daemon` feature. Install with `cargo install cxpak --features daemon` or use Homebrew (includes daemon support by default).
+> **Note:** The MCP server, embeddings, and all features are included by default. No extra feature flags needed.
 
 ### 3. Claude Code Plugin (auto-triggers + slash commands)
 
@@ -139,9 +139,6 @@ The plugin auto-downloads the cxpak binary if it's not already installed.
 Run cxpak as a persistent HTTP server with a hot index:
 
 ```bash
-# Install with daemon support
-cargo install cxpak --features daemon
-
 # Start HTTP server (default port 3000)
 cxpak serve .
 cxpak serve --port 8080 .
@@ -157,6 +154,11 @@ cxpak watch .
 | `GET /overview?tokens=50000` | Structured repo summary |
 | `GET /trace?target=handle_request` | Trace a symbol through dependencies |
 | `GET /diff?git_ref=HEAD~1` | Show changes with dependency context |
+| `POST /search` | Regex search with context |
+| `POST /blast_radius` | Change impact analysis |
+| `POST /api_surface` | Public API extraction |
+| `POST /auto_context` | One-call optimal context |
+| `POST /context_diff` | Session delta |
 
 ## What You Get
 
@@ -222,7 +224,7 @@ Non-import edges are surfaced in the dependency graph output and in pack context
 
 ## Intelligence
 
-cxpak v0.13.0 adds graph-based intelligence features that go beyond static analysis.
+cxpak includes graph-based intelligence features that go beyond static analysis.
 
 **PageRank File Importance** — Every file in the dependency graph is scored 0.0–1.0 using PageRank over the import graph. Files that are transitively imported by many others rank higher. PageRank is used as signal #6 in relevance scoring (weight 0.17) and drives degradation priority via the formula `0.6 × pagerank + 0.2 × concept_priority + 0.2 × file_role`. Symbol-level importance is computed as `file_pagerank × symbol_weight`, where symbol_weight is 1.0 (public + referenced), 0.7 (public), or 0.3 (private).
 
