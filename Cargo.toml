@@ -89,6 +89,7 @@ default = [
     "lang-proto", "lang-svelte", "lang-makefile", "lang-html", "lang-graphql", "lang-xml",
     "lang-sql", "lang-prisma",
     "daemon",
+    "embeddings",
 ]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-typescript = ["dep:tree-sitter-typescript"]
