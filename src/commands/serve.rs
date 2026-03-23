@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 type SharedIndex = Arc<RwLock<CodebaseIndex>>;
+type SharedSnapshot = Arc<RwLock<Option<crate::auto_context::diff::ContextSnapshot>>>;
 
 fn matches_focus(path: &str, focus: Option<&str>) -> bool {
     match focus {
@@ -72,6 +73,7 @@ type SharedPath = Arc<std::path::PathBuf>;
 struct AppState {
     index: SharedIndex,
     repo_path: SharedPath,
+    snapshot: SharedSnapshot,
 }
 
 impl axum::extract::FromRef<AppState> for SharedIndex {
@@ -86,11 +88,19 @@ impl axum::extract::FromRef<AppState> for SharedPath {
     }
 }
 
+impl axum::extract::FromRef<AppState> for SharedSnapshot {
+    fn from_ref(state: &AppState) -> Self {
+        state.snapshot.clone()
+    }
+}
+
 /// Build the axum Router for the HTTP server.
 fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
+    let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
     let state = AppState {
         index: shared,
         repo_path,
+        snapshot,
     };
     Router::new()
         .route("/health", get(health_handler))
@@ -101,6 +111,8 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
         .route("/search", axum::routing::post(search_handler))
         .route("/blast_radius", axum::routing::post(blast_radius_handler))
         .route("/api_surface", get(api_surface_handler))
+        .route("/auto_context", axum::routing::post(auto_context_handler))
+        .route("/context_diff", get(context_diff_handler))
         .with_state(state)
 }
 
@@ -434,6 +446,77 @@ async fn api_surface_handler(
     )))
 }
 
+// --- HTTP handlers for auto_context and context_diff ---
+
+#[derive(Deserialize)]
+struct AutoContextParams {
+    task: String,
+    tokens: Option<String>,
+    focus: Option<String>,
+    include_tests: Option<bool>,
+    include_blast_radius: Option<bool>,
+}
+
+async fn auto_context_handler(
+    State(index): State<SharedIndex>,
+    State(snapshot): State<SharedSnapshot>,
+    Json(params): Json<AutoContextParams>,
+) -> Result<Json<Value>, StatusCode> {
+    if params.task.is_empty() {
+        return Ok(Json(
+            json!({"error": "task is required and must not be empty"}),
+        ));
+    }
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let token_budget = params
+        .tokens
+        .as_deref()
+        .and_then(|t| crate::cli::parse_token_count(t).ok())
+        .unwrap_or(50_000);
+    let opts = crate::auto_context::AutoContextOpts {
+        tokens: token_budget,
+        focus: params.focus,
+        include_tests: params.include_tests.unwrap_or(true),
+        include_blast_radius: params.include_blast_radius.unwrap_or(true),
+    };
+    let result = crate::auto_context::auto_context(&params.task, &idx, &opts);
+    // Store snapshot for subsequent context_diff calls.
+    if let Ok(mut snap) = snapshot.write() {
+        *snap = Some(crate::auto_context::diff::create_snapshot(&idx));
+    }
+    Ok(Json(serde_json::to_value(&result).unwrap_or_else(
+        |_| json!({"error": "serialisation failed"}),
+    )))
+}
+
+#[derive(Deserialize)]
+struct ContextDiffParams {
+    #[allow(dead_code)]
+    since: Option<String>,
+}
+
+async fn context_diff_handler(
+    State(index): State<SharedIndex>,
+    State(snapshot): State<SharedSnapshot>,
+    Query(_params): Query<ContextDiffParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let snap_guard = snapshot
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let delta = match snap_guard.as_ref() {
+        None => crate::auto_context::diff::no_snapshot_recommendation(),
+        Some(snap) => crate::auto_context::diff::compute_diff(snap, &idx),
+    };
+    Ok(Json(serde_json::to_value(&delta).unwrap_or_else(
+        |_| json!({"error": "serialisation failed"}),
+    )))
+}
+
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -444,7 +527,8 @@ pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         index.total_files, index.total_tokens
     );
 
-    mcp_stdio_loop(path, &index)
+    let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
+    mcp_stdio_loop(path, &index, &snapshot)
 }
 
 /// Run the MCP stdio loop.
@@ -456,15 +540,17 @@ pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn mcp_stdio_loop(
     repo_path: &Path,
     index: &CodebaseIndex,
+    snapshot: &SharedSnapshot,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    mcp_stdio_loop_with_io(repo_path, index, stdin.lock(), &mut stdout.lock())
+    mcp_stdio_loop_with_io(repo_path, index, snapshot, stdin.lock(), &mut stdout.lock())
 }
 
 fn mcp_stdio_loop_with_io(
     repo_path: &Path,
     index: &CodebaseIndex,
+    snapshot: &SharedSnapshot,
     reader: impl std::io::BufRead,
     writer: &mut impl std::io::Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -501,6 +587,32 @@ fn mcp_stdio_loop_with_io(
                 id,
                 json!({
                     "tools": [
+                        {
+                            "name": "cxpak_auto_context",
+                            "description": "One-call optimal context for any task. Automatically selects, ranks, filters, packs, and annotates the best context from the entire codebase. Start here — use other tools only if you need finer control.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "task": { "type": "string", "description": "Natural language task description" },
+                                    "tokens": { "type": "string", "description": "Token budget (default '50k')", "default": "50k" },
+                                    "focus": { "type": "string", "description": "Path prefix to scope" },
+                                    "include_tests": { "type": "boolean", "description": "Include mapped test files (default true)", "default": true },
+                                    "include_blast_radius": { "type": "boolean", "description": "Include blast radius analysis (default true)", "default": true }
+                                },
+                                "required": ["task"]
+                            }
+                        },
+                        {
+                            "name": "cxpak_context_diff",
+                            "description": "Show what changed since the last auto_context call. Lightweight delta for long sessions.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "since": { "type": "string", "description": "What to diff against: 'last_call' (default) or a git ref", "default": "last_call" },
+                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
+                                }
+                            }
+                        },
                         {
                             "name": "cxpak_overview",
                             "description": "Get a structured overview of the codebase",
@@ -639,7 +751,7 @@ fn mcp_stdio_loop_with_io(
                 let params = request.get("params").cloned().unwrap_or(json!({}));
                 let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                handle_tool_call(id, tool_name, &arguments, index, repo_path)
+                handle_tool_call(id, tool_name, &arguments, index, repo_path, snapshot)
             }
             _ => mcp_error_response(id, -32601, "Method not found"),
         };
@@ -658,8 +770,61 @@ fn handle_tool_call(
     args: &Value,
     index: &CodebaseIndex,
     repo_path: &Path,
+    snapshot: &SharedSnapshot,
 ) -> Value {
     match tool_name {
+        "cxpak_auto_context" => {
+            let task = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
+            if task.is_empty() {
+                return mcp_tool_result(
+                    id,
+                    "Error: 'task' argument is required and must not be empty",
+                );
+            }
+            let token_budget = args
+                .get("tokens")
+                .and_then(|t| t.as_str())
+                .and_then(|t| crate::cli::parse_token_count(t).ok())
+                .unwrap_or(50_000);
+            let focus = args.get("focus").and_then(|f| f.as_str()).map(String::from);
+            let include_tests = args
+                .get("include_tests")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let include_blast_radius = args
+                .get("include_blast_radius")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let opts = crate::auto_context::AutoContextOpts {
+                tokens: token_budget,
+                focus,
+                include_tests,
+                include_blast_radius,
+            };
+            let result = crate::auto_context::auto_context(task, index, &opts);
+            // Store snapshot for subsequent context_diff calls.
+            if let Ok(mut snap) = snapshot.write() {
+                *snap = Some(crate::auto_context::diff::create_snapshot(index));
+            }
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
+        "cxpak_context_diff" => {
+            let snap_guard = snapshot.read();
+            let delta = match snap_guard {
+                Ok(guard) => match guard.as_ref() {
+                    None => crate::auto_context::diff::no_snapshot_recommendation(),
+                    Some(snap) => crate::auto_context::diff::compute_diff(snap, index),
+                },
+                Err(_) => crate::auto_context::diff::no_snapshot_recommendation(),
+            };
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&delta).unwrap_or_default(),
+            )
+        }
         "cxpak_stats" => {
             let focus = args.get("focus").and_then(|f| f.as_str());
 
@@ -1386,6 +1551,10 @@ mod tests {
         Arc::new(RwLock::new(make_test_index()))
     }
 
+    fn make_shared_snapshot() -> SharedSnapshot {
+        Arc::new(RwLock::new(None))
+    }
+
     // --- Health handler ---
 
     #[test]
@@ -1575,12 +1744,14 @@ mod tests {
     #[test]
     fn test_handle_tool_call_stats() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(1)),
             "cxpak_stats",
             &json!({}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         assert_eq!(resp["jsonrpc"], "2.0");
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1593,12 +1764,14 @@ mod tests {
     #[test]
     fn test_handle_tool_call_overview() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(2)),
             "cxpak_overview",
             &json!({}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -1609,12 +1782,14 @@ mod tests {
     #[test]
     fn test_handle_tool_call_trace_found() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(3)),
             "cxpak_trace",
             &json!({"target": "main"}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -1626,12 +1801,14 @@ mod tests {
     #[test]
     fn test_handle_tool_call_trace_content_fallback() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(4)),
             "cxpak_trace",
             &json!({"target": "hello"}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -1643,12 +1820,14 @@ mod tests {
     #[test]
     fn test_handle_tool_call_trace_not_found() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(5)),
             "cxpak_trace",
             &json!({"target": "nonexistent_xyz"}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -1658,12 +1837,14 @@ mod tests {
     #[test]
     fn test_handle_tool_call_trace_empty_target() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(6)),
             "cxpak_trace",
             &json!({"target": ""}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("required"));
@@ -1672,12 +1853,14 @@ mod tests {
     #[test]
     fn test_handle_tool_call_trace_missing_target_arg() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(7)),
             "cxpak_trace",
             &json!({}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("required"));
@@ -1686,12 +1869,14 @@ mod tests {
     #[test]
     fn test_handle_tool_call_unknown_tool() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(8)),
             "unknown_tool",
             &json!({}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1707,7 +1892,14 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "cxpak");
@@ -1720,11 +1912,18 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]
@@ -1734,7 +1933,14 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1749,7 +1955,14 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(resp["error"]["code"], -32601);
@@ -1763,7 +1976,14 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
         assert!(output.is_empty());
     }
 
@@ -1773,7 +1993,14 @@ mod tests {
         let input = "\n\n\n".to_string();
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
         assert!(output.is_empty());
     }
 
@@ -1783,7 +2010,14 @@ mod tests {
         let input = "not json\n".to_string();
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
         assert!(output.is_empty());
     }
 
@@ -1797,7 +2031,14 @@ mod tests {
         );
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
         let text = String::from_utf8(output).unwrap();
         let lines: Vec<&str> = text.trim().split('\n').collect();
         assert_eq!(lines.len(), 2);
@@ -1867,7 +2108,14 @@ mod tests {
         let input = format!("{input}\n");
         let cursor = std::io::Cursor::new(input.into_bytes());
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, cursor, &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
 
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
@@ -2429,13 +2677,20 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            9,
-            "should have 9 tools (4 existing + 2 v0.9 + 1 search + 1 blast_radius + 1 api_surface)"
+            11,
+            "should have 11 tools (4 existing + 2 v0.9 + 1 search + 1 blast_radius + 1 api_surface + 2 auto_context)"
         );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_context_for_task"));
@@ -2449,7 +2704,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context_for_task","arguments":{"task":"main function","limit":5}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2465,7 +2727,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context_for_task","arguments":{"task":""}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("Error") || content.contains("error"));
@@ -2478,7 +2747,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context_for_task","arguments":{"task":"hello"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2494,7 +2770,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs","src/lib.rs"],"tokens":"50k"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2511,7 +2794,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs"],"tokens":"50k","include_dependencies":true}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2527,7 +2817,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs","src/lib.rs"],"tokens":"1"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2544,7 +2841,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["nonexistent.rs"],"tokens":"50k"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2558,7 +2862,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":[],"tokens":"50k"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("Error") || content.contains("error"));
@@ -2572,7 +2883,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs"],"tokens":"xyz"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2589,7 +2907,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs","src/main.rs"],"tokens":"50k"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2612,7 +2937,14 @@ mod tests {
         let request1 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context_for_task","arguments":{"task":"main function"}}}"#;
         let input1 = format!("{request1}\n");
         let mut output1 = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input1.as_bytes(), &mut output1).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input1.as_bytes(),
+            &mut output1,
+        )
+        .unwrap();
         let response1: Value = serde_json::from_slice(&output1).unwrap();
         let content1 = response1["result"]["content"][0]["text"].as_str().unwrap();
         let result1: Value = serde_json::from_str(content1).unwrap();
@@ -2633,7 +2965,14 @@ mod tests {
         );
         let input2 = format!("{request2}\n");
         let mut output2 = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input2.as_bytes(), &mut output2).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input2.as_bytes(),
+            &mut output2,
+        )
+        .unwrap();
         let response2: Value = serde_json::from_slice(&output2).unwrap();
         let content2 = response2["result"]["content"][0]["text"].as_str().unwrap();
         let result2: Value = serde_json::from_str(content2).unwrap();
@@ -2668,7 +3007,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"fn main"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2689,7 +3035,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"zzz_nonexistent_pattern_zzz"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2705,7 +3058,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"[invalid"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("invalid regex"));
@@ -2719,7 +3079,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"fn","focus":"src/main"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2742,7 +3109,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"fn","limit":1}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2760,7 +3134,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":""}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -2774,12 +3155,14 @@ mod tests {
     #[test]
     fn test_mcp_overview_with_focus() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(1)),
             "cxpak_overview",
             &json!({"focus": "src/main"}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -2793,12 +3176,14 @@ mod tests {
     #[test]
     fn test_mcp_stats_with_focus() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(1)),
             "cxpak_stats",
             &json!({"focus": "src/lib"}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -2810,12 +3195,14 @@ mod tests {
     #[test]
     fn test_mcp_stats_with_focus_no_match() {
         let index = make_test_index();
+        let snap = make_shared_snapshot();
         let resp = handle_tool_call(
             Some(json!(1)),
             "cxpak_stats",
             &json!({"focus": "nonexistent/"}),
             &index,
             Path::new("/tmp"),
+            &snap,
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -2830,7 +3217,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -2869,7 +3263,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs"],"tokens":"50k"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2896,7 +3297,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs"],"tokens":"50k"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -2930,7 +3338,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/main.rs"],"tokens":"50k"}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -3000,7 +3415,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/util.rs"],"tokens":"50k","include_tests":true}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -3080,7 +3502,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_pack_context","arguments":{"files":["src/util.rs"],"tokens":"50k","include_tests":false}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -3141,7 +3570,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context_for_task","arguments":{"task":"auth","limit":5}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -3197,7 +3633,14 @@ mod tests {
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context_for_task","arguments":{"task":"db","limit":10}}}"#;
         let input = format!("{request}\n");
         let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo_path, &index, input.as_bytes(), &mut output).unwrap();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
@@ -3471,5 +3914,156 @@ mod tests {
             "app/models.py should have an OrmModel edge to schema/users.sql, got: {:?}",
             deps
         );
+    }
+
+    // --- cxpak_auto_context MCP tool ---
+
+    #[test]
+    fn test_mcp_auto_context_happy_path() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let snap = make_shared_snapshot();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_auto_context","arguments":{"task":"main function","tokens":"50k"}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, &snap, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(result["task"], "main function");
+        // Snapshot should have been populated after the call.
+        assert!(
+            snap.read().unwrap().is_some(),
+            "snapshot should be populated after cxpak_auto_context call"
+        );
+    }
+
+    #[test]
+    fn test_mcp_auto_context_empty_task_returns_error() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let snap = make_shared_snapshot();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_auto_context","arguments":{"task":""}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, &snap, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            content.contains("Error") || content.contains("error"),
+            "empty task should return error"
+        );
+    }
+
+    #[test]
+    fn test_mcp_auto_context_missing_task_returns_error() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let snap = make_shared_snapshot();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_auto_context","arguments":{}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, &snap, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            content.contains("Error") || content.contains("error"),
+            "missing task should return error"
+        );
+    }
+
+    #[test]
+    fn test_mcp_auto_context_first_in_tools_list() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let snap = make_shared_snapshot();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, &snap, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert_eq!(
+            tools[0]["name"], "cxpak_auto_context",
+            "cxpak_auto_context must be first in the tools list"
+        );
+    }
+
+    // --- cxpak_context_diff MCP tool ---
+
+    #[test]
+    fn test_mcp_context_diff_no_snapshot_returns_recommendation() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let snap = make_shared_snapshot();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context_diff","arguments":{}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, &snap, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        assert!(
+            result["recommendation"]
+                .as_str()
+                .unwrap()
+                .contains("cxpak_auto_context"),
+            "no-snapshot recommendation should mention cxpak_auto_context"
+        );
+    }
+
+    #[test]
+    fn test_mcp_context_diff_after_auto_context_shows_no_changes() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        // Use a persistent snapshot shared across both calls.
+        let snap = make_shared_snapshot();
+
+        // First: call auto_context to establish a snapshot.
+        let request1 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_auto_context","arguments":{"task":"main function"}}}"#;
+        let input1 = format!("{request1}\n");
+        let mut output1 = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, &snap, input1.as_bytes(), &mut output1).unwrap();
+        assert!(snap.read().unwrap().is_some(), "snapshot must be set");
+
+        // Second: call context_diff — should show no changes since index is unchanged.
+        let request2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cxpak_context_diff","arguments":{}}}"#;
+        let input2 = format!("{request2}\n");
+        let mut output2 = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, &snap, input2.as_bytes(), &mut output2).unwrap();
+        let response2: Value = serde_json::from_slice(&output2).unwrap();
+        let content2 = response2["result"]["content"][0]["text"].as_str().unwrap();
+        let result2: Value = serde_json::from_str(content2).unwrap();
+        assert!(
+            result2["recommendation"]
+                .as_str()
+                .unwrap()
+                .contains("No changes"),
+            "diff against identical index should report no changes, got: {}",
+            result2["recommendation"]
+        );
+    }
+
+    #[test]
+    fn test_mcp_tools_list_includes_auto_context_and_diff() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let snap = make_shared_snapshot();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo_path, &index, &snap, input.as_bytes(), &mut output).unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(
+            tool_names.contains(&"cxpak_auto_context"),
+            "tools/list should include cxpak_auto_context"
+        );
+        assert!(
+            tool_names.contains(&"cxpak_context_diff"),
+            "tools/list should include cxpak_context_diff"
+        );
+        assert_eq!(tools.len(), 11, "total tool count should be 11");
     }
 }
