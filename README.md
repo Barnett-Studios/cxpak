@@ -53,7 +53,7 @@ cxpak clean .                                         # Clear cache
 
 ### 2. MCP Server (for Claude Code, Cursor, and other AI tools)
 
-Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 9 codebase tools — including relevance scoring, query expansion, and schema-aware context packing.
+Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 11 codebase tools — including relevance scoring, query expansion, and schema-aware context packing.
 
 **Claude Code** — add to `.mcp.json` in your project root (or `~/.claude/.mcp.json` globally):
 
@@ -89,6 +89,7 @@ Once configured, your AI tool can call these tools:
 
 | Tool | Description |
 |------|-------------|
+| `cxpak_auto_context` | One-call optimal context for any task |
 | `cxpak_overview` | Structured repo summary |
 | `cxpak_trace` | Trace a symbol through dependencies |
 | `cxpak_stats` | Language stats and token counts |
@@ -98,6 +99,7 @@ Once configured, your AI tool can call these tools:
 | `cxpak_search` | Regex search with context lines |
 | `cxpak_blast_radius` | Analyze change impact with risk scores |
 | `cxpak_api_surface` | Extract public API surface |
+| `cxpak_context_diff` | Show what changed since last auto_context call |
 
 All tools support a `focus` path prefix parameter to scope results.
 
@@ -229,6 +231,70 @@ cxpak v0.13.0 adds graph-based intelligence features that go beyond static analy
 **API Surface Extraction** — The `cxpak_api_surface` MCP tool extracts the public API of a codebase: public symbols sorted by PageRank, HTTP routes (12 frameworks including Express, Actix, Axum, Flask, Django, FastAPI, Spring, Gin, Echo, Fiber, Rails, and Phoenix), gRPC services, and GraphQL types. Output is token-budgeted.
 
 **Test File Mapping** — cxpak automatically maps source files to their test files using naming conventions for 6 languages (Rust, TypeScript/JavaScript, Python, Java, Go, Ruby) plus a catch-all pattern, supplemented by import analysis. The `pack_context` tool auto-includes test files when the `include_tests` parameter is set. Blast radius uses the test map to populate the `test_files` category.
+
+## Auto Context
+
+`cxpak_auto_context` is the hero feature of v1.0.0 — one call that delivers optimal context for any task. Give it a task description and token budget; it returns everything the LLM needs.
+
+**10-step pipeline:**
+
+1. **Query expansion** — expands the task description with synonyms and domain-specific terms
+2. **Relevance scoring** — scores every file against the expanded query using 7 weighted signals
+3. **Seed selection** — picks the top-scoring files as seeds for graph traversal
+4. **Noise filtering** — 3 layers remove low-value files: blocklist (generated/vendored), similarity dedup (near-duplicate content), and relevance floor (below minimum score). Files removed by each layer are reported in `filtered_out` for transparency
+5. **Test inclusion** — maps seed files to their test files via naming conventions and import analysis
+6. **Schema linking** — pulls in schema files connected to seeds via typed dependency edges
+7. **Blast radius** — identifies files at risk from the seed set, sorted by risk score
+8. **API surface** — extracts public symbols and HTTP routes from seed files
+9. **Budget allocation** — fill-then-overflow priority packing: seeds first, then tests, schema, blast radius, and API surface until the budget is exhausted
+10. **Annotations** — each packed file gets a language-aware comment header with score, role, signals, and detail level
+
+**Noise filtering** applies three independent layers. The `filtered_out` field in the response lists every file removed and which layer caught it, so you can audit what was excluded and why.
+
+**Token-budgeted output** uses fill-then-overflow priority packing: high-priority categories (seeds, tests) fill first; lower-priority categories (blast radius, API surface) overflow into remaining budget. Content that doesn't fit is progressively degraded through 5 detail levels before being dropped.
+
+## Embeddings
+
+cxpak supports semantic embeddings as the 7th scoring signal (`embedding_similarity`, weight 0.15), improving relevance scoring for queries that don't share exact keywords with file content.
+
+**Local (zero config)** — On first use, cxpak auto-downloads the `all-MiniLM-L6-v2` model (~30 MB) and runs inference locally via candle. No API keys, no network calls after the initial download.
+
+**BYOK (Bring Your Own Key)** — For higher-quality embeddings, configure a remote provider in `.cxpak.json`:
+
+```json
+{
+  "embeddings": {
+    "provider": "openai",
+    "model": "text-embedding-3-small",
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url": "https://api.openai.com/v1",
+    "dimensions": 1536,
+    "batch_size": 100
+  }
+}
+```
+
+Supported providers: `openai`, `voyageai`, `cohere`. Set `api_key_env` to the environment variable holding your API key.
+
+**Graceful fallback** — If embedding computation fails for any reason (model download error, API timeout, missing key), cxpak falls back to the 6 deterministic scoring signals with zero impact on the rest of the pipeline.
+
+## Context Diff
+
+`cxpak_context_diff` shows what changed in the codebase since the last `cxpak_auto_context` call, enabling efficient session-length workflows.
+
+**Tracked changes:**
+
+- **Modified files** — files with content changes since the snapshot
+- **New files** — files added since the snapshot
+- **Deleted files** — files removed since the snapshot
+- **Symbol changes** — functions, types, and other symbols added, removed, or modified
+- **Graph edge changes** — new or removed dependency relationships
+
+The output includes a human-readable recommendation summarizing what changed and whether a fresh `auto_context` call is warranted.
+
+## Stable API
+
+v1.0.0 establishes semver for the MCP API. Tool names, required parameters, and response structures are stable in 1.x.
 
 ## Pack Mode
 

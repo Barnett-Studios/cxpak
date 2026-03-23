@@ -13,7 +13,7 @@ Pre-commit hooks enforce fmt + clippy + tests. CI enforces 90% coverage via tarp
 
 ## Architecture
 
-Pipeline: **Scanner → Parser → Schema → Index → Budget → Context Quality → Intelligence → Output**
+Pipeline: **Scanner → Parser → Schema → Index → Budget → Context Quality → Intelligence → Auto Context → Output**
 
 1. **Scanner** (`src/scanner/`) — walks git-tracked files, detects language from extension
 2. **Parser** (`src/parser/`) — tree-sitter extraction of symbols, imports, exports per language
@@ -22,7 +22,9 @@ Pipeline: **Scanner → Parser → Schema → Index → Budget → Context Quali
 5. **Budget** (`src/budget/`) — allocates token budget across sections, truncates with omission markers
 6. **Context Quality** (`src/context_quality/`) — progressive degradation, query expansion, context annotations
 7. **Intelligence** (`src/intelligence/`) — PageRank file importance, blast radius analysis, API surface extraction, test file mapping
-8. **Output** (`src/output/`) — renders to markdown, JSON, or XML
+8. **Auto Context** (`src/auto_context/`) — orchestrates the 10-step auto_context pipeline: query expansion, scoring, seed selection, noise filtering, test/schema/blast-radius/API-surface enrichment, budget allocation, and annotation
+9. **Embeddings** (`src/embeddings/`) — local candle inference with all-MiniLM-L6-v2 and remote API providers (OpenAI, Voyage AI, Cohere); builds and queries the vector index for semantic similarity scoring
+10. **Output** (`src/output/`) — renders to markdown, JSON, or XML
 
 ## Commands
 
@@ -83,6 +85,24 @@ Non-import edges are rendered with `(via: edge_type)` in the dependency subgraph
 - **`test_map.rs`** — `build_test_map()` (source→test file mapping via naming conventions for 6 languages: Rust, TypeScript/JavaScript, Python, Java, Go, Ruby, plus catch-all; supplemented by import analysis)
 
 PageRank scores feed into relevance scoring (signal #6, weight 0.17) and degradation priority (0.6 × pagerank + 0.2 × concept_priority + 0.2 × file_role).
+
+### Auto Context Module
+
+`src/auto_context/` orchestrates the one-call auto_context pipeline:
+
+- **`mod.rs`** — orchestration pipeline: wires the 10 steps (expansion → scoring → seeds → noise filtering → tests → schema → blast radius → API surface → budget allocation → annotations) into a single entry point
+- **`noise.rs`** — 3-layer noise filtering: blocklist (generated/vendored files), similarity dedup (near-duplicate content), relevance floor (below minimum score); reports every filtered file and the layer that caught it in `filtered_out`
+- **`briefing.rs`** — fill-then-overflow budget allocation: packs seeds first, then tests, schema, blast radius, and API surface by priority until the token budget is exhausted; applies progressive degradation to fit remaining content
+- **`diff.rs`** — context snapshots and deltas: captures a snapshot after each `auto_context` call and computes diffs (modified/new/deleted files, symbol changes, graph edge changes) for the `cxpak_context_diff` tool
+
+### Embeddings Module
+
+`src/embeddings/` provides semantic embedding support:
+
+- Local inference via candle with the `all-MiniLM-L6-v2` model (~30 MB, auto-downloaded on first use)
+- Remote API providers: OpenAI, Voyage AI, Cohere — configured via `.cxpak.json` with provider, model, api_key_env, base_url, dimensions, batch_size
+- Vector index for fast similarity queries
+- Embedding similarity is the 7th scoring signal (weight 0.15); graceful fallback to 6 deterministic signals on any failure
 
 ## Supported Languages (42)
 
