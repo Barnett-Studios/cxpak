@@ -24,6 +24,8 @@ pub struct CodebaseIndex {
     pub graph: DependencyGraph,
     pub pagerank: HashMap<String, f64>,
     pub test_map: HashMap<String, Vec<TestFileRef>>,
+    #[cfg(feature = "embeddings")]
+    pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
 }
 
 #[derive(Debug)]
@@ -141,6 +143,8 @@ impl CodebaseIndex {
             graph: DependencyGraph::new(),
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            #[cfg(feature = "embeddings")]
+            embedding_index: None,
         };
         index.schema = crate::schema::detect::build_schema_index(&index);
         index.graph =
@@ -152,6 +156,8 @@ impl CodebaseIndex {
             .map(|f| f.relative_path.clone())
             .collect();
         index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
+        // NOTE: embedding_index is NOT built here. It's built at server startup
+        // via build_embedding_index() — model download should not block CLI commands.
         index
     }
 
@@ -285,6 +291,8 @@ impl CodebaseIndex {
             graph: DependencyGraph::new(),
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            #[cfg(feature = "embeddings")]
+            embedding_index: None,
         };
         index.schema = crate::schema::detect::build_schema_index(&index);
         index.graph =
@@ -296,6 +304,8 @@ impl CodebaseIndex {
             .map(|f| f.relative_path.clone())
             .collect();
         index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
+        // NOTE: embedding_index is NOT built here. It's built at server startup
+        // via build_embedding_index() — model download should not block CLI commands.
         index
     }
 
@@ -305,6 +315,18 @@ impl CodebaseIndex {
     /// includes schema-aware edges.
     pub fn rebuild_graph(&mut self) {
         self.graph = crate::index::graph::build_dependency_graph(&self.files, self.schema.as_ref());
+    }
+
+    /// Returns `true` if an embedding index was successfully built for this codebase.
+    pub fn has_embedding_index(&self) -> bool {
+        #[cfg(feature = "embeddings")]
+        {
+            self.embedding_index.is_some()
+        }
+        #[cfg(not(feature = "embeddings"))]
+        {
+            false
+        }
     }
 
     /// Insert or update a single file in the index.
@@ -413,6 +435,66 @@ impl CodebaseIndex {
             || lower.ends_with("app.py")
             || lower.ends_with("index.ts")
             || lower.ends_with("index.js")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Embedding index construction (feature-gated)
+// ---------------------------------------------------------------------------
+
+/// Attempt to build an embedding index for all public symbols in the codebase.
+///
+/// Returns `None` on any error (missing API key, no network, etc.) so that
+/// the rest of the index build always succeeds.
+#[cfg(feature = "embeddings")]
+pub fn build_embedding_index(index: &CodebaseIndex) -> Option<crate::embeddings::EmbeddingIndex> {
+    use crate::embeddings::{create_provider, EmbeddingConfig, EmbeddingIndex};
+
+    let config = EmbeddingConfig::local_default();
+    let provider = match create_provider(config.clone()) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+
+    let symbols: Vec<(String, String)> = index
+        .files
+        .iter()
+        .filter_map(|f| {
+            f.parse_result
+                .as_ref()
+                .map(|pr| (f.relative_path.clone(), pr))
+        })
+        .flat_map(|(path, pr)| {
+            pr.symbols
+                .iter()
+                .filter(|s| s.visibility == crate::parser::language::Visibility::Public)
+                .map(move |s| (path.clone(), s.signature.clone()))
+        })
+        .collect();
+
+    if symbols.is_empty() {
+        return None;
+    }
+
+    let mut emb_index = EmbeddingIndex::new(provider.dimensions());
+
+    // Embed in batches.
+    let batch_size = config.batch_size;
+    for chunk in symbols.chunks(batch_size) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, sig)| sig.as_str()).collect();
+        let vectors = match provider.embed_batch(&texts) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        for ((path, _sig), vector) in chunk.iter().zip(vectors) {
+            emb_index.add(path.clone(), vector);
+        }
+    }
+
+    if emb_index.is_empty() {
+        None
+    } else {
+        Some(emb_index)
     }
 }
 

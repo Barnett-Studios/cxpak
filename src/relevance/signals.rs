@@ -310,6 +310,71 @@ pub fn pagerank_signal(file_path: &str, pagerank: &HashMap<String, f64>) -> Sign
     }
 }
 
+/// EmbeddingSimilarity: cosine similarity of the query embedding to the file's stored embedding.
+///
+/// Requires the `embeddings` feature and an `embedding_index` in the index.
+/// Returns a neutral score of 0.5 if no embedding is available for `file_path`.
+#[cfg(feature = "embeddings")]
+pub fn embedding_similarity_signal(
+    query: &str,
+    file_path: &str,
+    index: &CodebaseIndex,
+) -> crate::relevance::SignalResult {
+    use crate::embeddings::{create_provider, EmbeddingConfig};
+
+    let emb_index = match &index.embedding_index {
+        Some(ei) => ei,
+        None => {
+            return crate::relevance::SignalResult {
+                name: "embedding_similarity",
+                score: 0.5,
+                detail: "no embedding index".to_string(),
+            }
+        }
+    };
+
+    // Embed the query on-the-fly using the local provider.
+    let config = EmbeddingConfig::local_default();
+    let provider = match create_provider(config) {
+        Ok(p) => p,
+        Err(e) => {
+            return crate::relevance::SignalResult {
+                name: "embedding_similarity",
+                score: 0.5,
+                detail: format!("provider error: {e}"),
+            }
+        }
+    };
+
+    let query_vec = match provider.embed(query) {
+        Ok(v) => v,
+        Err(e) => {
+            return crate::relevance::SignalResult {
+                name: "embedding_similarity",
+                score: 0.5,
+                detail: format!("embed error: {e}"),
+            }
+        }
+    };
+
+    match emb_index.cosine_similarity(file_path, &query_vec) {
+        Some(sim) => {
+            // Cosine similarity is in [-1, 1]; map to [0, 1].
+            let score = ((sim + 1.0) / 2.0).clamp(0.0, 1.0);
+            crate::relevance::SignalResult {
+                name: "embedding_similarity",
+                score,
+                detail: format!("cosine={sim:.4}"),
+            }
+        }
+        None => crate::relevance::SignalResult {
+            name: "embedding_similarity",
+            score: 0.5,
+            detail: "file not in embedding index".to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

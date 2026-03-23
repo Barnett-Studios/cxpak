@@ -989,6 +989,8 @@ mod tests {
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
             files,
+            #[cfg(feature = "embeddings")]
+            embedding_index: None,
         }
     }
 

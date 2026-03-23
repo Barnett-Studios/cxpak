@@ -40,10 +40,32 @@ pub struct SignalWeights {
     pub term_frequency: f64,
     pub recency_boost: f64,
     pub pagerank: f64,
+    /// Always present; value is 0.0 when embeddings are inactive.
+    pub embedding_similarity: f64,
 }
 
 impl Default for SignalWeights {
     fn default() -> Self {
+        Self::without_embeddings()
+    }
+}
+
+impl SignalWeights {
+    /// Weights used when an embedding index is available (7 active signals, sum = 1.0).
+    pub fn with_embeddings() -> Self {
+        Self {
+            path_similarity: 0.15,
+            symbol_match: 0.27,
+            import_proximity: 0.12,
+            term_frequency: 0.16,
+            recency_boost: 0.00,
+            pagerank: 0.15,
+            embedding_similarity: 0.15,
+        }
+    }
+
+    /// Weights used when no embedding index is present (matches v0.13.0, sum = 1.0).
+    pub fn without_embeddings() -> Self {
         Self {
             path_similarity: 0.18,
             symbol_match: 0.32,
@@ -51,6 +73,7 @@ impl Default for SignalWeights {
             term_frequency: 0.19,
             recency_boost: 0.00, // no git history in index yet; weight redistributed
             pagerank: 0.17,
+            embedding_similarity: 0.00,
         }
     }
 }
@@ -65,6 +88,19 @@ impl MultiSignalScorer {
     pub fn new() -> Self {
         Self {
             weights: SignalWeights::default(),
+            expanded_tokens: None,
+        }
+    }
+
+    /// Select weights based on whether the index has an embedding index.
+    pub fn new_for_index(index: &CodebaseIndex) -> Self {
+        let weights = if index.has_embedding_index() {
+            SignalWeights::with_embeddings()
+        } else {
+            SignalWeights::without_embeddings()
+        };
+        Self {
+            weights,
             expanded_tokens: None,
         }
     }
@@ -107,12 +143,23 @@ impl RelevanceScorer for MultiSignalScorer {
         };
         let pr_sig = signals::pagerank_signal(file_path, &index.pagerank);
 
+        // Signal 7: embedding similarity (feature-gated, value 0.0 when inactive).
+        #[cfg(feature = "embeddings")]
+        let emb_sig = signals::embedding_similarity_signal(query, file_path, index);
+        #[cfg(not(feature = "embeddings"))]
+        let emb_sig = SignalResult {
+            name: "embedding_similarity",
+            score: 0.0,
+            detail: "embeddings feature not enabled".to_string(),
+        };
+
         let combined = w.path_similarity * path_sig.score
             + w.symbol_match * symbol_sig.score
             + w.import_proximity * import_sig.score
             + w.term_frequency * tf_sig.score
             + w.recency_boost * recency_sig.score
-            + w.pagerank * pr_sig.score;
+            + w.pagerank * pr_sig.score
+            + w.embedding_similarity * emb_sig.score;
 
         // Clamp to 0.0–1.0
         let score = combined.clamp(0.0, 1.0);
@@ -134,6 +181,7 @@ impl RelevanceScorer for MultiSignalScorer {
                 tf_sig,
                 recency_sig,
                 pr_sig,
+                emb_sig,
             ],
             token_count,
         }
@@ -223,7 +271,7 @@ mod tests {
         let scorer = MultiSignalScorer::new();
         let result = scorer.score("api request handler", "src/api/mod.rs", &index);
         assert!(result.score >= 0.0 && result.score <= 1.0);
-        assert_eq!(result.signals.len(), 6);
+        assert_eq!(result.signals.len(), 7);
         assert_eq!(result.path, "src/api/mod.rs");
     }
 
@@ -257,10 +305,76 @@ mod tests {
             + w.import_proximity
             + w.term_frequency
             + w.recency_boost
-            + w.pagerank;
+            + w.pagerank
+            + w.embedding_similarity;
         assert!(
             (sum - 1.0).abs() < 0.001,
             "Weights should sum to 1.0, got {sum}"
+        );
+    }
+
+    #[test]
+    fn weights_without_embeddings_sum_to_one() {
+        let w = SignalWeights::without_embeddings();
+        let sum = w.path_similarity
+            + w.symbol_match
+            + w.import_proximity
+            + w.term_frequency
+            + w.recency_boost
+            + w.pagerank
+            + w.embedding_similarity;
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "without_embeddings weights should sum to 1.0, got {sum}"
+        );
+        assert_eq!(
+            w.embedding_similarity, 0.0,
+            "embedding_similarity must be 0.0 when inactive"
+        );
+    }
+
+    #[test]
+    fn weights_with_embeddings_sum_to_one() {
+        let w = SignalWeights::with_embeddings();
+        let sum = w.path_similarity
+            + w.symbol_match
+            + w.import_proximity
+            + w.term_frequency
+            + w.recency_boost
+            + w.pagerank
+            + w.embedding_similarity;
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "with_embeddings weights should sum to 1.0, got {sum}"
+        );
+        assert!(
+            w.embedding_similarity > 0.0,
+            "embedding_similarity must be positive when active"
+        );
+    }
+
+    #[test]
+    fn scorer_selects_correct_weights() {
+        let index = make_test_index();
+        let scorer = MultiSignalScorer::new_for_index(&index);
+        // Index was built without embeddings (local provider would fail in tests),
+        // so we expect without_embeddings weights.
+        assert_eq!(
+            scorer.weights.embedding_similarity, 0.0,
+            "no embedding index => embedding_similarity weight must be 0.0"
+        );
+        // Ensure the total still sums to 1.0.
+        let w = &scorer.weights;
+        let sum = w.path_similarity
+            + w.symbol_match
+            + w.import_proximity
+            + w.term_frequency
+            + w.recency_boost
+            + w.pagerank
+            + w.embedding_similarity;
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "scorer weights should sum to 1.0, got {sum}"
         );
     }
 
@@ -274,6 +388,7 @@ mod tests {
             term_frequency: 0.0,
             recency_boost: 0.0,
             pagerank: 0.0,
+            embedding_similarity: 0.0,
         });
         let result = scorer.score("api", "src/api/mod.rs", &index);
         // Only path_similarity contributes
