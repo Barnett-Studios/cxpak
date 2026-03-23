@@ -82,6 +82,8 @@ default = [
     "lang-groovy", "lang-objc", "lang-r", "lang-julia", "lang-ocaml", "lang-matlab",
     "lang-proto", "lang-svelte", "lang-makefile", "lang-html", "lang-graphql", "lang-xml",
     "lang-sql", "lang-prisma",
+    "daemon",
+    "embeddings",
 ]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-typescript = ["dep:tree-sitter-typescript"]
@@ -126,3 +128,4 @@ lang-xml = ["dep:tree-sitter-xml"]
 lang-sql = ["dep:tree-sitter-sequel"]
 lang-prisma = ["dep:tree-sitter-prisma-io"]
 daemon = ["dep:notify", "dep:axum", "dep:tokio"]
+embeddings = []

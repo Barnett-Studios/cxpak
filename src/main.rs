@@ -1,11 +1,14 @@
 mod cli;
 mod commands;
 
+pub mod auto_context;
 pub mod budget;
 pub mod cache;
 pub mod context_quality;
 #[cfg(feature = "daemon")]
 pub mod daemon;
+#[cfg(feature = "embeddings")]
+pub mod embeddings;
 pub mod git;
 pub mod index;
 pub mod intelligence;
