@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
@@ -170,7 +171,7 @@ pub struct ScoredFileEntry {
 }
 
 /// A file that was excluded by the noise filter, along with the reason.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FilteredFile {
     pub path: String,
     pub reason: String,
