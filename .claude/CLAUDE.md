@@ -99,7 +99,7 @@ PageRank scores feed into relevance scoring (signal #6, weight 0.17) and degrada
 
 `src/embeddings/` provides semantic embedding support:
 
-- Local inference via candle with the `all-MiniLM-L6-v2` model (~30 MB, auto-downloaded on first use)
+- Local inference via candle with the `all-MiniLM-L6-v2` model (~30 MB, downloaded on first use)
 - Remote API providers: OpenAI, Voyage AI, Cohere — configured via `.cxpak.json` with provider, model, api_key_env, base_url, dimensions, batch_size
 - Vector index for fast similarity queries
 - Embedding similarity is the 7th scoring signal (weight 0.15); graceful fallback to 6 deterministic signals on any failure
@@ -124,11 +124,9 @@ Key files with version references (all must stay in sync):
 - `Cargo.toml` — crate version
 - `plugin/.claude-plugin/plugin.json` — plugin metadata version
 - `.claude-plugin/marketplace.json` — marketplace listing version
-- `plugin/lib/ensure-cxpak` — `REQUIRED_VERSION` (pinned download version)
+`plugin/lib/ensure-cxpak` finds cxpak on PATH, or installs via Homebrew/cargo if not found.
 
-`plugin/lib/ensure-cxpak` checks PATH and cached install, verifies version matches `REQUIRED_VERSION`, and downloads the pinned release if outdated.
-
-`plugin/lib/ensure-cxpak-serve` does the same for the `serve` command.
+`plugin/lib/ensure-cxpak-serve` uses `ensure-cxpak` to resolve the binary, then exec's `cxpak serve --mcp`.
 
 ## Release
 

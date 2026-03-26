@@ -116,7 +116,7 @@ The plugin wraps cxpak as skills and slash commands. Skills auto-trigger when Cl
 /plugin install cxpak
 ```
 
-The plugin auto-downloads the cxpak binary if it's not already installed.
+The plugin installs cxpak automatically via Homebrew (or cargo) if not already on PATH.
 
 **Skills (auto-invoked):**
 
@@ -259,7 +259,7 @@ cxpak includes graph-based intelligence features that go beyond static analysis.
 
 cxpak supports semantic embeddings as the 7th scoring signal (`embedding_similarity`, weight 0.15), improving relevance scoring for queries that don't share exact keywords with file content.
 
-**Local (zero config)** — On first use, cxpak auto-downloads the `all-MiniLM-L6-v2` model (~30 MB) and runs inference locally via candle. No API keys, no network calls after the initial download.
+**Local (zero config)** — On first use, cxpak downloads the `all-MiniLM-L6-v2` model (~30 MB) and runs inference locally via candle. No API keys needed.
 
 **BYOK (Bring Your Own Key)** — For higher-quality embeddings, configure a remote provider in `.cxpak.json`:
 

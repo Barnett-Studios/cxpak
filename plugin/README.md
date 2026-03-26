@@ -12,7 +12,7 @@ Structured codebase context for Claude Code, powered by [cxpak](https://github.c
 
 ### Prerequisites
 
-cxpak is auto-downloaded on first use if not already installed. To install manually:
+cxpak is installed automatically via Homebrew or cargo if not on PATH. To install manually:
 
 ```bash
 # Via Homebrew
