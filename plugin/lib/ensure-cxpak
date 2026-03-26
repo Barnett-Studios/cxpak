@@ -1,35 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Find cxpak on PATH. If not found, install via brew or cargo.
+REQUIRED_VERSION="1.0.0"
 
+# Helper: check if installed version matches required
+version_ok() {
+    local bin="$1"
+    local installed
+    installed="$("$bin" --version 2>/dev/null | awk '{print $2}')" || return 1
+    [ "$installed" = "$REQUIRED_VERSION" ]
+}
+
+# 1. Check PATH for correct version
 if command -v cxpak >/dev/null 2>&1; then
-    echo "$(command -v cxpak)"
-    exit 0
+    CXPAK_PATH="$(command -v cxpak)"
+    if version_ok "$CXPAK_PATH"; then
+        echo "$CXPAK_PATH"
+        exit 0
+    fi
+    echo "cxpak: found v$(cxpak --version 2>/dev/null | awk '{print $2}') on PATH, need v${REQUIRED_VERSION}. Upgrading..." >&2
 fi
 
-# Not on PATH — try to install
-
+# 2. Install/upgrade via Homebrew
 if command -v brew >/dev/null 2>&1; then
-    echo "cxpak: not found, installing via Homebrew..." >&2
-    brew tap Barnett-Studios/tap 2>&1 >&2
-    brew install cxpak 2>&1 >&2
-    if command -v cxpak >/dev/null 2>&1; then
+    echo "cxpak: installing v${REQUIRED_VERSION} via Homebrew..." >&2
+    brew tap Barnett-Studios/tap >/dev/null 2>&1 || true
+    brew upgrade cxpak >/dev/null 2>&1 || brew install cxpak >/dev/null 2>&1 || true
+    if command -v cxpak >/dev/null 2>&1 && version_ok "$(command -v cxpak)"; then
         echo "$(command -v cxpak)"
         exit 0
     fi
 fi
 
+# 3. Install/upgrade via cargo
 if command -v cargo >/dev/null 2>&1; then
-    echo "cxpak: not found, installing via cargo..." >&2
-    cargo install cxpak 2>&1 >&2
-    if command -v cxpak >/dev/null 2>&1; then
+    echo "cxpak: installing v${REQUIRED_VERSION} via cargo..." >&2
+    cargo install cxpak --version "${REQUIRED_VERSION}" >/dev/null 2>&1 || true
+    if command -v cxpak >/dev/null 2>&1 && version_ok "$(command -v cxpak)"; then
         echo "$(command -v cxpak)"
         exit 0
     fi
 fi
 
-echo "cxpak: not found and could not install automatically." >&2
+echo "cxpak: could not install v${REQUIRED_VERSION}." >&2
 echo "" >&2
 echo "Install manually:" >&2
 echo "  brew tap Barnett-Studios/tap && brew install cxpak" >&2
