@@ -59,12 +59,9 @@ pub(crate) fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::err
         content_map.insert(file.relative_path.clone(), source);
     }
 
-    Ok(CodebaseIndex::build_with_content(
-        files,
-        parse_results,
-        &counter,
-        content_map,
-    ))
+    let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+    index.conventions = crate::conventions::build_convention_profile(&index, path);
+    Ok(index)
 }
 
 type SharedPath = Arc<std::path::PathBuf>;
@@ -748,6 +745,29 @@ fn mcp_stdio_loop_with_io(
                                     "focus": { "type": "string", "description": "Path prefix to scope" },
                                     "include": { "type": "string", "description": "What to include: 'all', 'symbols', 'routes' (default 'all')", "default": "all" },
                                     "tokens": { "type": "string", "description": "Token budget (default '20k')", "default": "20k" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_verify",
+                            "description": "Verify code changes against the codebase's observed conventions. Reports deviations with evidence, severity, and suggested fixes. Only flags violations in changed lines, not pre-existing debt.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "ref": { "type": "string", "description": "Git ref to diff against (default: auto-detect uncommitted changes vs HEAD)" },
+                                    "focus": { "type": "string", "description": "Path prefix to scope verification" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_conventions",
+                            "description": "Return the full convention profile for the codebase. Shows all detected patterns with counts, percentages, strength labels, and exceptions.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "category": { "type": "string", "description": "Filter: 'naming', 'imports', 'errors', 'dependencies', 'testing', 'visibility', 'functions', 'git_health', or 'all' (default 'all')", "default": "all" },
+                                    "strength": { "type": "string", "description": "Minimum strength: 'convention', 'trend', 'mixed', or 'all' (default 'all')", "default": "all" },
+                                    "focus": { "type": "string", "description": "Path prefix — recompute stats scoped to this directory" }
                                 }
                             }
                         }
@@ -1443,6 +1463,67 @@ fn handle_tool_call(
                 &serde_json::to_string_pretty(&surface).unwrap_or_default(),
             )
         }
+        "cxpak_verify" => {
+            let git_ref = args.get("ref").and_then(|r| r.as_str());
+            let focus = args.get("focus").and_then(|f| f.as_str());
+
+            let changed =
+                match crate::conventions::verify::get_changed_lines(repo_path, git_ref, focus) {
+                    Ok(c) => c,
+                    Err(e) => return mcp_tool_result(id, &format!("Error: {e}")),
+                };
+
+            if changed.is_empty() {
+                return mcp_tool_result(
+                    id,
+                    &serde_json::to_string_pretty(&serde_json::json!({
+                        "files_checked": 0,
+                        "lines_checked": 0,
+                        "violations": [],
+                        "passed": ["No changes detected"],
+                        "summary": {"high": 0, "medium": 0, "low": 0}
+                    }))
+                    .unwrap_or_default(),
+                );
+            }
+
+            let result = crate::conventions::verify::verify_changes(&changed, index, repo_path);
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&serde_json::to_value(&result).unwrap_or_default())
+                    .unwrap_or_default(),
+            )
+        }
+        "cxpak_conventions" => {
+            let category = args
+                .get("category")
+                .and_then(|c| c.as_str())
+                .unwrap_or("all");
+            let _strength = args
+                .get("strength")
+                .and_then(|s| s.as_str())
+                .unwrap_or("all");
+            let _focus = args.get("focus").and_then(|f| f.as_str());
+
+            let profile = &index.conventions;
+
+            let result = match category {
+                "naming" => serde_json::to_value(&profile.naming).unwrap_or_default(),
+                "imports" => serde_json::to_value(&profile.imports).unwrap_or_default(),
+                "errors" => serde_json::to_value(&profile.errors).unwrap_or_default(),
+                "dependencies" => serde_json::to_value(&profile.dependencies).unwrap_or_default(),
+                "testing" => serde_json::to_value(&profile.testing).unwrap_or_default(),
+                "visibility" => serde_json::to_value(&profile.visibility).unwrap_or_default(),
+                "functions" => serde_json::to_value(&profile.functions).unwrap_or_default(),
+                "git_health" => serde_json::to_value(&profile.git_health).unwrap_or_default(),
+                _ => serde_json::to_value(profile).unwrap_or_default(),
+            };
+
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
         _ => mcp_response(
             id,
             json!({
@@ -1483,6 +1564,18 @@ fn process_watcher_changes(
         let update_count =
             apply_incremental_update(&mut idx, base_path, &modified_paths, &removed_paths);
         if update_count > 0 {
+            {
+                let mod_vec: Vec<String> = modified_paths.iter().cloned().collect();
+                let rem_vec: Vec<String> = removed_paths.iter().cloned().collect();
+                let mut conventions = std::mem::take(&mut idx.conventions);
+                crate::conventions::update_conventions_incremental(
+                    &mut conventions,
+                    &mod_vec,
+                    &rem_vec,
+                    &idx,
+                );
+                idx.conventions = conventions;
+            }
             eprintln!(
                 "cxpak: updated {} file(s), {} files / {} tokens total",
                 update_count, idx.total_files, idx.total_tokens
@@ -1930,7 +2023,7 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]
@@ -2696,8 +2789,8 @@ mod tests {
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            11,
-            "should have 11 tools (4 existing + 2 v0.9 + 1 search + 1 blast_radius + 1 api_surface + 2 auto_context)"
+            13,
+            "should have 13 tools (4 existing + 2 v0.9 + 1 search + 1 blast_radius + 1 api_surface + 2 auto_context + 2 conventions)"
         );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_context_for_task"));
@@ -4071,6 +4164,6 @@ mod tests {
             tool_names.contains(&"cxpak_context_diff"),
             "tools/list should include cxpak_context_diff"
         );
-        assert_eq!(tools.len(), 11, "total tool count should be 11");
+        assert_eq!(tools.len(), 13, "total tool count should be 13");
     }
 }

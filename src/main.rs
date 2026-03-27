@@ -5,6 +5,7 @@ pub mod auto_context;
 pub mod budget;
 pub mod cache;
 pub mod context_quality;
+pub mod conventions;
 #[cfg(feature = "daemon")]
 pub mod daemon;
 #[cfg(feature = "embeddings")]

@@ -48,13 +48,13 @@ cargo install cxpak
 
 All commands ask for a token budget (default: 50k).
 
-## MCP Tools (11)
+## MCP Tools (13)
 
 When used as an MCP server (`cxpak serve --mcp`), all tools support a `focus` path prefix parameter for scoped results:
 
 | Tool | Description |
 |------|-------------|
-| `cxpak_auto_context` | One-call optimal context for any task |
+| `cxpak_auto_context` | One-call optimal context for any task (includes DNA section) |
 | `cxpak_overview` | Structured repo summary |
 | `cxpak_trace` | Trace a symbol through dependencies |
 | `cxpak_stats` | Language stats and token counts |
@@ -65,6 +65,8 @@ When used as an MCP server (`cxpak serve --mcp`), all tools support a `focus` pa
 | `cxpak_blast_radius` | Analyze change impact with risk scores |
 | `cxpak_api_surface` | Extract public API surface |
 | `cxpak_context_diff` | Show what changed since last auto_context call |
+| `cxpak_verify` | Verify code changes against observed conventions |
+| `cxpak_conventions` | Return the full convention profile with evidence |
 
 ## License
 

@@ -13,7 +13,7 @@ Pre-commit hooks enforce fmt + clippy + tests. CI enforces 90% coverage via tarp
 
 ## Architecture
 
-Pipeline: **Scanner → Parser → Schema → Index → Budget → Context Quality → Intelligence → Auto Context → Output**
+Pipeline: **Scanner → Parser → Schema → Index → Conventions → Budget → Context Quality → Intelligence → Auto Context → Output**
 
 1. **Scanner** (`src/scanner/`) — walks git-tracked files, detects language from extension
 2. **Parser** (`src/parser/`) — tree-sitter extraction of symbols, imports, exports per language
@@ -22,9 +22,10 @@ Pipeline: **Scanner → Parser → Schema → Index → Budget → Context Quali
 5. **Budget** (`src/budget/`) — allocates token budget across sections, truncates with omission markers
 6. **Context Quality** (`src/context_quality/`) — progressive degradation, query expansion, context annotations
 7. **Intelligence** (`src/intelligence/`) — PageRank file importance, blast radius analysis, API surface extraction, test file mapping
-8. **Auto Context** (`src/auto_context/`) — orchestrates the 10-step auto_context pipeline: query expansion, scoring, seed selection, noise filtering, test/schema/blast-radius/API-surface enrichment, budget allocation, and annotation
-9. **Embeddings** (`src/embeddings/`) — local candle inference with all-MiniLM-L6-v2 and remote API providers (OpenAI, Voyage AI, Cohere); builds and queries the vector index for semantic similarity scoring
-10. **Output** (`src/output/`) — renders to markdown, JSON, or XML
+8. **Conventions** (`src/conventions/`) — extracts the codebase's actual patterns (naming, imports, errors, dependencies, testing, visibility, functions, git health) as a quantified `ConventionProfile`. Built after index construction via `build_convention_profile()`. Includes `verify.rs` for checking code changes against conventions, and `render.rs` for the ~1000 token DNA section included in every `auto_context` call.
+9. **Auto Context** (`src/auto_context/`) — orchestrates the 10-step auto_context pipeline: query expansion, scoring, seed selection, noise filtering, test/schema/blast-radius/API-surface enrichment, budget allocation, and annotation. Step 0 renders a DNA section (~1000 tokens) from the convention profile, deducted from the budget before fill-then-overflow allocation.
+10. **Embeddings** (`src/embeddings/`) — local candle inference with all-MiniLM-L6-v2 and remote API providers (OpenAI, Voyage AI, Cohere); builds and queries the vector index for semantic similarity scoring
+11. **Output** (`src/output/`) — renders to markdown, JSON, or XML
 
 ## Commands
 

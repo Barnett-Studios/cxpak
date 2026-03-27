@@ -4,6 +4,7 @@ pub mod symbols;
 
 use crate::budget::counter::TokenCounter;
 use crate::context_quality::expansion::Domain;
+use crate::conventions::ConventionProfile;
 use crate::index::graph::DependencyGraph;
 use crate::intelligence::test_map::TestFileRef;
 use crate::parser::language::{Import, ParseResult, Symbol, Visibility};
@@ -24,6 +25,7 @@ pub struct CodebaseIndex {
     pub graph: DependencyGraph,
     pub pagerank: HashMap<String, f64>,
     pub test_map: HashMap<String, Vec<TestFileRef>>,
+    pub conventions: ConventionProfile,
     #[cfg(feature = "embeddings")]
     pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
 }
@@ -143,6 +145,7 @@ impl CodebaseIndex {
             graph: DependencyGraph::new(),
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            conventions: ConventionProfile::default(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
         };
@@ -158,6 +161,8 @@ impl CodebaseIndex {
         index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
         // NOTE: embedding_index is NOT built here. It's built at server startup
         // via build_embedding_index() — model download should not block CLI commands.
+        // NOTE: conventions is NOT built here. It's built after index construction
+        // via build_convention_profile() — needs repo_path for git2 access.
         index
     }
 
@@ -291,6 +296,7 @@ impl CodebaseIndex {
             graph: DependencyGraph::new(),
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            conventions: ConventionProfile::default(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
         };
@@ -306,6 +312,8 @@ impl CodebaseIndex {
         index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
         // NOTE: embedding_index is NOT built here. It's built at server startup
         // via build_embedding_index() — model download should not block CLI commands.
+        // NOTE: conventions is NOT built here. It's built after index construction
+        // via build_convention_profile() — needs repo_path for git2 access.
         index
     }
 
@@ -422,6 +430,7 @@ impl CodebaseIndex {
             graph: DependencyGraph::new(),
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            conventions: ConventionProfile::default(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
         }

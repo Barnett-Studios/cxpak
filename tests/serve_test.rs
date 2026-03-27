@@ -473,7 +473,7 @@ mod serve_tests {
 
         assert_eq!(response["id"], 2);
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 13);
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_auto_context"));

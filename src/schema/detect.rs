@@ -988,6 +988,7 @@ mod tests {
             graph,
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            conventions: crate::conventions::ConventionProfile::default(),
             files,
             #[cfg(feature = "embeddings")]
             embedding_index: None,

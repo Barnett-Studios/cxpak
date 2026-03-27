@@ -21,6 +21,7 @@ pub struct AutoContextOpts {
 #[derive(Debug, Serialize)]
 pub struct AutoContextResult {
     pub task: String,
+    pub dna: String,
     pub budget: crate::auto_context::briefing::BudgetSummary,
     pub sections: crate::auto_context::briefing::PackedSections,
     pub filtered_out: Vec<FilteredFile>,
@@ -48,6 +49,21 @@ pub fn auto_context(
     index: &CodebaseIndex,
     opts: &AutoContextOpts,
 ) -> AutoContextResult {
+    // Step 0: DNA section — render convention profile, deduct from budget.
+    let counter = crate::budget::counter::TokenCounter::new();
+    let (effective_dna, dna_token_cost) = if opts.tokens < 2000 {
+        (String::new(), 0)
+    } else if opts.tokens < 5000 {
+        let compact = crate::conventions::render::render_compact_dna(&index.conventions);
+        let cost = counter.count(&compact);
+        (compact, cost)
+    } else {
+        let dna = crate::conventions::render::render_dna_section(&index.conventions);
+        let cost = counter.count(&dna);
+        (dna, cost)
+    };
+    let remaining_budget = opts.tokens.saturating_sub(dna_token_cost);
+
     // Step 1: Query expansion
     let expanded = crate::context_quality::expansion::expand_query(task, &index.domains);
 
@@ -140,18 +156,19 @@ pub fn auto_context(
         serde_json::to_value(&api).ok()
     };
 
-    // Step 10: Pack with budget allocation.
+    // Step 10: Pack with budget allocation (budget minus DNA tokens).
     let packed = crate::auto_context::briefing::allocate_and_pack(
         target_files,
         test_files,
         None,
         api_json,
         blast_json,
-        opts.tokens,
+        remaining_budget,
     );
 
     AutoContextResult {
         task: task.to_string(),
+        dna: effective_dna,
         budget: packed.budget,
         sections: packed.sections,
         filtered_out: filtered.filtered_out,
@@ -227,8 +244,8 @@ mod tests {
             result.budget.used + result.budget.remaining,
             result.budget.total
         );
-        // The pipeline should complete without panic; result fields are valid.
-        assert_eq!(result.budget.total, 50_000);
+        // Budget total is opts.tokens minus DNA token cost.
+        assert!(result.budget.total <= 50_000);
     }
 
     // -----------------------------------------------------------------------
