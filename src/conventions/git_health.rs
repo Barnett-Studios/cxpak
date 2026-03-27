@@ -318,4 +318,28 @@ mod tests {
             "real repo should have some history"
         );
     }
+
+    #[test]
+    fn test_needs_refresh_expired_ttl() {
+        // Timestamp older than TTL_SECONDS ago → needs_refresh must return true.
+        let expired_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(TTL_SECONDS + 10);
+
+        let profile = GitHealthProfile {
+            last_computed: Some(expired_ts),
+            ..Default::default()
+        };
+
+        assert!(needs_refresh(&profile));
+    }
+
+    #[test]
+    fn test_classify_trend_boundary_hot_vs_chronic() {
+        // c30_normalized == c180 → Chronic (not strictly greater)
+        // c30=10, c180=60 → c30*6=60 == c180=60 → Chronic
+        assert_eq!(classify_trend(10, 60), ChurnTrend::Chronic);
+    }
 }

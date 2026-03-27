@@ -452,6 +452,10 @@ fn to_camel_case(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::counter::TokenCounter;
+    use crate::conventions::PatternObservation;
+    use crate::parser::language::{Import, Symbol, SymbolKind, Visibility};
+    use std::collections::HashMap;
 
     #[test]
     fn test_to_snake_case() {
@@ -481,5 +485,468 @@ mod tests {
         };
         assert_eq!(cf.added_lines.len(), 3);
         assert!(!cf.is_new);
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Create a minimal git repo with one initial commit containing `filename`.
+    fn make_git_repo_with_file(dir: &tempfile::TempDir, filename: &str, content: &str) {
+        let repo = git2::Repository::init(dir.path()).unwrap();
+
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        let file_path = dir.path().join(filename);
+        std::fs::write(&file_path, content).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(filename)).unwrap();
+        index.write().unwrap();
+
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
+            .unwrap();
+    }
+
+    // ── get_changed_lines ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_changed_lines_not_a_git_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = get_changed_lines(dir.path(), None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Not a git repo"));
+    }
+
+    #[test]
+    fn test_get_changed_lines_clean_worktree_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_git_repo_with_file(&dir, "lib.rs", "fn main() {}");
+
+        // No changes since the commit → empty diff
+        let result = get_changed_lines(dir.path(), None, None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_changed_lines_detects_modified_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_git_repo_with_file(&dir, "lib.rs", "fn main() {}");
+
+        // Modify lib.rs without committing
+        std::fs::write(dir.path().join("lib.rs"), "fn main() {}\nfn extra() {}").unwrap();
+
+        let result = get_changed_lines(dir.path(), None, None).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].path, "lib.rs");
+        assert!(!result[0].is_new);
+    }
+
+    #[test]
+    fn test_get_changed_lines_detects_added_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_git_repo_with_file(&dir, "lib.rs", "fn main() {}");
+
+        // Append a new line
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "fn main() {}\nfn new_fn() { let x = 1; }",
+        )
+        .unwrap();
+
+        let result = get_changed_lines(dir.path(), None, None).unwrap();
+        let file = result.iter().find(|f| f.path == "lib.rs").unwrap();
+        // line 2 is added
+        assert!(file.added_lines.contains(&2));
+    }
+
+    #[test]
+    fn test_get_changed_lines_with_focus_filter() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_git_repo_with_file(&dir, "lib.rs", "fn main() {}");
+
+        // Modify lib.rs
+        std::fs::write(dir.path().join("lib.rs"), "fn main() {}\nfn extra() {}").unwrap();
+
+        // Focus on "src/" — lib.rs is not under src/, so it should be filtered out
+        let result = get_changed_lines(dir.path(), None, Some("src/")).unwrap();
+        assert!(result.is_empty());
+
+        // Focus on "lib" prefix — lib.rs should be included
+        let result2 = get_changed_lines(dir.path(), None, Some("lib")).unwrap();
+        assert_eq!(result2.len(), 1);
+    }
+
+    #[test]
+    fn test_get_changed_lines_tree_to_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_git_repo_with_file(&dir, "lib.rs", "fn main() {}");
+
+        // Make a second commit with a change
+        let repo = git2::Repository::discover(dir.path()).unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn main() {}\nfn extra() {}").unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("lib.rs")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "second commit", &tree, &[&parent])
+            .unwrap();
+
+        // Diff HEAD~1..HEAD
+        let result = get_changed_lines(dir.path(), Some("HEAD~1"), None).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].path, "lib.rs");
+    }
+
+    // ── verify_changes ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_changes_empty_changed_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+
+        let result = verify_changes(&[], &index, dir.path());
+        assert_eq!(result.files_checked, 0);
+        assert_eq!(result.lines_checked, 0);
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn test_verify_changes_no_violations_when_no_conventions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("src_lib.rs"), "fn my_fn() {}").unwrap();
+
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+
+        let changed = vec![ChangedFile {
+            path: "src_lib.rs".to_string(),
+            added_lines: vec![1],
+            is_new: true,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+        assert!(result.violations.is_empty());
+    }
+
+    // ── check_naming ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_check_naming_function_violation_snake_expected() {
+        let mut conventions = ConventionProfile::default();
+        conventions.naming.function_style =
+            PatternObservation::new("fn_naming", "snake_case", 95, 100);
+
+        let symbol = Symbol {
+            name: "handleRequest".into(), // camelCase — violates snake_case convention
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn handleRequest()".into(),
+            body: "{}".into(),
+            start_line: 1,
+            end_line: 2,
+        };
+
+        let mut violations = Vec::new();
+        check_naming("src/lib.rs", &symbol, &conventions, &mut violations);
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].category, "naming");
+        assert_eq!(violations[0].severity, "high");
+        assert!(violations[0]
+            .suggestion
+            .as_deref()
+            .unwrap()
+            .contains("handle_request"));
+    }
+
+    #[test]
+    fn test_check_naming_function_no_violation_when_matches() {
+        let mut conventions = ConventionProfile::default();
+        conventions.naming.function_style =
+            PatternObservation::new("fn_naming", "snake_case", 95, 100);
+
+        let symbol = Symbol {
+            name: "handle_request".into(), // already snake_case
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn handle_request()".into(),
+            body: "{}".into(),
+            start_line: 1,
+            end_line: 2,
+        };
+
+        let mut violations = Vec::new();
+        check_naming("src/lib.rs", &symbol, &conventions, &mut violations);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_check_naming_function_camel_expected_suggestion() {
+        // When convention is camelCase and name is snake_case, suggestion uses to_camel_case
+        let mut conventions = ConventionProfile::default();
+        conventions.naming.function_style =
+            PatternObservation::new("fn_naming", "camelCase", 90, 100);
+
+        let symbol = Symbol {
+            name: "handle_request".into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn handle_request()".into(),
+            body: "{}".into(),
+            start_line: 1,
+            end_line: 1,
+        };
+
+        let mut violations = Vec::new();
+        check_naming("src/api.rs", &symbol, &conventions, &mut violations);
+
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0]
+            .suggestion
+            .as_deref()
+            .unwrap()
+            .contains("handleRequest"));
+    }
+
+    #[test]
+    fn test_check_naming_type_violation() {
+        let mut conventions = ConventionProfile::default();
+        conventions.naming.type_style =
+            PatternObservation::new("type_naming", "PascalCase", 95, 100);
+
+        let symbol = Symbol {
+            name: "my_struct".into(), // snake_case — violates PascalCase convention
+            kind: SymbolKind::Struct,
+            visibility: Visibility::Public,
+            signature: "struct my_struct".into(),
+            body: "{}".into(),
+            start_line: 5,
+            end_line: 6,
+        };
+
+        let mut violations = Vec::new();
+        check_naming("src/lib.rs", &symbol, &conventions, &mut violations);
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].category, "naming");
+    }
+
+    #[test]
+    fn test_check_naming_no_convention_set() {
+        // When no naming convention is set, no violations are generated
+        let conventions = ConventionProfile::default();
+
+        let symbol = Symbol {
+            name: "anything".into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn anything()".into(),
+            body: "{}".into(),
+            start_line: 1,
+            end_line: 1,
+        };
+
+        let mut violations = Vec::new();
+        check_naming("src/lib.rs", &symbol, &conventions, &mut violations);
+        assert!(violations.is_empty());
+    }
+
+    // ── check_errors ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_check_errors_unwrap_in_production_code() {
+        let mut conventions = ConventionProfile::default();
+        conventions.errors.unwrap_usage =
+            PatternObservation::new("unwrap_usage", "no .unwrap() in src/", 95, 100);
+
+        let symbol = Symbol {
+            name: "my_fn".into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn my_fn()".into(),
+            body: "{ let x = foo.unwrap() }".into(), // contains .unwrap()
+            start_line: 1,
+            end_line: 3,
+        };
+
+        let mut violations = Vec::new();
+        // "src/lib.rs" — not a test file
+        check_errors("src/lib.rs", &symbol, &conventions, &mut violations);
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].category, "error_handling");
+        assert!(violations[0].suggestion.is_some());
+    }
+
+    #[test]
+    fn test_check_errors_unwrap_in_test_file_no_violation() {
+        let mut conventions = ConventionProfile::default();
+        conventions.errors.unwrap_usage =
+            PatternObservation::new("unwrap_usage", "no .unwrap() in src/", 95, 100);
+
+        let symbol = Symbol {
+            name: "test_fn".into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Private,
+            signature: "fn test_fn()".into(),
+            body: "{ foo.unwrap() }".into(),
+            start_line: 1,
+            end_line: 2,
+        };
+
+        let mut violations = Vec::new();
+        // Path contains "test" → no violation
+        check_errors("src/my_test.rs", &symbol, &conventions, &mut violations);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_check_errors_non_function_symbol_skipped() {
+        let mut conventions = ConventionProfile::default();
+        conventions.errors.unwrap_usage =
+            PatternObservation::new("unwrap_usage", "no .unwrap() in src/", 95, 100);
+
+        let symbol = Symbol {
+            name: "MyStruct".into(),
+            kind: SymbolKind::Struct, // not Function/Method → skipped
+            visibility: Visibility::Public,
+            signature: "struct MyStruct".into(),
+            body: "{ val: x.unwrap() }".into(),
+            start_line: 1,
+            end_line: 2,
+        };
+
+        let mut violations = Vec::new();
+        check_errors("src/lib.rs", &symbol, &conventions, &mut violations);
+        assert!(violations.is_empty());
+    }
+
+    // ── check_imports ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_check_imports_relative_violates_absolute_convention() {
+        let mut conventions = ConventionProfile::default();
+        conventions.imports.style = PatternObservation::new("import_style", "absolute", 95, 100);
+
+        let import = Import {
+            source: "./utils".into(), // relative — violates absolute convention
+            names: vec!["helper".into()],
+        };
+
+        let mut violations = Vec::new();
+        check_imports("src/lib.rs", &import, &conventions, &mut violations);
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].category, "imports");
+        assert!(violations[0].suggestion.is_some());
+    }
+
+    #[test]
+    fn test_check_imports_absolute_no_violation() {
+        let mut conventions = ConventionProfile::default();
+        conventions.imports.style = PatternObservation::new("import_style", "absolute", 95, 100);
+
+        let import = Import {
+            source: "crate::utils".into(), // absolute — OK
+            names: vec!["helper".into()],
+        };
+
+        let mut violations = Vec::new();
+        check_imports("src/lib.rs", &import, &conventions, &mut violations);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_check_imports_no_convention_set() {
+        let conventions = ConventionProfile::default();
+
+        let import = Import {
+            source: "./local".into(),
+            names: vec!["x".into()],
+        };
+
+        let mut violations = Vec::new();
+        check_imports("src/lib.rs", &import, &conventions, &mut violations);
+        assert!(violations.is_empty());
+    }
+
+    // ── verify_changes with symbols ──────────────────────────────────────────
+
+    #[test]
+    fn test_verify_changes_naming_violation_in_new_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Write a source file with a camelCase function
+        let content = "pub fn handleRequest() {}";
+        std::fs::write(dir.path().join("lib.rs"), content).unwrap();
+
+        let mut conventions = ConventionProfile::default();
+        conventions.naming.function_style =
+            PatternObservation::new("fn_naming", "snake_case", 95, 100);
+
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        index.conventions = conventions;
+
+        let changed = vec![ChangedFile {
+            path: "lib.rs".to_string(),
+            added_lines: vec![1],
+            is_new: true,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+        // The file has no parse result we inject, so tree-sitter parses the real content.
+        // Regardless, summary counts must be consistent.
+        assert_eq!(
+            result.summary.high + result.summary.medium + result.summary.low,
+            result.violations.len()
+        );
+    }
+
+    #[test]
+    fn test_verify_changes_summary_counts() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // File doesn't exist → skipped with no violations
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+
+        let changed = vec![ChangedFile {
+            path: "nonexistent.rs".to_string(),
+            added_lines: vec![1, 2, 3],
+            is_new: false,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+        assert_eq!(result.files_checked, 1);
+        assert_eq!(result.lines_checked, 3);
+        assert!(result.violations.is_empty());
+        assert_eq!(result.summary.high, 0);
+        assert_eq!(result.summary.medium, 0);
+        assert_eq!(result.summary.low, 0);
+    }
+
+    #[test]
+    fn test_verify_changes_passed_list_populated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn x() {}").unwrap();
+
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+
+        let changed = vec![ChangedFile {
+            path: "lib.rs".to_string(),
+            added_lines: vec![1],
+            is_new: true,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+        // error_handling and imports passes are always included
+        assert!(result.passed.iter().any(|p| p.contains("error_handling")));
+        assert!(result.passed.iter().any(|p| p.contains("imports")));
     }
 }

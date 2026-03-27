@@ -487,4 +487,102 @@ mod tests {
         let type_style = naming.type_style.unwrap();
         assert_eq!(type_style.dominant, "PascalCase");
     }
+
+    #[test]
+    fn test_file_contributions_populated_after_extract() {
+        use crate::budget::counter::TokenCounter;
+        use crate::parser::language::{ParseResult, Symbol, Visibility};
+        use crate::scanner::ScannedFile;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "my_fn".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn my_fn()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let naming = extract_naming(&index);
+
+        // file_contributions must contain the file
+        assert!(naming.file_contributions.contains_key("src/lib.rs"));
+        let contrib = &naming.file_contributions["src/lib.rs"];
+        // snake_case function was counted
+        assert_eq!(contrib.counts.get("fn:snake_case").copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn test_remove_file_contribution_removes_entry() {
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let mut naming = extract_naming(&index);
+
+        assert!(naming.file_contributions.contains_key("src/lib.rs"));
+        remove_file_contribution(&mut naming, "src/lib.rs");
+        assert!(!naming.file_contributions.contains_key("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_update_file_contribution_is_noop() {
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let mut naming = extract_naming(&index);
+        let before_len = naming.file_contributions.len();
+
+        let file = &index.files[0];
+        update_file_contribution(&mut naming, file);
+
+        assert_eq!(naming.file_contributions.len(), before_len);
+    }
 }

@@ -174,4 +174,90 @@ mod tests {
         let imports = extract_imports(&index);
         assert!(imports.style.is_none());
     }
+
+    #[test]
+    fn test_remove_file_contribution_removes_entry() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("test.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let mut imports = extract_imports(&index);
+
+        assert!(imports.file_contributions.contains_key("src/lib.rs"));
+        remove_file_contribution(&mut imports, "src/lib.rs");
+        assert!(!imports.file_contributions.contains_key("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_update_file_contribution_is_noop() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("test.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let mut imports = extract_imports(&index);
+        let before_len = imports.file_contributions.len();
+
+        let file = &index.files[0];
+        update_file_contribution(&mut imports, file);
+
+        assert_eq!(imports.file_contributions.len(), before_len);
+    }
+
+    #[test]
+    fn test_file_contributions_track_absolute_imports() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("test.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![],
+                imports: vec![
+                    Import {
+                        source: "std::io".into(),
+                        names: vec!["io".into()],
+                    },
+                    Import {
+                        source: "crate::utils".into(),
+                        names: vec!["helper".into()],
+                    },
+                ],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let imports = extract_imports(&index);
+
+        let contrib = &imports.file_contributions["src/lib.rs"];
+        assert_eq!(contrib.counts.get("absolute").copied().unwrap_or(0), 2);
+    }
 }

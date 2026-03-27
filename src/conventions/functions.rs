@@ -246,4 +246,102 @@ mod tests {
         assert_eq!(median(&mut [1, 2, 3, 4]), 2.5);
         assert_eq!(median(&mut [10]), 10.0);
     }
+
+    #[test]
+    fn test_median_empty_returns_zero() {
+        assert_eq!(median(&mut []), 0.0);
+    }
+
+    #[test]
+    fn test_median_even_count() {
+        // [2, 4] → (2 + 4) / 2 = 3.0
+        assert_eq!(median(&mut [4, 2]), 3.0);
+    }
+
+    #[test]
+    fn test_extract_functions_no_functions_returns_none() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        // No parse results → no functions
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let fns = extract_functions(&index);
+
+        assert!(fns.avg_length.is_none());
+        assert!(fns.median_length.is_none());
+        assert!(fns.by_directory.is_empty());
+    }
+
+    #[test]
+    fn test_remove_file_contribution_removes_entry() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "my_fn".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn my_fn()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 5,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let mut fns = extract_functions(&index);
+
+        assert!(fns.file_contributions.contains_key("src/lib.rs"));
+        remove_file_contribution(&mut fns, "src/lib.rs");
+        assert!(!fns.file_contributions.contains_key("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_update_file_contribution_is_noop() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let mut fns = extract_functions(&index);
+        let before_count = fns.file_contributions.len();
+
+        // update_file_contribution is a noop — state must be unchanged
+        let file = &index.files[0];
+        update_file_contribution(&mut fns, file);
+        assert_eq!(fns.file_contributions.len(), before_count);
+    }
 }

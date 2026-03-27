@@ -223,4 +223,146 @@ mod tests {
         assert!(profile.naming.function_style.is_none());
         assert!(profile.naming.type_style.is_none());
     }
+
+    #[test]
+    fn test_build_convention_profile_runs_without_git_repo() {
+        use crate::budget::counter::TokenCounter;
+        use crate::parser::language::SymbolKind;
+        use crate::parser::language::{ParseResult, Symbol, Visibility};
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "my_fn".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn my_fn() -> Result<(), E>".into(),
+                    body: "{ Ok(()) }".into(),
+                    start_line: 1,
+                    end_line: 3,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = crate::index::CodebaseIndex::build(files, parse_results, &counter);
+        // dir.path() is not a git repo — git_health will gracefully return default
+        let profile = build_convention_profile(&index, dir.path());
+
+        // naming should detect snake_case from "my_fn"
+        assert!(profile.naming.function_style.is_some());
+        let fn_style = profile.naming.function_style.unwrap();
+        assert_eq!(fn_style.dominant, "snake_case");
+
+        // errors should detect Result return type
+        assert!(profile.errors.result_return.is_some());
+
+        // git_health defaults when not a git repo
+        assert!(profile.git_health.churn_30d.is_empty());
+    }
+
+    #[test]
+    fn test_update_conventions_incremental_remove_then_add() {
+        use crate::budget::counter::TokenCounter;
+        use crate::parser::language::SymbolKind;
+        use crate::parser::language::{ParseResult, Symbol, Visibility};
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Create two source files
+        let fp_a = dir.path().join("a.rs");
+        let fp_b = dir.path().join("b.rs");
+        std::fs::write(&fp_a, "x").unwrap();
+        std::fs::write(&fp_b, "x").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/a.rs".into(),
+                absolute_path: fp_a,
+                language: Some("rust".into()),
+                size_bytes: 1,
+            },
+            ScannedFile {
+                relative_path: "src/b.rs".into(),
+                absolute_path: fp_b,
+                language: Some("rust".into()),
+                size_bytes: 1,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/a.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "fn_in_a".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn fn_in_a()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "src/b.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "fn_in_b".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn fn_in_b()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = crate::index::CodebaseIndex::build(files, parse_results, &counter);
+        // Build initial profile without a git repo (graceful default for git_health)
+        let mut profile = build_convention_profile(&index, dir.path());
+
+        // Both files should be tracked in naming contributions
+        assert!(profile.naming.file_contributions.contains_key("src/a.rs"));
+        assert!(profile.naming.file_contributions.contains_key("src/b.rs"));
+
+        // Remove "src/a.rs", update "src/b.rs"
+        update_conventions_incremental(
+            &mut profile,
+            &["src/b.rs".to_string()],
+            &["src/a.rs".to_string()],
+            &index,
+        );
+
+        // "src/a.rs" must be gone from naming contributions
+        assert!(!profile.naming.file_contributions.contains_key("src/a.rs"));
+        // "src/b.rs" still present (update is a noop but the key is preserved)
+        assert!(profile.naming.file_contributions.contains_key("src/b.rs"));
+    }
 }

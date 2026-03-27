@@ -184,4 +184,164 @@ mod tests {
         assert!(!has_doc_comment("{}", Some("rust")));
         assert!(has_doc_comment("/** JSDoc */\n{}", Some("javascript")));
     }
+
+    #[test]
+    fn test_extract_visibility_mostly_public() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "pub_a".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn pub_a()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "pub_b".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn pub_b()".into(),
+                        body: "{}".into(),
+                        start_line: 2,
+                        end_line: 2,
+                    },
+                    Symbol {
+                        name: "priv_a".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn priv_a()".into(),
+                        body: "{}".into(),
+                        start_line: 3,
+                        end_line: 3,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let vis = extract_visibility(&index);
+
+        let ratio = vis.public_ratio.unwrap();
+        assert_eq!(ratio.dominant, "public");
+        assert_eq!(ratio.count, 2);
+        assert_eq!(ratio.total, 3);
+    }
+
+    #[test]
+    fn test_extract_visibility_doc_comment_coverage() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "documented".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn documented()".into(),
+                        // body starts with doc comment → detected
+                        body: "/// Does the thing.\n{ }".into(),
+                        start_line: 1,
+                        end_line: 3,
+                    },
+                    Symbol {
+                        name: "undocumented".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn undocumented()".into(),
+                        body: "{ }".into(),
+                        start_line: 5,
+                        end_line: 6,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let vis = extract_visibility(&index);
+
+        let doc = vis.doc_comment_coverage.unwrap();
+        assert_eq!(doc.count, 1);
+        assert_eq!(doc.total, 2);
+        assert_eq!(doc.percentage, 50.0);
+    }
+
+    #[test]
+    fn test_remove_file_contribution_removes_entry() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let mut vis = extract_visibility(&index);
+
+        assert!(vis.file_contributions.contains_key("src/lib.rs"));
+        remove_file_contribution(&mut vis, "src/lib.rs");
+        assert!(!vis.file_contributions.contains_key("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_update_file_contribution_is_noop() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let mut vis = extract_visibility(&index);
+        let before_len = vis.file_contributions.len();
+
+        let file = &index.files[0];
+        update_file_contribution(&mut vis, file);
+
+        assert_eq!(vis.file_contributions.len(), before_len);
+    }
 }

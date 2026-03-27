@@ -387,4 +387,236 @@ mod tests {
         let compact = render_compact_dna(&profile);
         assert!(compact.contains("No strong conventions"));
     }
+
+    #[test]
+    fn test_render_dna_dependencies_strict_layers() {
+        use crate::conventions::deps::{DependencyConventions, DirectionPair};
+
+        let profile = ConventionProfile {
+            dependencies: DependencyConventions {
+                strict_layers: vec![DirectionPair {
+                    from: "src".to_string(),
+                    to: "core".to_string(),
+                    edge_count: 12,
+                    reverse_count: 0,
+                }],
+                circular_deps: vec![],
+                db_isolation: None,
+                additional: vec![],
+            },
+            ..Default::default()
+        };
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("Architecture"));
+        assert!(dna.contains("src"));
+        assert!(dna.contains("core"));
+        assert!(dna.contains("12"));
+        assert!(dna.contains("No circular deps"));
+    }
+
+    #[test]
+    fn test_render_dna_dependencies_with_circular() {
+        use crate::conventions::deps::{DependencyConventions, DirectionPair};
+
+        let profile = ConventionProfile {
+            dependencies: DependencyConventions {
+                strict_layers: vec![DirectionPair {
+                    from: "a".to_string(),
+                    to: "b".to_string(),
+                    edge_count: 3,
+                    reverse_count: 1,
+                }],
+                circular_deps: vec!["a → b → a".to_string()],
+                db_isolation: None,
+                additional: vec![],
+            },
+            ..Default::default()
+        };
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("Circular"));
+        assert!(dna.contains("a → b → a"));
+    }
+
+    #[test]
+    fn test_render_dna_visibility_with_doc_coverage() {
+        let mut profile = ConventionProfile::default();
+        profile.visibility.public_ratio = PatternObservation::new("visibility", "private", 80, 100);
+        profile.visibility.doc_comment_coverage =
+            PatternObservation::new("doc_coverage", "documented public APIs", 70, 100);
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("Visibility"));
+        assert!(dna.contains("Doc comments"));
+    }
+
+    #[test]
+    fn test_render_dna_functions_section() {
+        use crate::conventions::functions::{DirectoryFunctionStats, FunctionConventions};
+        use std::collections::HashMap;
+
+        let mut profile = ConventionProfile::default();
+        let mut by_directory = HashMap::new();
+        by_directory.insert(
+            "src/api".to_string(),
+            DirectoryFunctionStats {
+                avg_length: 15.0,
+                median_length: 12.0,
+                count: 5,
+            },
+        );
+        profile.functions = FunctionConventions {
+            avg_length: Some(15.0),
+            median_length: Some(12.0),
+            by_directory,
+            additional: vec![],
+            file_contributions: HashMap::new(),
+        };
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("Functions"));
+        assert!(dna.contains("15"));
+        assert!(dna.contains("src/api"));
+    }
+
+    #[test]
+    fn test_render_dna_testing_section_with_naming_and_density() {
+        let mut profile = ConventionProfile::default();
+        profile.testing.mock_usage = PatternObservation::new("mock_usage", "no mocks", 9, 10);
+        profile.testing.test_naming =
+            PatternObservation::new("test_naming", "test_{fn}_{scenario}", 8, 10);
+        profile.testing.density = Some(crate::conventions::PatternObservation {
+            name: "test_density".into(),
+            dominant: "2.0 tests/public fn".into(),
+            count: 20,
+            total: 10,
+            percentage: 200.0,
+            strength: crate::conventions::PatternStrength::Trend,
+            exceptions: vec![],
+        });
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("Testing"));
+        assert!(dna.contains("no mocks"));
+        assert!(dna.contains("test_{fn}_{scenario}"));
+        assert!(dna.contains("2.0 tests/public fn"));
+    }
+
+    #[test]
+    fn test_render_dna_git_health_with_reverts() {
+        use crate::conventions::git_health::{ChurnEntry, GitHealthProfile, RevertEntry};
+
+        let profile = ConventionProfile {
+            git_health: GitHealthProfile {
+                churn_30d: vec![ChurnEntry {
+                    path: "src/hot_file.rs".to_string(),
+                    modifications: 42,
+                }],
+                churn_180d: vec![ChurnEntry {
+                    path: "src/hot_file.rs".to_string(),
+                    modifications: 120,
+                }],
+                reverts: vec![RevertEntry {
+                    commit_message: "Revert bad change".to_string(),
+                    reverted_message: Some("Add broken feature".to_string()),
+                }],
+                bugfix_density: std::collections::HashMap::new(),
+                churn_trend: std::collections::HashMap::new(),
+                last_computed: None,
+            },
+            ..Default::default()
+        };
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("Git Health"));
+        assert!(dna.contains("src/hot_file.rs"));
+        assert!(dna.contains("42"));
+        assert!(dna.contains("Reverts"));
+        assert!(dna.contains("Add broken feature"));
+    }
+
+    #[test]
+    fn test_render_dna_git_health_revert_no_original_message() {
+        use crate::conventions::git_health::{ChurnEntry, GitHealthProfile, RevertEntry};
+
+        let profile = ConventionProfile {
+            git_health: GitHealthProfile {
+                churn_30d: vec![ChurnEntry {
+                    path: "src/lib.rs".to_string(),
+                    modifications: 10,
+                }],
+                churn_180d: vec![],
+                reverts: vec![RevertEntry {
+                    commit_message: "Revert: undo something".to_string(),
+                    reverted_message: None, // no original message
+                }],
+                bugfix_density: std::collections::HashMap::new(),
+                churn_trend: std::collections::HashMap::new(),
+                last_computed: None,
+            },
+            ..Default::default()
+        };
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("Revert: undo something"));
+    }
+
+    #[test]
+    fn test_render_dna_type_style_and_file_style_and_constant_style() {
+        let mut profile = ConventionProfile::default();
+        profile.naming.type_style = PatternObservation::new("type_naming", "PascalCase", 95, 100);
+        profile.naming.file_style = PatternObservation::new("file_naming", "snake_case", 90, 100);
+        profile.naming.constant_style =
+            PatternObservation::new("constant_naming", "SCREAMING_SNAKE_CASE", 92, 100);
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("PascalCase"));
+        assert!(dna.contains("snake_case"));
+        assert!(dna.contains("SCREAMING_SNAKE_CASE"));
+    }
+
+    #[test]
+    fn test_render_dna_error_handling_all_fields() {
+        let mut profile = ConventionProfile::default();
+        profile.errors.result_return =
+            PatternObservation::new("result_return", "Result<T, E>", 90, 100);
+        profile.errors.unwrap_usage =
+            PatternObservation::new("unwrap_usage", "no .unwrap() in src/", 88, 100);
+        profile.errors.question_mark_propagation =
+            PatternObservation::new("question_mark", "? operator", 85, 100);
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("Error Handling"));
+        assert!(dna.contains("Result<T, E>"));
+        assert!(dna.contains("no .unwrap() in src/"));
+        assert!(dna.contains("? operator"));
+    }
+
+    #[test]
+    fn test_render_dna_imports_section() {
+        let mut profile = ConventionProfile::default();
+        profile.imports.style = PatternObservation::new("import_style", "absolute", 95, 100);
+
+        let dna = render_dna_section(&profile);
+        assert!(dna.contains("Imports"));
+        assert!(dna.contains("absolute"));
+    }
+
+    #[test]
+    fn test_render_compact_dna_caps_at_three() {
+        // With 5 Convention-strength observations, only 3 are rendered.
+        let mut profile = ConventionProfile::default();
+        profile.naming.function_style = PatternObservation::new("fn_naming", "snake_case", 95, 100);
+        profile.naming.type_style = PatternObservation::new("type_naming", "PascalCase", 98, 100);
+        profile.errors.result_return =
+            PatternObservation::new("result_return", "Result<T, E>", 92, 100);
+        profile.errors.unwrap_usage =
+            PatternObservation::new("unwrap_usage", "no .unwrap() in src/", 91, 100);
+        profile.imports.style = PatternObservation::new("import_style", "absolute", 96, 100);
+
+        let compact = render_compact_dna(&profile);
+        let lines: Vec<&str> = compact.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(lines.len(), 3);
+    }
 }

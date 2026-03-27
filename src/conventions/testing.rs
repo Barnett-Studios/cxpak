@@ -287,4 +287,301 @@ mod tests {
 
         assert!(testing.test_naming.is_some());
     }
+
+    #[test]
+    fn test_test_naming_two_part_pattern() {
+        // test_{fn}_{scenario} — 3 parts total
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("test.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "tests/test_api.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "tests/test_api.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    // splitn(4, '_') on "test_parse_ok" gives ["test", "parse", "ok"] → 3 parts
+                    Symbol {
+                        name: "test_parse_ok".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_parse_ok()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "test_build_err".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_build_err()".into(),
+                        body: "{}".into(),
+                        start_line: 3,
+                        end_line: 3,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let testing = extract_testing(&index);
+
+        let naming = testing.test_naming.unwrap();
+        assert_eq!(naming.dominant, "test_{fn}_{scenario}");
+        assert_eq!(naming.count, 2);
+    }
+
+    #[test]
+    fn test_density_calculation_with_public_fns_and_tests() {
+        // Populate both source files (with public fns) and test files (with test_ fns)
+        // so that the density branch fires.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let src_fp = dir.path().join("src.rs");
+        let test_fp = dir.path().join("test.rs");
+        std::fs::write(&src_fp, "x").unwrap();
+        std::fs::write(&test_fp, "x").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/lib.rs".into(),
+                absolute_path: src_fp,
+                language: Some("rust".into()),
+                size_bytes: 1,
+            },
+            ScannedFile {
+                relative_path: "tests/lib_test.rs".into(),
+                absolute_path: test_fp,
+                language: Some("rust".into()),
+                size_bytes: 1,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        // 2 public functions in source
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "process_a".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn process_a()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "process_b".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn process_b()".into(),
+                        body: "{}".into(),
+                        start_line: 3,
+                        end_line: 3,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        // 6 test functions → ratio = 6/2 = 3.0 → Convention strength
+        parse_results.insert(
+            "tests/lib_test.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "test_a_ok".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_a_ok()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "test_a_err".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_a_err()".into(),
+                        body: "{}".into(),
+                        start_line: 3,
+                        end_line: 3,
+                    },
+                    Symbol {
+                        name: "test_b_ok".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_b_ok()".into(),
+                        body: "{}".into(),
+                        start_line: 5,
+                        end_line: 5,
+                    },
+                    Symbol {
+                        name: "test_b_err".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_b_err()".into(),
+                        body: "{}".into(),
+                        start_line: 7,
+                        end_line: 7,
+                    },
+                    Symbol {
+                        name: "test_b_edge".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_b_edge()".into(),
+                        body: "{}".into(),
+                        start_line: 9,
+                        end_line: 9,
+                    },
+                    Symbol {
+                        name: "test_a_edge".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_a_edge()".into(),
+                        body: "{}".into(),
+                        start_line: 11,
+                        end_line: 11,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let testing = extract_testing(&index);
+
+        let density = testing.density.unwrap();
+        assert_eq!(density.count, 6); // 6 test functions
+        assert_eq!(density.total, 2); // 2 public functions
+        assert_eq!(density.percentage, 300.0); // 6/2 * 100
+        assert!(matches!(
+            density.strength,
+            crate::conventions::PatternStrength::Convention
+        ));
+    }
+
+    #[test]
+    fn test_density_trend_strength() {
+        // ratio between 1.5 and 3.0 → Trend
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let src_fp = dir.path().join("src.rs");
+        let test_fp = dir.path().join("test.rs");
+        std::fs::write(&src_fp, "x").unwrap();
+        std::fs::write(&test_fp, "x").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/lib.rs".into(),
+                absolute_path: src_fp,
+                language: Some("rust".into()),
+                size_bytes: 1,
+            },
+            ScannedFile {
+                relative_path: "tests/lib_test.rs".into(),
+                absolute_path: test_fp,
+                language: Some("rust".into()),
+                size_bytes: 1,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        // 2 public functions
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "fn_one".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn fn_one()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "fn_two".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn fn_two()".into(),
+                        body: "{}".into(),
+                        start_line: 3,
+                        end_line: 3,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        // 4 test functions → ratio = 4/2 = 2.0 → Trend (1.5 ≤ 2.0 < 3.0)
+        parse_results.insert(
+            "tests/lib_test.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "test_one_a".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_one_a()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "test_one_b".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_one_b()".into(),
+                        body: "{}".into(),
+                        start_line: 3,
+                        end_line: 3,
+                    },
+                    Symbol {
+                        name: "test_two_a".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_two_a()".into(),
+                        body: "{}".into(),
+                        start_line: 5,
+                        end_line: 5,
+                    },
+                    Symbol {
+                        name: "test_two_b".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn test_two_b()".into(),
+                        body: "{}".into(),
+                        start_line: 7,
+                        end_line: 7,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let testing = extract_testing(&index);
+
+        let density = testing.density.unwrap();
+        assert!(matches!(
+            density.strength,
+            crate::conventions::PatternStrength::Trend
+        ));
+    }
 }

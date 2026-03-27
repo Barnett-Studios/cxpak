@@ -306,4 +306,127 @@ mod tests {
 
         assert!(errors.question_mark_propagation.is_some());
     }
+
+    #[test]
+    fn test_extract_errors_expect_usage_branch() {
+        // expect_usage is only Some when expect_src > 0 AND no_expect_count/total >= 50%.
+        // Use 10 functions where only 1 has .expect() → 9/10 = 90% → Some.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let clean_sym = |i: usize| Symbol {
+            name: format!("clean_{i}"),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: format!("fn clean_{i}()"),
+            body: "{ Ok(()) }".into(),
+            start_line: i,
+            end_line: i,
+        };
+
+        let mut symbols: Vec<Symbol> = (1..10).map(clean_sym).collect();
+        symbols.push(Symbol {
+            name: "bad_fn".into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn bad_fn()".into(),
+            body: "{ x.expect(\"must work\") }".into(),
+            start_line: 10,
+            end_line: 11,
+        });
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols,
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let errors = extract_errors(&index);
+
+        // expect_src == 1, total_src_fns == 10, no_expect_count == 9 → 90% → Some
+        assert!(errors.expect_usage.is_some());
+        let obs = errors.expect_usage.unwrap();
+        assert_eq!(obs.dominant, "no .expect() in src/");
+        assert_eq!(obs.count, 9);
+        assert_eq!(obs.total, 10);
+    }
+
+    #[test]
+    fn test_extract_errors_no_unwrap_at_all_branch() {
+        // When total_src_fns > 0 but unwrap_src == 0, unwrap_usage should
+        // use the "no unwrap at all" branch (unwrap_usage is Some with 100%).
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "clean_fn".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn clean_fn() -> Result<(), E>".into(),
+                    body: "{ Ok(()) }".into(),
+                    start_line: 1,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let errors = extract_errors(&index);
+
+        // No unwrap at all in source → still reported as observation
+        let obs = errors.unwrap_usage.unwrap();
+        assert_eq!(obs.dominant, "no .unwrap() in src/");
+        assert_eq!(obs.percentage, 100.0);
+    }
+
+    #[test]
+    fn test_remove_file_contribution_removes_entry() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let mut errors = extract_errors(&index);
+
+        assert!(errors.file_contributions.contains_key("src/lib.rs"));
+        remove_file_contribution(&mut errors, "src/lib.rs");
+        assert!(!errors.file_contributions.contains_key("src/lib.rs"));
+    }
 }
