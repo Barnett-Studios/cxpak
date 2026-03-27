@@ -14,6 +14,12 @@ if [ ! -x "$CXPAK" ]; then
     exit 1
 fi
 
+# Find the git repo root from cwd. If not in a git repo, cxpak cannot index.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "cxpak: not in a git repository. MCP server requires a git repo." >&2
+    exit 1
+}
+
 # exec replaces this shell process so stdio flows directly
 # between Claude Code and cxpak's MCP server
-exec "$CXPAK" serve --mcp
+exec "$CXPAK" serve --mcp "$REPO_ROOT"
