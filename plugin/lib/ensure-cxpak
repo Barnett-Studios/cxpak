@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REQUIRED_VERSION="1.0.2"
+REQUIRED_VERSION="1.0.3"
 
 # Helper: check if installed version matches required
 version_ok() {

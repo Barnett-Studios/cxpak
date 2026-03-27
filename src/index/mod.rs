@@ -407,6 +407,26 @@ impl CodebaseIndex {
         }
     }
 
+    /// Create an empty index with no files. Used when the MCP server
+    /// starts in a non-git directory (graceful degradation).
+    pub fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            language_stats: HashMap::new(),
+            total_files: 0,
+            total_bytes: 0,
+            total_tokens: 0,
+            term_frequencies: HashMap::new(),
+            domains: HashSet::new(),
+            schema: None,
+            graph: DependencyGraph::new(),
+            pagerank: HashMap::new(),
+            test_map: HashMap::new(),
+            #[cfg(feature = "embeddings")]
+            embedding_index: None,
+        }
+    }
+
     pub fn is_key_file(path: &str) -> bool {
         let lower = path.to_lowercase();
         let filename = lower.rsplit('/').next().unwrap_or(&lower);

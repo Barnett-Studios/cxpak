@@ -520,7 +520,14 @@ async fn context_diff_handler(
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let index = build_index(path)?;
+    let index = match build_index(path) {
+        Ok(idx) => idx,
+        Err(e) => {
+            eprintln!("cxpak: warning: could not index {}: {e}", path.display());
+            eprintln!("cxpak: starting MCP server with empty index");
+            CodebaseIndex::empty()
+        }
+    };
 
     eprintln!(
         "cxpak: MCP server ready ({} files indexed, {} tokens)",
