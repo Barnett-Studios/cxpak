@@ -132,4 +132,4 @@ Key files with version references (all must stay in sync):
 
 Tag with `vX.Y.Z` to trigger CI: cross-compile for Linux/macOS + publish to crates.io.
 
-When bumping version, update all four files listed under Claude Code Plugin above.
+When bumping version, update all four files listed under Claude Code Plugin above, then run `cargo check` to regenerate `Cargo.lock` and commit it BEFORE tagging. The `cargo publish` step fails if `Cargo.lock` has a stale version.
