@@ -246,6 +246,13 @@ mod tests {
         );
         // Budget total is opts.tokens minus DNA token cost.
         assert!(result.budget.total <= 50_000);
+        // Full mode: packed file content must always be Some.
+        for file in &result.sections.target_files.files {
+            assert!(
+                file.content.is_some(),
+                "full-mode file content must be Some"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

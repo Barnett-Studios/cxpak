@@ -42,7 +42,7 @@ pub struct PackedFile {
     pub score: f64,
     pub detail_level: String,
     pub tokens: usize,
-    pub content: String,
+    pub content: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ pub fn allocate_and_pack(
                 score,
                 detail_level: "full".to_string(),
                 tokens: full_tokens,
-                content,
+                content: Some(content),
             });
         } else if remaining > 0 {
             // Truncate to whatever budget is left (line-level granularity).
@@ -106,7 +106,7 @@ pub fn allocate_and_pack(
                 score,
                 detail_level: "truncated".to_string(),
                 tokens: truncated_tokens,
-                content: truncated,
+                content: Some(truncated),
             });
         }
     }
@@ -129,7 +129,7 @@ pub fn allocate_and_pack(
                 score: 0.0,
                 detail_level: "full".to_string(),
                 tokens: full_tokens,
-                content,
+                content: Some(content),
             });
         } else if remaining > 0 {
             let truncated = truncate_to_budget(&content, remaining, &counter);
@@ -141,7 +141,7 @@ pub fn allocate_and_pack(
                 score: 0.0,
                 detail_level: "truncated".to_string(),
                 tokens: truncated_tokens,
-                content: truncated,
+                content: Some(truncated),
             });
         }
     }
@@ -164,7 +164,7 @@ pub fn allocate_and_pack(
                     score: 0.0,
                     detail_level: "full".to_string(),
                     tokens: schema_tok,
-                    content: schema_str,
+                    content: Some(schema_str),
                 });
             } else {
                 let truncated = truncate_to_budget(&schema_str, remaining, &counter);
@@ -176,7 +176,7 @@ pub fn allocate_and_pack(
                     score: 0.0,
                     detail_level: "truncated".to_string(),
                     tokens: truncated_tokens,
-                    content: truncated,
+                    content: Some(truncated),
                 });
             }
         }
@@ -477,6 +477,10 @@ mod tests {
         assert_eq!(
             result.sections.target_files.files[0].path, "src/high.rs",
             "higher-scored file should be packed when budget is tight"
+        );
+        assert!(
+            result.sections.target_files.files[0].content.is_some(),
+            "content must be Some in full mode"
         );
     }
 }
