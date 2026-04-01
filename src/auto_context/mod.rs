@@ -4,6 +4,11 @@ pub mod noise;
 
 use crate::auto_context::noise::{FilteredFile, ScoredFileEntry};
 use crate::index::CodebaseIndex;
+use crate::intelligence::architecture::ArchitectureMap;
+use crate::intelligence::co_change::CoChangeEdge;
+use crate::intelligence::health::HealthScore;
+use crate::intelligence::recent_changes::RecentChange;
+use crate::intelligence::risk::RiskEntry;
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -25,6 +30,12 @@ pub struct AutoContextResult {
     pub budget: crate::auto_context::briefing::BudgetSummary,
     pub sections: crate::auto_context::briefing::PackedSections,
     pub filtered_out: Vec<FilteredFile>,
+    // v1.2.0 compound intelligence
+    pub health: HealthScore,
+    pub risks: Vec<RiskEntry>,
+    pub architecture: ArchitectureMap,
+    pub co_changes: Vec<CoChangeEdge>,
+    pub recent_changes: Vec<RecentChange>,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,12 +177,25 @@ pub fn auto_context(
         remaining_budget,
     );
 
+    // Compound intelligence (computed after packing to avoid double-borrowing index)
+    let health = crate::intelligence::health::compute_health(index);
+    let all_risks = crate::intelligence::risk::compute_risk_ranking(index);
+    let risks: Vec<RiskEntry> = all_risks.into_iter().take(10).collect();
+    let architecture = crate::intelligence::architecture::build_architecture_map(index, 2);
+    let co_changes = index.co_changes.clone();
+    let recent_changes = crate::intelligence::recent_changes::compute_recent_changes(index);
+
     AutoContextResult {
         task: task.to_string(),
         dna: effective_dna,
         budget: packed.budget,
         sections: packed.sections,
         filtered_out: filtered.filtered_out,
+        health,
+        risks,
+        architecture,
+        co_changes,
+        recent_changes,
     }
 }
 
@@ -253,6 +277,12 @@ mod tests {
                 "full-mode file content must be Some"
             );
         }
+        assert!(
+            result.health.composite >= 0.0 && result.health.composite <= 10.0,
+            "health composite out of range: {}",
+            result.health.composite
+        );
+        assert!(result.risks.len() <= 10, "risks should be capped at 10");
     }
 
     // -----------------------------------------------------------------------
