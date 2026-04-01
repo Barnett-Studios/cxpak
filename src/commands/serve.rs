@@ -454,6 +454,7 @@ struct AutoContextParams {
     focus: Option<String>,
     include_tests: Option<bool>,
     include_blast_radius: Option<bool>,
+    mode: Option<String>,
 }
 
 async fn auto_context_handler(
@@ -479,6 +480,7 @@ async fn auto_context_handler(
         focus: params.focus,
         include_tests: params.include_tests.unwrap_or(true),
         include_blast_radius: params.include_blast_radius.unwrap_or(true),
+        mode: params.mode.unwrap_or_else(|| "full".to_string()),
     };
     let result = crate::auto_context::auto_context(&params.task, &idx, &opts);
     // Store snapshot for subsequent context_diff calls.
@@ -824,11 +826,17 @@ fn handle_tool_call(
                 .get("include_blast_radius")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            let mode = args
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("full")
+                .to_string();
             let opts = crate::auto_context::AutoContextOpts {
                 tokens: token_budget,
                 focus,
                 include_tests,
                 include_blast_radius,
+                mode,
             };
             let result = crate::auto_context::auto_context(task, index, &opts);
             // Store snapshot for subsequent context_diff calls.

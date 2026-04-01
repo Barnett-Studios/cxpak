@@ -21,6 +21,7 @@ pub struct AutoContextOpts {
     pub focus: Option<String>,
     pub include_tests: bool,
     pub include_blast_radius: bool,
+    pub mode: String, // "full" (default) or "briefing"
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +169,7 @@ pub fn auto_context(
     };
 
     // Step 10: Pack with budget allocation (budget minus DNA tokens).
+    let briefing_mode = opts.mode == "briefing";
     let packed = crate::auto_context::briefing::allocate_and_pack(
         target_files,
         test_files,
@@ -175,6 +177,7 @@ pub fn auto_context(
         api_json,
         blast_json,
         remaining_budget,
+        briefing_mode,
     );
 
     // Compound intelligence (computed after packing to avoid double-borrowing index)
@@ -242,6 +245,7 @@ mod tests {
             focus: None,
             include_tests: false,
             include_blast_radius: false,
+            mode: "full".to_string(),
         }
     }
 
@@ -320,6 +324,7 @@ mod tests {
             focus: Some("src/api/".to_string()),
             include_tests: false,
             include_blast_radius: false,
+            mode: "full".to_string(),
         };
         let result = auto_context("handler", &index, &opts);
 
@@ -416,6 +421,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // test_auto_context_briefing_mode_content_is_none
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_auto_context_briefing_mode_content_is_none() {
+        let (index, _dir) = make_index(&[(
+            "src/auth.rs",
+            "pub fn authenticate(user: &str) -> bool { true }",
+        )]);
+        let opts = AutoContextOpts {
+            tokens: 50_000,
+            focus: None,
+            include_tests: false,
+            include_blast_radius: false,
+            mode: "briefing".to_string(),
+        };
+        let result = auto_context("authenticate", &index, &opts);
+        for file in &result.sections.target_files.files {
+            assert!(
+                file.content.is_none(),
+                "briefing mode must set content to None, got Some for {}",
+                file.path
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // test_auto_context_full_mode_content_is_some
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_auto_context_full_mode_content_is_some() {
+        let (index, _dir) = make_index(&[(
+            "src/auth.rs",
+            "pub fn authenticate(user: &str) -> bool { true }",
+        )]);
+        let opts = default_opts(50_000);
+        let result = auto_context("authenticate", &index, &opts);
+        for file in &result.sections.target_files.files {
+            assert!(
+                file.content.is_some(),
+                "full mode must set content to Some, got None for {}",
+                file.path
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // test_auto_context_no_tests_flag
     // -----------------------------------------------------------------------
     #[test]
@@ -432,6 +483,7 @@ mod tests {
             focus: None,
             include_tests: false,
             include_blast_radius: false,
+            mode: "full".to_string(),
         };
         let result = auto_context("handle request", &index, &opts);
 

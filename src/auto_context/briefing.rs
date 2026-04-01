@@ -67,6 +67,7 @@ pub fn allocate_and_pack(
     api_surface_json: Option<serde_json::Value>,
     blast_radius_json: Option<serde_json::Value>,
     token_budget: usize,
+    briefing_mode: bool,
 ) -> PackedBriefing {
     let counter = TokenCounter::new();
     let mut remaining = token_budget;
@@ -93,7 +94,7 @@ pub fn allocate_and_pack(
                 score,
                 detail_level: "full".to_string(),
                 tokens: full_tokens,
-                content: Some(content),
+                content: if briefing_mode { None } else { Some(content) },
             });
         } else if remaining > 0 {
             // Truncate to whatever budget is left (line-level granularity).
@@ -106,7 +107,7 @@ pub fn allocate_and_pack(
                 score,
                 detail_level: "truncated".to_string(),
                 tokens: truncated_tokens,
-                content: Some(truncated),
+                content: if briefing_mode { None } else { Some(truncated) },
             });
         }
     }
@@ -129,7 +130,7 @@ pub fn allocate_and_pack(
                 score: 0.0,
                 detail_level: "full".to_string(),
                 tokens: full_tokens,
-                content: Some(content),
+                content: if briefing_mode { None } else { Some(content) },
             });
         } else if remaining > 0 {
             let truncated = truncate_to_budget(&content, remaining, &counter);
@@ -141,7 +142,7 @@ pub fn allocate_and_pack(
                 score: 0.0,
                 detail_level: "truncated".to_string(),
                 tokens: truncated_tokens,
-                content: Some(truncated),
+                content: if briefing_mode { None } else { Some(truncated) },
             });
         }
     }
@@ -164,7 +165,11 @@ pub fn allocate_and_pack(
                     score: 0.0,
                     detail_level: "full".to_string(),
                     tokens: schema_tok,
-                    content: Some(schema_str),
+                    content: if briefing_mode {
+                        None
+                    } else {
+                        Some(schema_str)
+                    },
                 });
             } else {
                 let truncated = truncate_to_budget(&schema_str, remaining, &counter);
@@ -176,7 +181,7 @@ pub fn allocate_and_pack(
                     score: 0.0,
                     detail_level: "truncated".to_string(),
                     tokens: truncated_tokens,
-                    content: Some(truncated),
+                    content: if briefing_mode { None } else { Some(truncated) },
                 });
             }
         }
@@ -332,6 +337,7 @@ mod tests {
             None,
             None,
             budget,
+            false,
         );
 
         assert_eq!(
@@ -366,6 +372,7 @@ mod tests {
             None,
             None,
             budget,
+            false,
         );
 
         assert_eq!(
@@ -395,6 +402,7 @@ mod tests {
             Some(api_val),
             Some(blast_val),
             100_000,
+            false,
         );
 
         assert_eq!(result.sections.target_files.count, 1);
@@ -414,7 +422,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_empty_input() {
-        let result = allocate_and_pack(vec![], vec![], None, None, None, 10_000);
+        let result = allocate_and_pack(vec![], vec![], None, None, None, 10_000, false);
 
         assert_eq!(result.sections.target_files.count, 0);
         assert_eq!(result.sections.target_files.tokens, 0);
@@ -438,6 +446,7 @@ mod tests {
             None,
             None,
             10_000,
+            false,
         );
 
         assert_eq!(
@@ -471,6 +480,7 @@ mod tests {
             None,
             None,
             budget,
+            false,
         );
 
         assert_eq!(result.sections.target_files.count, 1);
