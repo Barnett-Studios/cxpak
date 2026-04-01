@@ -523,6 +523,7 @@ mod tests {
                 }],
                 bugfix_density: std::collections::HashMap::new(),
                 churn_trend: std::collections::HashMap::new(),
+                co_changes: vec![],
                 last_computed: None,
             },
             ..Default::default()
@@ -553,6 +554,7 @@ mod tests {
                 }],
                 bugfix_density: std::collections::HashMap::new(),
                 churn_trend: std::collections::HashMap::new(),
+                co_changes: vec![],
                 last_computed: None,
             },
             ..Default::default()

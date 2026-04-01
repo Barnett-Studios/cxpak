@@ -10,6 +10,7 @@ pub struct GitHealthProfile {
     pub bugfix_density: HashMap<String, f64>,
     pub reverts: Vec<RevertEntry>,
     pub churn_trend: HashMap<String, ChurnTrend>,
+    pub co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
     #[serde(skip)]
     pub last_computed: Option<u64>,
 }
@@ -58,6 +59,8 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
     let mut bugfix_commits: HashMap<String, usize> = HashMap::new();
     let mut dir_commits: HashMap<String, usize> = HashMap::new();
     let mut reverts: Vec<RevertEntry> = Vec::new();
+    // Accumulate (changed_files, days_ago) for co-change analysis
+    let mut commit_file_sets: Vec<(Vec<String>, i64)> = Vec::new();
 
     let bugfix_re = regex::Regex::new(r"(?i)\b(fix|bug|patch|hotfix)\b")
         .unwrap_or_else(|_| regex::Regex::new(r"$^").unwrap());
@@ -114,6 +117,12 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
         .ok();
 
         let is_bugfix = bugfix_re.is_match(message);
+
+        // Accumulate for co-change analysis (days_ago from commit time)
+        let days_ago = (now_epoch - commit_time).max(0) / 86400;
+        if !changed_files.is_empty() {
+            commit_file_sets.push((changed_files.clone(), days_ago));
+        }
 
         for path in &changed_files {
             // 180d churn
@@ -211,12 +220,16 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
         .unwrap_or_default()
         .as_secs();
 
+    // Build co-change edges from the accumulated commit file sets
+    let co_changes = crate::intelligence::co_change::build_co_changes(&commit_file_sets);
+
     GitHealthProfile {
         churn_30d: churn_30d_vec,
         churn_180d: churn_180d_vec,
         bugfix_density,
         reverts,
         churn_trend,
+        co_changes,
         last_computed: Some(now_secs),
     }
 }
