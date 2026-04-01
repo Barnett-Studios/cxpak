@@ -26,6 +26,7 @@ pub struct CodebaseIndex {
     pub pagerank: HashMap<String, f64>,
     pub test_map: HashMap<String, Vec<TestFileRef>>,
     pub conventions: ConventionProfile,
+    pub co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
     #[cfg(feature = "embeddings")]
     pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
 }
@@ -146,6 +147,7 @@ impl CodebaseIndex {
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
             conventions: ConventionProfile::default(),
+            co_changes: Vec::new(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
         };
@@ -297,6 +299,7 @@ impl CodebaseIndex {
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
             conventions: ConventionProfile::default(),
+            co_changes: Vec::new(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
         };
@@ -431,6 +434,7 @@ impl CodebaseIndex {
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
             conventions: ConventionProfile::default(),
+            co_changes: Vec::new(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
         }
@@ -1078,5 +1082,12 @@ mod tests {
             "build_with_content should NOT read from disk when content is provided. Got: {}",
             index.files[0].content
         );
+    }
+
+    #[test]
+    fn test_index_co_changes_empty_by_default() {
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        assert!(index.co_changes.is_empty());
     }
 }

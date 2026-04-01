@@ -61,6 +61,8 @@ pub(crate) fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::err
 
     let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
     index.conventions = crate::conventions::build_convention_profile(&index, path);
+    // Propagate co-change data from git_health into the top-level index field
+    index.co_changes = index.conventions.git_health.co_changes.clone();
     Ok(index)
 }
 

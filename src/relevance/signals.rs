@@ -297,6 +297,27 @@ pub fn term_frequency(
     }
 }
 
+/// RecencyBoost: returns a score based on git churn data for the file.
+///
+/// - 0.667 if the file appears in the 30-day churn bucket (recently changed)
+/// - 0.0   if only in the 180-day bucket (changed but not recently)
+/// - 0.5   (neutral) when no git history is available
+pub fn recency_boost_signal(file_path: &str, index: &CodebaseIndex) -> SignalResult {
+    let score = crate::intelligence::recent_changes::recency_score_for_file(file_path, index);
+    let detail = if score > 0.6 {
+        "in 30d churn bucket".to_string()
+    } else if score == 0.0 {
+        "in 180d bucket only".to_string()
+    } else {
+        "no git history".to_string()
+    };
+    SignalResult {
+        name: "recency_boost",
+        score,
+        detail,
+    }
+}
+
 /// PageRank: file-level importance score from the dependency graph.
 ///
 /// Returns the pre-computed PageRank score for `file_path` from the index,

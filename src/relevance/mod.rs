@@ -57,21 +57,21 @@ impl SignalWeights {
             path_similarity: 0.15,
             symbol_match: 0.27,
             import_proximity: 0.12,
-            term_frequency: 0.16,
-            recency_boost: 0.00,
+            term_frequency: 0.11,
+            recency_boost: 0.05,
             pagerank: 0.15,
             embedding_similarity: 0.15,
         }
     }
 
-    /// Weights used when no embedding index is present (matches v0.13.0, sum = 1.0).
+    /// Weights used when no embedding index is present (sum = 1.0).
     pub fn without_embeddings() -> Self {
         Self {
             path_similarity: 0.18,
             symbol_match: 0.32,
             import_proximity: 0.14,
-            term_frequency: 0.19,
-            recency_boost: 0.00, // no git history in index yet; weight redistributed
+            term_frequency: 0.14,
+            recency_boost: 0.05,
             pagerank: 0.17,
             embedding_similarity: 0.00,
         }
@@ -136,11 +136,7 @@ impl RelevanceScorer for MultiSignalScorer {
         let symbol_sig = signals::symbol_match(query, file_path, index, expanded);
         let import_sig = signals::import_proximity(file_path, index);
         let tf_sig = signals::term_frequency(query, file_path, index, expanded);
-        let recency_sig = SignalResult {
-            name: "recency_boost",
-            score: 0.5, // neutral — no git history in index
-            detail: "no git history available".to_string(),
-        };
+        let recency_sig = signals::recency_boost_signal(file_path, index);
         let pr_sig = signals::pagerank_signal(file_path, &index.pagerank);
 
         // Signal 7: embedding similarity (feature-gated, value 0.0 when inactive).
