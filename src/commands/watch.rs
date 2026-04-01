@@ -110,6 +110,7 @@ pub(crate) fn apply_incremental_update(
                 &content,
                 parse_result,
                 &counter,
+                None,
             );
             update_count += 1;
         }

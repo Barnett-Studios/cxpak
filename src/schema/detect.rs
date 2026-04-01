@@ -970,6 +970,7 @@ mod tests {
                 exports: vec![],
             }),
             content: content.to_string(),
+            mtime_secs: None,
         }
     }
 

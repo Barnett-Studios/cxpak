@@ -39,6 +39,7 @@ pub struct IndexedFile {
     pub token_count: usize,
     pub parse_result: Option<ParseResult>,
     pub content: String,
+    pub mtime_secs: Option<u64>, // Unix epoch seconds, None if unavailable
 }
 
 #[derive(Debug)]
@@ -121,6 +122,12 @@ impl CodebaseIndex {
                 compute_term_frequencies(&content),
             );
 
+            let mtime_secs = std::fs::metadata(&file.absolute_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+
             let parse_result = parse_results.get(&file.relative_path).cloned();
             indexed_files.push(IndexedFile {
                 relative_path: file.relative_path.clone(),
@@ -129,6 +136,7 @@ impl CodebaseIndex {
                 token_count,
                 parse_result,
                 content,
+                mtime_secs,
             });
         }
 
@@ -273,6 +281,12 @@ impl CodebaseIndex {
                 compute_term_frequencies(&file_content),
             );
 
+            let mtime_secs = std::fs::metadata(&file.absolute_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+
             let parse_result = parse_results.get(&file.relative_path).cloned();
             indexed_files.push(IndexedFile {
                 relative_path: file.relative_path.clone(),
@@ -281,6 +295,7 @@ impl CodebaseIndex {
                 token_count,
                 parse_result,
                 content: file_content,
+                mtime_secs,
             });
         }
 
@@ -328,6 +343,79 @@ impl CodebaseIndex {
         self.graph = crate::index::graph::build_dependency_graph(&self.files, self.schema.as_ref());
     }
 
+    /// Rebuild the index incrementally: re-parse only files whose mtime/size differs.
+    ///
+    /// Steps:
+    /// 1. Scan current files, compare mtime against stored IndexedFile.mtime_secs.
+    /// 2. Call upsert_file() for changed/new files.
+    /// 3. Call remove_file() for deleted files.
+    /// 4. Call rebuild_graph() to recompute the dependency graph.
+    /// 5. Recompute PageRank and test_map.
+    pub fn incremental_rebuild(
+        &mut self,
+        current_files: &[crate::scanner::ScannedFile],
+        parse_results: &std::collections::HashMap<String, crate::parser::language::ParseResult>,
+        counter: &TokenCounter,
+    ) {
+        let current_paths: std::collections::HashSet<String> = current_files
+            .iter()
+            .map(|f| f.relative_path.clone())
+            .collect();
+
+        // Remove files that no longer exist
+        let to_remove: Vec<String> = self
+            .files
+            .iter()
+            .filter(|f| !current_paths.contains(&f.relative_path))
+            .map(|f| f.relative_path.clone())
+            .collect();
+        for path in &to_remove {
+            self.remove_file(path);
+        }
+
+        // Upsert changed or new files
+        for file in current_files {
+            let mtime_secs = std::fs::metadata(&file.absolute_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+
+            let needs_update = match self
+                .files
+                .iter()
+                .find(|f| f.relative_path == file.relative_path)
+            {
+                None => true, // new file
+                Some(existing) => match (existing.mtime_secs, mtime_secs) {
+                    (Some(old), Some(new)) => new > old || file.size_bytes != existing.size_bytes,
+                    _ => true, // no mtime available: always re-parse
+                },
+            };
+
+            if needs_update {
+                let content = std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
+                let parse_result = parse_results.get(&file.relative_path).cloned();
+                self.upsert_file(
+                    &file.relative_path,
+                    file.language.as_deref(),
+                    &content,
+                    parse_result,
+                    counter,
+                    mtime_secs,
+                );
+            }
+        }
+
+        // Rebuild graph and recompute derived scores
+        self.rebuild_graph();
+        self.pagerank = crate::intelligence::pagerank::compute_pagerank(&self.graph, 0.85, 100);
+        let all_paths: std::collections::HashSet<String> =
+            self.files.iter().map(|f| f.relative_path.clone()).collect();
+        self.test_map = crate::intelligence::test_map::build_test_map(&self.files, &all_paths);
+        self.total_files = self.files.len();
+    }
+
     /// Returns `true` if an embedding index was successfully built for this codebase.
     pub fn has_embedding_index(&self) -> bool {
         #[cfg(feature = "embeddings")]
@@ -351,6 +439,7 @@ impl CodebaseIndex {
         content: &str,
         parse_result: Option<ParseResult>,
         counter: &TokenCounter,
+        mtime_secs: Option<u64>,
     ) {
         // Remove old entry if it exists (adjusts stats)
         self.remove_file(relative_path);
@@ -382,6 +471,7 @@ impl CodebaseIndex {
             token_count,
             parse_result,
             content: content.to_string(),
+            mtime_secs,
         });
 
         self.total_files = self.files.len();
@@ -734,7 +824,7 @@ mod tests {
         let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
         assert_eq!(index.files.len(), 1);
 
-        index.upsert_file("b.rs", Some("rust"), "fn b() {}", None, &counter);
+        index.upsert_file("b.rs", Some("rust"), "fn b() {}", None, &counter, None);
         assert_eq!(index.files.len(), 2);
         assert_eq!(index.total_files, 2);
         let b = index
@@ -765,6 +855,7 @@ mod tests {
             "fn a_v2() { /* updated */ }",
             None,
             &counter,
+            None,
         );
         assert_eq!(index.files.len(), 1);
         assert!(index.files[0].content.contains("a_v2"));
@@ -934,7 +1025,14 @@ mod tests {
         }];
         let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
         assert!(index.term_frequencies["a.rs"].contains_key("old"));
-        index.upsert_file("a.rs", Some("rust"), "fn new_func() {}", None, &counter);
+        index.upsert_file(
+            "a.rs",
+            Some("rust"),
+            "fn new_func() {}",
+            None,
+            &counter,
+            None,
+        );
         assert!(!index.term_frequencies["a.rs"].contains_key("old"));
         assert!(index.term_frequencies["a.rs"].contains_key("new"));
     }
@@ -1089,5 +1187,61 @@ mod tests {
         let counter = TokenCounter::new();
         let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
         assert!(index.co_changes.is_empty());
+    }
+
+    #[test]
+    fn test_indexed_file_has_mtime_from_disk() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 9,
+        }];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        assert!(
+            index.files[0].mtime_secs.is_some(),
+            "mtime_secs should be populated from disk"
+        );
+    }
+
+    #[test]
+    fn test_incremental_rebuild_removes_deleted_file() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp_a = dir.path().join("a.rs");
+        let fp_b = dir.path().join("b.rs");
+        std::fs::write(&fp_a, "fn a() {}").unwrap();
+        std::fs::write(&fp_b, "fn b() {}").unwrap();
+        let files = vec![
+            ScannedFile {
+                relative_path: "a.rs".into(),
+                absolute_path: fp_a.clone(),
+                language: Some("rust".into()),
+                size_bytes: 9,
+            },
+            ScannedFile {
+                relative_path: "b.rs".into(),
+                absolute_path: fp_b,
+                language: Some("rust".into()),
+                size_bytes: 9,
+            },
+        ];
+        let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        assert_eq!(index.files.len(), 2);
+
+        // Simulate b.rs deleted: only pass a.rs in current_files
+        let current = vec![ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp_a,
+            language: Some("rust".into()),
+            size_bytes: 9,
+        }];
+        index.incremental_rebuild(&current, &HashMap::new(), &counter);
+        assert_eq!(index.files.len(), 1);
+        assert_eq!(index.files[0].relative_path, "a.rs");
     }
 }

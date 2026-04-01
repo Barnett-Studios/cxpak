@@ -275,6 +275,7 @@ mod tests {
                 exports: vec![],
             }),
             content: content.to_string(),
+            mtime_secs: None,
         }
     }
 
@@ -290,6 +291,7 @@ mod tests {
             token_count: 0,
             parse_result: None,
             content: content.to_string(),
+            mtime_secs: None,
         }
     }
 
