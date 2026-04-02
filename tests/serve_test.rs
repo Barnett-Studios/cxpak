@@ -473,7 +473,7 @@ mod serve_tests {
 
         assert_eq!(response["id"], 2);
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 16);
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_auto_context"));
@@ -482,6 +482,9 @@ mod serve_tests {
         assert!(tool_names.contains(&"cxpak_trace"));
         assert!(tool_names.contains(&"cxpak_stats"));
         assert!(tool_names.contains(&"cxpak_diff"));
+        assert!(tool_names.contains(&"cxpak_health"));
+        assert!(tool_names.contains(&"cxpak_risks"));
+        assert!(tool_names.contains(&"cxpak_briefing"));
         assert!(tool_names.contains(&"cxpak_context_for_task"));
         assert!(tool_names.contains(&"cxpak_pack_context"));
         assert!(tool_names.contains(&"cxpak_search"));

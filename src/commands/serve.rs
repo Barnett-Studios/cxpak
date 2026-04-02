@@ -112,6 +112,8 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
         .route("/api_surface", get(api_surface_handler))
         .route("/auto_context", axum::routing::post(auto_context_handler))
         .route("/context_diff", get(context_diff_handler))
+        .route("/health_score", get(health_score_handler))
+        .route("/risks", get(risks_handler))
         .with_state(state)
 }
 
@@ -518,6 +520,37 @@ async fn context_diff_handler(
     )))
 }
 
+#[derive(Deserialize)]
+struct RisksParams {
+    limit: Option<usize>,
+}
+
+async fn health_score_handler(State(index): State<SharedIndex>) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let health = crate::intelligence::health::compute_health(&idx);
+    Ok(Json(serde_json::to_value(&health).unwrap_or_else(
+        |_| json!({"error": "serialisation failed"}),
+    )))
+}
+
+async fn risks_handler(
+    State(index): State<SharedIndex>,
+    Query(params): Query<RisksParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let limit = params.limit.unwrap_or(10);
+    let all_risks = crate::intelligence::risk::compute_risk_ranking(&idx);
+    let risks: Vec<crate::intelligence::risk::RiskEntry> =
+        all_risks.into_iter().take(limit).collect();
+    Ok(Json(serde_json::to_value(&risks).unwrap_or_else(
+        |_| json!({"error": "serialisation failed"}),
+    )))
+}
+
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -773,6 +806,50 @@ fn mcp_stdio_loop_with_io(
                                     "strength": { "type": "string", "description": "Minimum strength: 'convention', 'trend', 'mixed', or 'all' (default 'all')", "default": "all" },
                                     "focus": { "type": "string", "description": "Path prefix — recompute stats scoped to this directory" }
                                 }
+                            }
+                        },
+                        {
+                            "name": "cxpak_health",
+                            "description": "Returns the codebase health score — a composite metric across 6 dimensions: convention adherence, test coverage, churn stability, module coupling, circular dependencies, and dead code (null until v1.3.0). Use this to understand the overall quality state before making structural changes.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "focus": {
+                                        "type": "string",
+                                        "description": "Optional path prefix to scope the analysis (e.g. 'src/api/')"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_risks",
+                            "description": "Returns the top risky files ranked by a composite of churn rate, blast radius, and test coverage gap. Use this to identify where to focus refactoring or additional testing.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "limit": {
+                                        "type": "number",
+                                        "description": "Maximum number of risk entries to return (default 10)",
+                                        "default": 10
+                                    },
+                                    "focus": {
+                                        "type": "string",
+                                        "description": "Optional path prefix to scope the analysis (e.g. 'src/api/')"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_briefing",
+                            "description": "Returns a compact briefing: file manifest with scores and signals, health score, top risks, and architecture map — but no file content. Ideal for orientation at the start of a task when you need structure, not code.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "task": { "type": "string", "description": "Natural language task description" },
+                                    "tokens": { "type": "string", "description": "Token budget (default '50k')", "default": "50k" },
+                                    "focus": { "type": "string", "description": "Path prefix to scope" }
+                                },
+                                "required": ["task"]
                             }
                         }
                     ]
@@ -1534,6 +1611,50 @@ fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
+        "cxpak_health" => {
+            let health = crate::intelligence::health::compute_health(index);
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&health).unwrap_or_default(),
+            )
+        }
+        "cxpak_risks" => {
+            let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
+            let all_risks = crate::intelligence::risk::compute_risk_ranking(index);
+            let risks: Vec<&crate::intelligence::risk::RiskEntry> =
+                all_risks.iter().take(limit).collect();
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&risks).unwrap_or_default(),
+            )
+        }
+        "cxpak_briefing" => {
+            let task = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
+            if task.is_empty() {
+                return mcp_tool_result(
+                    id,
+                    "Error: 'task' argument is required and must not be empty",
+                );
+            }
+            let token_budget = args
+                .get("tokens")
+                .and_then(|t| t.as_str())
+                .and_then(|t| crate::cli::parse_token_count(t).ok())
+                .unwrap_or(50_000);
+            let focus = args.get("focus").and_then(|f| f.as_str()).map(String::from);
+            let opts = crate::auto_context::AutoContextOpts {
+                tokens: token_budget,
+                focus,
+                include_tests: true,
+                include_blast_radius: true,
+                mode: "briefing".to_string(),
+            };
+            let result = crate::auto_context::auto_context(task, index, &opts);
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
         _ => mcp_response(
             id,
             json!({
@@ -2033,7 +2154,7 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 16);
     }
 
     #[test]
@@ -2799,8 +2920,8 @@ mod tests {
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            13,
-            "should have 13 tools (4 existing + 2 v0.9 + 1 search + 1 blast_radius + 1 api_surface + 2 auto_context + 2 conventions)"
+            16,
+            "should have 16 tools (13 existing + 1 health + 1 risks + 1 briefing)"
         );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_context_for_task"));
@@ -4174,6 +4295,256 @@ mod tests {
             tool_names.contains(&"cxpak_context_diff"),
             "tools/list should include cxpak_context_diff"
         );
-        assert_eq!(tools.len(), 13, "total tool count should be 13");
+        assert_eq!(tools.len(), 16, "total tool count should be 16");
+    }
+
+    // --- Task 11: cxpak_health MCP tool ---
+
+    #[test]
+    fn test_mcp_health_tool() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(1)),
+            "cxpak_health",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed["composite"].is_number(),
+            "health result should have composite score"
+        );
+        assert!(
+            parsed["conventions"].is_number(),
+            "health result should have conventions score"
+        );
+        assert!(
+            parsed["test_coverage"].is_number(),
+            "health result should have test_coverage score"
+        );
+        assert!(
+            parsed["churn_stability"].is_number(),
+            "health result should have churn_stability score"
+        );
+        assert!(
+            parsed["coupling"].is_number(),
+            "health result should have coupling score"
+        );
+        assert!(
+            parsed["cycles"].is_number(),
+            "health result should have cycles score"
+        );
+        // composite should be in [0, 10]
+        let composite = parsed["composite"].as_f64().unwrap();
+        assert!(
+            (0.0..=10.0).contains(&composite),
+            "composite should be in [0, 10], got {composite}"
+        );
+    }
+
+    // --- Task 12: cxpak_risks MCP tool ---
+
+    #[test]
+    fn test_mcp_risks_tool_returns_array() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(2)),
+            "cxpak_risks",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed.as_array().is_some(),
+            "risks result should be an array, got: {parsed}"
+        );
+        let risks = parsed.as_array().unwrap();
+        // Risks count should be <= default limit of 10
+        assert!(risks.len() <= 10, "risks should be capped at 10 by default");
+        // Each entry should have the required fields
+        for entry in risks {
+            assert!(entry["path"].is_string(), "risk entry should have path");
+            assert!(
+                entry["risk_score"].is_number(),
+                "risk entry should have risk_score"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mcp_risks_tool_with_custom_limit() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(3)),
+            "cxpak_risks",
+            &json!({"limit": 1}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let risks = parsed.as_array().unwrap();
+        assert!(
+            risks.len() <= 1,
+            "risks should be capped at custom limit of 1"
+        );
+    }
+
+    // --- Task 13: cxpak_briefing MCP tool ---
+
+    #[test]
+    fn test_mcp_briefing_tool_returns_auto_context_result() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(4)),
+            "cxpak_briefing",
+            &json!({"task": "main function"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        // Should have auto_context result fields
+        assert!(
+            parsed["health"].is_object(),
+            "briefing should have health object"
+        );
+        assert!(
+            parsed["sections"].is_object(),
+            "briefing should have sections object"
+        );
+        // In briefing mode, target_files entries should have null content
+        let target_files = parsed["sections"]["target_files"]["files"]
+            .as_array()
+            .unwrap();
+        for file in target_files {
+            assert!(
+                file["content"].is_null(),
+                "briefing mode file content should be null for path: {}",
+                file["path"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_mcp_briefing_tool_empty_task_errors() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(5)),
+            "cxpak_briefing",
+            &json!({"task": ""}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Error") || text.contains("error"),
+            "empty task should return error"
+        );
+    }
+
+    // --- Task 14: HTTP endpoints for health_score and risks ---
+
+    #[test]
+    fn test_axum_health_score_endpoint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/health_score")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                json["composite"].is_number(),
+                "health_score endpoint should return composite"
+            );
+            let composite = json["composite"].as_f64().unwrap();
+            assert!(
+                (0.0..=10.0).contains(&composite),
+                "composite should be in [0, 10], got {composite}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_axum_risks_endpoint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/risks")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                json.as_array().is_some(),
+                "risks endpoint should return an array"
+            );
+            let risks = json.as_array().unwrap();
+            assert!(risks.len() <= 10, "default limit is 10");
+        });
+    }
+
+    #[test]
+    fn test_axum_risks_endpoint_with_limit() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/risks?limit=1")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            let risks = json.as_array().unwrap();
+            assert!(risks.len() <= 1, "limit=1 should return at most 1 entry");
+        });
     }
 }
