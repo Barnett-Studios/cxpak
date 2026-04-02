@@ -6,6 +6,7 @@ use crate::budget::counter::TokenCounter;
 use crate::context_quality::expansion::Domain;
 use crate::conventions::ConventionProfile;
 use crate::index::graph::DependencyGraph;
+use crate::intelligence::call_graph::CallGraph;
 use crate::intelligence::test_map::TestFileRef;
 use crate::parser::language::{Import, ParseResult, Symbol, Visibility};
 use crate::scanner::ScannedFile;
@@ -26,6 +27,7 @@ pub struct CodebaseIndex {
     pub pagerank: HashMap<String, f64>,
     pub test_map: HashMap<String, Vec<TestFileRef>>,
     pub conventions: ConventionProfile,
+    pub call_graph: CallGraph,
     pub co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
     #[cfg(feature = "embeddings")]
     pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
@@ -154,6 +156,7 @@ impl CodebaseIndex {
             graph: DependencyGraph::new(),
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            call_graph: CallGraph::default(),
             conventions: ConventionProfile::default(),
             co_changes: Vec::new(),
             #[cfg(feature = "embeddings")]
@@ -169,6 +172,7 @@ impl CodebaseIndex {
             .map(|f| f.relative_path.clone())
             .collect();
         index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
+        index.call_graph = crate::intelligence::call_graph::build_call_graph(&index);
         // NOTE: embedding_index is NOT built here. It's built at server startup
         // via build_embedding_index() — model download should not block CLI commands.
         // NOTE: conventions is NOT built here. It's built after index construction
@@ -313,6 +317,7 @@ impl CodebaseIndex {
             graph: DependencyGraph::new(),
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            call_graph: CallGraph::default(),
             conventions: ConventionProfile::default(),
             co_changes: Vec::new(),
             #[cfg(feature = "embeddings")]
@@ -328,6 +333,7 @@ impl CodebaseIndex {
             .map(|f| f.relative_path.clone())
             .collect();
         index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
+        index.call_graph = crate::intelligence::call_graph::build_call_graph(&index);
         // NOTE: embedding_index is NOT built here. It's built at server startup
         // via build_embedding_index() — model download should not block CLI commands.
         // NOTE: conventions is NOT built here. It's built after index construction
@@ -341,6 +347,7 @@ impl CodebaseIndex {
     /// includes schema-aware edges.
     pub fn rebuild_graph(&mut self) {
         self.graph = crate::index::graph::build_dependency_graph(&self.files, self.schema.as_ref());
+        self.call_graph = crate::intelligence::call_graph::build_call_graph(self);
     }
 
     /// Rebuild the index incrementally: re-parse only files whose mtime/size differs.
@@ -523,6 +530,7 @@ impl CodebaseIndex {
             graph: DependencyGraph::new(),
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            call_graph: CallGraph::default(),
             conventions: ConventionProfile::default(),
             co_changes: Vec::new(),
             #[cfg(feature = "embeddings")]

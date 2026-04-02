@@ -989,6 +989,7 @@ mod tests {
             graph,
             pagerank: HashMap::new(),
             test_map: HashMap::new(),
+            call_graph: crate::intelligence::call_graph::CallGraph::default(),
             conventions: crate::conventions::ConventionProfile::default(),
             co_changes: Vec::new(),
             files,
