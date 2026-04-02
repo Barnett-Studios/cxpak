@@ -55,9 +55,10 @@ fn test_v120_auto_context_result_has_all_fields() {
         "composite out of range: {}",
         result.health.composite
     );
+    // v1.3.0: dead_code dimension is now populated from call graph
     assert!(
-        result.health.dead_code.is_none(),
-        "dead_code must be None in v1.2.0"
+        result.health.dead_code.is_some(),
+        "dead_code must be Some in v1.3.0"
     );
 
     // Risks: capped at 10

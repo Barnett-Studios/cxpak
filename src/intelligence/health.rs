@@ -14,9 +14,19 @@ pub struct HealthScore {
     pub dead_code: Option<f64>,
 }
 
+/// Compute the dead_code dimension score.
+/// Score = 10.0 * (1.0 - dead_ratio). Zero symbols = 10.0 (no dead code possible).
+pub fn compute_dead_code_dimension(total_symbols: usize, dead_count: usize) -> f64 {
+    if total_symbols == 0 {
+        return 10.0;
+    }
+    let dead_ratio = dead_count as f64 / total_symbols as f64;
+    10.0 * (1.0 - dead_ratio)
+}
+
 /// Compute the composite health score from the index.
 ///
-/// When `dead_code` is None (v1.2.0), weights are renormalized over 5 dimensions.
+/// Now includes the dead_code dimension (v1.3.0), populated from the call graph.
 pub fn compute_health(index: &CodebaseIndex) -> HealthScore {
     let conventions_score = score_conventions(index);
     let test_coverage_score = score_test_coverage(index);
@@ -24,8 +34,18 @@ pub fn compute_health(index: &CodebaseIndex) -> HealthScore {
     let coupling_score = score_coupling(index, 2);
     let cycles_score = score_cycles(&index.graph);
 
-    // dead_code is None until v1.3.0 populates it.
-    let dead_code: Option<f64> = None;
+    // v1.3.0: populate dead_code dimension from call graph
+    let total_symbols: usize = index
+        .files
+        .iter()
+        .filter_map(|f| f.parse_result.as_ref())
+        .map(|pr| pr.symbols.len())
+        .sum();
+    let dead_symbols = crate::intelligence::dead_code::detect_dead_code(index, None);
+    let dead_code = Some(compute_dead_code_dimension(
+        total_symbols,
+        dead_symbols.len(),
+    ));
 
     let composite = compute_composite(
         conventions_score,
@@ -467,11 +487,11 @@ mod tests {
             churn_stability: 8.0,
             coupling: 9.5,
             cycles: 10.0,
-            dead_code: None,
+            dead_code: Some(9.0),
         };
         let json = serde_json::to_string(&h).unwrap();
         assert!(json.contains("\"composite\":8.5"));
-        assert!(json.contains("\"dead_code\":null"));
+        assert!(json.contains("\"dead_code\":9.0"));
     }
 
     #[test]
@@ -527,5 +547,46 @@ mod tests {
             "minimum risk floor must be 1e-6"
         );
         assert!((1.0_f64.max(0.01) * 1.0_f64.max(0.01) * 1.0_f64.max(0.01) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_dead_code_dimension_populated_when_call_graph_present() {
+        // 10 symbols, 2 dead = dead_ratio 0.2 -> dead_code_score = 10.0 * (1 - 0.2) = 8.0
+        let score = compute_dead_code_dimension(10, 2);
+        assert!((score - 8.0).abs() < 1e-9, "expected 8.0, got {score}");
+    }
+
+    #[test]
+    fn test_dead_code_dimension_zero_symbols_is_ten() {
+        let score = compute_dead_code_dimension(0, 0);
+        assert!((score - 10.0).abs() < 1e-9, "expected 10.0, got {score}");
+    }
+
+    #[test]
+    fn test_dead_code_dimension_all_dead() {
+        let score = compute_dead_code_dimension(5, 5);
+        assert!((score - 0.0).abs() < 1e-9, "expected 0.0, got {score}");
+    }
+
+    #[test]
+    fn test_health_score_dead_code_is_now_some() {
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 9,
+        }];
+        let index = CodebaseIndex::build(files, std::collections::HashMap::new(), &counter);
+        let health = compute_health(&index);
+        assert!(
+            health.dead_code.is_some(),
+            "dead_code should be Some in v1.3.0"
+        );
     }
 }
