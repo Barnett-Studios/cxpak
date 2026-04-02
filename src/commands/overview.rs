@@ -27,6 +27,7 @@ fn detail_file_ext(format: &OutputFormat) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     path: &Path,
     token_budget: usize,
@@ -35,6 +36,7 @@ pub fn run(
     verbose: bool,
     focus: Option<&str>,
     timing: bool,
+    health: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let counter = TokenCounter::new();
     let total_start = std::time::Instant::now();
@@ -262,7 +264,39 @@ pub fn run(
     }
 
     // 5. Render to format
-    let rendered = output::render(&sections, format);
+    let mut rendered = output::render(&sections, format);
+
+    // 5b. Append health score if requested
+    if health {
+        let health_score = crate::intelligence::health::compute_health(&index);
+        rendered.push_str("\n\n## Codebase Health\n\n");
+        rendered.push_str(&format!("Composite: {:.1}/10\n", health_score.composite));
+        rendered.push_str(&format!(
+            "  conventions:     {:.1}/10\n",
+            health_score.conventions
+        ));
+        rendered.push_str(&format!(
+            "  test_coverage:   {:.1}/10\n",
+            health_score.test_coverage
+        ));
+        rendered.push_str(&format!(
+            "  churn_stability: {:.1}/10\n",
+            health_score.churn_stability
+        ));
+        rendered.push_str(&format!(
+            "  coupling:        {:.1}/10\n",
+            health_score.coupling
+        ));
+        rendered.push_str(&format!(
+            "  cycles:          {:.1}/10\n",
+            health_score.cycles
+        ));
+        if let Some(dc) = health_score.dead_code {
+            rendered.push_str(&format!("  dead_code:       {:.1}/10\n", dc));
+        } else {
+            rendered.push_str("  dead_code:       N/A (available in v1.3.0)\n");
+        }
+    }
 
     // 6. Output
     if timing {

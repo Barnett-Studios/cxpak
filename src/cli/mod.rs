@@ -30,6 +30,9 @@ pub enum Commands {
         /// Print pipeline stage durations to stderr
         #[arg(long)]
         timing: bool,
+        /// Append codebase health score to the overview output
+        #[arg(long)]
+        health: bool,
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -332,6 +335,30 @@ mod tests {
                 assert_eq!(tokens, "50k");
             }
             _ => panic!("expected Trace"),
+        }
+    }
+
+    #[test]
+    fn test_health_flag_parses_for_overview() {
+        let cli = Cli::try_parse_from(["cxpak", "overview", "--tokens", "50k", "--health"])
+            .expect("should parse with --health");
+        match cli.command {
+            Commands::Overview { health, .. } => {
+                assert!(health);
+            }
+            _ => panic!("expected Overview command"),
+        }
+    }
+
+    #[test]
+    fn test_health_flag_defaults_to_false() {
+        let cli = Cli::try_parse_from(["cxpak", "overview", "--tokens", "50k"])
+            .expect("should parse without --health");
+        match cli.command {
+            Commands::Overview { health, .. } => {
+                assert!(!health);
+            }
+            _ => panic!("expected Overview command"),
         }
     }
 

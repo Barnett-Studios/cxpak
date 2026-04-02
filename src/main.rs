@@ -126,6 +126,7 @@ fn main() {
             verbose,
             focus,
             timing,
+            health,
             path,
         } => {
             let token_budget = match parse_token_count(tokens) {
@@ -147,6 +148,7 @@ fn main() {
                 *verbose,
                 focus.as_deref(),
                 *timing,
+                *health,
             )
         }
         Commands::Trace {
