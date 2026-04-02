@@ -1,6 +1,7 @@
 pub mod api_surface;
 pub mod architecture;
 pub mod blast_radius;
+pub mod call_graph;
 pub mod co_change;
 pub mod health;
 pub mod pagerank;
