@@ -810,13 +810,13 @@ fn mcp_stdio_loop_with_io(
                         },
                         {
                             "name": "cxpak_health",
-                            "description": "Returns the codebase health score — a composite metric across 6 dimensions: convention adherence, test coverage, churn stability, module coupling, circular dependencies, and dead code (null until v1.3.0). Use this to understand the overall quality state before making structural changes.",
+                            "description": "Returns the codebase health score — a composite metric across 6 dimensions: convention adherence, test coverage, churn stability, module coupling, circular dependencies, and dead code (null until v1.3.0). Use this to understand the overall quality state before making structural changes. Note: always computed repo-wide in v1.2.0; focus param reserved for future use.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
                                     "focus": {
                                         "type": "string",
-                                        "description": "Optional path prefix to scope the analysis (e.g. 'src/api/')"
+                                        "description": "Reserved for future use — health score is computed repo-wide in v1.2.0"
                                     }
                                 }
                             }
@@ -829,8 +829,8 @@ fn mcp_stdio_loop_with_io(
                                 "properties": {
                                     "limit": {
                                         "type": "number",
-                                        "description": "Maximum number of risk entries to return (default 10)",
-                                        "default": 10
+                                        "description": "Maximum number of risk entries to return (default 20)",
+                                        "default": 20
                                     },
                                     "focus": {
                                         "type": "string",
@@ -1619,8 +1619,12 @@ fn handle_tool_call(
             )
         }
         "cxpak_risks" => {
-            let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
-            let all_risks = crate::intelligence::risk::compute_risk_ranking(index);
+            let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let mut all_risks = crate::intelligence::risk::compute_risk_ranking(index);
+            if let Some(f) = focus {
+                all_risks.retain(|r| r.path.starts_with(f));
+            }
             let risks: Vec<&crate::intelligence::risk::RiskEntry> =
                 all_risks.iter().take(limit).collect();
             mcp_tool_result(
@@ -4369,8 +4373,8 @@ mod tests {
             "risks result should be an array, got: {parsed}"
         );
         let risks = parsed.as_array().unwrap();
-        // Risks count should be <= default limit of 10
-        assert!(risks.len() <= 10, "risks should be capped at 10 by default");
+        // Risks count should be <= default limit of 20
+        assert!(risks.len() <= 20, "risks should be capped at 20 by default");
         // Each entry should have the required fields
         for entry in risks {
             assert!(entry["path"].is_string(), "risk entry should have path");
