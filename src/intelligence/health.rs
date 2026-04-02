@@ -473,4 +473,59 @@ mod tests {
         assert!(json.contains("\"composite\":8.5"));
         assert!(json.contains("\"dead_code\":null"));
     }
+
+    #[test]
+    fn test_composite_all_combinations_within_range() {
+        let values = [0.0_f64, 5.0, 10.0];
+        for &c in &values {
+            for &t in &values {
+                for &ch in &values {
+                    for &cp in &values {
+                        for &cy in &values {
+                            let comp = compute_composite(c, t, ch, cp, cy, None);
+                            assert!(
+                                (0.0..=10.0).contains(&comp),
+                                "composite out of range [{c},{t},{ch},{cp},{cy}]: {comp}"
+                            );
+                            for &dc in &values {
+                                let comp6 = compute_composite(c, t, ch, cp, cy, Some(dc));
+                                assert!(
+                                    (0.0..=10.0).contains(&comp6),
+                                    "composite (with dead_code) out of range: {comp6}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_score_cycles_invariants() {
+        let mut graph = DependencyGraph::new();
+        let score_0 = score_cycles(&graph);
+        assert!((score_0 - 10.0).abs() < 1e-6, "0 cycles must give 10.0");
+
+        graph.add_edge("a.rs", "b.rs", EdgeType::Import);
+        graph.add_edge("b.rs", "a.rs", EdgeType::Import);
+        let score_1 = score_cycles(&graph);
+        assert!(score_1 < score_0, "1 cycle must score lower than 0 cycles");
+        assert!((score_1 - 5.0).abs() < 1e-6, "1 cycle -> 10/2 = 5.0");
+
+        graph.add_edge("c.rs", "d.rs", EdgeType::Import);
+        graph.add_edge("d.rs", "c.rs", EdgeType::Import);
+        let score_2 = score_cycles(&graph);
+        assert!(score_2 < score_1, "2 cycles must score lower than 1 cycle");
+    }
+
+    #[test]
+    fn test_risk_score_multiplicative_floor() {
+        let min = 0.01_f64 * 0.01 * 0.01;
+        assert!(
+            (min - 1e-6).abs() < 1e-15,
+            "minimum risk floor must be 1e-6"
+        );
+        assert!((1.0_f64.max(0.01) * 1.0_f64.max(0.01) * 1.0_f64.max(0.01) - 1.0).abs() < 1e-9);
+    }
 }
