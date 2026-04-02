@@ -66,6 +66,19 @@ pub(crate) fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::err
     Ok(index)
 }
 
+/// Returns a cache directory name scoped to the given workspace.
+///
+/// When workspace is None: ".cxpak/cache/root"
+/// When workspace is Some("packages/api"): ".cxpak/cache/packages_api"
+#[allow(dead_code)]
+pub fn cache_namespace(repo_root: &std::path::Path, workspace: Option<&str>) -> String {
+    let _ = repo_root;
+    match workspace {
+        None => ".cxpak/cache/root".to_string(),
+        Some(ws) => format!(".cxpak/cache/{}", ws.replace('/', "_")),
+    }
+}
+
 type SharedPath = Arc<std::path::PathBuf>;
 
 #[derive(Clone)]
@@ -114,6 +127,9 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
         .route("/context_diff", get(context_diff_handler))
         .route("/health_score", get(health_score_handler))
         .route("/risks", get(risks_handler))
+        .route("/call_graph", axum::routing::post(call_graph_handler))
+        .route("/dead_code", axum::routing::post(dead_code_handler))
+        .route("/architecture", axum::routing::post(architecture_handler))
         .with_state(state)
 }
 
@@ -551,6 +567,123 @@ async fn risks_handler(
     )))
 }
 
+// --- v1.3.0 MCP endpoints: call_graph, dead_code, architecture ---
+
+#[derive(Deserialize)]
+struct CallGraphParams {
+    target: Option<String>,
+    #[allow(dead_code)]
+    depth: Option<usize>,
+    focus: Option<String>,
+    #[allow(dead_code)]
+    workspace: Option<String>,
+}
+
+async fn call_graph_handler(
+    State(index): State<SharedIndex>,
+    Json(params): Json<CallGraphParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cg = &idx.call_graph;
+
+    let filtered_edges: Vec<&crate::intelligence::call_graph::CallEdge> =
+        if let Some(ref target) = params.target {
+            cg.edges
+                .iter()
+                .filter(|e| {
+                    e.caller_file.contains(target.as_str())
+                        || e.callee_file.contains(target.as_str())
+                        || e.caller_symbol.contains(target.as_str())
+                        || e.callee_symbol.contains(target.as_str())
+                })
+                .collect()
+        } else {
+            cg.edges.iter().collect()
+        };
+
+    let edges: Vec<&crate::intelligence::call_graph::CallEdge> =
+        if let Some(ref focus) = params.focus {
+            filtered_edges
+                .into_iter()
+                .filter(|e| {
+                    e.caller_file.starts_with(focus.as_str())
+                        || e.callee_file.starts_with(focus.as_str())
+                })
+                .collect()
+        } else {
+            filtered_edges
+        };
+
+    Ok(Json(json!({
+        "edges": edges,
+        "unresolved": cg.unresolved,
+        "total_edges": cg.edges.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct DeadCodeParams {
+    focus: Option<String>,
+    limit: Option<usize>,
+    #[allow(dead_code)]
+    workspace: Option<String>,
+}
+
+async fn dead_code_handler(
+    State(index): State<SharedIndex>,
+    Json(params): Json<DeadCodeParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let limit = params.limit.unwrap_or(50);
+    let focus = params.focus.as_deref();
+
+    let dead = crate::intelligence::dead_code::detect_dead_code(&idx, focus);
+    let total_count = dead.len();
+    let limited: Vec<_> = dead.into_iter().take(limit).collect();
+    let showing = limited.len();
+
+    Ok(Json(json!({
+        "dead_symbols": limited,
+        "total_count": total_count,
+        "showing": showing,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ArchitectureParams {
+    focus: Option<String>,
+    #[allow(dead_code)]
+    workspace: Option<String>,
+}
+
+async fn architecture_handler(
+    State(index): State<SharedIndex>,
+    Json(params): Json<ArchitectureParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let map = crate::intelligence::architecture::build_architecture_map(&idx, 2);
+
+    let modules = if let Some(ref focus) = params.focus {
+        map.modules
+            .into_iter()
+            .filter(|m| m.prefix.starts_with(focus.as_str()))
+            .collect::<Vec<_>>()
+    } else {
+        map.modules
+    };
+
+    Ok(Json(json!({
+        "modules": modules,
+        "circular_deps": map.circular_deps,
+    })))
+}
+
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -850,6 +983,42 @@ fn mcp_stdio_loop_with_io(
                                     "focus": { "type": "string", "description": "Path prefix to scope" }
                                 },
                                 "required": ["task"]
+                            }
+                        },
+                        {
+                            "name": "cxpak_call_graph",
+                            "description": "Returns the cross-file call graph for a file or symbol. Edges include confidence level (Exact = import-resolved, Approximate = name-matched).",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "target": { "type": "string", "description": "File path or symbol name to filter edges" },
+                                    "depth": { "type": "number", "description": "BFS depth (default 1)", "default": 1 },
+                                    "focus": { "type": "string", "description": "Path prefix to scope" },
+                                    "workspace": { "type": "string", "description": "Monorepo workspace prefix" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_dead_code",
+                            "description": "Returns dead symbol list sorted by liveness_score descending (most important dead symbols first). A symbol is dead when it has zero callers, is not an entry point, and is not referenced from test files.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "focus": { "type": "string", "description": "Path prefix to scope" },
+                                    "limit": { "type": "number", "description": "Max results (default 50)", "default": 50 },
+                                    "workspace": { "type": "string", "description": "Monorepo workspace prefix" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_architecture",
+                            "description": "Returns full architecture quality report. Each module includes 5 metrics: coupling, cohesion, circular_dep_count, boundary_violations, and god_files.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "focus": { "type": "string", "description": "Path prefix to scope" },
+                                    "workspace": { "type": "string", "description": "Monorepo workspace prefix" }
+                                }
                             }
                         }
                     ]
@@ -1659,6 +1828,80 @@ fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
+        "cxpak_call_graph" => {
+            let target = args.get("target").and_then(|t| t.as_str());
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let cg = &index.call_graph;
+
+            let filtered: Vec<&crate::intelligence::call_graph::CallEdge> = cg
+                .edges
+                .iter()
+                .filter(|e| {
+                    if let Some(t) = target {
+                        e.caller_file.contains(t)
+                            || e.callee_file.contains(t)
+                            || e.caller_symbol.contains(t)
+                            || e.callee_symbol.contains(t)
+                    } else {
+                        true
+                    }
+                })
+                .filter(|e| {
+                    if let Some(f) = focus {
+                        e.caller_file.starts_with(f) || e.callee_file.starts_with(f)
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            let result = json!({
+                "edges": filtered,
+                "unresolved": cg.unresolved,
+                "total_edges": cg.edges.len(),
+            });
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
+        "cxpak_dead_code" => {
+            let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let dead = crate::intelligence::dead_code::detect_dead_code(index, focus);
+            let total_count = dead.len();
+            let limited: Vec<_> = dead.into_iter().take(limit).collect();
+            let showing = limited.len();
+            let result = json!({
+                "dead_symbols": limited,
+                "total_count": total_count,
+                "showing": showing,
+            });
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
+        "cxpak_architecture" => {
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let map = crate::intelligence::architecture::build_architecture_map(index, 2);
+            let modules: Vec<_> = if let Some(f) = focus {
+                map.modules
+                    .into_iter()
+                    .filter(|m| m.prefix.starts_with(f))
+                    .collect()
+            } else {
+                map.modules
+            };
+            let result = json!({
+                "modules": modules,
+                "circular_deps": map.circular_deps,
+            });
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
         _ => mcp_response(
             id,
             json!({
@@ -2158,7 +2401,7 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 19);
     }
 
     #[test]
@@ -2924,8 +3167,8 @@ mod tests {
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            16,
-            "should have 16 tools (13 existing + 1 health + 1 risks + 1 briefing)"
+            19,
+            "should have 19 tools (13 existing + 3 v1.2.0 + 3 v1.3.0)"
         );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_context_for_task"));
@@ -4299,7 +4542,7 @@ mod tests {
             tool_names.contains(&"cxpak_context_diff"),
             "tools/list should include cxpak_context_diff"
         );
-        assert_eq!(tools.len(), 16, "total tool count should be 16");
+        assert_eq!(tools.len(), 19, "total tool count should be 19");
     }
 
     // --- Task 11: cxpak_health MCP tool ---

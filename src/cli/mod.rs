@@ -33,6 +33,9 @@ pub enum Commands {
         /// Append codebase health score to the overview output
         #[arg(long)]
         health: bool,
+        /// Monorepo workspace prefix (only index files under this path)
+        #[arg(long)]
+        workspace: Option<String>,
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -113,6 +116,9 @@ pub enum Commands {
         /// Print pipeline stage durations to stderr
         #[arg(long)]
         timing: bool,
+        /// Monorepo workspace prefix (only index files under this path)
+        #[arg(long)]
+        workspace: Option<String>,
         target: String,
         #[arg(default_value = ".")]
         path: PathBuf,

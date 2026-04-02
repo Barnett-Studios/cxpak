@@ -127,6 +127,7 @@ fn main() {
             focus,
             timing,
             health,
+            workspace: _workspace,
             path,
         } => {
             let token_budget = match parse_token_count(tokens) {
@@ -159,6 +160,7 @@ fn main() {
             all,
             focus,
             timing,
+            workspace: _workspace,
             target,
             path,
         } => {

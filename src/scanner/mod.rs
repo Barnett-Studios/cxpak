@@ -138,6 +138,22 @@ impl Scanner {
 
         Ok(files)
     }
+
+    /// Scan files restricted to a workspace prefix.
+    ///
+    /// When `workspace` is `None`, behaves identically to `scan()`.
+    /// When `workspace` is `Some(prefix)`, only files whose `relative_path`
+    /// starts with `prefix` are returned.
+    pub fn scan_workspace(&self, workspace: Option<&str>) -> Result<Vec<ScannedFile>, ScanError> {
+        let all = self.scan()?;
+        match workspace {
+            None => Ok(all),
+            Some(prefix) => Ok(all
+                .into_iter()
+                .filter(|f| f.relative_path.starts_with(prefix))
+                .collect()),
+        }
+    }
 }
 
 /// Detect a programming language from a file's name or extension.
