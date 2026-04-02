@@ -1,5 +1,6 @@
 use crate::index::CodebaseIndex;
 use crate::intelligence::health::module_prefix;
+use crate::schema::EdgeType;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -9,12 +10,79 @@ pub struct ArchitectureMap {
     pub circular_deps: Vec<Vec<String>>,
 }
 
+/// A cross-module import that bypasses the module's public interface.
+#[derive(Debug, Clone, Serialize)]
+pub struct BoundaryViolation {
+    pub source_file: String,
+    pub target_file: String,
+    pub target_module: String,
+    pub edge_type: EdgeType,
+}
+
+/// Per-module quality metrics.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModuleInfo {
+    // v1.2.0 fields
     pub prefix: String,
     pub file_count: usize,
     pub aggregate_pagerank: f64,
     pub coupling: f64,
+    // v1.3.0 fields
+    pub cohesion: f64,
+    pub boundary_violations: Vec<BoundaryViolation>,
+    pub god_files: Vec<String>,
+}
+
+/// Cohesion = ratio of actual intra-module edges to maximum possible.
+/// Maximum possible for N files = N * (N-1) directed edges.
+/// Returns 0.0 for single-file modules (undefined ratio).
+pub fn compute_cohesion(intra_edges: usize, file_count: usize) -> f64 {
+    if file_count <= 1 {
+        return 0.0;
+    }
+    let max_possible = file_count * (file_count - 1);
+    if max_possible == 0 {
+        return 0.0;
+    }
+    (intra_edges as f64 / max_possible as f64).min(1.0)
+}
+
+/// Returns true when `target_path` is not a root file of `target_module`.
+///
+/// Root files are: mod.rs, lib.rs, index.ts, index.js, __init__.py.
+/// A file in `src/db/internal/pool.rs` is not the root of `src/db` -> violation.
+/// A file in `src/db/mod.rs` IS the root of `src/db` -> not a violation.
+pub fn is_boundary_violation(target_path: &str, target_module: &str) -> bool {
+    let root_files = ["mod.rs", "lib.rs", "index.ts", "index.js", "__init__.py"];
+    let filename = target_path.rsplit('/').next().unwrap_or(target_path);
+    // Not a violation if target is the barrel/root file of its module
+    if root_files.contains(&filename) {
+        let parent = target_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        return parent != target_module;
+    }
+    // Violation if file is in a subdirectory of the target module
+    let direct = format!("{}/", target_module);
+    target_path
+        .strip_prefix(&direct)
+        .map(|rest| rest.contains('/'))
+        .unwrap_or(true)
+}
+
+/// Files with inbound count > mean + 2sigma are god files.
+pub fn detect_god_files<'a>(inbound_counts: &[(&'a str, usize)]) -> Vec<&'a str> {
+    if inbound_counts.len() < 3 {
+        return vec![];
+    }
+    let counts: Vec<f64> = inbound_counts.iter().map(|(_, c)| *c as f64).collect();
+    let mean = counts.iter().sum::<f64>() / counts.len() as f64;
+    let variance = counts.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / counts.len() as f64;
+    let sigma = variance.sqrt();
+    let threshold = mean + 2.0 * sigma;
+    inbound_counts
+        .iter()
+        .filter(|(_, c)| *c as f64 > threshold)
+        .map(|(path, _)| *path)
+        .collect()
 }
 
 /// Build the architecture map for the index.
@@ -30,18 +98,34 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
             .push(file.relative_path.clone());
     }
 
+    // Pre-compute per-file inbound edge counts (for god file detection)
+    let mut inbound_counts: HashMap<String, usize> = HashMap::new();
+    for edges in index.graph.reverse_edges.values() {
+        for edge in edges {
+            *inbound_counts.entry(edge.target.clone()).or_default() += 1;
+        }
+    }
+    // Also count call graph inbound edges
+    for call_edge in &index.call_graph.edges {
+        *inbound_counts
+            .entry(call_edge.callee_file.clone())
+            .or_default() += 1;
+    }
+
     let modules: Vec<ModuleInfo> = {
         let mut mods: Vec<ModuleInfo> = module_files
             .iter()
             .map(|(prefix, files)| {
+                let file_set: HashSet<&str> = files.iter().map(|f| f.as_str()).collect();
                 let aggregate_pagerank: f64 = files
                     .iter()
                     .map(|f| index.pagerank.get(f.as_str()).copied().unwrap_or(0.0))
                     .sum();
 
-                // Coupling: cross-module edge ratio (outgoing + incoming / total)
+                // Coupling: cross-module edge ratio
                 let mut total_edges = 0usize;
                 let mut cross_edges = 0usize;
+                let mut intra_edges = 0usize;
                 for file in files {
                     if let Some(deps) = index.graph.edges.get(file.as_str()) {
                         for edge in deps {
@@ -49,6 +133,8 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
                             let target_mod = module_prefix(&edge.target, module_depth);
                             if target_mod != *prefix {
                                 cross_edges += 1;
+                            } else {
+                                intra_edges += 1;
                             }
                         }
                     }
@@ -59,6 +145,7 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
                             if src_mod != *prefix {
                                 cross_edges += 1;
                             }
+                            // Don't double-count intra for reverse edges
                         }
                     }
                 }
@@ -68,11 +155,53 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
                     cross_edges as f64 / total_edges as f64
                 };
 
+                // Cohesion
+                let cohesion = compute_cohesion(intra_edges, files.len());
+
+                // Boundary violations: cross-module edges where target is not a root file
+                let mut boundary_violations: Vec<BoundaryViolation> = Vec::new();
+                for file in files {
+                    if let Some(deps) = index.graph.edges.get(file.as_str()) {
+                        for edge in deps {
+                            let target_mod = module_prefix(&edge.target, module_depth);
+                            if target_mod != *prefix
+                                && !file_set.contains(edge.target.as_str())
+                                && is_boundary_violation(&edge.target, &target_mod)
+                            {
+                                boundary_violations.push(BoundaryViolation {
+                                    source_file: file.clone(),
+                                    target_file: edge.target.clone(),
+                                    target_module: target_mod,
+                                    edge_type: edge.edge_type.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // God files: files in this module with inbound count > mean + 2sigma
+                let module_inbound: Vec<(&str, usize)> = files
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.as_str(),
+                            inbound_counts.get(f.as_str()).copied().unwrap_or(0),
+                        )
+                    })
+                    .collect();
+                let god_files: Vec<String> = detect_god_files(&module_inbound)
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect();
+
                 ModuleInfo {
                     prefix: prefix.clone(),
                     file_count: files.len(),
                     aggregate_pagerank,
                     coupling,
+                    cohesion,
+                    boundary_violations,
+                    god_files,
                 }
             })
             .collect();
@@ -84,8 +213,6 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
         mods
     };
 
-    // Detect circular deps via Tarjan's SCC on the full dependency graph.
-    // Each SCC with >1 node is a circular dependency group.
     let circular_deps = find_circular_dep_groups(index);
 
     ArchitectureMap {
@@ -96,7 +223,6 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
 
 /// Returns ordered path lists for each non-trivial SCC using an iterative Tarjan implementation.
 fn find_circular_dep_groups(index: &CodebaseIndex) -> Vec<Vec<String>> {
-    // Build node list (forward edges only for circular dep detection)
     let nodes: Vec<String> = {
         let mut set = HashSet::new();
         for (k, edges) in &index.graph.edges {
@@ -121,7 +247,6 @@ fn find_circular_dep_groups(index: &CodebaseIndex) -> Vec<Vec<String>> {
         .map(|(i, s)| (s.as_str(), i))
         .collect();
 
-    // Build adjacency list
     let adj: Vec<Vec<usize>> = nodes
         .iter()
         .map(|node| {
@@ -145,8 +270,6 @@ fn find_circular_dep_groups(index: &CodebaseIndex) -> Vec<Vec<String>> {
     let mut indices = vec![usize::MAX; n];
     let mut lowlinks = vec![0usize; n];
     let mut cycles: Vec<Vec<String>> = Vec::new();
-
-    // Explicit call stack to avoid clippy "too many arguments" from recursive fn
     let mut call_stack: Vec<(usize, usize)> = Vec::new();
 
     for start in 0..n {
@@ -192,7 +315,7 @@ fn find_circular_dep_groups(index: &CodebaseIndex) -> Vec<Vec<String>> {
                         }
                     }
                     if scc.len() > 1 {
-                        scc.sort(); // deterministic ordering
+                        scc.sort();
                         cycles.push(scc);
                     }
                 }
@@ -208,7 +331,6 @@ mod tests {
     use super::*;
     use crate::budget::counter::TokenCounter;
     use crate::scanner::ScannedFile;
-    use crate::schema::EdgeType;
     use std::collections::HashMap;
 
     #[test]
@@ -267,7 +389,6 @@ mod tests {
             HashMap::new(),
             &counter,
         );
-        // Manually inject a cycle: a -> b -> a
         index.graph.add_edge("a.rs", "b.rs", EdgeType::Import);
         index.graph.add_edge("b.rs", "a.rs", EdgeType::Import);
 
@@ -286,11 +407,111 @@ mod tests {
                 file_count: 3,
                 aggregate_pagerank: 2.5,
                 coupling: 0.4,
+                cohesion: 0.5,
+                boundary_violations: vec![],
+                god_files: vec![],
             }],
             circular_deps: vec![vec!["a.rs".into(), "b.rs".into()]],
         };
         let json = serde_json::to_string(&map).unwrap();
         assert!(json.contains("\"prefix\":\"src/api\""));
         assert!(json.contains("\"circular_deps\""));
+        assert!(json.contains("\"cohesion\""));
+    }
+
+    // --- Cohesion tests ---
+
+    #[test]
+    fn test_cohesion_fully_connected_module() {
+        let cohesion = compute_cohesion(6, 3);
+        assert!(
+            (cohesion - 1.0).abs() < 1e-9,
+            "expected 1.0, got {cohesion}"
+        );
+    }
+
+    #[test]
+    fn test_cohesion_isolated_module() {
+        let cohesion = compute_cohesion(0, 3);
+        assert!(
+            (cohesion - 0.0).abs() < 1e-9,
+            "expected 0.0, got {cohesion}"
+        );
+    }
+
+    #[test]
+    fn test_cohesion_single_file_module() {
+        let cohesion = compute_cohesion(0, 1);
+        assert!(
+            (cohesion - 0.0).abs() < 1e-9,
+            "single-file module cohesion = 0.0"
+        );
+    }
+
+    // --- Boundary violation tests ---
+
+    #[test]
+    fn test_boundary_violation_detects_non_root_import() {
+        assert!(is_boundary_violation("src/db/internal/pool.rs", "src/db"));
+        assert!(!is_boundary_violation("src/db/mod.rs", "src/db"));
+        assert!(!is_boundary_violation("src/db/lib.rs", "src/db"));
+    }
+
+    #[test]
+    fn test_boundary_violation_index_ts_not_violation() {
+        assert!(!is_boundary_violation("src/api/index.ts", "src/api"));
+    }
+
+    // --- God file tests ---
+
+    #[test]
+    fn test_god_file_detection_mean_plus_2sigma() {
+        // mean = (1+2+2+100)/4 = 26.25
+        // variance = ((1-26.25)^2 + (2-26.25)^2 + (2-26.25)^2 + (100-26.25)^2) / 4 = ~1507.19
+        // sigma ~= 38.82, threshold ~= 103.9 ... still too high.
+        // Use a tighter cluster with one clear outlier:
+        // mean = (1+1+1+20)/4 = 5.75
+        // variance = ((1-5.75)^2*3 + (20-5.75)^2) / 4 = (67.6875 + 203.0625) / 4 = 67.6875
+        // sigma ~= 8.23, threshold ~= 22.2 => 20 < 22.2
+        // Need even tighter. Use (1,1,1,1,1,50):
+        // mean=9.17, var=338.8, sigma=18.4, threshold=45.97 => 50 > 45.97 works!
+        let inbound_counts = vec![
+            ("a.rs", 1usize),
+            ("b.rs", 1),
+            ("c.rs", 1),
+            ("d.rs", 1),
+            ("e.rs", 1),
+            ("f.rs", 50),
+        ];
+        let god_files = detect_god_files(&inbound_counts);
+        assert!(god_files.contains(&"f.rs"), "f.rs should be a god file");
+        assert!(
+            !god_files.contains(&"a.rs"),
+            "a.rs should not be a god file"
+        );
+    }
+
+    #[test]
+    fn test_god_file_detection_requires_at_least_3_files() {
+        let counts = vec![("a.rs", 100usize)];
+        let gods = detect_god_files(&counts);
+        assert!(gods.is_empty(), "single file should never be a god file");
+    }
+
+    // --- ModuleInfo v1.3.0 fields ---
+
+    #[test]
+    fn test_module_info_has_v130_fields() {
+        let mi = ModuleInfo {
+            prefix: "src/api".into(),
+            file_count: 3,
+            aggregate_pagerank: 0.8,
+            coupling: 0.3,
+            cohesion: 0.5,
+            boundary_violations: vec![],
+            god_files: vec![],
+        };
+        assert_eq!(mi.prefix, "src/api");
+        assert!((mi.cohesion - 0.5).abs() < 1e-9);
     }
 }
