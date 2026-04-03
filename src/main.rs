@@ -127,7 +127,7 @@ fn main() {
             focus,
             timing,
             health,
-            workspace: _workspace,
+            workspace,
             path,
         } => {
             let token_budget = match parse_token_count(tokens) {
@@ -150,6 +150,7 @@ fn main() {
                 focus.as_deref(),
                 *timing,
                 *health,
+                workspace.as_deref(),
             )
         }
         Commands::Trace {
@@ -160,7 +161,7 @@ fn main() {
             all,
             focus,
             timing,
-            workspace: _workspace,
+            workspace,
             target,
             path,
         } => {
@@ -185,6 +186,7 @@ fn main() {
                 *all,
                 focus.as_deref(),
                 *timing,
+                workspace.as_deref(),
             )
         }
     };

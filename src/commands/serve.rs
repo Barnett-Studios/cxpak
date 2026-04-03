@@ -35,11 +35,19 @@ fn matches_focus(path: &str, focus: Option<&str>) -> bool {
 
 /// Scan and parse all files in a path, returning a fully built CodebaseIndex.
 pub(crate) fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
+    build_index_with_workspace(path, None)
+}
+
+/// Scan and parse files in a path, optionally scoped to a workspace prefix.
+pub(crate) fn build_index_with_workspace(
+    path: &Path,
+    workspace: Option<&str>,
+) -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
     let counter = TokenCounter::new();
     let registry = LanguageRegistry::new();
 
     let scanner = Scanner::new(path)?;
-    let files = scanner.scan()?;
+    let files = scanner.scan_workspace(workspace)?;
 
     let mut parse_results = HashMap::new();
     let mut content_map = HashMap::new();

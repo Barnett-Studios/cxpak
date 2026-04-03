@@ -37,6 +37,7 @@ pub fn run(
     focus: Option<&str>,
     timing: bool,
     health: bool,
+    workspace: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let counter = TokenCounter::new();
     let total_start = std::time::Instant::now();
@@ -47,7 +48,7 @@ pub fn run(
         eprintln!("cxpak: scanning {}", path.display());
     }
     let scanner = Scanner::new(path)?;
-    let files = scanner.scan()?;
+    let files = scanner.scan_workspace(workspace)?;
     if verbose {
         eprintln!("cxpak: found {} files", files.len());
     }
