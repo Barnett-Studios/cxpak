@@ -32,6 +32,16 @@ Pipeline: **Scanner → Parser → Schema → Index → Conventions → Budget �
 - `overview` — structured repo summary within a token budget
 - `trace` — finds a target symbol, walks dependency graph, packs relevant code paths
 
+### MCP Tools (v1.4.0)
+
+- `cxpak_predict` — POST, params: `files` (required list), `depth`, `focus`. Predicts change impact with structural/historical/call-based signals.
+- `cxpak_drift` — POST, params: `save_baseline` (bool), `focus`. Compares architecture snapshot against baseline and historical snapshots.
+- `cxpak_security_surface` — POST, params: `focus`. Analyzes unprotected endpoints, secrets, SQL injection, validation gaps, exposure scores.
+
+`RouteEndpoint.handler` now extracts real handler function names per framework (12 frameworks); fallback `"<anonymous>"` for inline closures.
+
+`AutoContextResult.predictions` is populated when the task string mentions specific file paths matching the index.
+
 ## Key Patterns
 
 ### Adding a Language
@@ -84,6 +94,11 @@ Non-import edges are rendered with `(via: edge_type)` in the dependency subgraph
 - **`blast_radius.rs`** — `compute_blast_radius()` (BFS from changed files, categorizes into direct_dependents, transitive_dependents, test_files, schema_dependents), `compute_risk()` (hop_decay × edge_weight × pagerank × test_penalty, clamped to [0,1])
 - **`api_surface.rs`** — `extract_api_surface()` (public symbols sorted by PageRank, token-budgeted), `detect_routes()` (HTTP route extraction for 12 frameworks: Express, Actix, Axum, Flask, Django, FastAPI, Spring, Gin, Echo, Fiber, Rails, Phoenix), gRPC service and GraphQL type extraction
 - **`test_map.rs`** — `build_test_map()` (source→test file mapping via naming conventions for 6 languages: Rust, TypeScript/JavaScript, Python, Java, Go, Ruby, plus catch-all; supplemented by import analysis)
+
+- **`predict.rs`** — `predict()` combines structural (blast radius), historical (co-change), and call-based signals into `PredictionResult` with `TestPrediction` entries ranked by confidence (0.3–0.9 across all 7 signal combinations)
+- **`drift.rs`** — `build_drift_report()` compares the current architecture snapshot against a stored baseline (`.cxpak/baseline.json`) and historical snapshots (`.cxpak/snapshots/`); `snapshot_from_index()` auto-saves on each call
+- **`security.rs`** — `build_security_surface()` runs 5 deterministic detections: unprotected endpoints (real handler names from api_surface), input validation gaps (high-PageRank files), secret patterns (per-type regex, 5 types), SQL injection (interpolation detection per language), and exposure scores
+- **`co_change.rs`** — `mine_co_changes_from_git()` walks git log 180 days back; `build_co_change_edges_with_dates()` applies configurable threshold and recency decay; edges stored on `CodebaseIndex.co_changes`
 
 PageRank scores feed into relevance scoring (signal #6, weight 0.17) and degradation priority (0.6 × pagerank + 0.2 × concept_priority + 0.2 × file_role).
 
