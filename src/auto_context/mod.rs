@@ -37,6 +37,8 @@ pub struct AutoContextResult {
     pub architecture: ArchitectureMap,
     pub co_changes: Vec<CoChangeEdge>,
     pub recent_changes: Vec<RecentChange>,
+    // v1.4.0 prediction
+    pub predictions: Option<crate::intelligence::predict::PredictionResult>,
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +190,41 @@ pub fn auto_context(
     let co_changes = index.co_changes.clone();
     let recent_changes = crate::intelligence::recent_changes::compute_recent_changes(index);
 
+    // v1.4.0: detect file mentions in task and compute predictions
+    let predictions = {
+        let ext_re =
+            regex::Regex::new(r"\b[\w/.-]+\.(?:rs|ts|js|py|go|java|rb|c|cpp|h|cs|swift|kt)\b").ok();
+        let slash_re = regex::Regex::new(r"\b(?:src|lib|tests?|spec|app|pkg)/[\w/.-]+\b").ok();
+
+        let mut mentions: Vec<&str> = Vec::new();
+        if let Some(re) = &ext_re {
+            for m in re.find_iter(task) {
+                mentions.push(m.as_str());
+            }
+        }
+        if let Some(re) = &slash_re {
+            for m in re.find_iter(task) {
+                if !mentions.contains(&m.as_str()) {
+                    mentions.push(m.as_str());
+                }
+            }
+        }
+        mentions.retain(|p| index.files.iter().any(|f| f.relative_path == *p));
+
+        if !mentions.is_empty() {
+            Some(crate::intelligence::predict::predict(
+                &mentions,
+                &index.graph,
+                &index.pagerank,
+                &index.co_changes,
+                &index.test_map,
+                3,
+            ))
+        } else {
+            None
+        }
+    };
+
     AutoContextResult {
         task: task.to_string(),
         dna: effective_dna,
@@ -199,6 +236,7 @@ pub fn auto_context(
         architecture,
         co_changes,
         recent_changes,
+        predictions,
     }
 }
 
