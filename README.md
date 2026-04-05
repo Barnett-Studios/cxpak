@@ -44,7 +44,10 @@ cxpak diff --tokens 50k .
 cxpak overview --tokens 50k --out context.md .       # Write to file
 cxpak overview --tokens 50k --focus src/api .         # Focus on a directory
 cxpak overview --tokens 50k --format json .           # JSON or XML output
+cxpak overview --tokens 50k --health .                # Append codebase health score
+cxpak overview --tokens 50k --workspace packages/api .  # Monorepo workspace scope
 cxpak trace --tokens 50k --all "MyError" .            # Full graph traversal
+cxpak trace --tokens 50k --workspace packages/api "handle" .  # Trace within workspace
 cxpak diff --tokens 50k --git-ref main .              # Diff against a branch
 cxpak diff --tokens 50k --since "1 week" .            # Diff by time range
 cxpak overview --tokens 50k --timing .                # Show pipeline timing
@@ -53,7 +56,7 @@ cxpak clean .                                         # Clear cache
 
 ### 2. MCP Server (for Claude Code, Cursor, and other AI tools)
 
-Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 11 codebase tools — including relevance scoring, query expansion, and schema-aware context packing.
+Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 19 codebase tools — including relevance scoring, query expansion, convention verification, health scoring, call graph analysis, and schema-aware context packing.
 
 **Claude Code** — add to `.mcp.json` in your project root (or `~/.claude/.mcp.json` globally):
 
@@ -100,6 +103,14 @@ Once configured, your AI tool can call these tools:
 | `cxpak_blast_radius` | Analyze change impact with risk scores |
 | `cxpak_api_surface` | Extract public API surface |
 | `cxpak_context_diff` | Show what changed since last auto_context call |
+| `cxpak_verify` | Check code changes against observed conventions |
+| `cxpak_conventions` | Full convention profile with evidence and patterns |
+| `cxpak_health` | Composite health score across 6 dimensions |
+| `cxpak_risks` | Top risky files ranked by churn, blast radius, and test gap |
+| `cxpak_briefing` | Compact orientation: manifest, health, risks, architecture — no code |
+| `cxpak_call_graph` | Cross-file call graph with confidence levels |
+| `cxpak_dead_code` | Dead symbols ranked by importance |
+| `cxpak_architecture` | Architecture quality: coupling, cohesion, boundary violations |
 
 All tools support a `focus` path prefix parameter to scope results.
 
@@ -156,9 +167,14 @@ cxpak watch .
 | `GET /diff?git_ref=HEAD~1` | Show changes with dependency context |
 | `POST /search` | Regex search with context |
 | `POST /blast_radius` | Change impact analysis |
-| `POST /api_surface` | Public API extraction |
+| `GET /api_surface` | Public API extraction |
 | `POST /auto_context` | One-call optimal context |
-| `POST /context_diff` | Session delta |
+| `GET /context_diff` | Session delta |
+| `GET /health_score` | Codebase health score |
+| `GET /risks` | Top risky files |
+| `POST /call_graph` | Cross-file call graph |
+| `POST /dead_code` | Dead symbol detection |
+| `POST /architecture` | Architecture quality report |
 
 ## What You Get
 
@@ -187,6 +203,71 @@ cxpak applies intelligent context management to maximize the usefulness of every
 **Context Annotations** — Each packed file gets a language-aware comment header showing its relevance score, role (selected/dependency), signal breakdown, and detail level. The LLM knows exactly why each file was included and how much detail it's seeing.
 
 **Chunk Splitting** — Symbols exceeding 4000 tokens are split into labeled chunks (e.g., `handler [1/3]`) that degrade independently. Each chunk carries the parent signature for context.
+
+## Conventions
+
+cxpak extracts a quantified convention profile from the codebase — the patterns your team actually follows, not what a linter wishes you followed.
+
+**8 convention categories:** naming, imports, errors, dependencies, testing, visibility, functions, git health. Each pattern includes counts, percentages, strength labels (Convention ≥90%, Trend ≥70%, Mixed), and exceptions.
+
+**Convention verification** — `cxpak_verify` checks code changes against observed conventions. It only flags violations in changed lines, not pre-existing debt. Reports include severity, evidence, and suggested fixes.
+
+**Repository DNA** — Every `auto_context` call includes a ~1000 token DNA section summarizing naming conventions, error handling patterns, import style, architecture layering, visibility defaults, function length stats, testing patterns, and git health. This gives the LLM implicit knowledge of "how we do things here" before it sees any code.
+
+## Intelligence
+
+cxpak includes graph-based intelligence features that go beyond static analysis.
+
+**PageRank File Importance** — Every file in the dependency graph is scored 0.0–1.0 using PageRank over the import graph. Files that are transitively imported by many others rank higher. PageRank is used as signal #6 in relevance scoring (weight 0.17) and drives degradation priority via the formula `0.6 × pagerank + 0.2 × concept_priority + 0.2 × file_role`. Symbol-level importance is computed as `file_pagerank × symbol_weight`, where symbol_weight is 1.0 (public + referenced), 0.7 (public), or 0.3 (private).
+
+**Blast Radius Analysis** — The `cxpak_blast_radius` tool takes a set of changed files and returns categorized affected files: `direct_dependents`, `transitive_dependents`, `test_files`, and `schema_dependents`, each with a risk score. Risk is calculated as `hop_decay × edge_weight × pagerank × test_penalty`, clamped to [0, 1]. This tells you which parts of the codebase are most likely to break when you change a file.
+
+**API Surface Extraction** — The `cxpak_api_surface` tool extracts the public API of a codebase: public symbols sorted by PageRank, HTTP routes (12 frameworks including Express, Actix, Axum, Flask, Django, FastAPI, Spring, Gin, Echo, Fiber, Rails, and Phoenix), gRPC services, and GraphQL types. Output is token-budgeted.
+
+**Test File Mapping** — cxpak automatically maps source files to their test files using naming conventions for 6 languages (Rust, TypeScript/JavaScript, Python, Java, Go, Ruby) plus a catch-all pattern, supplemented by import analysis. The `pack_context` tool auto-includes test files when the `include_tests` parameter is set. Blast radius uses the test map to populate the `test_files` category.
+
+**Call Graph** — `cxpak_call_graph` builds a cross-file call graph from parse results. Each edge carries a confidence level: Exact (import-resolved) or Approximate (name-matched). Use it to understand how functions flow across module boundaries.
+
+**Dead Code Detection** — `cxpak_dead_code` identifies symbols with zero callers that are not entry points and not referenced from tests. Results are sorted by a liveness score so the most important dead symbols surface first.
+
+**Health Score** — `cxpak_health` returns a composite metric across 6 dimensions: convention adherence, test coverage, churn stability, module coupling, circular dependencies, and dead code. Use it to understand overall codebase quality before making structural changes.
+
+**Risk Ranking** — `cxpak_risks` ranks files by a composite of churn rate, blast radius, and test coverage gap. These are the files most likely to cause problems and most in need of refactoring or additional tests.
+
+**Architecture Quality** — `cxpak_architecture` reports per-module metrics: coupling (inter-module dependencies), cohesion (intra-module relatedness), circular dependency count, boundary violations (cross-layer imports), and god files (files with excessive responsibility).
+
+## Auto Context
+
+`cxpak_auto_context` is the main entry point — one call that delivers optimal context for any task. Give it a task description and token budget; it returns everything the LLM needs.
+
+**Pipeline:**
+
+0. **DNA section** — renders a ~1000 token convention summary (naming, errors, imports, architecture, visibility, functions, testing, git health), deducted from the budget before allocation
+1. **Query expansion** — expands the task description with synonyms and domain-specific terms
+2. **Relevance scoring** — scores every file against the expanded query using 7 weighted signals
+3. **Seed selection** — picks the top-scoring files as seeds for graph traversal
+4. **Noise filtering** — 3 layers remove low-value files: blocklist (generated/vendored), similarity dedup (near-duplicate content), and relevance floor (below minimum score). Files removed by each layer are reported in `filtered_out` for transparency
+5. **Test inclusion** — maps seed files to their test files via naming conventions and import analysis
+6. **Schema linking** — pulls in schema files connected to seeds via typed dependency edges
+7. **Blast radius** — identifies files at risk from the seed set, sorted by risk score
+8. **API surface** — extracts public symbols and HTTP routes from seed files
+9. **Budget allocation** — fill-then-overflow priority packing: seeds first, then tests, schema, blast radius, and API surface until the budget is exhausted
+10. **Annotations** — each packed file gets a language-aware comment header with score, role, signals, and detail level
+
+**Noise filtering** applies three independent layers. The `filtered_out` field in the response lists every file removed and which layer caught it, so you can audit what was excluded and why.
+
+**Token-budgeted output** uses fill-then-overflow priority packing: high-priority categories (seeds, tests) fill first; lower-priority categories (blast radius, API surface) overflow into remaining budget. Content that doesn't fit is progressively degraded through 5 detail levels before being dropped.
+
+## Workspace Support
+
+For monorepos, the `--workspace` flag scopes scanning to a subdirectory while keeping the full repo as the git root:
+
+```bash
+cxpak overview --tokens 50k --workspace packages/api .
+cxpak trace --tokens 50k --workspace packages/api "handle_request" .
+```
+
+Only files under the workspace prefix are indexed. MCP tools that accept a `workspace` parameter (`cxpak_call_graph`, `cxpak_dead_code`, `cxpak_architecture`) also support workspace scoping.
 
 ## Data Layer Awareness
 
@@ -221,39 +302,6 @@ Non-import edges are surfaced in the dependency graph output and in pack context
 **Embedded SQL Linking** — When application code (Python, TypeScript, Rust, etc.) contains inline SQL strings that reference known tables, cxpak creates `embedded_sql` edges connecting those files to the table definition files. This means `context_for_task` and `pack_context` will automatically pull in relevant schema files when you ask about database-related tasks.
 
 **Schema-Aware Query Expansion** — When the Database domain is detected, table names and column names from the schema index are added as expansion terms. Queries for "orders" or "user_id" will match files that reference those identifiers even if the query term doesn't appear literally in the file path or symbol names.
-
-## Intelligence
-
-cxpak includes graph-based intelligence features that go beyond static analysis.
-
-**PageRank File Importance** — Every file in the dependency graph is scored 0.0–1.0 using PageRank over the import graph. Files that are transitively imported by many others rank higher. PageRank is used as signal #6 in relevance scoring (weight 0.17) and drives degradation priority via the formula `0.6 × pagerank + 0.2 × concept_priority + 0.2 × file_role`. Symbol-level importance is computed as `file_pagerank × symbol_weight`, where symbol_weight is 1.0 (public + referenced), 0.7 (public), or 0.3 (private).
-
-**Blast Radius Analysis** — The `cxpak_blast_radius` MCP tool takes a set of changed files and returns categorized affected files: `direct_dependents`, `transitive_dependents`, `test_files`, and `schema_dependents`, each with a risk score. Risk is calculated as `hop_decay × edge_weight × pagerank × test_penalty`, clamped to [0, 1]. This tells you which parts of the codebase are most likely to break when you change a file.
-
-**API Surface Extraction** — The `cxpak_api_surface` MCP tool extracts the public API of a codebase: public symbols sorted by PageRank, HTTP routes (12 frameworks including Express, Actix, Axum, Flask, Django, FastAPI, Spring, Gin, Echo, Fiber, Rails, and Phoenix), gRPC services, and GraphQL types. Output is token-budgeted.
-
-**Test File Mapping** — cxpak automatically maps source files to their test files using naming conventions for 6 languages (Rust, TypeScript/JavaScript, Python, Java, Go, Ruby) plus a catch-all pattern, supplemented by import analysis. The `pack_context` tool auto-includes test files when the `include_tests` parameter is set. Blast radius uses the test map to populate the `test_files` category.
-
-## Auto Context
-
-`cxpak_auto_context` is the hero feature of v1.0.0 — one call that delivers optimal context for any task. Give it a task description and token budget; it returns everything the LLM needs.
-
-**10-step pipeline:**
-
-1. **Query expansion** — expands the task description with synonyms and domain-specific terms
-2. **Relevance scoring** — scores every file against the expanded query using 7 weighted signals
-3. **Seed selection** — picks the top-scoring files as seeds for graph traversal
-4. **Noise filtering** — 3 layers remove low-value files: blocklist (generated/vendored), similarity dedup (near-duplicate content), and relevance floor (below minimum score). Files removed by each layer are reported in `filtered_out` for transparency
-5. **Test inclusion** — maps seed files to their test files via naming conventions and import analysis
-6. **Schema linking** — pulls in schema files connected to seeds via typed dependency edges
-7. **Blast radius** — identifies files at risk from the seed set, sorted by risk score
-8. **API surface** — extracts public symbols and HTTP routes from seed files
-9. **Budget allocation** — fill-then-overflow priority packing: seeds first, then tests, schema, blast radius, and API surface until the budget is exhausted
-10. **Annotations** — each packed file gets a language-aware comment header with score, role, signals, and detail level
-
-**Noise filtering** applies three independent layers. The `filtered_out` field in the response lists every file removed and which layer caught it, so you can audit what was excluded and why.
-
-**Token-budgeted output** uses fill-then-overflow priority packing: high-priority categories (seeds, tests) fill first; lower-priority categories (blast radius, API surface) overflow into remaining budget. Content that doesn't fit is progressively degraded through 5 detail levels before being dropped.
 
 ## Embeddings
 
