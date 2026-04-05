@@ -6,6 +6,7 @@ pub mod co_change;
 pub mod dead_code;
 pub mod health;
 pub mod pagerank;
+pub mod predict;
 pub mod recent_changes;
 pub mod risk;
 pub mod test_map;

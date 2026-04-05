@@ -78,7 +78,7 @@ pub fn compute_risk(
 
 /// Returns true when `path` looks like a test file based on path components.
 /// Checks for `test`, `spec`, `__tests__` anywhere in the path.
-fn is_test_path(path: &str) -> bool {
+pub(crate) fn is_test_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     let parts: Vec<&str> = lower.split('/').collect();
     for part in &parts[..parts.len().saturating_sub(1)] {
