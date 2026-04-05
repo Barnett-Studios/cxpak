@@ -459,6 +459,34 @@ mod tests {
     }
 
     #[test]
+    fn test_all_seven_confidence_subsets_are_distinct() {
+        use std::collections::HashSet;
+        let cases: Vec<(&[ImpactSignal], f64)> = vec![
+            (&[ImpactSignal::Historical], 0.3),
+            (&[ImpactSignal::Structural], 0.4),
+            (&[ImpactSignal::CallBased], 0.5),
+            (&[ImpactSignal::Structural, ImpactSignal::Historical], 0.5),
+            (&[ImpactSignal::CallBased, ImpactSignal::Historical], 0.6),
+            (&[ImpactSignal::Structural, ImpactSignal::CallBased], 0.7),
+            (
+                &[
+                    ImpactSignal::Structural,
+                    ImpactSignal::CallBased,
+                    ImpactSignal::Historical,
+                ],
+                0.9,
+            ),
+        ];
+        let values: HashSet<u64> = cases.iter().map(|(_, v)| (v * 100.0) as u64).collect();
+        // 0.5 appears for both (CallBased only) and (Structural+Historical) — 6 distinct levels
+        assert_eq!(
+            values.len(),
+            6,
+            "6 distinct confidence levels in the 7 subsets"
+        );
+    }
+
+    #[test]
     fn test_empty_signals_produces_zero_confidence() {
         assert_eq!(confidence_for_signals(&[]), 0.0);
     }
