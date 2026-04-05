@@ -61,7 +61,7 @@ jobs:
         run: cargo install cargo-tarpaulin
       - name: Check coverage (90% minimum)
         run: |
-          OUTPUT=$(cargo tarpaulin --skip-clean --no-default-features --features "daemon,lang-rust,lang-typescript,lang-javascript,lang-java,lang-python,lang-go,lang-c,lang-cpp,lang-ruby,lang-csharp,lang-swift,lang-kotlin,lang-bash,lang-css,lang-scss,lang-php,lang-markdown,lang-json,lang-yaml,lang-toml,lang-dockerfile,lang-hcl,lang-dart,lang-scala,lang-lua,lang-elixir,lang-zig,lang-haskell,lang-groovy,lang-objc,lang-r,lang-julia,lang-ocaml,lang-matlab,lang-proto,lang-svelte,lang-makefile,lang-html,lang-graphql,lang-xml,lang-sql,lang-prisma" --lib --test cli_test --test diff_test --test overview_test --test scanner_test --test trace_test --timeout 300 2>&1) || true
+          OUTPUT=$(cargo tarpaulin --skip-clean --no-default-features --features "daemon,lang-rust,lang-typescript,lang-javascript,lang-java,lang-python,lang-go,lang-c,lang-cpp,lang-ruby,lang-csharp,lang-swift,lang-kotlin,lang-bash,lang-css,lang-scss,lang-php,lang-markdown,lang-json,lang-yaml,lang-toml,lang-dockerfile,lang-hcl,lang-dart,lang-scala,lang-lua,lang-elixir,lang-zig,lang-haskell,lang-groovy,lang-objc,lang-r,lang-julia,lang-ocaml,lang-matlab,lang-proto,lang-svelte,lang-makefile,lang-html,lang-graphql,lang-xml,lang-sql,lang-prisma" --lib --test cli_test --test diff_test --test overview_test --test scanner_test --test serve_test --test trace_test --test auto_context_v120 --test incremental_index --timeout 300 2>&1) || true
           echo "$OUTPUT"
           COVERAGE=$(echo "$OUTPUT" | grep -oP '[\d.]+(?=% coverage)' | tail -1)
           echo "Coverage: ${COVERAGE}%"
