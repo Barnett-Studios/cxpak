@@ -4,6 +4,7 @@ pub mod blast_radius;
 pub mod call_graph;
 pub mod co_change;
 pub mod dead_code;
+pub mod drift;
 pub mod health;
 pub mod pagerank;
 pub mod predict;
