@@ -67,6 +67,110 @@ pub fn build_co_changes(commits: &[(Vec<String>, i64)]) -> Vec<CoChangeEdge> {
         .collect()
 }
 
+/// Alias for `build_co_changes()` taking per-commit dates.
+pub fn build_co_change_edges_with_dates(
+    commits: &[(Vec<String>, i64)],
+    threshold: u32,
+    window_days: i64,
+) -> Vec<CoChangeEdge> {
+    // Filter commits outside window, then delegate to build_co_changes
+    let within_window: Vec<(Vec<String>, i64)> = commits
+        .iter()
+        .filter(|(_, days_ago)| *days_ago <= window_days)
+        .cloned()
+        .collect();
+    let mut edges = build_co_changes(&within_window);
+    edges.retain(|e| e.count >= threshold);
+    edges
+}
+
+/// Convenience wrapper: convert `Vec<Vec<String>>` (no dates) by assuming days_ago=0.
+pub fn build_co_change_edges(
+    commits: &[Vec<String>],
+    threshold: u32,
+    window_days: i64,
+) -> Vec<CoChangeEdge> {
+    let with_dates: Vec<(Vec<String>, i64)> = commits.iter().map(|c| (c.clone(), 0i64)).collect();
+    build_co_change_edges_with_dates(&with_dates, threshold, window_days)
+}
+
+/// Mine co-change data from a git repository using git2.
+/// Returns `(changed_files, days_ago)` for each commit within the window.
+pub fn mine_co_changes_from_git(
+    repo_path: &std::path::Path,
+    window_days: i64,
+) -> Vec<(Vec<String>, i64)> {
+    let repo = match git2::Repository::open(repo_path) {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - window_days * 86400;
+
+    let mut revwalk = match repo.revwalk() {
+        Ok(rw) => rw,
+        Err(_) => return vec![],
+    };
+    if revwalk.push_head().is_err() {
+        return vec![];
+    }
+
+    let mut results = Vec::new();
+
+    for oid_result in revwalk {
+        let oid = match oid_result {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let commit = match repo.find_commit(oid) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let commit_time = commit.time().seconds();
+        if commit_time < cutoff {
+            break; // revwalk is time-ordered descending
+        }
+
+        let days_ago = (now - commit_time) / 86400;
+
+        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+        let current_tree = match commit.tree() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&current_tree), None) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let mut changed_files: Vec<String> = Vec::new();
+        diff.foreach(
+            &mut |delta, _| {
+                if let Some(path) = delta.new_file().path() {
+                    changed_files.push(path.to_string_lossy().to_string());
+                }
+                true
+            },
+            None,
+            None,
+            None,
+        )
+        .ok();
+
+        if changed_files.len() >= 2 {
+            results.push((changed_files, days_ago));
+        }
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +263,59 @@ mod tests {
         ];
         let edges = build_co_changes(&commits);
         assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn test_build_co_change_edges_threshold_filters_noise() {
+        let commits: Vec<Vec<String>> = vec![
+            vec!["a.rs".into(), "b.rs".into()],
+            vec!["a.rs".into(), "b.rs".into()],
+        ];
+        let edges = build_co_change_edges(&commits, 3, 180);
+        assert!(edges.is_empty(), "below threshold should produce no edges");
+    }
+
+    #[test]
+    fn test_build_co_change_edges_meets_threshold() {
+        let commits: Vec<Vec<String>> = vec![
+            vec!["a.rs".into(), "b.rs".into()],
+            vec!["a.rs".into(), "b.rs".into()],
+            vec!["a.rs".into(), "b.rs".into()],
+        ];
+        let edges = build_co_change_edges(&commits, 3, 180);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].count, 3);
+    }
+
+    #[test]
+    fn test_build_co_change_edges_with_dates_recency() {
+        let commits_with_dates = vec![
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 0i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 5i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 10i64),
+        ];
+        let edges = build_co_change_edges_with_dates(&commits_with_dates, 3, 180);
+        assert!((edges[0].recency_weight - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_build_co_change_edges_excludes_beyond_window() {
+        let commits_with_dates = vec![
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 181i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 200i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 250i64),
+        ];
+        let edges = build_co_change_edges_with_dates(&commits_with_dates, 3, 180);
+        assert!(
+            edges.is_empty(),
+            "commits beyond 180-day window must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_mine_co_changes_nonexistent_repo_returns_empty() {
+        let result = mine_co_changes_from_git(std::path::Path::new("/nonexistent/path"), 180);
+        assert!(result.is_empty(), "non-existent repo must return empty vec");
     }
 
     #[test]
