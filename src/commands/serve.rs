@@ -138,6 +138,12 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
         .route("/call_graph", axum::routing::post(call_graph_handler))
         .route("/dead_code", axum::routing::post(dead_code_handler))
         .route("/architecture", axum::routing::post(architecture_handler))
+        .route("/predict", axum::routing::post(predict_handler))
+        .route("/drift", axum::routing::post(drift_handler))
+        .route(
+            "/security_surface",
+            axum::routing::post(security_surface_handler),
+        )
         .with_state(state)
 }
 
@@ -692,6 +698,93 @@ async fn architecture_handler(
     })))
 }
 
+// --- v1.4.0 handlers: predict, drift, security_surface ---
+
+#[derive(Deserialize)]
+struct PredictParams {
+    files: Option<Vec<String>>,
+    #[allow(dead_code)]
+    focus: Option<String>,
+    depth: Option<usize>,
+}
+
+async fn predict_handler(
+    State(index): State<SharedIndex>,
+    Json(params): Json<PredictParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let files = match params.files {
+        Some(f) if !f.is_empty() => f,
+        _ => {
+            return Ok(Json(
+                json!({"error": "missing required field: files (non-empty list of paths)"}),
+            ));
+        }
+    };
+
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let depth = params.depth.unwrap_or(3);
+
+    let result = crate::intelligence::predict::predict(
+        &file_refs,
+        &idx.graph,
+        &idx.pagerank,
+        &idx.co_changes,
+        &idx.test_map,
+        depth,
+    );
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_else(
+        |_| json!({"error": "serialization failed"}),
+    )))
+}
+
+#[derive(Deserialize)]
+struct DriftParams {
+    save_baseline: Option<bool>,
+    #[allow(dead_code)]
+    focus: Option<String>,
+}
+
+async fn drift_handler(
+    State(index): State<SharedIndex>,
+    State(repo_path): State<SharedPath>,
+    Json(params): Json<DriftParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let save_baseline = params.save_baseline.unwrap_or(false);
+    let report = crate::intelligence::drift::build_drift_report(&idx, &repo_path, save_baseline);
+    Ok(Json(serde_json::to_value(&report).unwrap_or_else(
+        |_| json!({"error": "serialization failed"}),
+    )))
+}
+
+#[derive(Deserialize)]
+struct SecuritySurfaceParams {
+    focus: Option<String>,
+}
+
+async fn security_surface_handler(
+    State(index): State<SharedIndex>,
+    Json(params): Json<SecuritySurfaceParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let surface = crate::intelligence::security::build_security_surface(
+        &idx,
+        crate::intelligence::security::DEFAULT_AUTH_PATTERNS,
+        params.focus.as_deref(),
+    );
+    Ok(Json(serde_json::to_value(&surface).unwrap_or_else(
+        |_| json!({"error": "serialization failed"}),
+    )))
+}
+
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1026,6 +1119,40 @@ fn mcp_stdio_loop_with_io(
                                 "properties": {
                                     "focus": { "type": "string", "description": "Path prefix to scope" },
                                     "workspace": { "type": "string", "description": "Monorepo workspace prefix" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_predict",
+                            "description": "Predict change impact for a set of files. Returns structural (blast radius), historical (co-change), and call-based impact predictions with test predictions ranked by confidence (0.3-0.9).",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "files": { "type": "array", "items": { "type": "string" }, "description": "List of changed file paths (required)" },
+                                    "depth": { "type": "number", "description": "BFS depth for structural impact (default 3)", "default": 3 },
+                                    "focus": { "type": "string", "description": "Path prefix to scope" }
+                                },
+                                "required": ["files"]
+                            }
+                        },
+                        {
+                            "name": "cxpak_drift",
+                            "description": "Detect architecture drift by comparing current snapshot against baseline and historical snapshots. Auto-saves snapshot on each call. Set save_baseline=true to establish a new baseline.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "save_baseline": { "type": "boolean", "description": "Save current state as baseline (default false)", "default": false },
+                                    "focus": { "type": "string", "description": "Path prefix to scope" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_security_surface",
+                            "description": "Analyze security surface: unprotected endpoints, input validation gaps, secret patterns (AWS, GitHub PAT, passwords, connection strings, Slack), SQL injection risks, and exposure scores.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "focus": { "type": "string", "description": "Path prefix to scope" }
                                 }
                             }
                         }
@@ -1910,6 +2037,61 @@ fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
+        "cxpak_predict" => {
+            let files: Vec<String> = args
+                .get("files")
+                .and_then(|f| f.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                return mcp_tool_result(
+                    id,
+                    "Error: 'files' argument is required and must not be empty",
+                );
+            }
+            let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+            let depth = args.get("depth").and_then(|d| d.as_u64()).unwrap_or(3) as usize;
+            let result = crate::intelligence::predict::predict(
+                &file_refs,
+                &index.graph,
+                &index.pagerank,
+                &index.co_changes,
+                &index.test_map,
+                depth,
+            );
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
+        "cxpak_drift" => {
+            let save_baseline = args
+                .get("save_baseline")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let report =
+                crate::intelligence::drift::build_drift_report(index, repo_path, save_baseline);
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&report).unwrap_or_default(),
+            )
+        }
+        "cxpak_security_surface" => {
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let surface = crate::intelligence::security::build_security_surface(
+                index,
+                crate::intelligence::security::DEFAULT_AUTH_PATTERNS,
+                focus,
+            );
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&surface).unwrap_or_default(),
+            )
+        }
         _ => mcp_response(
             id,
             json!({
@@ -2409,7 +2591,7 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 22);
     }
 
     #[test]
@@ -3175,8 +3357,8 @@ mod tests {
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            19,
-            "should have 19 tools (13 existing + 3 v1.2.0 + 3 v1.3.0)"
+            22,
+            "should have 22 tools (13 existing + 3 v1.2.0 + 3 v1.3.0 + 3 v1.4.0)"
         );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_context_for_task"));
@@ -4550,7 +4732,7 @@ mod tests {
             tool_names.contains(&"cxpak_context_diff"),
             "tools/list should include cxpak_context_diff"
         );
-        assert_eq!(tools.len(), 19, "total tool count should be 19");
+        assert_eq!(tools.len(), 22, "total tool count should be 22");
     }
 
     // --- Task 11: cxpak_health MCP tool ---
