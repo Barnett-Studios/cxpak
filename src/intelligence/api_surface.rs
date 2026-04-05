@@ -177,25 +177,55 @@ pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
     let line_of =
         |offset: usize| -> usize { content[..offset].chars().filter(|&c| c == '\n').count() + 1 };
 
-    // 1. Express/Koa: (app|router).(get|post|put|delete|patch)("/<path>")
-    if let Ok(re) =
-        Regex::new(r#"(?i)(app|router)\.(get|post|put|delete|patch)\s*\(\s*["'](/[^"']*)"#)
-    {
+    // 1. Express/Koa: (app|router).(get|post|put|delete|patch)("/<path>", handlerName)
+    if let Ok(re) = Regex::new(
+        r#"(?i)(app|router)\.(get|post|put|delete|patch)\s*\(\s*["'](/[^"']*)["']\s*,\s*([a-zA-Z_$][a-zA-Z0-9_$]*)"#,
+    ) {
+        let js_keywords = ["function", "async", "new", "class", "return"];
         for cap in re.captures_iter(content) {
             let method = cap[2].to_uppercase();
             let path = cap[3].to_string();
+            let raw_handler = cap[4].to_string();
+            let handler = if js_keywords.contains(&raw_handler.as_str()) {
+                "<anonymous>".to_string()
+            } else {
+                raw_handler
+            };
             let line = line_of(cap.get(0).unwrap().start());
             routes.push(RouteEndpoint {
                 method,
                 path,
-                handler: "handler".to_string(),
+                handler,
                 file: file_path.to_string(),
                 line,
             });
         }
     }
 
-    // 2. Flask: @(app|blueprint).(route|get|post|put|delete)("/<path>")
+    // 2. Flask: @(app|blueprint).(route|get|post|put|delete)("/<path>") followed by def func_name
+    if let Ok(re) = Regex::new(
+        r#"(?i)@(app|blueprint)\.(route|get|post|put|delete)\s*\(\s*["'](/[^"']*?)["'][^)]*\)\s*\n\s*(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)"#,
+    ) {
+        for cap in re.captures_iter(content) {
+            let method_or_route = cap[2].to_lowercase();
+            let method = if method_or_route == "route" {
+                "GET".to_string()
+            } else {
+                method_or_route.to_uppercase()
+            };
+            let path = cap[3].to_string();
+            let handler = cap[4].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
+            routes.push(RouteEndpoint {
+                method,
+                path,
+                handler,
+                file: file_path.to_string(),
+                line,
+            });
+        }
+    }
+    // Flask fallback: decorator without def on next line
     if let Ok(re) =
         Regex::new(r#"(?i)@(app|blueprint)\.(route|get|post|put|delete)\s*\(\s*["'](/[^"']*)"#)
     {
@@ -208,26 +238,14 @@ pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
             };
             let path = cap[3].to_string();
             let line = line_of(cap.get(0).unwrap().start());
-            routes.push(RouteEndpoint {
-                method,
-                path,
-                handler: "handler".to_string(),
-                file: file_path.to_string(),
-                line,
-            });
-        }
-    }
-
-    // 3. Django: path("/<path>") — only in files containing "urls" in the path
-    if file_path.contains("urls") {
-        if let Ok(re) = Regex::new(r#"(?i)path\s*\(\s*["']([^"']*)"#) {
-            for cap in re.captures_iter(content) {
-                let path_val = cap[1].to_string();
-                let line = line_of(cap.get(0).unwrap().start());
+            if !routes
+                .iter()
+                .any(|r| r.line == line && r.method == method && r.path == path)
+            {
                 routes.push(RouteEndpoint {
-                    method: "GET".to_string(),
-                    path: format!("/{}", path_val.trim_start_matches('/')),
-                    handler: "handler".to_string(),
+                    method,
+                    path,
+                    handler: "<anonymous>".to_string(),
                     file: file_path.to_string(),
                     line,
                 });
@@ -235,7 +253,45 @@ pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
         }
     }
 
-    // 4. FastAPI: @(app|router).(get|post|put|delete|patch)("/<path>")
+    // 3. Django: path("/<path>", view_func) — only in files containing "urls" in the path
+    if file_path.contains("urls") {
+        if let Ok(re) =
+            Regex::new(r#"(?i)path\s*\(\s*["']([^"']*)["']\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)"#)
+        {
+            for cap in re.captures_iter(content) {
+                let path_val = cap[1].to_string();
+                let handler = cap[2].to_string();
+                let line = line_of(cap.get(0).unwrap().start());
+                routes.push(RouteEndpoint {
+                    method: "GET".to_string(),
+                    path: format!("/{}", path_val.trim_start_matches('/')),
+                    handler,
+                    file: file_path.to_string(),
+                    line,
+                });
+            }
+        }
+    }
+
+    // 4. FastAPI: @(app|router).(get|post|put|delete|patch)("/<path>") followed by def func_name
+    if let Ok(re) = Regex::new(
+        r#"(?i)@(app|router)\.(get|post|put|delete|patch)\s*\(\s*["'](/[^"']*?)["'][^)]*\)\s*\n\s*(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)"#,
+    ) {
+        for cap in re.captures_iter(content) {
+            let method = cap[2].to_uppercase();
+            let path = cap[3].to_string();
+            let handler = cap[4].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
+            routes.push(RouteEndpoint {
+                method,
+                path,
+                handler,
+                file: file_path.to_string(),
+                line,
+            });
+        }
+    }
+    // FastAPI fallback: decorator without def on next line
     if let Ok(re) =
         Regex::new(r#"(?i)@(app|router)\.(get|post|put|delete|patch)\s*\(\s*["'](/[^"']*)"#)
     {
@@ -243,17 +299,45 @@ pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
             let method = cap[2].to_uppercase();
             let path = cap[3].to_string();
             let line = line_of(cap.get(0).unwrap().start());
+            if !routes
+                .iter()
+                .any(|r| r.line == line && r.method == method && r.path == path)
+            {
+                routes.push(RouteEndpoint {
+                    method,
+                    path,
+                    handler: "<anonymous>".to_string(),
+                    file: file_path.to_string(),
+                    line,
+                });
+            }
+        }
+    }
+
+    // 5. Spring: @(Get|Post|Put|Delete|Patch|Request)Mapping("/<path>") followed by method name
+    if let Ok(re) = Regex::new(
+        r#"(?s)@(Get|Post|Put|Delete|Patch|Request)Mapping\s*\(\s*["'](/[^"']*?)["'][^)]*\)\s*(?:public\s+)?(?:\S+\s+)+?([a-zA-Z_][a-zA-Z0-9_]*)\s*\("#,
+    ) {
+        for cap in re.captures_iter(content) {
+            let verb = cap[1].to_lowercase();
+            let method = if verb == "request" {
+                "GET".to_string()
+            } else {
+                verb.to_uppercase()
+            };
+            let path = cap[2].to_string();
+            let handler = cap[3].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
             routes.push(RouteEndpoint {
                 method,
                 path,
-                handler: "handler".to_string(),
+                handler,
                 file: file_path.to_string(),
                 line,
             });
         }
     }
-
-    // 5. Spring: @(Get|Post|Put|Delete|Patch|Request)Mapping("/<path>")
+    // Spring fallback: no method signature found after annotation
     if let Ok(re) =
         Regex::new(r#"@(Get|Post|Put|Delete|Patch|Request)Mapping\s*\(\s*["'](/[^"']*)"#)
     {
@@ -266,94 +350,14 @@ pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
             };
             let path = cap[2].to_string();
             let line = line_of(cap.get(0).unwrap().start());
-            routes.push(RouteEndpoint {
-                method,
-                path,
-                handler: "handler".to_string(),
-                file: file_path.to_string(),
-                line,
-            });
-        }
-    }
-
-    // 6. actix-web: #[get("/path")]
-    if let Ok(re) = Regex::new(r#"#\[(get|post|put|delete|patch)\s*\(\s*["'](/[^"']*)"#) {
-        for cap in re.captures_iter(content) {
-            let method = cap[1].to_uppercase();
-            let path = cap[2].to_string();
-            let line = line_of(cap.get(0).unwrap().start());
-            routes.push(RouteEndpoint {
-                method,
-                path,
-                handler: "handler".to_string(),
-                file: file_path.to_string(),
-                line,
-            });
-        }
-    }
-
-    // 7. axum: .route("/path")
-    if let Ok(re) = Regex::new(r#"\.route\s*\(\s*["'](/[^"']*)"#) {
-        for cap in re.captures_iter(content) {
-            let path = cap[1].to_string();
-            let line = line_of(cap.get(0).unwrap().start());
-            routes.push(RouteEndpoint {
-                method: "GET".to_string(),
-                path,
-                handler: "handler".to_string(),
-                file: file_path.to_string(),
-                line,
-            });
-        }
-    }
-
-    // 8. Gin: (r|router|group).(GET|POST|PUT|DELETE|PATCH)("/path")
-    if let Ok(re) =
-        Regex::new(r#"(?i)(r|router|group)\.(GET|POST|PUT|DELETE|PATCH)\s*\(\s*["'](/[^"']*)"#)
-    {
-        for cap in re.captures_iter(content) {
-            let method = cap[2].to_uppercase();
-            let path = cap[3].to_string();
-            let line = line_of(cap.get(0).unwrap().start());
-            routes.push(RouteEndpoint {
-                method,
-                path,
-                handler: "handler".to_string(),
-                file: file_path.to_string(),
-                line,
-            });
-        }
-    }
-
-    // 9. Echo: (e|g|echo|group).(GET|POST|PUT|DELETE|PATCH)("/path")
-    if let Ok(re) =
-        Regex::new(r#"(?i)(e|g|echo|group)\.(GET|POST|PUT|DELETE|PATCH)\s*\(\s*["'](/[^"']*)"#)
-    {
-        for cap in re.captures_iter(content) {
-            let method = cap[2].to_uppercase();
-            let path = cap[3].to_string();
-            let line = line_of(cap.get(0).unwrap().start());
-            routes.push(RouteEndpoint {
-                method,
-                path,
-                handler: "handler".to_string(),
-                file: file_path.to_string(),
-                line,
-            });
-        }
-    }
-
-    // 10. Rails: (get|post|put|patch|delete) "/path" — only in files containing "routes"
-    if file_path.contains("routes") {
-        if let Ok(re) = Regex::new(r#"(?i)(get|post|put|patch|delete)\s+["'](/[^"']*)"#) {
-            for cap in re.captures_iter(content) {
-                let method = cap[1].to_uppercase();
-                let path = cap[2].to_string();
-                let line = line_of(cap.get(0).unwrap().start());
+            if !routes
+                .iter()
+                .any(|r| r.line == line && r.method == method && r.path == path)
+            {
                 routes.push(RouteEndpoint {
                     method,
                     path,
-                    handler: "handler".to_string(),
+                    handler: "<anonymous>".to_string(),
                     file: file_path.to_string(),
                     line,
                 });
@@ -361,7 +365,166 @@ pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
         }
     }
 
-    // 11. ASP.NET: [(HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch|Route)("/path")]
+    // 6. actix-web: #[get("/path")] followed by fn handler_name
+    if let Ok(re) = Regex::new(
+        r#"(?s)#\[(get|post|put|delete|patch)\s*\(\s*["'](/[^"']*?)["']\s*\)\s*\]\s*(?:pub\s+)?(?:async\s+)?fn\s+([a-zA-Z_][a-zA-Z0-9_]*)"#,
+    ) {
+        for cap in re.captures_iter(content) {
+            let method = cap[1].to_uppercase();
+            let path = cap[2].to_string();
+            let handler = cap[3].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
+            routes.push(RouteEndpoint {
+                method,
+                path,
+                handler,
+                file: file_path.to_string(),
+                line,
+            });
+        }
+    }
+    // actix-web fallback: attribute without fn on next line
+    if let Ok(re) = Regex::new(r#"#\[(get|post|put|delete|patch)\s*\(\s*["'](/[^"']*)"#) {
+        for cap in re.captures_iter(content) {
+            let method = cap[1].to_uppercase();
+            let path = cap[2].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
+            if !routes
+                .iter()
+                .any(|r| r.line == line && r.method == method && r.path == path)
+            {
+                routes.push(RouteEndpoint {
+                    method,
+                    path,
+                    handler: "<anonymous>".to_string(),
+                    file: file_path.to_string(),
+                    line,
+                });
+            }
+        }
+    }
+
+    // 7. axum: .route("/path", get(handler_name))
+    if let Ok(re) = Regex::new(
+        r#"\.route\s*\(\s*["'](/[^"']*?)["']\s*,\s*(?:get|post|put|delete|patch|any)\(([a-zA-Z_][a-zA-Z0-9_]*)\)"#,
+    ) {
+        for cap in re.captures_iter(content) {
+            let path = cap[1].to_string();
+            let handler = cap[2].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
+            routes.push(RouteEndpoint {
+                method: "GET".to_string(),
+                path,
+                handler,
+                file: file_path.to_string(),
+                line,
+            });
+        }
+    }
+    // axum fallback: .route("/path") without handler capture
+    if let Ok(re) = Regex::new(r#"\.route\s*\(\s*["'](/[^"']*)"#) {
+        for cap in re.captures_iter(content) {
+            let path = cap[1].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
+            if !routes.iter().any(|r| r.line == line && r.path == path) {
+                routes.push(RouteEndpoint {
+                    method: "GET".to_string(),
+                    path,
+                    handler: "<anonymous>".to_string(),
+                    file: file_path.to_string(),
+                    line,
+                });
+            }
+        }
+    }
+
+    // 8. Gin: (r|router|group).(GET|POST|PUT|DELETE|PATCH)("/path", handlerFunc)
+    if let Ok(re) = Regex::new(
+        r#"(?i)(r|router|group)\.(GET|POST|PUT|DELETE|PATCH)\s*\(\s*["'](/[^"']*?)["']\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)"#,
+    ) {
+        for cap in re.captures_iter(content) {
+            let method = cap[2].to_uppercase();
+            let path = cap[3].to_string();
+            let handler = cap[4].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
+            routes.push(RouteEndpoint {
+                method,
+                path,
+                handler,
+                file: file_path.to_string(),
+                line,
+            });
+        }
+    }
+
+    // 9. Echo: (e|g|echo|group).(GET|POST|PUT|DELETE|PATCH)("/path", handlerFunc)
+    if let Ok(re) = Regex::new(
+        r#"(?i)(e|g|echo|group)\.(GET|POST|PUT|DELETE|PATCH)\s*\(\s*["'](/[^"']*?)["']\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)"#,
+    ) {
+        for cap in re.captures_iter(content) {
+            let method = cap[2].to_uppercase();
+            let path = cap[3].to_string();
+            let handler = cap[4].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
+            routes.push(RouteEndpoint {
+                method,
+                path,
+                handler,
+                file: file_path.to_string(),
+                line,
+            });
+        }
+    }
+
+    // 10. Rails: (get|post|put|patch|delete) "/path", to: "controller#action" — only in files containing "routes"
+    if file_path.contains("routes") {
+        // Try to capture "to: 'controller#action'" first
+        if let Ok(re) = Regex::new(
+            r#"(?i)(get|post|put|patch|delete)\s+["'](/[^"']*?)["'](?:[^,\n]*,\s*to:\s*["']([^"']+)["'])?"#,
+        ) {
+            for cap in re.captures_iter(content) {
+                let method = cap[1].to_uppercase();
+                let path = cap[2].to_string();
+                let handler = cap
+                    .get(3)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_else(|| "<anonymous>".to_string());
+                let line = line_of(cap.get(0).unwrap().start());
+                routes.push(RouteEndpoint {
+                    method,
+                    path,
+                    handler,
+                    file: file_path.to_string(),
+                    line,
+                });
+            }
+        }
+    }
+
+    // 11. ASP.NET: [(HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch|Route)("/path")] followed by method
+    if let Ok(re) = Regex::new(
+        r#"(?s)\[(Http(Get|Post|Put|Delete|Patch)|Route)\s*\(\s*["'](/[^"']*?)["']\s*\)\s*\]\s*(?:public\s+)?(?:async\s+)?(?:\w+(?:<[^>]+>)?\s+)+([a-zA-Z_][a-zA-Z0-9_]*)\s*\("#,
+    ) {
+        for cap in re.captures_iter(content) {
+            let verb_raw = if cap.get(2).is_some() {
+                cap[2].to_lowercase()
+            } else {
+                "get".to_string()
+            };
+            let method = verb_raw.to_uppercase();
+            let path = cap[3].to_string();
+            let handler = cap[4].to_string();
+            let line = line_of(cap.get(0).unwrap().start());
+            routes.push(RouteEndpoint {
+                method,
+                path,
+                handler,
+                file: file_path.to_string(),
+                line,
+            });
+        }
+    }
+    // ASP.NET fallback
     if let Ok(re) = Regex::new(r#"\[(Http(Get|Post|Put|Delete|Patch)|Route)\s*\(\s*["'](/[^"']*)"#)
     {
         for cap in re.captures_iter(content) {
@@ -373,30 +536,59 @@ pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
             let method = verb_raw.to_uppercase();
             let path = cap[3].to_string();
             let line = line_of(cap.get(0).unwrap().start());
-            routes.push(RouteEndpoint {
-                method,
-                path,
-                handler: "handler".to_string(),
-                file: file_path.to_string(),
-                line,
-            });
+            if !routes
+                .iter()
+                .any(|r| r.line == line && r.method == method && r.path == path)
+            {
+                routes.push(RouteEndpoint {
+                    method,
+                    path,
+                    handler: "<anonymous>".to_string(),
+                    file: file_path.to_string(),
+                    line,
+                });
+            }
         }
     }
 
-    // 12. Phoenix: (get|post|put|patch|delete) "/path" — only in files containing "router"
+    // 12. Phoenix: (get|post|put|patch|delete) "/path", Controller, :action — only in files containing "router"
     if file_path.contains("router") {
+        // Try to capture Controller, :action
+        if let Ok(re) = Regex::new(
+            r#"(?i)(get|post|put|patch|delete)\s+["'](/[^"']*?)["']\s*,\s*([A-Z][a-zA-Z0-9.]*)\s*,\s*:([a-zA-Z_][a-zA-Z0-9_]*)"#,
+        ) {
+            for cap in re.captures_iter(content) {
+                let method = cap[1].to_uppercase();
+                let path = cap[2].to_string();
+                let handler = format!("{}/{}", &cap[3], &cap[4]);
+                let line = line_of(cap.get(0).unwrap().start());
+                routes.push(RouteEndpoint {
+                    method,
+                    path,
+                    handler,
+                    file: file_path.to_string(),
+                    line,
+                });
+            }
+        }
+        // Phoenix fallback: no Controller, :action captured
         if let Ok(re) = Regex::new(r#"(?i)(get|post|put|patch|delete)\s+["'](/[^"']*)"#) {
             for cap in re.captures_iter(content) {
                 let method = cap[1].to_uppercase();
                 let path = cap[2].to_string();
                 let line = line_of(cap.get(0).unwrap().start());
-                routes.push(RouteEndpoint {
-                    method,
-                    path,
-                    handler: "handler".to_string(),
-                    file: file_path.to_string(),
-                    line,
-                });
+                if !routes
+                    .iter()
+                    .any(|r| r.line == line && r.method == method && r.path == path)
+                {
+                    routes.push(RouteEndpoint {
+                        method,
+                        path,
+                        handler: "<anonymous>".to_string(),
+                        file: file_path.to_string(),
+                        line,
+                    });
+                }
             }
         }
     }
@@ -792,25 +984,28 @@ mod tests {
 
     #[test]
     fn test_detect_routes_express() {
-        let content = r#"app.get('/users', handler); router.post("/items", create);"#;
+        let content = r#"app.get('/users', listUsers); router.post("/items", createItem);"#;
         let routes = detect_routes(content, "routes/index.js");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].handler, "listUsers");
         assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].path, "/items");
+        assert_eq!(routes[1].handler, "createItem");
     }
 
     #[test]
     fn test_detect_routes_flask() {
-        let content = r#"@app.route('/home')
-@blueprint.get('/api/data')"#;
+        let content = "@app.route('/home')\ndef home_view():\n    pass\n@blueprint.get('/api/data')\ndef get_data():\n    pass";
         let routes = detect_routes(content, "app.py");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/home");
+        assert_eq!(routes[0].handler, "home_view");
         assert_eq!(routes[1].method, "GET");
         assert_eq!(routes[1].path, "/api/data");
+        assert_eq!(routes[1].handler, "get_data");
     }
 
     #[test]
@@ -823,45 +1018,49 @@ mod tests {
         let routes = detect_routes(content, "app/urls.py");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].path, "/users/");
+        assert_eq!(routes[0].handler, "views.user_list");
     }
 
     #[test]
     fn test_detect_routes_fastapi() {
-        let content = r#"@app.get("/users")
-@router.post("/items")"#;
+        let content = "@app.get(\"/users\")\nasync def list_users():\n    pass\n@router.post(\"/items\")\ndef create_item():\n    pass";
         let routes = detect_routes(content, "main.py");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].handler, "list_users");
         assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].path, "/items");
+        assert_eq!(routes[1].handler, "create_item");
     }
 
     #[test]
     fn test_detect_routes_spring() {
-        let content = r#"@GetMapping("/users")
-@PostMapping("/users")
-@RequestMapping("/api")"#;
+        let content = "@GetMapping(\"/users\")\npublic List<User> getUsers() {}\n@PostMapping(\"/users\")\npublic User createUser() {}\n@RequestMapping(\"/api\")\npublic String apiRoot() {}";
         let routes = detect_routes(content, "UserController.java");
         assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].handler, "getUsers");
         assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].path, "/users");
+        assert_eq!(routes[1].handler, "createUser");
         assert_eq!(routes[2].method, "GET");
         assert_eq!(routes[2].path, "/api");
+        assert_eq!(routes[2].handler, "apiRoot");
     }
 
     #[test]
     fn test_detect_routes_actix() {
-        let content = r#"#[get("/health")]
-#[post("/login")]"#;
+        let content = "#[get(\"/health\")]\nasync fn health_check() -> impl Responder { HttpResponse::Ok() }\n#[post(\"/login\")]\nasync fn do_login() -> impl Responder { HttpResponse::Ok() }";
         let routes = detect_routes(content, "src/main.rs");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/health");
+        assert_eq!(routes[0].handler, "health_check");
         assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].path, "/login");
+        assert_eq!(routes[1].handler, "do_login");
     }
 
     #[test]
@@ -870,7 +1069,9 @@ mod tests {
         let routes = detect_routes(content, "src/server.rs");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].handler, "list_users");
         assert_eq!(routes[1].path, "/users/:id");
+        assert_eq!(routes[1].handler, "create_user");
     }
 
     #[test]
@@ -881,8 +1082,10 @@ router.POST("/users", createUser)"#;
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/ping");
+        assert_eq!(routes[0].handler, "pingHandler");
         assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].path, "/users");
+        assert_eq!(routes[1].handler, "createUser");
     }
 
     #[test]
@@ -894,10 +1097,13 @@ echo.DELETE("/users/:id", deleteUser)"#;
         assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].handler, "getUsers");
         assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].path, "/items");
+        assert_eq!(routes[1].handler, "createItem");
         assert_eq!(routes[2].method, "DELETE");
         assert_eq!(routes[2].path, "/users/:id");
+        assert_eq!(routes[2].handler, "deleteUser");
     }
 
     #[test]
@@ -912,21 +1118,23 @@ post "/items", to: 'items#create'"#;
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].handler, "users#index");
         assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].path, "/items");
+        assert_eq!(routes[1].handler, "items#create");
     }
 
     #[test]
     fn test_detect_routes_aspnet() {
-        let content = r#"[HttpGet("/api/users")]
-[HttpPost("/api/items")]
-[Route("/api/health")]"#;
+        let content = "[HttpGet(\"/api/users\")]\npublic IActionResult GetUsers() {}\n[HttpPost(\"/api/items\")]\npublic IActionResult CreateItem() {}\n[Route(\"/api/health\")]\npublic IActionResult HealthCheck() {}";
         let routes = detect_routes(content, "Controllers/UsersController.cs");
         assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/api/users");
+        assert_eq!(routes[0].handler, "GetUsers");
         assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].path, "/api/items");
+        assert_eq!(routes[1].handler, "CreateItem");
     }
 
     #[test]
@@ -941,8 +1149,18 @@ post "/items", ItemController, :create"#;
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].handler, "UserController/index");
         assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].path, "/items");
+        assert_eq!(routes[1].handler, "ItemController/create");
+    }
+
+    #[test]
+    fn test_detect_routes_express_anonymous_handler() {
+        let content = r#"app.get('/x', function(req, res) { res.send('ok'); });"#;
+        let routes = detect_routes(content, "app.js");
+        assert!(!routes.is_empty());
+        assert_eq!(routes[0].handler, "<anonymous>");
     }
 
     #[test]
