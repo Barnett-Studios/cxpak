@@ -53,7 +53,7 @@ pub struct TrendComparison {
     pub coupling_trend: f64,
     pub cohesion_trend: f64,
     pub new_cycles: Vec<Vec<String>>,
-    pub new_cross_module_imports: Vec<String>,
+    pub new_cross_module_imports: Vec<crate::intelligence::architecture::BoundaryViolation>,
 }
 
 #[derive(Debug, Serialize)]
