@@ -809,4 +809,246 @@ pub fn process_input(data: String) {
             "file with no auth keywords must be unprotected"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // build_security_surface orchestrator tests
+    // -----------------------------------------------------------------------
+
+    fn make_indexed_file(
+        path: &str,
+        content: &str,
+        symbols: Vec<crate::parser::language::Symbol>,
+    ) -> crate::index::IndexedFile {
+        crate::index::IndexedFile {
+            relative_path: path.to_string(),
+            language: Some("rust".into()),
+            size_bytes: content.len() as u64,
+            token_count: content.len() / 4,
+            parse_result: Some(crate::parser::language::ParseResult {
+                symbols,
+                imports: vec![],
+                exports: vec![],
+            }),
+            content: content.to_string(),
+            mtime_secs: None,
+        }
+    }
+
+    fn make_pub_symbol(name: &str) -> crate::parser::language::Symbol {
+        crate::parser::language::Symbol {
+            name: name.to_string(),
+            kind: crate::parser::language::SymbolKind::Function,
+            visibility: crate::parser::language::Visibility::Public,
+            signature: format!("pub fn {name}()"),
+            body: String::new(),
+            start_line: 1,
+            end_line: 5,
+        }
+    }
+
+    #[test]
+    fn test_build_security_surface_empty_index() {
+        let index = crate::index::CodebaseIndex::empty();
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        assert!(surface.secret_patterns.is_empty());
+        assert!(surface.sql_injection_surface.is_empty());
+        assert!(surface.input_validation_gaps.is_empty());
+        assert!(surface.unprotected_endpoints.is_empty());
+        assert!(surface.exposure_scores.is_empty());
+    }
+
+    #[test]
+    fn test_build_security_surface_detects_secrets() {
+        let mut index = crate::index::CodebaseIndex::empty();
+        let content = "const KEY = \"AKIAIOSFODNN7EXAMPLE123\";";
+        index
+            .files
+            .push(make_indexed_file("src/config.rs", content, vec![]));
+
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        assert!(
+            !surface.secret_patterns.is_empty(),
+            "AWS key in file content must be detected"
+        );
+        assert_eq!(surface.secret_patterns[0].file, "src/config.rs");
+    }
+
+    #[test]
+    fn test_build_security_surface_detects_sql_injection() {
+        let mut index = crate::index::CodebaseIndex::empty();
+        let content = r#"let q = format!("SELECT * FROM users WHERE id = '{}'", id);"#;
+        index
+            .files
+            .push(make_indexed_file("src/repo.rs", content, vec![]));
+
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        assert!(
+            !surface.sql_injection_surface.is_empty(),
+            "SQL injection via format! must be detected"
+        );
+        assert_eq!(surface.sql_injection_surface[0].file, "src/repo.rs");
+    }
+
+    #[test]
+    fn test_build_security_surface_detects_validation_gaps() {
+        let mut index = crate::index::CodebaseIndex::empty();
+        let content = "pub fn create_user(name: String) {\n    db.insert(name);\n}\n";
+        index
+            .files
+            .push(make_indexed_file("src/user.rs", content, vec![]));
+        // Set high pagerank so validation gap scanning activates
+        index.pagerank.insert("src/user.rs".to_string(), 0.8);
+
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        assert!(
+            !surface.input_validation_gaps.is_empty(),
+            "public fn with unvalidated String param must be flagged"
+        );
+    }
+
+    #[test]
+    fn test_build_security_surface_detects_unprotected_endpoints() {
+        let mut index = crate::index::CodebaseIndex::empty();
+        // Express-style route that detect_routes can find
+        let content = "app.get('/api/users', listUsers);";
+        index
+            .files
+            .push(make_indexed_file("src/routes.js", content, vec![]));
+        // Override language to JS so detect_routes matches
+        index.files[0].language = Some("javascript".into());
+
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        assert!(
+            !surface.unprotected_endpoints.is_empty(),
+            "Express route without auth must be flagged as unprotected"
+        );
+        assert_eq!(surface.unprotected_endpoints[0].file, "src/routes.js");
+    }
+
+    #[test]
+    fn test_build_security_surface_exposure_scores_with_pub_symbols() {
+        use crate::schema::EdgeType;
+
+        let mut index = crate::index::CodebaseIndex::empty();
+        let symbols = vec![make_pub_symbol("handle_request"), make_pub_symbol("serve")];
+        index.files.push(make_indexed_file(
+            "src/api.rs",
+            "pub fn handle_request() {}\npub fn serve() {}",
+            symbols,
+        ));
+
+        // Add inbound edge so exposure > 0
+        index
+            .graph
+            .add_edge("src/main.rs", "src/api.rs", EdgeType::Import);
+
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        // File has 2 public symbols, 1 inbound edge, no tests -> exposure > 0
+        assert!(
+            !surface.exposure_scores.is_empty(),
+            "file with pub symbols and inbound edges must have exposure score"
+        );
+        assert_eq!(surface.exposure_scores[0].path, "src/api.rs");
+        assert!(surface.exposure_scores[0].exposure_score > 0.0);
+        assert_eq!(surface.exposure_scores[0].pub_symbol_count, 2);
+        assert_eq!(surface.exposure_scores[0].inbound_edges, 1);
+    }
+
+    #[test]
+    fn test_build_security_surface_focus_filters_files() {
+        let mut index = crate::index::CodebaseIndex::empty();
+        let secret_content = "const KEY = \"AKIAIOSFODNN7EXAMPLE123\";";
+        index
+            .files
+            .push(make_indexed_file("src/config.rs", secret_content, vec![]));
+        index
+            .files
+            .push(make_indexed_file("other/util.rs", secret_content, vec![]));
+
+        // Focus on "src/" -> other/util.rs should be excluded
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, Some("src/"));
+        assert_eq!(
+            surface.secret_patterns.len(),
+            1,
+            "only files matching focus prefix should be scanned"
+        );
+        assert_eq!(surface.secret_patterns[0].file, "src/config.rs");
+    }
+
+    #[test]
+    fn test_build_security_surface_exposure_sorted_descending() {
+        use crate::schema::EdgeType;
+
+        let mut index = crate::index::CodebaseIndex::empty();
+
+        // File A: 1 pub symbol, 1 inbound edge
+        index.files.push(make_indexed_file(
+            "src/a.rs",
+            "pub fn a() {}",
+            vec![make_pub_symbol("a")],
+        ));
+        // File B: 3 pub symbols, 2 inbound edges (higher exposure)
+        index.files.push(make_indexed_file(
+            "src/b.rs",
+            "pub fn b1() {}\npub fn b2() {}\npub fn b3() {}",
+            vec![
+                make_pub_symbol("b1"),
+                make_pub_symbol("b2"),
+                make_pub_symbol("b3"),
+            ],
+        ));
+
+        index
+            .graph
+            .add_edge("src/main.rs", "src/a.rs", EdgeType::Import);
+        index
+            .graph
+            .add_edge("src/main.rs", "src/b.rs", EdgeType::Import);
+        index
+            .graph
+            .add_edge("src/lib.rs", "src/b.rs", EdgeType::Import);
+
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        assert!(
+            surface.exposure_scores.len() >= 2,
+            "both files should have exposure > 0"
+        );
+        assert!(
+            surface.exposure_scores[0].exposure_score >= surface.exposure_scores[1].exposure_score,
+            "exposure scores must be sorted descending"
+        );
+        assert_eq!(
+            surface.exposure_scores[0].path, "src/b.rs",
+            "file with more pub symbols and edges should rank first"
+        );
+    }
+
+    #[test]
+    fn test_build_security_surface_tested_file_zero_exposure() {
+        use crate::intelligence::test_map::{TestConfidence, TestFileRef};
+
+        let mut index = crate::index::CodebaseIndex::empty();
+        let symbols = vec![make_pub_symbol("handle")];
+        index.files.push(make_indexed_file(
+            "src/api.rs",
+            "pub fn handle() {}",
+            symbols,
+        ));
+
+        // Mark the file as having test coverage
+        index.test_map.insert(
+            "src/api.rs".to_string(),
+            vec![TestFileRef {
+                path: "tests/api_test.rs".to_string(),
+                confidence: TestConfidence::Both,
+            }],
+        );
+
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        // test_cov = 1.0 -> raw = pub_count * inbound * (1 - 1.0) = 0
+        assert!(
+            surface.exposure_scores.is_empty(),
+            "fully tested file must have zero exposure"
+        );
+    }
 }

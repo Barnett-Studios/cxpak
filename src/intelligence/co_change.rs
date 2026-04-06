@@ -341,4 +341,155 @@ mod tests {
         assert!(has_ab);
         assert!(has_ac);
     }
+
+    #[test]
+    fn test_build_co_changes_most_recent_days_ago_tracked() {
+        // 3 commits with decreasing recency: 50, 20, 10 days ago.
+        // The most recent (10) should be used for the recency_weight.
+        let commits = vec![
+            (vec!["x.rs".to_string(), "y.rs".to_string()], 50i64),
+            (vec!["x.rs".to_string(), "y.rs".to_string()], 20i64),
+            (vec!["x.rs".to_string(), "y.rs".to_string()], 10i64),
+        ];
+        let edges = build_co_changes(&commits);
+        assert_eq!(edges.len(), 1);
+        // 10 days ago is <= 30 -> weight = 1.0
+        assert!((edges[0].recency_weight - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_build_co_changes_most_recent_updates_correctly() {
+        // First commit is more recent than second, but third is most recent.
+        // Ensures the min-tracking logic works when data arrives out of order.
+        let commits = vec![
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 100i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 150i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 60i64),
+        ];
+        let edges = build_co_changes(&commits);
+        assert_eq!(edges.len(), 1);
+        // Most recent = 60 days ago -> 1.0 - 0.7 * 30/150 = 0.86
+        let expected = 1.0 - 0.7 * 30.0 / 150.0;
+        assert!(
+            (edges[0].recency_weight - expected).abs() < 1e-9,
+            "expected {expected}, got {}",
+            edges[0].recency_weight
+        );
+    }
+
+    #[test]
+    fn test_build_co_change_edges_with_dates_window_filtering() {
+        // 5 commits: 3 within window (days 10, 50, 90), 2 outside (200, 300)
+        let commits = vec![
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 10i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 50i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 90i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 200i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 300i64),
+        ];
+        let edges = build_co_change_edges_with_dates(&commits, 3, 180);
+        assert_eq!(
+            edges.len(),
+            1,
+            "3 commits within window should produce 1 edge"
+        );
+        assert_eq!(
+            edges[0].count, 3,
+            "only 3 within-window commits should count"
+        );
+    }
+
+    #[test]
+    fn test_build_co_change_edges_with_dates_threshold_filters() {
+        // 2 commits within window -> below threshold of 3
+        let commits = vec![
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 10i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 20i64),
+        ];
+        let edges = build_co_change_edges_with_dates(&commits, 3, 180);
+        assert!(edges.is_empty(), "below threshold must produce no edges");
+    }
+
+    #[test]
+    fn test_build_co_change_edges_with_dates_custom_threshold() {
+        // 2 commits within window, threshold=2 -> should produce edge
+        let commits = vec![
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 5i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 15i64),
+        ];
+        // build_co_changes requires >= 3, but build_co_change_edges_with_dates
+        // first delegates to build_co_changes then applies its own threshold.
+        // Since build_co_changes hard-codes >= 3 and count=2 < 3,
+        // this should still be empty.
+        let edges = build_co_change_edges_with_dates(&commits, 2, 180);
+        assert!(
+            edges.is_empty(),
+            "build_co_changes internal threshold of 3 still applies"
+        );
+    }
+
+    #[test]
+    fn test_build_co_change_edges_with_dates_narrow_window() {
+        // All commits at days_ago=10, window=5 -> all excluded
+        let commits = vec![
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 10i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 10i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 10i64),
+        ];
+        let edges = build_co_change_edges_with_dates(&commits, 3, 5);
+        assert!(
+            edges.is_empty(),
+            "commits outside narrow window must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_build_co_change_edges_with_dates_boundary_exact() {
+        // Commits at exactly the window boundary (days_ago == window_days)
+        // The filter is `days_ago <= window_days`, so these should be included
+        let commits = vec![
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 180i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 180i64),
+            (vec!["a.rs".to_string(), "b.rs".to_string()], 180i64),
+        ];
+        let edges = build_co_change_edges_with_dates(&commits, 3, 180);
+        assert_eq!(
+            edges.len(),
+            1,
+            "commits at exactly window boundary must be included"
+        );
+    }
+
+    #[test]
+    fn test_mine_co_changes_from_git_on_this_repo() {
+        // Use the actual cxpak repository as a test subject
+        let repo_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let results = mine_co_changes_from_git(repo_path, 180);
+        // This is a real repository with commits; we should get results
+        // (at least some commits touch 2+ files)
+        assert!(
+            !results.is_empty(),
+            "mining the cxpak repo should find co-changes"
+        );
+        // Every result should have at least 2 files
+        for (files, days_ago) in &results {
+            assert!(files.len() >= 2, "each result must have >= 2 changed files");
+            assert!(*days_ago <= 180, "days_ago must be within the window");
+        }
+    }
+
+    #[test]
+    fn test_mine_co_changes_respects_window() {
+        // Use a very small window (0 days) on the real repo
+        let repo_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let results = mine_co_changes_from_git(repo_path, 0);
+        // With a 0-day window, only commits from "today" (same second) would match.
+        // All results must have days_ago <= 0.
+        for (_, days_ago) in &results {
+            assert!(
+                *days_ago <= 0,
+                "all results must be within 0-day window, got {days_ago}"
+            );
+        }
+    }
 }

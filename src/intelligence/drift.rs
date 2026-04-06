@@ -480,4 +480,230 @@ mod tests {
         assert_eq!(module_prefix("main.rs", 2), "main.rs");
         assert_eq!(module_prefix("src/lib.rs", 2), "src/lib.rs");
     }
+
+    #[test]
+    fn test_snapshot_from_index_empty() {
+        let index = crate::index::CodebaseIndex::empty();
+        let snap = snapshot_from_index(&index, "2026-04-01T00:00:00Z");
+        assert_eq!(snap.timestamp, "2026-04-01T00:00:00Z");
+        assert_eq!(snap.metrics.module_count, 0);
+        assert!((snap.metrics.mean_coupling - 0.0).abs() < 1e-9);
+        assert!((snap.metrics.mean_cohesion - 0.0).abs() < 1e-9);
+        assert!(snap.modules.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_from_index_with_files_and_edges() {
+        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::schema::EdgeType;
+
+        let mut index = CodebaseIndex::empty();
+
+        // Create a module with 3+ files so it qualifies for coupling/cohesion
+        for name in &[
+            "src/api/handler.rs",
+            "src/api/router.rs",
+            "src/api/middleware.rs",
+        ] {
+            index.files.push(IndexedFile {
+                relative_path: name.to_string(),
+                language: Some("rust".into()),
+                size_bytes: 100,
+                token_count: 50,
+                parse_result: None,
+                content: "fn f() {}".to_string(),
+                mtime_secs: None,
+            });
+        }
+
+        // Add an intra-module edge (both within src/api)
+        index
+            .graph
+            .add_edge("src/api/handler.rs", "src/api/router.rs", EdgeType::Import);
+        // Add a cross-module edge (handler -> external)
+        index
+            .graph
+            .add_edge("src/api/handler.rs", "src/db/query.rs", EdgeType::Import);
+
+        let snap = snapshot_from_index(&index, "2026-04-01T12:00:00Z");
+        assert_eq!(snap.metrics.module_count, 1, "one module prefix (src/api)");
+        assert_eq!(snap.modules.len(), 1, "one qualifying module");
+        let m = &snap.modules[0];
+        assert_eq!(m.prefix, "src/api");
+        assert_eq!(m.edge_count, 2, "1 intra + 1 cross = 2 total edges");
+        // coupling = cross / total = 1/2 = 0.5
+        assert!((m.coupling - 0.5).abs() < 1e-9);
+        // cohesion = intra / (n*(n-1)) = 1 / (3*2) = 1/6
+        assert!((m.cohesion - 1.0 / 6.0).abs() < 1e-9);
+        assert!((snap.metrics.mean_coupling - 0.5).abs() < 1e-9);
+        assert!((snap.metrics.mean_cohesion - 1.0 / 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_snapshot_from_index_module_below_min_files_skipped() {
+        use crate::index::{CodebaseIndex, IndexedFile};
+
+        let mut index = CodebaseIndex::empty();
+
+        // Only 2 files in same prefix -> below the "< 3" threshold
+        for name in &["src/tiny/a.rs", "src/tiny/b.rs"] {
+            index.files.push(IndexedFile {
+                relative_path: name.to_string(),
+                language: Some("rust".into()),
+                size_bytes: 50,
+                token_count: 25,
+                parse_result: None,
+                content: "fn f() {}".to_string(),
+                mtime_secs: None,
+            });
+        }
+
+        let snap = snapshot_from_index(&index, "2026-04-02T00:00:00Z");
+        // module_count counts all unique prefixes, including small ones
+        assert_eq!(snap.metrics.module_count, 1);
+        // But no qualifying modules (< 3 files), so modules vec is empty
+        assert!(
+            snap.modules.is_empty(),
+            "modules with < 3 files must be skipped"
+        );
+        assert!((snap.metrics.mean_coupling - 0.0).abs() < 1e-9);
+        assert!((snap.metrics.mean_cohesion - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_snapshot_from_index_no_edges_zero_coupling() {
+        use crate::index::{CodebaseIndex, IndexedFile};
+
+        let mut index = CodebaseIndex::empty();
+
+        // 3 files in same module but no edges -> coupling 0, cohesion 0
+        for name in &["src/lib/a.rs", "src/lib/b.rs", "src/lib/c.rs"] {
+            index.files.push(IndexedFile {
+                relative_path: name.to_string(),
+                language: Some("rust".into()),
+                size_bytes: 100,
+                token_count: 50,
+                parse_result: None,
+                content: "fn f() {}".to_string(),
+                mtime_secs: None,
+            });
+        }
+
+        let snap = snapshot_from_index(&index, "2026-04-03T00:00:00Z");
+        assert_eq!(snap.modules.len(), 1);
+        let m = &snap.modules[0];
+        assert_eq!(m.edge_count, 0);
+        assert!((m.coupling - 0.0).abs() < 1e-9);
+        assert!((m.cohesion - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_build_drift_report_with_empty_index() {
+        let index = crate::index::CodebaseIndex::empty();
+        let dir = tempfile::TempDir::new().unwrap();
+        let report = build_drift_report(&index, dir.path(), false);
+        // No baseline saved before -> baseline comparison is None
+        assert!(report.baseline.is_none());
+        // Only one snapshot saved -> trend needs >= 2
+        assert!(report.trend.is_none());
+        assert!(report.hotspots.is_empty());
+    }
+
+    #[test]
+    fn test_build_drift_report_saves_baseline_when_flagged() {
+        let index = crate::index::CodebaseIndex::empty();
+        let dir = tempfile::TempDir::new().unwrap();
+        let _report = build_drift_report(&index, dir.path(), true);
+        // Baseline file should now exist
+        let baseline = load_baseline(dir.path());
+        assert!(
+            baseline.is_some(),
+            "baseline must be saved when save_baseline_flag is true"
+        );
+    }
+
+    #[test]
+    fn test_build_drift_report_hotspots_from_high_coupling() {
+        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::schema::EdgeType;
+
+        let mut index = CodebaseIndex::empty();
+
+        // Create a module with 3 files, mostly cross-module edges -> high coupling
+        for name in &["src/hot/a.rs", "src/hot/b.rs", "src/hot/c.rs"] {
+            index.files.push(IndexedFile {
+                relative_path: name.to_string(),
+                language: Some("rust".into()),
+                size_bytes: 100,
+                token_count: 50,
+                parse_result: None,
+                content: "fn f() {}".to_string(),
+                mtime_secs: None,
+            });
+        }
+
+        // All edges are cross-module -> coupling = 1.0 (> 0.6 threshold)
+        index
+            .graph
+            .add_edge("src/hot/a.rs", "src/other/x.rs", EdgeType::Import);
+        index
+            .graph
+            .add_edge("src/hot/b.rs", "src/other/y.rs", EdgeType::Import);
+        index
+            .graph
+            .add_edge("src/hot/c.rs", "src/other/z.rs", EdgeType::Import);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let report = build_drift_report(&index, dir.path(), false);
+        assert_eq!(
+            report.hotspots.len(),
+            1,
+            "module with coupling > 0.6 must appear as hotspot"
+        );
+        assert_eq!(report.hotspots[0].module, "src/hot");
+        assert!(report.hotspots[0].severity > 0.6);
+    }
+
+    #[test]
+    fn test_build_drift_report_with_existing_baseline() {
+        use crate::index::{CodebaseIndex, IndexedFile};
+
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Save a baseline with known metrics
+        let baseline_snap = ArchitectureSnapshot {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            metrics: ArchitectureMetrics {
+                module_count: 2,
+                mean_coupling: 0.1,
+                mean_cohesion: 0.9,
+                cycle_count: 0,
+                boundary_violation_count: 0,
+            },
+            modules: vec![],
+        };
+        save_baseline(dir.path(), &baseline_snap).unwrap();
+
+        // Build report with empty index (different metrics)
+        let mut index = CodebaseIndex::empty();
+        for name in &["src/mod/a.rs", "src/mod/b.rs", "src/mod/c.rs"] {
+            index.files.push(IndexedFile {
+                relative_path: name.to_string(),
+                language: Some("rust".into()),
+                size_bytes: 100,
+                token_count: 50,
+                parse_result: None,
+                content: "fn f() {}".to_string(),
+                mtime_secs: None,
+            });
+        }
+
+        let report = build_drift_report(&index, dir.path(), false);
+        assert!(
+            report.baseline.is_some(),
+            "baseline comparison must be present when baseline file exists"
+        );
+        let bc = report.baseline.unwrap();
+        assert_eq!(bc.baseline_date, "2026-01-01T00:00:00Z");
+    }
 }
