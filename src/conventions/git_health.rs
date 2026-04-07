@@ -355,4 +355,155 @@ mod tests {
         // c30=10, c180=60 → c30*6=60 == c180=60 → Chronic
         assert_eq!(classify_trend(10, 60), ChurnTrend::Chronic);
     }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Initialize a real git repo in a temp dir with one or more commits.
+    fn init_repo_with_commits(
+        dir: &tempfile::TempDir,
+        commits: &[(&str, &str, &str)], // (filename, content, message)
+    ) -> git2::Repository {
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        let mut parent_commit: Option<git2::Oid> = None;
+
+        for (filename, content, message) in commits {
+            let file_path = dir.path().join(filename);
+            // Create parent directories if needed (e.g. "src/lib.rs")
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&file_path, content).unwrap();
+
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new(filename)).unwrap();
+            index.write().unwrap();
+
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+
+            let parents: Vec<git2::Commit> = match parent_commit {
+                Some(oid) => vec![repo.find_commit(oid).unwrap()],
+                None => vec![],
+            };
+            let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+            let oid = repo
+                .commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
+                .unwrap();
+            parent_commit = Some(oid);
+        }
+        repo
+    }
+
+    // ── extract_git_health: real-repo paths ──────────────────────────────────
+
+    #[test]
+    fn test_extract_git_health_collects_churn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Two commits modifying the same file → churn count of 2.
+        init_repo_with_commits(
+            &dir,
+            &[
+                ("a.rs", "fn one() {}", "initial"),
+                ("a.rs", "fn one() {}\nfn two() {}", "add two"),
+            ],
+        );
+
+        let profile = extract_git_health(dir.path());
+        // Both commits within 180d (just made now) → churn_180d should track a.rs
+        assert!(
+            profile.churn_180d.iter().any(|e| e.path == "a.rs"),
+            "churn_180d should contain a.rs"
+        );
+        // last_computed should be set
+        assert!(profile.last_computed.is_some());
+    }
+
+    #[test]
+    fn test_extract_git_health_bugfix_density() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Mix of bugfix and feature commits
+        init_repo_with_commits(
+            &dir,
+            &[
+                ("src/lib.rs", "fn x() {}", "feat: initial"),
+                ("src/lib.rs", "fn x() { 1 }", "fix: typo"),
+                ("src/lib.rs", "fn x() { 2 }", "bug: wrong number"),
+            ],
+        );
+
+        let profile = extract_git_health(dir.path());
+        // src/ directory should have bugfix density > 0
+        assert!(
+            profile.bugfix_density.contains_key("src"),
+            "src directory should be tracked: {:?}",
+            profile.bugfix_density
+        );
+        let density = profile.bugfix_density.get("src").copied().unwrap_or(0.0);
+        assert!(
+            density > 0.0,
+            "bugfix density for src should be > 0: {density}"
+        );
+    }
+
+    #[test]
+    fn test_extract_git_health_revert_detected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_repo_with_commits(
+            &dir,
+            &[
+                ("file.rs", "fn x() {}", "feat: add x"),
+                ("file.rs", "fn x() { 1 }", "Revert: rollback"),
+            ],
+        );
+
+        let profile = extract_git_health(dir.path());
+        assert!(
+            !profile.reverts.is_empty(),
+            "reverts should not be empty: {:?}",
+            profile.reverts
+        );
+        assert!(profile
+            .reverts
+            .iter()
+            .any(|r| r.commit_message.to_lowercase().contains("revert")));
+    }
+
+    #[test]
+    fn test_extract_git_health_churn_trend_classified() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_repo_with_commits(
+            &dir,
+            &[("hot.rs", "v1", "initial"), ("hot.rs", "v2", "update")],
+        );
+
+        let profile = extract_git_health(dir.path());
+        // Some trend classification must exist for hot.rs
+        assert!(
+            profile.churn_trend.contains_key("hot.rs"),
+            "trend should be classified for hot.rs: {:?}",
+            profile.churn_trend
+        );
+    }
+
+    #[test]
+    fn test_extract_git_health_root_file_tracked_in_empty_dir() {
+        // Files at the repo root use directory key "" — verify the empty dir is
+        // tracked under bugfix_density when a fix commit modifies a root file.
+        let dir = tempfile::TempDir::new().unwrap();
+        init_repo_with_commits(
+            &dir,
+            &[
+                ("root.rs", "v1", "initial"),
+                ("root.rs", "v2", "fix: corrected"),
+            ],
+        );
+
+        let profile = extract_git_health(dir.path());
+        // The empty string directory should be present as a tracked dir
+        assert!(
+            profile.bugfix_density.contains_key(""),
+            "root directory (empty key) should be tracked"
+        );
+    }
 }

@@ -493,4 +493,391 @@ mod tests {
             "content must be Some in full mode"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // test_truncate_to_budget_helper
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_truncate_to_budget_zero() {
+        let counter = TokenCounter::new();
+        let result = truncate_to_budget("some content\nmore lines\n", 0, &counter);
+        assert_eq!(result, "", "zero budget should produce empty string");
+    }
+
+    #[test]
+    fn test_truncate_to_budget_very_small() {
+        let counter = TokenCounter::new();
+        // Budget so small even the marker doesn't fit.
+        let result = truncate_to_budget("some content\nmore lines\n", 1, &counter);
+        assert_eq!(
+            result, "",
+            "budget smaller than marker should produce empty string"
+        );
+    }
+
+    #[test]
+    fn test_truncate_to_budget_partial() {
+        let counter = TokenCounter::new();
+        // Use many lines so that even 3/4 of the budget triggers truncation but
+        // still leaves room for at least one line plus the marker.
+        let content = (1..=20)
+            .map(|i| format!("line number {} has enough text to cost several tokens", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let full_tokens = tok(&content);
+        // 3/4 budget: enough for the marker + some lines, but not all.
+        let budget = (full_tokens * 3) / 4;
+        let result = truncate_to_budget(&content, budget, &counter);
+        assert!(
+            result.contains("// ... (truncated)"),
+            "truncated output should contain omission marker"
+        );
+        assert!(
+            result.len() < content.len(),
+            "truncated output should be shorter than original"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // test_target_file_truncated_when_budget_tight
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_target_file_truncated_when_budget_tight() {
+        // Use many lines so there's enough room for the marker + some lines.
+        let content = (1..=20)
+            .map(|i| format!("fn line_{}() {{ /* body {} */ }}", i, i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let full_tokens = tok(&content);
+        // 3/4 budget: enough for some lines + marker, but not all.
+        let budget = (full_tokens * 3) / 4;
+
+        let result = allocate_and_pack(
+            vec![make_target("src/big.rs", 0.9, &content)],
+            vec![],
+            None,
+            None,
+            None,
+            budget,
+            false,
+        );
+
+        assert_eq!(result.sections.target_files.count, 1);
+        assert_eq!(
+            result.sections.target_files.files[0].detail_level, "truncated",
+            "file should be truncated when budget is tight"
+        );
+        let packed_content = result.sections.target_files.files[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert!(
+            packed_content.contains("// ... (truncated)"),
+            "truncated content should include omission marker"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // test_test_files_truncated_when_budget_tight
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_test_files_truncated_when_budget_tight() {
+        let test_content =
+            "fn test_a() { assert!(true); }\nfn test_b() { assert!(true); }\nfn test_c() {}";
+        let test_tokens = tok(test_content);
+        // Budget only covers a fraction of the test file (no targets to consume budget first).
+        let budget = test_tokens / 2;
+
+        let result = allocate_and_pack(
+            vec![],
+            vec![make_test("tests/big.rs", test_content)],
+            None,
+            None,
+            None,
+            budget,
+            false,
+        );
+
+        assert_eq!(result.sections.test_files.count, 1);
+        assert_eq!(
+            result.sections.test_files.files[0].detail_level, "truncated",
+            "test file should be truncated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // test_schema_section_packed
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_schema_section_packed_full() {
+        let schema_val = serde_json::json!({
+            "tables": ["users", "orders"],
+            "views": []
+        });
+
+        let result =
+            allocate_and_pack(vec![], vec![], Some(schema_val), None, None, 100_000, false);
+
+        assert_eq!(result.sections.schema_context.count, 1);
+        assert_eq!(
+            result.sections.schema_context.files[0].detail_level, "full",
+            "schema should be fully packed with generous budget"
+        );
+        assert_eq!(result.sections.schema_context.files[0].path, "<schema>");
+        assert!(
+            result.sections.schema_context.files[0].content.is_some(),
+            "content should be present in non-briefing mode"
+        );
+    }
+
+    #[test]
+    fn test_schema_section_truncated_when_tight() {
+        let schema_val = serde_json::json!({
+            "tables": ["users", "orders", "products", "categories", "reviews", "inventory"],
+            "columns": {
+                "users": ["id", "name", "email", "created_at"],
+                "orders": ["id", "user_id", "total", "status"]
+            }
+        });
+        let schema_str = serde_json::to_string_pretty(&schema_val).unwrap();
+        let schema_tokens = tok(&schema_str);
+
+        // Budget smaller than the full schema but > 0.
+        let budget = schema_tokens / 2;
+
+        let result = allocate_and_pack(vec![], vec![], Some(schema_val), None, None, budget, false);
+
+        assert_eq!(result.sections.schema_context.count, 1);
+        assert_eq!(
+            result.sections.schema_context.files[0].detail_level, "truncated",
+            "schema should be truncated when budget is tight"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // test_api_surface_skipped_when_too_large
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_api_surface_skipped_when_too_large() {
+        let api_val = serde_json::json!({
+            "endpoints": [
+                {"method": "GET", "path": "/users"},
+                {"method": "POST", "path": "/users"},
+                {"method": "GET", "path": "/orders"},
+                {"method": "DELETE", "path": "/orders/:id"}
+            ]
+        });
+        // Tiny budget: API surface JSON won't fit.
+        let result = allocate_and_pack(vec![], vec![], None, Some(api_val), None, 2, false);
+
+        assert!(
+            result.sections.api_surface.is_none(),
+            "api surface should be skipped when it doesn't fit the budget"
+        );
+    }
+
+    #[test]
+    fn test_api_surface_included_when_fits() {
+        let api_val = serde_json::json!({"routes": ["/health"]});
+        let result = allocate_and_pack(
+            vec![],
+            vec![],
+            None,
+            Some(api_val.clone()),
+            None,
+            100_000,
+            false,
+        );
+
+        assert!(
+            result.sections.api_surface.is_some(),
+            "api surface should be included when budget is generous"
+        );
+        assert_eq!(result.sections.api_surface.unwrap(), api_val);
+    }
+
+    // -----------------------------------------------------------------------
+    // test_blast_radius_skipped_when_too_large
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_blast_radius_skipped_when_too_large() {
+        let blast_val = serde_json::json!({
+            "direct_dependents": ["a.rs", "b.rs", "c.rs"],
+            "transitive_dependents": ["d.rs", "e.rs"]
+        });
+
+        let result = allocate_and_pack(vec![], vec![], None, None, Some(blast_val), 2, false);
+
+        assert!(
+            result.sections.blast_radius.is_none(),
+            "blast radius should be skipped when budget is too small"
+        );
+    }
+
+    #[test]
+    fn test_blast_radius_included_when_fits() {
+        let blast_val = serde_json::json!({"affected": 0});
+        let result = allocate_and_pack(
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(blast_val.clone()),
+            100_000,
+            false,
+        );
+
+        assert!(
+            result.sections.blast_radius.is_some(),
+            "blast radius should be included when budget is generous"
+        );
+        assert_eq!(result.sections.blast_radius.unwrap(), blast_val);
+    }
+
+    // -----------------------------------------------------------------------
+    // test_briefing_mode_suppresses_content
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_briefing_mode_suppresses_content() {
+        let target_content = "fn target() { /* body */ }";
+        let test_content = "fn test_target() { assert!(true); }";
+        let schema_val = serde_json::json!({"tables": ["users"]});
+
+        let result = allocate_and_pack(
+            vec![make_target("src/main.rs", 0.9, target_content)],
+            vec![make_test("tests/main.rs", test_content)],
+            Some(schema_val),
+            None,
+            None,
+            100_000,
+            true, // briefing_mode
+        );
+
+        assert_eq!(result.sections.target_files.count, 1);
+        assert!(
+            result.sections.target_files.files[0].content.is_none(),
+            "briefing mode should suppress target file content"
+        );
+        assert_eq!(result.sections.test_files.count, 1);
+        assert!(
+            result.sections.test_files.files[0].content.is_none(),
+            "briefing mode should suppress test file content"
+        );
+        assert_eq!(result.sections.schema_context.count, 1);
+        assert!(
+            result.sections.schema_context.files[0].content.is_none(),
+            "briefing mode should suppress schema content"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // test_multiple_targets_fill_then_overflow
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_multiple_targets_fill_then_overflow() {
+        let content_a = "fn alpha() { /* alpha body */ }";
+        let content_b = "fn beta() { /* beta body here too */ }";
+        let content_c = "fn gamma() { /* gamma body content */ }";
+        let toks_a = tok(content_a);
+        let toks_b = tok(content_b);
+
+        // Budget fits exactly two files (a and b) but not c.
+        let budget = toks_a + toks_b;
+
+        let result = allocate_and_pack(
+            vec![
+                make_target("src/a.rs", 0.9, content_a),
+                make_target("src/b.rs", 0.8, content_b),
+                make_target("src/c.rs", 0.7, content_c),
+            ],
+            vec![],
+            None,
+            None,
+            None,
+            budget,
+            false,
+        );
+
+        // Two files fit fully; third is skipped or truncated.
+        assert_eq!(
+            result.sections.target_files.count, 2,
+            "only two files should fit in the budget"
+        );
+        assert_eq!(result.sections.target_files.files[0].path, "src/a.rs");
+        assert_eq!(result.sections.target_files.files[1].path, "src/b.rs");
+        assert_eq!(result.sections.target_files.files[0].detail_level, "full");
+        assert_eq!(result.sections.target_files.files[1].detail_level, "full");
+    }
+
+    // -----------------------------------------------------------------------
+    // test_all_sections_compete_for_budget
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_all_sections_compete_for_budget() {
+        let target_content = "fn main() { println!(\"hello world\"); }";
+        let test_content = "fn test_main() { assert_eq!(1, 1); }";
+        let schema_val = serde_json::json!({"tables": ["users"]});
+        let api_val = serde_json::json!({"routes": ["/api"]});
+        let blast_val = serde_json::json!({"total": 1});
+
+        let target_toks = tok(target_content);
+        let test_toks = tok(test_content);
+        let schema_toks = tok(&serde_json::to_string_pretty(&schema_val).unwrap());
+
+        // Budget covers target + test + schema but not API or blast.
+        let budget = target_toks + test_toks + schema_toks;
+
+        let result = allocate_and_pack(
+            vec![make_target("src/main.rs", 0.9, target_content)],
+            vec![make_test("tests/main.rs", test_content)],
+            Some(schema_val),
+            Some(api_val),
+            Some(blast_val),
+            budget,
+            false,
+        );
+
+        assert_eq!(result.sections.target_files.count, 1);
+        assert_eq!(result.sections.test_files.count, 1);
+        assert_eq!(result.sections.schema_context.count, 1);
+        // API and blast are lower priority; they should be skipped/None.
+        assert!(
+            result.sections.api_surface.is_none(),
+            "api surface should be skipped when budget is exhausted by higher-priority sections"
+        );
+        assert!(
+            result.sections.blast_radius.is_none(),
+            "blast radius should be skipped when budget is exhausted"
+        );
+        assert_eq!(
+            result.budget.used + result.budget.remaining,
+            result.budget.total,
+            "budget accounting must be consistent"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // test_zero_budget
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_zero_budget() {
+        let result = allocate_and_pack(
+            vec![make_target("src/x.rs", 0.9, "fn x() { /* content */ }")],
+            vec![make_test("tests/x.rs", "fn test_x() {}")],
+            Some(serde_json::json!({"tables": []})),
+            Some(serde_json::json!({"routes": []})),
+            Some(serde_json::json!({"total": 0})),
+            0,
+            false,
+        );
+
+        assert_eq!(result.sections.target_files.count, 0);
+        assert_eq!(result.sections.test_files.count, 0);
+        assert_eq!(result.sections.schema_context.count, 0);
+        assert!(result.sections.api_surface.is_none());
+        assert!(result.sections.blast_radius.is_none());
+        assert_eq!(result.budget.total, 0);
+        assert_eq!(result.budget.used, 0);
+        assert_eq!(result.budget.remaining, 0);
+    }
 }

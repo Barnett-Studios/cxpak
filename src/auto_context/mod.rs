@@ -531,4 +531,137 @@ mod tests {
         );
         assert!(result.sections.test_files.files.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // DNA section budget branches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_context_tiny_budget_skips_dna() {
+        // tokens < 2000 → DNA section is skipped entirely
+        let (index, _dir) = make_index(&[("src/auth.rs", "pub fn authenticate() {}")]);
+        let opts = default_opts(1_500);
+        let result = auto_context("authenticate", &index, &opts);
+        // dna must be empty when tokens < 2000
+        assert!(
+            result.dna.is_empty(),
+            "DNA must be empty for tokens < 2000, got {} chars",
+            result.dna.len()
+        );
+        // Budget invariant
+        assert_eq!(
+            result.budget.used + result.budget.remaining,
+            result.budget.total
+        );
+    }
+
+    #[test]
+    fn test_auto_context_compact_dna_for_medium_budget() {
+        // 2000 <= tokens < 5000 → compact DNA rendered
+        let (index, _dir) = make_index(&[("src/auth.rs", "pub fn authenticate() {}")]);
+        let opts = default_opts(3_000);
+        let result = auto_context("authenticate", &index, &opts);
+        // Compact DNA may be empty if no convention data, but the branch is exercised.
+        // Budget invariant must hold.
+        assert_eq!(
+            result.budget.used + result.budget.remaining,
+            result.budget.total
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // include_tests=true path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_context_include_tests_with_test_map() {
+        let (mut index, _dir) = make_index(&[
+            ("src/handler.rs", "pub fn handle_request() {}"),
+            (
+                "tests/handler_test.rs",
+                "fn test_handle() { assert!(true); }",
+            ),
+        ]);
+        // Inject a test_map entry so the include_tests branch resolves a test file.
+        use crate::intelligence::test_map::{TestConfidence, TestFileRef};
+        index.test_map.insert(
+            "src/handler.rs".to_string(),
+            vec![TestFileRef {
+                path: "tests/handler_test.rs".to_string(),
+                confidence: TestConfidence::NameMatch,
+            }],
+        );
+
+        let opts = AutoContextOpts {
+            tokens: 50_000,
+            focus: None,
+            include_tests: true,
+            include_blast_radius: false,
+            mode: "full".to_string(),
+        };
+        let result = auto_context("handle request", &index, &opts);
+        // The test resolver only emits a test if the seed file ("src/handler.rs") was kept.
+        // We just verify the include_tests branch executed without crashing and the budget
+        // invariant still holds.
+        assert_eq!(
+            result.budget.used + result.budget.remaining,
+            result.budget.total
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // include_blast_radius=true path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_context_include_blast_radius() {
+        let (index, _dir) = make_index(&[
+            ("src/auth.rs", "pub fn authenticate() {}"),
+            ("src/session.rs", "pub fn make_session() {}"),
+        ]);
+        let opts = AutoContextOpts {
+            tokens: 50_000,
+            focus: None,
+            include_tests: false,
+            include_blast_radius: true,
+            mode: "full".to_string(),
+        };
+        let result = auto_context("authenticate", &index, &opts);
+        // The branch was exercised — we just need budget invariance.
+        assert_eq!(
+            result.budget.used + result.budget.remaining,
+            result.budget.total
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // predictions: file mention in task
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_context_predictions_for_file_mention() {
+        // Mentioning a file path with a recognized extension in the task should
+        // populate the predictions field.
+        let (index, _dir) = make_index(&[
+            ("src/auth.rs", "pub fn authenticate() {}"),
+            ("src/session.rs", "pub fn make_session() {}"),
+        ]);
+        let opts = default_opts(50_000);
+        let result = auto_context("please update src/auth.rs to fix the bug", &index, &opts);
+        assert!(
+            result.predictions.is_some(),
+            "predictions should be Some when a file is mentioned"
+        );
+    }
+
+    #[test]
+    fn test_auto_context_no_predictions_without_mentions() {
+        let (index, _dir) = make_index(&[("src/auth.rs", "pub fn authenticate() {}")]);
+        let opts = default_opts(50_000);
+        let result = auto_context("just a generic question", &index, &opts);
+        assert!(
+            result.predictions.is_none(),
+            "predictions should be None when no file is mentioned"
+        );
+    }
 }

@@ -827,4 +827,237 @@ mod tests {
             result.detail
         );
     }
+
+    // --- additional path_similarity edge cases ---
+
+    #[test]
+    fn test_path_similarity_empty_query_returns_zero() {
+        // Empty query → empty query_tokens → returns score 0.0 with "empty tokens"
+        let result = path_similarity("", "src/api/mod.rs");
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.detail, "empty tokens");
+    }
+
+    #[test]
+    fn test_path_similarity_empty_path_returns_zero() {
+        let result = path_similarity("api", "");
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.detail, "empty tokens");
+    }
+
+    #[test]
+    fn test_path_similarity_only_punctuation_query() {
+        // Only single-char/punctuation tokens get filtered → empty query tokens
+        let result = path_similarity("!@#", "src/api/mod.rs");
+        assert_eq!(result.score, 0.0);
+    }
+
+    // --- additional symbol_match edge cases ---
+
+    #[test]
+    fn test_symbol_match_file_not_found() {
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        let result = symbol_match("anything", "missing.rs", &index, None);
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.detail, "file not found");
+    }
+
+    #[test]
+    fn test_symbol_match_no_parse_result() {
+        // A file in the index but with no parse result
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("noparse.rs");
+        std::fs::write(&fp, "fn x() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "noparse.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 9,
+        }];
+        // Empty parse_results map → file ends up with no parse result
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        // CodebaseIndex::build assigns parse results from the map; if missing, file.parse_result = None
+        let result = symbol_match("anything", "noparse.rs", &index, None);
+        // Either "no parse result" or "no symbols" or "empty query" depending on Rust parser behavior;
+        // we just assert it gracefully returns 0.0 for the empty/missing case.
+        assert_eq!(result.score, 0.0);
+    }
+
+    #[test]
+    fn test_symbol_match_empty_query_with_expanded_tokens() {
+        let index = make_symbol_index();
+        // Pass an explicitly empty expanded token set
+        let empty: HashSet<String> = HashSet::new();
+        let result = symbol_match("anything", "handler.rs", &index, Some(&empty));
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.detail, "empty query");
+    }
+
+    #[test]
+    fn test_symbol_match_uses_expanded_tokens_when_provided() {
+        let index = make_symbol_index();
+        let mut tokens = HashSet::new();
+        tokens.insert("handle".to_string());
+        tokens.insert("api".to_string());
+        let result = symbol_match("totally unrelated", "handler.rs", &index, Some(&tokens));
+        // The expanded tokens overrule the raw query → should get a real score
+        assert!(result.score > 0.0);
+    }
+
+    // --- additional import_proximity edge cases ---
+
+    #[test]
+    fn test_import_proximity_file_not_found() {
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        let result = import_proximity("missing.rs", &index);
+        assert_eq!(result.score, 0.5);
+        assert_eq!(result.detail, "file not found");
+    }
+
+    #[test]
+    fn test_import_proximity_short_stem_skipped() {
+        // A file with a very short stem (e.g. "a.rs") whose stem length is <2.
+        // The import-stem guard should skip it as a possible incoming reference.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp1 = dir.path().join("a.rs");
+        let fp2 = dir.path().join("user.rs");
+        std::fs::write(&fp1, "// short stem file").unwrap();
+        std::fs::write(&fp2, "use a;").unwrap();
+        let files = vec![
+            ScannedFile {
+                relative_path: "a.rs".into(),
+                absolute_path: fp1,
+                language: Some("rust".into()),
+                size_bytes: 18,
+            },
+            ScannedFile {
+                relative_path: "user.rs".into(),
+                absolute_path: fp2,
+                language: Some("rust".into()),
+                size_bytes: 6,
+            },
+        ];
+        let mut pr = HashMap::new();
+        pr.insert(
+            "user.rs".to_string(),
+            ParseResult {
+                symbols: vec![],
+                imports: vec![Import {
+                    source: "a".into(),
+                    names: vec!["a".into()],
+                }],
+                exports: vec![],
+            },
+        );
+        let index = CodebaseIndex::build(files, pr, &counter);
+        // a.rs has no outgoing imports and stem "a" is too short → no incoming match
+        let result = import_proximity("a.rs", &index);
+        assert!(
+            (result.score - 0.5).abs() < 0.01,
+            "short stem should be neutral: {}",
+            result.score
+        );
+    }
+
+    // --- additional term_frequency edge cases ---
+
+    #[test]
+    fn test_term_frequency_file_not_found() {
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        let result = term_frequency("query", "missing.rs", &index, None);
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.detail, "file not found");
+    }
+
+    #[test]
+    fn test_term_frequency_empty_query_with_expanded_tokens() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("data.rs");
+        std::fs::write(&fp, "fn process_data() { handle_data(); }").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "data.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 36,
+        }];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let empty: HashSet<String> = HashSet::new();
+        let result = term_frequency("anything", "data.rs", &index, Some(&empty));
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.detail, "empty query");
+    }
+
+    #[test]
+    fn test_term_frequency_uses_expanded_tokens() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("data.rs");
+        std::fs::write(
+            &fp,
+            "fn process_data() { handle_data(); apply_data(); save_data(); }",
+        )
+        .unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "data.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 64,
+        }];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let mut expanded = HashSet::new();
+        expanded.insert("data".to_string());
+        let result = term_frequency("totally unrelated", "data.rs", &index, Some(&expanded));
+        // expanded tokens should override the raw query → produces score>0
+        assert!(result.score > 0.0);
+    }
+
+    // --- recency_boost_signal tests ---
+
+    #[test]
+    fn test_recency_boost_signal_no_git_history() {
+        // Empty index → no churn data → neutral 0.5
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        let result = recency_boost_signal("any.rs", &index);
+        assert_eq!(result.name, "recency_boost");
+        // 0.5 → falls in else branch → "no git history"
+        assert_eq!(result.detail, "no git history");
+        assert!((result.score - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_recency_boost_signal_in_30d_bucket() {
+        use crate::conventions::git_health::ChurnEntry;
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        index.conventions.git_health.churn_30d.push(ChurnEntry {
+            path: "src/hot.rs".to_string(),
+            modifications: 5,
+        });
+        let result = recency_boost_signal("src/hot.rs", &index);
+        assert_eq!(result.name, "recency_boost");
+        assert_eq!(result.detail, "in 30d churn bucket");
+        assert!(result.score > 0.6);
+    }
+
+    #[test]
+    fn test_recency_boost_signal_in_180d_only() {
+        use crate::conventions::git_health::ChurnEntry;
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        index.conventions.git_health.churn_180d.push(ChurnEntry {
+            path: "src/cold.rs".to_string(),
+            modifications: 2,
+        });
+        let result = recency_boost_signal("src/cold.rs", &index);
+        assert_eq!(result.name, "recency_boost");
+        assert_eq!(result.detail, "in 180d bucket only");
+        assert_eq!(result.score, 0.0);
+    }
 }

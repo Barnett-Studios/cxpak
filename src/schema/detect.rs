@@ -1553,4 +1553,462 @@ mod tests {
         let chains = detect_migrations(&index);
         assert!(chains.is_empty());
     }
+
+    // -------------------------------------------------------------------------
+    // Additional ORM detection tests for field extraction branches
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_django_foreign_key_field_relation() {
+        let sym = make_symbol(
+            "Comment",
+            SymbolKind::Class,
+            "class Comment(models.Model)",
+            r#"
+    body = models.TextField()
+    author = models.ForeignKey(User, on_delete=models.CASCADE)
+"#,
+        );
+        let file = make_file("app/models.py", Some("python"), "", vec![sym], vec![]);
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert_eq!(models.len(), 1);
+        // Two fields: body (TextField), author (ForeignKey -> User)
+        let author = models[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "author")
+            .expect("author field");
+        assert!(author.is_relation, "author should be a relation");
+        assert_eq!(author.related_model.as_deref(), Some("User"));
+
+        let body = models[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "body")
+            .expect("body field");
+        assert!(!body.is_relation);
+        assert!(body.related_model.is_none());
+    }
+
+    #[test]
+    fn test_django_many_to_many_relation() {
+        let sym = make_symbol(
+            "Article",
+            SymbolKind::Class,
+            "class Article(models.Model)",
+            r#"
+    tags = models.ManyToManyField(Tag)
+"#,
+        );
+        let file = make_file("app/models.py", Some("python"), "", vec![sym], vec![]);
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert_eq!(models.len(), 1);
+        let tags = &models[0].fields[0];
+        assert!(tags.is_relation);
+        assert_eq!(tags.related_model.as_deref(), Some("Tag"));
+    }
+
+    #[test]
+    fn test_django_meta_attributes_skipped() {
+        // db_table, ordering, verbose_name should NOT be extracted as fields
+        let sym = make_symbol(
+            "Thing",
+            SymbolKind::Class,
+            "class Thing(models.Model)",
+            r#"
+    name = models.CharField(max_length=100)
+    db_table = models.CharField(max_length=10)
+    ordering = models.IntegerField()
+    verbose_name = models.CharField(max_length=10)
+"#,
+        );
+        let file = make_file("app/models.py", Some("python"), "", vec![sym], vec![]);
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert_eq!(models.len(), 1);
+        // Only name should remain
+        assert_eq!(models[0].fields.len(), 1);
+        assert_eq!(models[0].fields[0].name, "name");
+    }
+
+    #[test]
+    fn test_sqlalchemy_field_with_foreign_key() {
+        let sym = make_symbol(
+            "Order",
+            SymbolKind::Class,
+            "class Order(Base)",
+            r#"
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+"#,
+        );
+        let imports = vec![Import {
+            source: "sqlalchemy".to_string(),
+            names: vec!["Column".to_string()],
+        }];
+        let file = make_file("app/models.py", Some("python"), "", vec![sym], imports);
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert_eq!(models.len(), 1);
+        let user_id = models[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "user_id")
+            .expect("user_id field");
+        assert!(user_id.is_relation);
+        assert_eq!(user_id.related_model.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn test_sqlalchemy_declarative_base_signature() {
+        // Test alternative signature: (DeclarativeBase)
+        let sym = make_symbol(
+            "Item",
+            SymbolKind::Class,
+            "class Item(DeclarativeBase)",
+            r#"
+    __tablename__ = "items"
+    id = Column(Integer)
+"#,
+        );
+        let imports = vec![Import {
+            source: "sqlalchemy.orm".to_string(),
+            names: vec!["DeclarativeBase".to_string()],
+        }];
+        let file = make_file("app/models.py", Some("python"), "", vec![sym], imports);
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].table_name, "items");
+    }
+
+    #[test]
+    fn test_typeorm_relation_decorators_extracted() {
+        // Use simple decorator args (no arrow functions / nested parens) so the
+        // single-pass regex `@(\w+)\([^)]*\)\s+(\w+)\s*:\s*(\w+)` matches.
+        let sym = make_symbol(
+            "Post",
+            SymbolKind::Class,
+            "class Post",
+            r#"
+    @PrimaryColumn() id: number
+    @Column() title: string
+    @ManyToOne(User) author: User
+    @OneToMany(Comment) comments: string
+"#,
+        );
+        let content = "import { Entity } from 'typeorm'; @Entity() class Post {";
+        let file = make_file(
+            "src/post.entity.ts",
+            Some("typescript"),
+            content,
+            vec![sym],
+            vec![],
+        );
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert_eq!(models.len(), 1);
+        let author = models[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "author")
+            .expect("author field");
+        assert!(author.is_relation);
+        let comments = models[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "comments")
+            .expect("comments field");
+        assert!(comments.is_relation);
+        let title = models[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "title")
+            .expect("title field");
+        assert!(!title.is_relation);
+    }
+
+    #[test]
+    fn test_active_record_pluralize_word_ending_in_s() {
+        let sym = make_symbol(
+            "Status",
+            SymbolKind::Class,
+            "class Status < ApplicationRecord",
+            "end\n",
+        );
+        let file = make_file("app/models/status.rb", Some("ruby"), "", vec![sym], vec![]);
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].table_name, "statuses");
+    }
+
+    #[test]
+    fn test_prisma_db_map_override() {
+        let sym = make_symbol(
+            "Customer",
+            SymbolKind::Struct,
+            "model Customer",
+            r#"
+    id   Int    @id
+    name String
+    @@map("customers_table")
+"#,
+        );
+        let file = make_file(
+            "prisma/schema.prisma",
+            Some("prisma"),
+            "",
+            vec![sym],
+            vec![],
+        );
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].table_name, "customers_table");
+    }
+
+    #[test]
+    fn test_prisma_struct_in_non_prisma_lang_not_detected() {
+        // Struct in a non-prisma file should NOT be detected as a Prisma model
+        let sym = make_symbol("Foo", SymbolKind::Struct, "struct Foo", "    bar: i32\n");
+        let file = make_file("src/foo.rs", Some("rust"), "", vec![sym], vec![]);
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_typeorm_no_decorators_skipped() {
+        // Class with no TypeORM decorators
+        let sym = make_symbol(
+            "Helper",
+            SymbolKind::Class,
+            "class Helper",
+            "    foo: string\n",
+        );
+        let file = make_file("src/helper.ts", Some("typescript"), "", vec![sym], vec![]);
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert!(models.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // Knex migration tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_knex_migrations_js_detected() {
+        let f1 = make_file(
+            "migrations/20230101120000_create_users.js",
+            Some("javascript"),
+            "",
+            vec![],
+            vec![],
+        );
+        let f2 = make_file(
+            "migrations/20230102000000_add_email.js",
+            Some("javascript"),
+            "",
+            vec![],
+            vec![],
+        );
+        let index = make_index(vec![f1, f2]);
+        let chains = detect_migrations(&index);
+        assert_eq!(chains.len(), 1);
+        assert!(matches!(chains[0].framework, MigrationFramework::Knex));
+        assert_eq!(chains[0].migrations.len(), 2);
+        assert_eq!(chains[0].migrations[0].name, "create_users");
+    }
+
+    #[test]
+    fn test_knex_migrations_ts_detected() {
+        let f1 = make_file(
+            "migrations/20230101120000_create_orders.ts",
+            Some("typescript"),
+            "",
+            vec![],
+            vec![],
+        );
+        let f2 = make_file(
+            "migrations/20230101130000_add_index.ts",
+            Some("typescript"),
+            "",
+            vec![],
+            vec![],
+        );
+        let index = make_index(vec![f1, f2]);
+        let chains = detect_migrations(&index);
+        assert_eq!(chains.len(), 1);
+        assert!(matches!(chains[0].framework, MigrationFramework::Knex));
+    }
+
+    // -------------------------------------------------------------------------
+    // Drizzle migration tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_drizzle_migrations_detected() {
+        let f1 = make_file("drizzle/0001_init.sql", Some("sql"), "", vec![], vec![]);
+        let f2 = make_file(
+            "drizzle/0002_add_users.sql",
+            Some("sql"),
+            "",
+            vec![],
+            vec![],
+        );
+        let index = make_index(vec![f1, f2]);
+        let chains = detect_migrations(&index);
+        assert_eq!(chains.len(), 1);
+        assert!(matches!(chains[0].framework, MigrationFramework::Drizzle));
+        assert_eq!(chains[0].migrations.len(), 2);
+        assert_eq!(chains[0].migrations[0].sequence, "0001");
+        assert_eq!(chains[0].migrations[1].sequence, "0002");
+    }
+
+    // -------------------------------------------------------------------------
+    // Prisma migration tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_prisma_migrations_detected() {
+        let f1 = make_file(
+            "myapp/prisma/migrations/20230101120000_init/migration.sql",
+            Some("sql"),
+            "CREATE TABLE users();",
+            vec![],
+            vec![],
+        );
+        let f2 = make_file(
+            "myapp/prisma/migrations/20230102120000_add_email/migration.sql",
+            Some("sql"),
+            "ALTER TABLE users ADD COLUMN email TEXT;",
+            vec![],
+            vec![],
+        );
+        let index = make_index(vec![f1, f2]);
+        let chains = detect_migrations(&index);
+        // The Prisma branch should pick this up.
+        let prisma_chains: Vec<_> = chains
+            .iter()
+            .filter(|c| matches!(c.framework, MigrationFramework::Prisma))
+            .collect();
+        assert_eq!(
+            prisma_chains.len(),
+            1,
+            "expected exactly one prisma chain, got: {:?}",
+            chains
+        );
+        assert_eq!(prisma_chains[0].migrations.len(), 2);
+        assert_eq!(prisma_chains[0].directory, "myapp/prisma/migrations");
+    }
+
+    // -------------------------------------------------------------------------
+    // Alembic filename fallback test (no revision in content)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_alembic_filename_fallback() {
+        // No `revision = ...` in content; sequence is parsed from the filename.
+        // Filename must match `^([a-f0-9_]+)\.py$` — only hex chars + underscore.
+        let f1 = make_file(
+            "alembic/versions/abcdef123456.py",
+            Some("python"),
+            "# no revision here\n",
+            vec![],
+            vec![],
+        );
+        let index = make_index(vec![f1]);
+        let chains = detect_migrations(&index);
+        assert_eq!(chains.len(), 1);
+        assert!(matches!(chains[0].framework, MigrationFramework::Alembic));
+        // The fname_re captures the entire stem when it matches.
+        assert_eq!(chains[0].migrations[0].sequence, "abcdef123456");
+    }
+
+    // -------------------------------------------------------------------------
+    // build_schema_index orchestrator tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_build_schema_index_returns_none_for_plain_repo() {
+        let f = make_file("src/main.rs", Some("rust"), "fn main() {}", vec![], vec![]);
+        let index = make_index(vec![f]);
+        let schema = build_schema_index(&index);
+        assert!(schema.is_none(), "plain repo should produce no schema");
+    }
+
+    #[test]
+    fn test_build_schema_index_with_orm_models() {
+        let sym = make_symbol(
+            "User",
+            SymbolKind::Class,
+            "class User(models.Model)",
+            "    name = models.CharField(max_length=100)\n",
+        );
+        let file = make_file("app/models.py", Some("python"), "", vec![sym], vec![]);
+        let index = make_index(vec![file]);
+        let schema = build_schema_index(&index).expect("schema should be built");
+        assert!(
+            schema.orm_models.contains_key("User"),
+            "User model should be in schema"
+        );
+    }
+
+    #[test]
+    fn test_build_schema_index_with_terraform() {
+        let sym = make_symbol(
+            "aws_dynamodb_table.events",
+            SymbolKind::Block,
+            "resource aws_dynamodb_table events",
+            "    hash_key = \"EventId\"\n",
+        );
+        let file = make_file("infra/main.tf", Some("hcl"), "", vec![sym], vec![]);
+        let index = make_index(vec![file]);
+        let schema = build_schema_index(&index).expect("schema should be built");
+        assert!(schema.tables.contains_key("aws_dynamodb_table.events"));
+    }
+
+    #[test]
+    fn test_build_schema_index_with_migrations() {
+        let f = make_file(
+            "db/migrate/20230101000000_create_users.rb",
+            Some("ruby"),
+            "",
+            vec![],
+            vec![],
+        );
+        let index = make_index(vec![f]);
+        let schema = build_schema_index(&index).expect("schema should be built");
+        assert_eq!(schema.migrations.len(), 1);
+        assert!(matches!(
+            schema.migrations[0].framework,
+            MigrationFramework::Rails
+        ));
+    }
+
+    #[test]
+    fn test_build_schema_index_with_prisma_enrichment() {
+        // A Prisma struct symbol triggers both detect_orm_models and the
+        // enrichment pass via extract_prisma_schema.
+        let sym = make_symbol(
+            "Post",
+            SymbolKind::Struct,
+            "model Post",
+            "id Int @id\ntitle String\n",
+        );
+        let file = make_file(
+            "prisma/schema.prisma",
+            Some("prisma"),
+            "model Post {\n  id Int @id\n  title String\n}\n",
+            vec![sym],
+            vec![],
+        );
+        let index = make_index(vec![file]);
+        let schema = build_schema_index(&index).expect("schema should be built");
+        assert!(schema.orm_models.contains_key("Post"));
+    }
 }

@@ -949,4 +949,245 @@ mod tests {
         assert!(result.passed.iter().any(|p| p.contains("error_handling")));
         assert!(result.passed.iter().any(|p| p.contains("imports")));
     }
+
+    // ── verify_changes branches not yet covered ───────────────────────────────
+
+    #[test]
+    fn test_verify_changes_passed_list_includes_naming_when_set() {
+        // When a naming convention is set and there are no naming violations,
+        // the passed list should include a "naming" entry.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn good_name() {}").unwrap();
+
+        let mut conventions = ConventionProfile::default();
+        conventions.naming.function_style =
+            PatternObservation::new("fn_naming", "snake_case", 95, 100);
+
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        index.conventions = conventions;
+
+        let changed = vec![ChangedFile {
+            path: "lib.rs".to_string(),
+            added_lines: vec![1],
+            is_new: true,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+        // Should report a passed naming entry referencing snake_case
+        assert!(
+            result.passed.iter().any(|p| p.starts_with("naming:")),
+            "expected naming pass entry: {:?}",
+            result.passed
+        );
+    }
+
+    #[test]
+    fn test_verify_changes_skips_unreadable_file() {
+        // A file that doesn't exist on disk → read_to_string returns Err → skipped.
+        let dir = tempfile::TempDir::new().unwrap();
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+
+        let changed = vec![ChangedFile {
+            path: "does_not_exist.rs".to_string(),
+            added_lines: vec![1, 2, 3],
+            is_new: true,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+        // File was skipped — no violations, but lines_checked still counts.
+        assert_eq!(result.files_checked, 1);
+        assert_eq!(result.lines_checked, 3);
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn test_verify_changes_modified_symbol_in_changed_range() {
+        // is_new=false but symbol falls inside an added line range → checked.
+        let dir = tempfile::TempDir::new().unwrap();
+        // Place a snake_case violation on line 1 of a Rust file
+        std::fs::write(dir.path().join("lib.rs"), "pub fn handleRequest() {}\n").unwrap();
+
+        let mut conventions = ConventionProfile::default();
+        conventions.naming.function_style =
+            PatternObservation::new("fn_naming", "snake_case", 95, 100);
+
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        index.conventions = conventions;
+
+        let changed = vec![ChangedFile {
+            path: "lib.rs".to_string(),
+            added_lines: vec![1],
+            is_new: false,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+        // The violation might or might not be picked up depending on parser symbol ranges,
+        // but the summary invariant must hold.
+        assert_eq!(
+            result.summary.high + result.summary.medium + result.summary.low,
+            result.violations.len()
+        );
+    }
+
+    #[test]
+    fn test_verify_changes_symbol_outside_changed_range_skipped() {
+        // is_new=false and added_lines doesn't overlap symbol range → skipped.
+        let dir = tempfile::TempDir::new().unwrap();
+        // Multi-line Rust file: function on lines 5-7, but only line 1 changed
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "// line 1\n// line 2\n// line 3\n// line 4\npub fn handleRequest() {\n  ()\n}\n",
+        )
+        .unwrap();
+
+        let mut conventions = ConventionProfile::default();
+        conventions.naming.function_style =
+            PatternObservation::new("fn_naming", "snake_case", 95, 100);
+
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        index.conventions = conventions;
+
+        let changed = vec![ChangedFile {
+            path: "lib.rs".to_string(),
+            added_lines: vec![1], // line 1 only — symbol on line 5+
+            is_new: false,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+        // Symbol outside changed range → no naming violations
+        let naming_violations = result
+            .violations
+            .iter()
+            .filter(|v| v.category == "naming")
+            .count();
+        assert_eq!(
+            naming_violations, 0,
+            "naming violations should be 0 for symbol outside changed range"
+        );
+    }
+
+    #[test]
+    fn test_verify_changes_unknown_language_skipped() {
+        // A file with no recognized extension → no parse, no violations.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.unknownext"), "some content").unwrap();
+
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+
+        let changed = vec![ChangedFile {
+            path: "notes.unknownext".to_string(),
+            added_lines: vec![1],
+            is_new: true,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+        assert!(result.violations.is_empty());
+        assert_eq!(result.files_checked, 1);
+    }
+
+    // ── get_changed_lines: ref-not-found error path ───────────────────────────
+
+    #[test]
+    fn test_get_changed_lines_ref_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_git_repo_with_file(&dir, "lib.rs", "fn main() {}");
+
+        // Reference a non-existent ref
+        let result = get_changed_lines(dir.path(), Some("nonexistent_ref"), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Cannot resolve ref"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── check_errors: revert history ──────────────────────────────────────────
+
+    #[test]
+    fn test_check_errors_unwrap_with_revert_history() {
+        use crate::conventions::git_health::RevertEntry;
+
+        let mut conventions = ConventionProfile::default();
+        conventions.errors.unwrap_usage =
+            PatternObservation::new("unwrap_usage", "no .unwrap() in src/", 95, 100);
+        // Inject a revert mentioning unwrap so that the history branch is exercised.
+        conventions.git_health.reverts = vec![RevertEntry {
+            commit_message: "Revert: removed dangerous unwrap call".to_string(),
+            reverted_message: None,
+        }];
+
+        let symbol = Symbol {
+            name: "do_thing".into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn do_thing()".into(),
+            body: "{ foo.unwrap() }".into(),
+            start_line: 1,
+            end_line: 2,
+        };
+
+        let mut violations = Vec::new();
+        check_errors("src/lib.rs", &symbol, &conventions, &mut violations);
+
+        assert_eq!(violations.len(), 1);
+        let history = violations[0].evidence.history.as_deref().unwrap_or("");
+        assert!(
+            history.contains("commits reverted unwrap() usage"),
+            "history should mention unwrap reverts: {history}"
+        );
+    }
+
+    #[test]
+    fn test_check_errors_unwrap_with_unrelated_reverts() {
+        use crate::conventions::git_health::RevertEntry;
+
+        let mut conventions = ConventionProfile::default();
+        conventions.errors.unwrap_usage =
+            PatternObservation::new("unwrap_usage", "no .unwrap() in src/", 95, 100);
+        // Inject reverts that don't mention unwrap → history should be None.
+        conventions.git_health.reverts = vec![RevertEntry {
+            commit_message: "Revert: unrelated change".to_string(),
+            reverted_message: None,
+        }];
+
+        let symbol = Symbol {
+            name: "do_thing".into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn do_thing()".into(),
+            body: "{ foo.unwrap() }".into(),
+            start_line: 1,
+            end_line: 2,
+        };
+
+        let mut violations = Vec::new();
+        check_errors("src/lib.rs", &symbol, &conventions, &mut violations);
+
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].evidence.history.is_none());
+    }
+
+    #[test]
+    fn test_check_errors_unwrap_no_convention() {
+        // No unwrap_usage convention → check_errors emits no violations.
+        let conventions = ConventionProfile::default();
+        let symbol = Symbol {
+            name: "any".into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "fn any()".into(),
+            body: "{ x.unwrap() }".into(),
+            start_line: 1,
+            end_line: 2,
+        };
+        let mut violations = Vec::new();
+        check_errors("src/lib.rs", &symbol, &conventions, &mut violations);
+        assert!(violations.is_empty());
+    }
 }

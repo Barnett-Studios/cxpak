@@ -1176,4 +1176,940 @@ let x = 42;
             "non-route strings should produce no results"
         );
     }
+
+    // --- gRPC extraction tests ---
+
+    fn make_index_with_proto() -> CodebaseIndex {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let proto_content = r#"syntax = "proto3";
+service UserService {
+  rpc GetUser (GetUserRequest) returns (GetUserResponse);
+  rpc ListUsers (ListUsersRequest) returns (ListUsersResponse);
+}
+service OrderService {
+  rpc CreateOrder (CreateOrderRequest) returns (CreateOrderResponse);
+}"#;
+
+        let fp = dir.path().join("api/user.proto");
+        std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+        std::fs::write(&fp, proto_content).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "api/user.proto".into(),
+            absolute_path: fp,
+            language: Some("protobuf".into()),
+            size_bytes: proto_content.len() as u64,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "api/user.proto".to_string(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "UserService".to_string(),
+                        kind: SymbolKind::Service,
+                        visibility: Visibility::Public,
+                        signature: "service UserService".to_string(),
+                        body: String::new(),
+                        start_line: 2,
+                        end_line: 5,
+                    },
+                    Symbol {
+                        name: "GetUser".to_string(),
+                        kind: SymbolKind::Method,
+                        visibility: Visibility::Public,
+                        signature: "rpc GetUser".to_string(),
+                        body: String::new(),
+                        start_line: 3,
+                        end_line: 3,
+                    },
+                    Symbol {
+                        name: "ListUsers".to_string(),
+                        kind: SymbolKind::Method,
+                        visibility: Visibility::Public,
+                        signature: "rpc ListUsers".to_string(),
+                        body: String::new(),
+                        start_line: 4,
+                        end_line: 4,
+                    },
+                    Symbol {
+                        name: "OrderService".to_string(),
+                        kind: SymbolKind::Service,
+                        visibility: Visibility::Public,
+                        signature: "service OrderService".to_string(),
+                        body: String::new(),
+                        start_line: 6,
+                        end_line: 8,
+                    },
+                    Symbol {
+                        name: "CreateOrder".to_string(),
+                        kind: SymbolKind::Method,
+                        visibility: Visibility::Public,
+                        signature: "rpc CreateOrder".to_string(),
+                        body: String::new(),
+                        start_line: 7,
+                        end_line: 7,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        CodebaseIndex::build(files, parse_results, &counter)
+    }
+
+    #[test]
+    fn test_extract_grpc_services() {
+        let index = make_index_with_proto();
+        let services = extract_grpc_services(&index, None);
+        assert_eq!(services.len(), 2);
+
+        let user_svc = services.iter().find(|s| s.name == "UserService");
+        assert!(
+            user_svc.is_some(),
+            "UserService should be extracted from proto"
+        );
+        let user_svc = user_svc.unwrap();
+        assert_eq!(user_svc.methods.len(), 2);
+        assert!(user_svc.methods.contains(&"GetUser".to_string()));
+        assert!(user_svc.methods.contains(&"ListUsers".to_string()));
+        assert_eq!(user_svc.file, "api/user.proto");
+
+        let order_svc = services.iter().find(|s| s.name == "OrderService");
+        assert!(
+            order_svc.is_some(),
+            "OrderService should be extracted from proto"
+        );
+        assert_eq!(order_svc.unwrap().methods.len(), 1);
+        assert!(order_svc
+            .unwrap()
+            .methods
+            .contains(&"CreateOrder".to_string()));
+    }
+
+    #[test]
+    fn test_extract_grpc_services_with_focus_filter() {
+        let index = make_index_with_proto();
+        // Focus on a non-matching prefix => no services.
+        let services = extract_grpc_services(&index, Some("src/"));
+        assert_eq!(
+            services.len(),
+            0,
+            "focus filter should exclude proto files not under src/"
+        );
+
+        // Focus matching prefix => includes services.
+        let services = extract_grpc_services(&index, Some("api/"));
+        assert_eq!(services.len(), 2);
+    }
+
+    // --- GraphQL extraction tests ---
+
+    fn make_index_with_graphql() -> CodebaseIndex {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let gql_content = r#"type Query {
+  users: [User]
+  user(id: ID!): User
+}
+
+type Mutation {
+  createUser(input: CreateUserInput!): User
+}
+
+type User {
+  id: ID!
+  name: String!
+  email: String!
+}"#;
+
+        let fp = dir.path().join("schema.graphql");
+        std::fs::write(&fp, gql_content).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "schema.graphql".into(),
+            absolute_path: fp,
+            language: Some("graphql".into()),
+            size_bytes: gql_content.len() as u64,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "schema.graphql".to_string(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "Query".to_string(),
+                        kind: SymbolKind::Query,
+                        visibility: Visibility::Public,
+                        signature: "type Query".to_string(),
+                        body: String::new(),
+                        start_line: 1,
+                        end_line: 4,
+                    },
+                    Symbol {
+                        name: "Mutation".to_string(),
+                        kind: SymbolKind::Mutation,
+                        visibility: Visibility::Public,
+                        signature: "type Mutation".to_string(),
+                        body: String::new(),
+                        start_line: 6,
+                        end_line: 8,
+                    },
+                    Symbol {
+                        name: "User".to_string(),
+                        kind: SymbolKind::Type,
+                        visibility: Visibility::Public,
+                        signature: "type User".to_string(),
+                        body: String::new(),
+                        start_line: 10,
+                        end_line: 14,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        CodebaseIndex::build(files, parse_results, &counter)
+    }
+
+    #[test]
+    fn test_extract_graphql_types() {
+        let index = make_index_with_graphql();
+        let types = extract_graphql_types(&index, None);
+        assert_eq!(types.len(), 3);
+
+        let query = types.iter().find(|t| t.name == "Query");
+        assert!(query.is_some(), "Query type should be extracted");
+        assert_eq!(query.unwrap().kind, "query");
+        assert_eq!(query.unwrap().file, "schema.graphql");
+
+        let mutation = types.iter().find(|t| t.name == "Mutation");
+        assert!(mutation.is_some(), "Mutation type should be extracted");
+        assert_eq!(mutation.unwrap().kind, "mutation");
+
+        let user = types.iter().find(|t| t.name == "User");
+        assert!(user.is_some(), "User type should be extracted");
+        assert_eq!(user.unwrap().kind, "type");
+    }
+
+    #[test]
+    fn test_extract_graphql_types_with_focus_filter() {
+        let index = make_index_with_graphql();
+        // Non-matching focus => no types.
+        let types = extract_graphql_types(&index, Some("api/"));
+        assert_eq!(
+            types.len(),
+            0,
+            "focus filter should exclude graphql files not under api/"
+        );
+
+        // Matching focus => includes types.
+        let types = extract_graphql_types(&index, Some("schema"));
+        assert_eq!(types.len(), 3);
+    }
+
+    #[test]
+    fn test_extract_graphql_gql_extension() {
+        // Verify .gql extension is also recognized.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let gql_content = "type Subscription { onMessage: Message }";
+        let fp = dir.path().join("events.gql");
+        std::fs::write(&fp, gql_content).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "events.gql".into(),
+            absolute_path: fp,
+            language: None, // language not set, but extension is .gql
+            size_bytes: gql_content.len() as u64,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "events.gql".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "Subscription".to_string(),
+                    kind: SymbolKind::Type,
+                    visibility: Visibility::Public,
+                    signature: "type Subscription".to_string(),
+                    body: String::new(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let types = extract_graphql_types(&index, None);
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].name, "Subscription");
+        assert_eq!(types[0].file, "events.gql");
+    }
+
+    // --- extract_api_surface orchestrator tests ---
+
+    #[test]
+    fn test_extract_api_surface_all_includes_grpc_and_graphql() {
+        // Build an index with proto + graphql + rust files.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let proto_content = "syntax = \"proto3\"; service Greeter { rpc SayHello(); }";
+        let gql_content = "type Query { hello: String }";
+        let rs_content = "pub fn hello() {}";
+
+        let fp_proto = dir.path().join("api.proto");
+        let fp_gql = dir.path().join("schema.graphql");
+        let fp_rs = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(fp_rs.parent().unwrap()).unwrap();
+        std::fs::write(&fp_proto, proto_content).unwrap();
+        std::fs::write(&fp_gql, gql_content).unwrap();
+        std::fs::write(&fp_rs, rs_content).unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "api.proto".into(),
+                absolute_path: fp_proto,
+                language: Some("protobuf".into()),
+                size_bytes: proto_content.len() as u64,
+            },
+            ScannedFile {
+                relative_path: "schema.graphql".into(),
+                absolute_path: fp_gql,
+                language: Some("graphql".into()),
+                size_bytes: gql_content.len() as u64,
+            },
+            ScannedFile {
+                relative_path: "src/lib.rs".into(),
+                absolute_path: fp_rs,
+                language: Some("rust".into()),
+                size_bytes: rs_content.len() as u64,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "api.proto".to_string(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "Greeter".to_string(),
+                        kind: SymbolKind::Service,
+                        visibility: Visibility::Public,
+                        signature: "service Greeter".to_string(),
+                        body: String::new(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "SayHello".to_string(),
+                        kind: SymbolKind::Method,
+                        visibility: Visibility::Public,
+                        signature: "rpc SayHello".to_string(),
+                        body: String::new(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "schema.graphql".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "Query".to_string(),
+                    kind: SymbolKind::Query,
+                    visibility: Visibility::Public,
+                    signature: "type Query".to_string(),
+                    body: String::new(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "src/lib.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "hello".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn hello()".to_string(),
+                    body: "{}".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+
+        let surface = extract_api_surface(&index, None, "all", 100_000);
+        assert!(
+            surface.symbols.total >= 1,
+            "should include public symbols from src/lib.rs"
+        );
+        assert_eq!(surface.grpc_services.len(), 1);
+        assert_eq!(surface.grpc_services[0].name, "Greeter");
+        assert_eq!(surface.grpc_services[0].methods.len(), 1);
+        assert_eq!(surface.grpc_services[0].methods[0], "SayHello");
+        assert_eq!(surface.graphql_types.len(), 1);
+        assert_eq!(surface.graphql_types[0].name, "Query");
+        assert_eq!(surface.graphql_types[0].kind, "query");
+    }
+
+    #[test]
+    fn test_extract_api_surface_include_symbols_only() {
+        let index = make_index_with_symbols();
+        let surface = extract_api_surface(&index, None, "symbols", 100_000);
+        assert!(surface.symbols.total >= 1, "symbols should be included");
+        assert!(
+            surface.routes.endpoints.is_empty(),
+            "routes should be empty when include=symbols"
+        );
+        assert!(
+            surface.grpc_services.is_empty(),
+            "grpc should be empty when include=symbols"
+        );
+        assert!(
+            surface.graphql_types.is_empty(),
+            "graphql should be empty when include=symbols"
+        );
+    }
+
+    #[test]
+    fn test_extract_api_surface_include_routes_only() {
+        let index = make_index_with_symbols();
+        let surface = extract_api_surface(&index, None, "routes", 100_000);
+        assert_eq!(
+            surface.symbols.total, 0,
+            "symbols should be empty when include=routes"
+        );
+        assert!(
+            surface.grpc_services.is_empty(),
+            "grpc should be empty when include=routes"
+        );
+        assert!(
+            surface.graphql_types.is_empty(),
+            "graphql should be empty when include=routes"
+        );
+    }
+
+    #[test]
+    fn test_extract_api_surface_token_budget_trims_symbols() {
+        // Use a large index with many public symbols so the budget clips them.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let content = "pub fn a() {} pub fn b() {} pub fn c() {} pub fn d() {}";
+        let fp = dir.path().join("src/big.rs");
+        std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+        std::fs::write(&fp, content).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/big.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: content.len() as u64,
+        }];
+
+        let mut parse_results = HashMap::new();
+        let symbols: Vec<Symbol> = ["a", "b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Symbol {
+                name: name.to_string(),
+                kind: SymbolKind::Function,
+                visibility: Visibility::Public,
+                signature: format!("pub fn {}()", name),
+                body: "{}".to_string(),
+                start_line: i + 1,
+                end_line: i + 1,
+            })
+            .collect();
+
+        parse_results.insert(
+            "src/big.rs".to_string(),
+            ParseResult {
+                symbols,
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+
+        // With a very generous budget, all symbols fit.
+        let surface_full = extract_api_surface(&index, None, "all", 100_000);
+        assert_eq!(surface_full.symbols.total, 4);
+
+        // With a tiny budget (e.g., 1 token), symbols should be trimmed.
+        let surface_tiny = extract_api_surface(&index, None, "all", 1);
+        assert!(
+            surface_tiny.symbols.total < 4,
+            "tiny budget should trim symbols; got {}",
+            surface_tiny.symbols.total
+        );
+    }
+
+    #[test]
+    fn test_extract_api_surface_with_focus() {
+        let index = make_index_with_symbols();
+        // Focus on "src/api" => only api.rs symbols.
+        let surface = extract_api_surface(&index, Some("src/api"), "all", 100_000);
+        assert_eq!(surface.symbols.total, 1);
+        assert_eq!(surface.symbols.by_file[0].path, "src/api.rs");
+
+        // Focus on non-matching prefix => empty.
+        let surface_empty = extract_api_surface(&index, Some("lib/"), "all", 100_000);
+        assert_eq!(surface_empty.symbols.total, 0);
+        assert!(surface_empty.symbols.by_file.is_empty());
+    }
+
+    #[test]
+    fn test_extract_api_surface_empty_index() {
+        let index = CodebaseIndex::empty();
+        let surface = extract_api_surface(&index, None, "all", 100_000);
+        assert_eq!(surface.symbols.total, 0);
+        assert!(surface.routes.endpoints.is_empty());
+        assert!(surface.grpc_services.is_empty());
+        assert!(surface.graphql_types.is_empty());
+        assert_eq!(surface.token_count, 0);
+    }
+
+    // --- symbol_kind_str coverage via extract_public_symbols ---
+    //
+    // `symbol_kind_str` is a private helper with one match arm per SymbolKind
+    // variant.  Cover every arm by building an index with one public symbol
+    // of each kind and verifying the rendered `kind` string in the output.
+    #[test]
+    fn test_symbol_kind_str_all_variants_via_public_symbols() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("src/all_kinds.rs");
+        std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+        std::fs::write(&fp, "// placeholder content").unwrap();
+
+        // One public symbol for each SymbolKind variant.
+        let kinds: Vec<(SymbolKind, &'static str, &'static str)> = vec![
+            (SymbolKind::Function, "s_fn", "function"),
+            (SymbolKind::Struct, "s_struct", "struct"),
+            (SymbolKind::Enum, "s_enum", "enum"),
+            (SymbolKind::Trait, "s_trait", "trait"),
+            (SymbolKind::Interface, "s_interface", "interface"),
+            (SymbolKind::Class, "s_class", "class"),
+            (SymbolKind::Method, "s_method", "method"),
+            (SymbolKind::Constant, "s_const", "constant"),
+            (SymbolKind::TypeAlias, "s_alias", "type_alias"),
+            (SymbolKind::Selector, "s_sel", "selector"),
+            (SymbolKind::Mixin, "s_mix", "mixin"),
+            (SymbolKind::Variable, "s_var", "variable"),
+            (SymbolKind::Heading, "s_head", "heading"),
+            (SymbolKind::Section, "s_sect", "section"),
+            (SymbolKind::Key, "s_key", "key"),
+            (SymbolKind::Table, "s_tab", "table"),
+            (SymbolKind::Block, "s_blk", "block"),
+            (SymbolKind::Target, "s_tgt", "target"),
+            (SymbolKind::Rule, "s_rule", "rule"),
+            (SymbolKind::Element, "s_elem", "element"),
+            (SymbolKind::Message, "s_msg", "message"),
+            (SymbolKind::Service, "s_svc", "service"),
+            (SymbolKind::Query, "s_qry", "query"),
+            (SymbolKind::Mutation, "s_mut", "mutation"),
+            (SymbolKind::Type, "s_type", "type"),
+            (SymbolKind::Instruction, "s_instr", "instruction"),
+        ];
+
+        let symbols: Vec<Symbol> = kinds
+            .iter()
+            .map(|(k, name, _)| Symbol {
+                name: (*name).to_string(),
+                kind: k.clone(),
+                visibility: Visibility::Public,
+                signature: format!("sig {}", name),
+                body: String::new(),
+                start_line: 1,
+                end_line: 1,
+            })
+            .collect();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/all_kinds.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 20,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/all_kinds.rs".to_string(),
+            ParseResult {
+                symbols,
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let (section, _tokens) = extract_public_symbols(&index, None);
+        assert_eq!(section.total, kinds.len());
+        assert_eq!(section.by_file.len(), 1);
+
+        // Every expected kind string must appear in the output.
+        let rendered: Vec<&str> = section.by_file[0]
+            .symbols
+            .iter()
+            .map(|s| s.kind.as_str())
+            .collect();
+        for (_, name, expected_kind_str) in &kinds {
+            assert!(
+                rendered.iter().any(|k| k == expected_kind_str),
+                "missing kind `{}` for symbol `{}` in rendered output: {:?}",
+                expected_kind_str,
+                name,
+                rendered
+            );
+        }
+    }
+
+    // --- Fallback route regex paths ---
+    //
+    // Each supported framework has a "strict" regex that matches a full
+    // function signature, and a "fallback" regex that matches only the
+    // decorator/annotation when no signature follows.  Cover each fallback.
+
+    #[test]
+    fn test_detect_routes_flask_fallback() {
+        // Flask decorator with no `def` on the following line — triggers the
+        // fallback branch which emits `<anonymous>` as the handler.
+        let content = "@app.route('/fallback')\n# no def follows";
+        let routes = detect_routes(content, "app.py");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].method, "GET");
+        assert_eq!(routes[0].path, "/fallback");
+        assert_eq!(routes[0].handler, "<anonymous>");
+    }
+
+    #[test]
+    fn test_detect_routes_fastapi_fallback() {
+        // FastAPI decorator with no `def` on the following line.
+        let content = "@router.delete('/fallback-fast')\n# dangling decorator";
+        let routes = detect_routes(content, "main.py");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].method, "DELETE");
+        assert_eq!(routes[0].path, "/fallback-fast");
+        assert_eq!(routes[0].handler, "<anonymous>");
+    }
+
+    #[test]
+    fn test_detect_routes_spring_fallback() {
+        // Spring annotation with no method signature following it.
+        let content = "@PostMapping(\"/fallback-spring\")\n// end of file";
+        let routes = detect_routes(content, "Controller.java");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].method, "POST");
+        assert_eq!(routes[0].path, "/fallback-spring");
+        assert_eq!(routes[0].handler, "<anonymous>");
+    }
+
+    #[test]
+    fn test_detect_routes_actix_fallback() {
+        // actix attribute with no `fn` on the following line.
+        let content = "#[put(\"/fallback-actix\")]\n// trailing comment";
+        let routes = detect_routes(content, "src/lib.rs");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].method, "PUT");
+        assert_eq!(routes[0].path, "/fallback-actix");
+        assert_eq!(routes[0].handler, "<anonymous>");
+    }
+
+    #[test]
+    fn test_detect_routes_axum_fallback() {
+        // .route("/path") without an explicit handler signature matched
+        // by the strict regex (no verb wrapper).
+        let content = r#".route("/fallback-axum")"#;
+        let routes = detect_routes(content, "src/server.rs");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].method, "GET");
+        assert_eq!(routes[0].path, "/fallback-axum");
+        assert_eq!(routes[0].handler, "<anonymous>");
+    }
+
+    #[test]
+    fn test_detect_routes_rails_anonymous_handler() {
+        // Rails route without an explicit `to:` clause — handler should
+        // default to "<anonymous>" (covers the `unwrap_or_else` branch).
+        let content = "get '/health'\n";
+        let routes = detect_routes(content, "config/routes.rb");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].method, "GET");
+        assert_eq!(routes[0].path, "/health");
+        assert_eq!(routes[0].handler, "<anonymous>");
+    }
+
+    #[test]
+    fn test_detect_routes_aspnet_fallback() {
+        // ASP.NET attribute with no method signature afterwards.
+        let content = "[HttpPut(\"/fallback-aspnet\")]\n// trailing";
+        let routes = detect_routes(content, "Controllers/Foo.cs");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].method, "PUT");
+        assert_eq!(routes[0].path, "/fallback-aspnet");
+        assert_eq!(routes[0].handler, "<anonymous>");
+    }
+
+    #[test]
+    fn test_detect_routes_phoenix_fallback() {
+        // Phoenix route without a Controller/action pair.  The strict regex
+        // requires `Controller, :action`; without it, the fallback branch
+        // emits an `<anonymous>` handler.
+        let content = "get \"/ping\"\n";
+        let routes = detect_routes(content, "lib/my_app_web/router.ex");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].method, "GET");
+        assert_eq!(routes[0].path, "/ping");
+        assert_eq!(routes[0].handler, "<anonymous>");
+    }
+
+    // --- extract_api_surface token budget: fit-then-skip branch ---
+    //
+    // The orchestrator's trim loop walks each file and keeps it iff its
+    // per-file token cost fits in the remaining budget.  Covers the branch
+    // where at least one file fits AND a subsequent file is skipped.
+    #[test]
+    fn test_extract_api_surface_budget_keeps_fitting_files_skips_rest() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let content_a = "pub fn a() {}";
+        let content_b = "pub fn b_with_lots_of_tokens_in_signature() {}";
+        let fp_a = dir.path().join("src/small.rs");
+        let fp_b = dir.path().join("src/big.rs");
+        std::fs::create_dir_all(fp_a.parent().unwrap()).unwrap();
+        std::fs::write(&fp_a, content_a).unwrap();
+        std::fs::write(&fp_b, content_b).unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/small.rs".into(),
+                absolute_path: fp_a,
+                language: Some("rust".into()),
+                size_bytes: content_a.len() as u64,
+            },
+            ScannedFile {
+                relative_path: "src/big.rs".into(),
+                absolute_path: fp_b,
+                language: Some("rust".into()),
+                size_bytes: content_b.len() as u64,
+            },
+        ];
+
+        // "small" has a trivial signature (2 words + 2 = 4 tokens).
+        // "big" has many words in the signature (plus 2) so it won't fit.
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/small.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "a".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    // 2 words => token cost = 2 + 2 = 4
+                    signature: "pub fn".to_string(),
+                    body: "{}".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "src/big.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "b".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    // ~10 words => token cost well above 4.
+                    signature:
+                        "pub fn b one two three four five six seven eight nine ten eleven twelve"
+                            .to_string(),
+                    body: "{}".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+
+        // Budget is 6 tokens — fits "small" (4) but not "big" (~16).
+        let surface = extract_api_surface(&index, None, "all", 6);
+
+        // Exactly one of the two files must be kept.
+        assert_eq!(
+            surface.symbols.by_file.len(),
+            1,
+            "exactly one file should fit the tight budget"
+        );
+        assert_eq!(
+            surface.symbols.total, 1,
+            "total kept count must match kept file symbols"
+        );
+        // The kept file must be the one with the smaller signature.
+        assert_eq!(surface.symbols.by_file[0].path, "src/small.rs");
+    }
+
+    // --- extract_api_surface: gRPC + GraphQL end-to-end coverage ---
+    //
+    // Verify the orchestrator correctly wires both extractors when the
+    // `include` knob is set to "all", with parseable proto and graphql
+    // files present in the index.  This exercises the loop bodies in
+    // `extract_grpc_services` and `extract_graphql_types` that walk
+    // parse_result symbols.
+    #[test]
+    fn test_extract_api_surface_orchestrator_grpc_and_graphql_loops() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let proto_content = "syntax = \"proto3\"; service Ping { rpc SendPing(); rpc Recv(); }";
+        let gql_content = "type Foo { id: ID } type Query { items: [Foo] }";
+        let fp_proto = dir.path().join("rpc/ping.proto");
+        let fp_gql = dir.path().join("gql/schema.graphql");
+        std::fs::create_dir_all(fp_proto.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(fp_gql.parent().unwrap()).unwrap();
+        std::fs::write(&fp_proto, proto_content).unwrap();
+        std::fs::write(&fp_gql, gql_content).unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "rpc/ping.proto".into(),
+                absolute_path: fp_proto,
+                language: Some("protobuf".into()),
+                size_bytes: proto_content.len() as u64,
+            },
+            ScannedFile {
+                relative_path: "gql/schema.graphql".into(),
+                absolute_path: fp_gql,
+                language: Some("graphql".into()),
+                size_bytes: gql_content.len() as u64,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "rpc/ping.proto".to_string(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "Ping".to_string(),
+                        kind: SymbolKind::Service,
+                        visibility: Visibility::Public,
+                        signature: "service Ping".to_string(),
+                        body: String::new(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "SendPing".to_string(),
+                        kind: SymbolKind::Method,
+                        visibility: Visibility::Public,
+                        signature: "rpc SendPing".to_string(),
+                        body: String::new(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "Recv".to_string(),
+                        kind: SymbolKind::Method,
+                        visibility: Visibility::Public,
+                        signature: "rpc Recv".to_string(),
+                        body: String::new(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "gql/schema.graphql".to_string(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "Foo".to_string(),
+                        kind: SymbolKind::Type,
+                        visibility: Visibility::Public,
+                        signature: "type Foo".to_string(),
+                        body: String::new(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "Query".to_string(),
+                        kind: SymbolKind::Query,
+                        visibility: Visibility::Public,
+                        signature: "type Query".to_string(),
+                        body: String::new(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let surface = extract_api_surface(&index, None, "all", 100_000);
+
+        // gRPC: one service with two methods.
+        assert_eq!(surface.grpc_services.len(), 1);
+        let svc = &surface.grpc_services[0];
+        assert_eq!(svc.name, "Ping");
+        assert_eq!(svc.file, "rpc/ping.proto");
+        assert_eq!(svc.methods.len(), 2);
+        assert!(svc.methods.contains(&"SendPing".to_string()));
+        assert!(svc.methods.contains(&"Recv".to_string()));
+
+        // GraphQL: two types extracted (Foo as "type", Query as "query").
+        assert_eq!(surface.graphql_types.len(), 2);
+        let foo = surface
+            .graphql_types
+            .iter()
+            .find(|t| t.name == "Foo")
+            .expect("Foo type should be extracted");
+        assert_eq!(foo.kind, "type");
+        assert_eq!(foo.file, "gql/schema.graphql");
+        let query = surface
+            .graphql_types
+            .iter()
+            .find(|t| t.name == "Query")
+            .expect("Query type should be extracted");
+        assert_eq!(query.kind, "query");
+
+        // Token budget sanity: token_count is non-zero and under the budget.
+        assert!(surface.token_count > 0);
+        assert!(surface.token_count <= 100_000);
+    }
 }
