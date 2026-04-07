@@ -1,6 +1,6 @@
 # cxpak
 
-![Rust](https://img.shields.io/badge/Rust-1.80+-orange.svg)
+![Rust](https://img.shields.io/badge/Rust-1.88+-orange.svg)
 ![CI](https://github.com/Barnett-Studios/cxpak/actions/workflows/ci.yml/badge.svg)
 ![Crates.io](https://img.shields.io/crates/v/cxpak)
 ![Downloads](https://img.shields.io/crates/d/cxpak)

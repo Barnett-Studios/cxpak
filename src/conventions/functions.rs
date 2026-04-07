@@ -98,7 +98,7 @@ fn median(values: &mut [usize]) -> f64 {
     if len == 0 {
         return 0.0;
     }
-    if len % 2 == 0 {
+    if len.is_multiple_of(2) {
         (values[len / 2 - 1] + values[len / 2]) as f64 / 2.0
     } else {
         values[len / 2] as f64

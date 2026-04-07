@@ -2,7 +2,7 @@
 name = "cxpak"
 version = "1.4.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Spends CPU cycles so you don't spend tokens. The LLM gets a briefing packet instead of a flashlight in a dark room."
 license = "MIT"
 repository = "https://github.com/Barnett-Studios/cxpak"
