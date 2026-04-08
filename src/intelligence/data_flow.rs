@@ -26,8 +26,17 @@
 //! - **No call graph** — when [`CodebaseIndex::call_graph`] has no edges
 //!   (because v1.3.0 extraction has not been run for this language), the
 //!   trace returns an empty path list rather than panicking.
+//!
+//! ## Security boundary integration
+//!
+//! Each [`FlowPath`] carries `touches_security_boundary`, populated by
+//! comparing every node's file against the v1.4.0 security surface
+//! (unprotected endpoints, input-validation gaps, secret patterns, SQL
+//! injection risks). The surface is built once per trace call and threaded
+//! through BFS, so the flag is a real signal rather than a placeholder.
 
 use crate::intelligence::call_graph::{CallConfidence, CallEdge};
+use crate::intelligence::security::{build_security_surface, DEFAULT_AUTH_PATTERNS};
 use serde::Serialize;
 use std::collections::HashSet;
 
@@ -158,6 +167,13 @@ pub fn trace_data_flow(
         node_type: FlowNodeType::Source,
     };
 
+    // Compute the set of "security-sensitive" files once per trace. A file is
+    // security-sensitive when it appears in the v1.4.0 SecuritySurface as an
+    // unprotected endpoint, an input-validation gap, a secret-pattern match,
+    // or a SQL injection risk. Data flowing into any of those files is
+    // flagged via `touches_security_boundary` on the resulting FlowPath.
+    let security_files = compute_security_file_set(index);
+
     // 2. Guard: empty call graph or unknown source → empty paths.
     if index.call_graph.edges.is_empty() {
         return DataFlowResult {
@@ -175,7 +191,7 @@ pub fn trace_data_flow(
             length: 1,
             crosses_module_boundary: false,
             crosses_language_boundary: false,
-            touches_security_boundary: touches_security(&source_node, index),
+            touches_security_boundary: security_files.contains(&source_node.file),
             confidence: FlowConfidence::Exact,
             nodes: vec![source_node.clone()],
         };
@@ -220,7 +236,7 @@ pub fn trace_data_flow(
                 &entry.nodes,
                 &entry.confidences,
                 entry.unresolved,
-                index,
+                &security_files,
             ));
             continue;
         }
@@ -233,7 +249,7 @@ pub fn trace_data_flow(
                     &entry.nodes,
                     &entry.confidences,
                     entry.unresolved,
-                    index,
+                    &security_files,
                 ));
                 continue;
             }
@@ -246,7 +262,7 @@ pub fn trace_data_flow(
                 &entry.nodes,
                 &entry.confidences,
                 entry.unresolved,
-                index,
+                &security_files,
             ));
             continue;
         }
@@ -258,7 +274,7 @@ pub fn trace_data_flow(
                 &entry.nodes,
                 &entry.confidences,
                 entry.unresolved,
-                index,
+                &security_files,
             ));
             continue;
         }
@@ -271,7 +287,7 @@ pub fn trace_data_flow(
                 &entry.nodes,
                 &entry.confidences,
                 entry.unresolved,
-                index,
+                &security_files,
             ));
             continue;
         }
@@ -370,7 +386,7 @@ fn build_path(
     nodes: &[FlowNode],
     confidences: &[CallConfidence],
     unresolved: bool,
-    index: &crate::index::CodebaseIndex,
+    security_files: &HashSet<String>,
 ) -> FlowPath {
     let crosses_module_boundary = nodes
         .windows(2)
@@ -378,7 +394,7 @@ fn build_path(
     let crosses_language_boundary = nodes
         .windows(2)
         .any(|pair| pair[0].language != pair[1].language);
-    let touches_security_boundary = nodes.iter().any(|n| touches_security(n, index));
+    let touches_security_boundary = nodes.iter().any(|n| security_files.contains(&n.file));
 
     FlowPath {
         length: nodes.len(),
@@ -390,10 +406,33 @@ fn build_path(
     }
 }
 
-/// Stub for a future SecuritySurface integration. v1.5.0 has no
-/// SecuritySurface field on `CodebaseIndex`, so this always returns false.
-fn touches_security(_node: &FlowNode, _index: &crate::index::CodebaseIndex) -> bool {
-    false
+/// Build the set of file paths flagged as "security-sensitive" by the v1.4.0
+/// security surface detection. A file is included when it appears in any of:
+///
+/// - `unprotected_endpoints` — HTTP routes without an auth guard.
+/// - `input_validation_gaps` — public entry points that skip input validation.
+/// - `secret_patterns` — hard-coded secrets / credentials.
+/// - `sql_injection_surface` — string-interpolated SQL.
+///
+/// Called once at the start of [`trace_data_flow`] and threaded through the
+/// BFS so each path's `touches_security_boundary` flag is a real signal
+/// rather than a placeholder.
+fn compute_security_file_set(index: &crate::index::CodebaseIndex) -> HashSet<String> {
+    let surface = build_security_surface(index, DEFAULT_AUTH_PATTERNS, None);
+    let mut files: HashSet<String> = HashSet::new();
+    for e in &surface.unprotected_endpoints {
+        files.insert(e.file.clone());
+    }
+    for g in &surface.input_validation_gaps {
+        files.insert(g.file.clone());
+    }
+    for s in &surface.secret_patterns {
+        files.insert(s.file.clone());
+    }
+    for r in &surface.sql_injection_surface {
+        files.insert(r.file.clone());
+    }
+    files
 }
 
 /// What role a node plays in the data flow.
@@ -728,6 +767,93 @@ mod tests {
         assert!(
             result.paths.iter().any(|p| p.crosses_module_boundary),
             "expected at least one path with module boundary crossed"
+        );
+    }
+
+    #[test]
+    fn test_flow_path_touches_security_boundary() {
+        // A sink file that matches a v1.4.0 security pattern (here: a
+        // hard-coded AWS access key, which scan_secret_patterns flags)
+        // should cause the FlowPath's touches_security_boundary to be true.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let api_path = dir.path().join("src/api.rs");
+        std::fs::create_dir_all(api_path.parent().unwrap()).unwrap();
+        std::fs::write(&api_path, "fn handle_request(req: Request) {}\n").unwrap();
+
+        // Use an AWS-shaped token that scan_secret_patterns will flag.
+        let db_path = dir.path().join("src/dbwrite.rs");
+        std::fs::write(
+            &db_path,
+            "const LEAKED: &str = \"AKIAIOSFODNN7EXAMPLE\";\nfn save_user(req: Request) {}\n",
+        )
+        .unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/api.rs".into(),
+                absolute_path: api_path,
+                language: Some("rust".into()),
+                size_bytes: 40,
+            },
+            ScannedFile {
+                relative_path: "src/dbwrite.rs".into(),
+                absolute_path: db_path,
+                language: Some("rust".into()),
+                size_bytes: 80,
+            },
+        ];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/api.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "handle_request".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn handle_request(req: Request)".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "src/dbwrite.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "save_user".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn save_user(req: Request)".into(),
+                    body: "{}".into(),
+                    start_line: 2,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut index = CodebaseIndex::build(files, parse_results, &counter);
+        index.call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "src/api.rs".into(),
+                caller_symbol: "handle_request".into(),
+                callee_file: "src/dbwrite.rs".into(),
+                callee_symbol: "save_user".into(),
+                confidence: CallConfidence::Exact,
+            }],
+            unresolved: Vec::new(),
+        };
+
+        let result = trace_data_flow("handle_request", None, 10, &index);
+        assert!(!result.paths.is_empty(), "expected at least one path");
+        assert!(
+            result.paths.iter().any(|p| p.touches_security_boundary),
+            "expected touches_security_boundary to be true for path through a file with a hard-coded secret"
         );
     }
 
