@@ -144,6 +144,8 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
             "/security_surface",
             axum::routing::post(security_surface_handler),
         )
+        .route("/data_flow", axum::routing::post(data_flow_handler))
+        .route("/cross_lang", get(cross_lang_handler))
         .with_state(state)
 }
 
@@ -785,6 +787,75 @@ async fn security_surface_handler(
     )))
 }
 
+// v1.5.0: data flow and cross-language HTTP handlers
+
+#[derive(Deserialize)]
+struct DataFlowParams {
+    symbol: Option<String>,
+    sink: Option<String>,
+    depth: Option<usize>,
+    #[allow(dead_code)]
+    focus: Option<String>,
+}
+
+async fn data_flow_handler(
+    State(index): State<SharedIndex>,
+    Json(params): Json<DataFlowParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let Some(symbol) = params.symbol.filter(|s| !s.is_empty()) else {
+        return Ok(Json(json!({
+            "error": "missing required field: symbol"
+        })));
+    };
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let depth = params
+        .depth
+        .unwrap_or(crate::intelligence::data_flow::MAX_DEPTH)
+        .min(crate::intelligence::data_flow::MAX_DEPTH);
+    let result = crate::intelligence::data_flow::trace_data_flow(
+        &symbol,
+        params.sink.as_deref(),
+        depth,
+        &idx,
+    );
+    Ok(Json(serde_json::to_value(&result).unwrap_or_else(
+        |_| json!({"error": "serialization failed"}),
+    )))
+}
+
+#[derive(Deserialize)]
+struct CrossLangParams {
+    file: Option<String>,
+    focus: Option<String>,
+}
+
+async fn cross_lang_handler(
+    State(index): State<SharedIndex>,
+    Query(params): Query<CrossLangParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let filtered: Vec<&crate::intelligence::cross_lang::CrossLangEdge> = idx
+        .cross_lang_edges
+        .iter()
+        .filter(|e| match &params.file {
+            Some(f) => &e.source_file == f || &e.target_file == f,
+            None => true,
+        })
+        .filter(|e| match &params.focus {
+            Some(p) => e.source_file.starts_with(p) || e.target_file.starts_with(p),
+            None => true,
+        })
+        .collect();
+    Ok(Json(json!({
+        "edges": filtered,
+        "total": filtered.len(),
+    })))
+}
+
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1153,6 +1224,31 @@ fn mcp_stdio_loop_with_io(
                                 "type": "object",
                                 "properties": {
                                     "focus": { "type": "string", "description": "Path prefix to scope" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_data_flow",
+                            "description": "Trace how a value flows through the system from source to sink(s). Structural analysis — follows static call paths, not runtime dispatch. Paths crossing closures or trait objects are tagged Speculative.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "symbol": { "type": "string", "description": "Starting symbol to trace from (e.g. 'handle_request')" },
+                                    "sink": { "type": "string", "description": "Optional target symbol to stop at" },
+                                    "depth": { "type": "number", "description": "Max hops to follow (default 10, max 10)", "default": 10 },
+                                    "focus": { "type": "string", "description": "Path prefix to scope" }
+                                },
+                                "required": ["symbol"]
+                            }
+                        },
+                        {
+                            "name": "cxpak_cross_lang",
+                            "description": "List all detected cross-language boundaries: HTTP calls, FFI bindings, gRPC calls, GraphQL queries, shared DB schemas, and command exec bridges.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "file": { "type": "string", "description": "Filter to edges touching this file path" },
+                                    "focus": { "type": "string", "description": "Path prefix to scope results" }
                                 }
                             }
                         }
@@ -1664,14 +1760,15 @@ fn handle_tool_call(
                 let annotation_parent = parent.as_ref().map(|p| match edge_type {
                     Some(et) if *et != EdgeType::Import => {
                         let label = match et {
-                            EdgeType::ForeignKey => "foreign_key",
-                            EdgeType::ViewReference => "view_reference",
-                            EdgeType::TriggerTarget => "trigger_target",
-                            EdgeType::IndexTarget => "index_target",
-                            EdgeType::FunctionReference => "function_reference",
-                            EdgeType::EmbeddedSql => "embedded_sql",
-                            EdgeType::OrmModel => "orm_model",
-                            EdgeType::MigrationSequence => "migration_sequence",
+                            EdgeType::ForeignKey => "foreign_key".to_string(),
+                            EdgeType::ViewReference => "view_reference".to_string(),
+                            EdgeType::TriggerTarget => "trigger_target".to_string(),
+                            EdgeType::IndexTarget => "index_target".to_string(),
+                            EdgeType::FunctionReference => "function_reference".to_string(),
+                            EdgeType::EmbeddedSql => "embedded_sql".to_string(),
+                            EdgeType::OrmModel => "orm_model".to_string(),
+                            EdgeType::MigrationSequence => "migration_sequence".to_string(),
+                            EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
                             EdgeType::Import => unreachable!(),
                         };
                         format!("{p} (via: {label})")
@@ -2092,6 +2189,52 @@ fn handle_tool_call(
                 &serde_json::to_string_pretty(&surface).unwrap_or_default(),
             )
         }
+        "cxpak_data_flow" => {
+            let symbol = args.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+            if symbol.is_empty() {
+                return mcp_tool_result(
+                    id,
+                    "Error: 'symbol' argument is required and must not be empty",
+                );
+            }
+            let sink = args.get("sink").and_then(|s| s.as_str());
+            let depth = args
+                .get("depth")
+                .and_then(|d| d.as_u64())
+                .map(|d| d as usize)
+                .unwrap_or(10)
+                .min(crate::intelligence::data_flow::MAX_DEPTH);
+            let result =
+                crate::intelligence::data_flow::trace_data_flow(symbol, sink, depth, index);
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
+        "cxpak_cross_lang" => {
+            let file_filter = args.get("file").and_then(|s| s.as_str());
+            let focus = args.get("focus").and_then(|s| s.as_str());
+            let filtered: Vec<&crate::intelligence::cross_lang::CrossLangEdge> = index
+                .cross_lang_edges
+                .iter()
+                .filter(|e| match file_filter {
+                    Some(f) => e.source_file == f || e.target_file == f,
+                    None => true,
+                })
+                .filter(|e| match focus {
+                    Some(p) => e.source_file.starts_with(p) || e.target_file.starts_with(p),
+                    None => true,
+                })
+                .collect();
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&json!({
+                    "edges": filtered,
+                    "total": filtered.len(),
+                }))
+                .unwrap_or_default(),
+            )
+        }
         _ => mcp_response(
             id,
             json!({
@@ -2407,6 +2550,62 @@ mod tests {
         assert_eq!(result.0["token_budget"], 10_000);
     }
 
+    // --- v1.5.0: HTTP handlers for data_flow and cross_lang ---
+
+    #[test]
+    fn test_http_data_flow_handler() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = DataFlowParams {
+            symbol: Some("main".into()),
+            sink: None,
+            depth: Some(10),
+            focus: None,
+        };
+        let result = rt
+            .block_on(data_flow_handler(State(shared), Json(params)))
+            .unwrap();
+        assert!(
+            result.0.get("source").is_some(),
+            "data_flow handler must return a source field"
+        );
+        assert!(
+            result.0.get("limitations").is_some(),
+            "data_flow handler must include limitations"
+        );
+    }
+
+    #[test]
+    fn test_http_data_flow_handler_missing_symbol() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = DataFlowParams {
+            symbol: None,
+            sink: None,
+            depth: None,
+            focus: None,
+        };
+        let result = rt
+            .block_on(data_flow_handler(State(shared), Json(params)))
+            .unwrap();
+        assert!(result.0["error"].as_str().unwrap_or("").contains("symbol"));
+    }
+
+    #[test]
+    fn test_http_cross_lang_handler() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared = make_shared_index();
+        let params = CrossLangParams {
+            file: None,
+            focus: None,
+        };
+        let result = rt
+            .block_on(cross_lang_handler(State(shared), Query(params)))
+            .unwrap();
+        assert!(result.0["edges"].is_array());
+        assert!(result.0["total"].is_u64());
+    }
+
     // --- handle_tool_call ---
 
     #[test]
@@ -2551,6 +2750,95 @@ mod tests {
         assert!(text.contains("Unknown tool"));
     }
 
+    // --- v1.5.0: data_flow and cross_lang MCP tools ---
+
+    #[test]
+    fn test_mcp_data_flow_tool() {
+        // Use make_test_index which has a "main" symbol in src/main.rs.
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(10)),
+            "cxpak_data_flow",
+            &json!({"symbol": "main"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed.get("source").is_some(),
+            "response must contain source"
+        );
+        assert!(
+            parsed.get("limitations").is_some(),
+            "response must contain limitations array"
+        );
+    }
+
+    #[test]
+    fn test_mcp_data_flow_missing_symbol() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(11)),
+            "cxpak_data_flow",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("required"),
+            "missing symbol should error with 'required', got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_cross_lang_tool() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(12)),
+            "cxpak_cross_lang",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(parsed["edges"].is_array(), "response must have edges array");
+        assert!(parsed["total"].is_u64(), "response must have total count");
+    }
+
+    #[test]
+    fn test_mcp_cross_lang_file_filter() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(13)),
+            "cxpak_cross_lang",
+            &json!({"file": "src/main.rs"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let edges = parsed["edges"].as_array().unwrap();
+        for e in edges {
+            let src = e["source_file"].as_str().unwrap();
+            let tgt = e["target_file"].as_str().unwrap();
+            assert!(
+                src == "src/main.rs" || tgt == "src/main.rs",
+                "filtered edge must touch src/main.rs"
+            );
+        }
+    }
+
     // --- MCP stdio loop ---
 
     #[test]
@@ -2591,7 +2879,7 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 24);
     }
 
     #[test]
@@ -3357,8 +3645,8 @@ mod tests {
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            22,
-            "should have 22 tools (13 existing + 3 v1.2.0 + 3 v1.3.0 + 3 v1.4.0)"
+            24,
+            "should have 24 tools (13 existing + 3 v1.2.0 + 3 v1.3.0 + 3 v1.4.0 + 2 v1.5.0)"
         );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_context_for_task"));
@@ -4732,7 +5020,7 @@ mod tests {
             tool_names.contains(&"cxpak_context_diff"),
             "tools/list should include cxpak_context_diff"
         );
-        assert_eq!(tools.len(), 22, "total tool count should be 22");
+        assert_eq!(tools.len(), 24, "total tool count should be 24");
     }
 
     // --- Task 11: cxpak_health MCP tool ---

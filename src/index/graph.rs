@@ -1,6 +1,45 @@
 use super::IndexedFile;
-use crate::schema::{EdgeType, TypedEdge};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Identifies a cross-language boundary type. Used as the payload of
+/// [`EdgeType::CrossLanguage`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BridgeType {
+    /// HTTP request from one service to another (fetch / axios / reqwest → route handler).
+    HttpCall,
+    /// FFI binding between languages (e.g. Rust extern "C" to a C function).
+    FfiBinding,
+    /// gRPC client call to a service defined in a `.proto` file.
+    GrpcCall,
+    /// GraphQL query/mutation against a typed schema.
+    GraphqlCall,
+    /// Two files that read/write the same database schema entity from different languages.
+    SharedSchema,
+    /// `subprocess.run` / `exec.Command` invocation of another binary tracked in the index.
+    CommandExec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeType {
+    Import,
+    ForeignKey,
+    ViewReference,
+    TriggerTarget,
+    IndexTarget,
+    FunctionReference,
+    EmbeddedSql,
+    OrmModel,
+    MigrationSequence,
+    /// Cross-language symbol resolution edge (v1.5.0).
+    CrossLanguage(BridgeType),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TypedEdge {
+    pub target: String,
+    pub edge_type: EdgeType,
+}
 
 #[derive(Debug, Default)]
 pub struct DependencyGraph {
@@ -370,5 +409,62 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].target, "a.rs");
         assert_eq!(deps[0].edge_type, EdgeType::Import);
+    }
+
+    #[test]
+    fn test_edge_type_local_to_module() {
+        // EdgeType lives in src/index/graph.rs (this module) — not in crate::schema.
+        // This test asserts the type is reachable via the local module path.
+        let _import = EdgeType::Import;
+        let _fk = EdgeType::ForeignKey;
+    }
+
+    #[test]
+    fn test_cross_language_edge_hash() {
+        let mut set = HashSet::new();
+        set.insert(TypedEdge {
+            target: "b.rs".into(),
+            edge_type: EdgeType::CrossLanguage(BridgeType::HttpCall),
+        });
+        set.insert(TypedEdge {
+            target: "b.rs".into(),
+            edge_type: EdgeType::CrossLanguage(BridgeType::FfiBinding),
+        });
+        // Same target, different bridge types — both unique edges.
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_edge_type_cross_language_serialization() {
+        let variants = [
+            BridgeType::HttpCall,
+            BridgeType::FfiBinding,
+            BridgeType::GrpcCall,
+            BridgeType::GraphqlCall,
+            BridgeType::SharedSchema,
+            BridgeType::CommandExec,
+        ];
+        for bt in variants {
+            let edge = TypedEdge {
+                target: "x.py".into(),
+                edge_type: EdgeType::CrossLanguage(bt.clone()),
+            };
+            let json = serde_json::to_string(&edge).unwrap();
+            let back: TypedEdge = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.edge_type, edge.edge_type);
+        }
+    }
+
+    #[test]
+    fn test_add_cross_language_edge() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(
+            "a.ts",
+            "b.rs",
+            EdgeType::CrossLanguage(BridgeType::FfiBinding),
+        );
+        let deps = graph.dependencies("a.ts").unwrap();
+        assert!(deps.iter().any(|e| e.target == "b.rs"
+            && e.edge_type == EdgeType::CrossLanguage(BridgeType::FfiBinding)));
     }
 }

@@ -992,6 +992,7 @@ mod tests {
             call_graph: crate::intelligence::call_graph::CallGraph::default(),
             conventions: crate::conventions::ConventionProfile::default(),
             co_changes: Vec::new(),
+            cross_lang_edges: Vec::new(),
             files,
             #[cfg(feature = "embeddings")]
             embedding_index: None,

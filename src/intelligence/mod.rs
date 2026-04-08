@@ -3,6 +3,8 @@ pub mod architecture;
 pub mod blast_radius;
 pub mod call_graph;
 pub mod co_change;
+pub mod cross_lang;
+pub mod data_flow;
 pub mod dead_code;
 pub mod drift;
 pub mod health;

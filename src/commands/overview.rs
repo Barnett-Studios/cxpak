@@ -473,14 +473,15 @@ fn render_dependency_graph(
                 }
                 et => {
                     let label = match et {
-                        EdgeType::ForeignKey => "foreign_key",
-                        EdgeType::ViewReference => "view_reference",
-                        EdgeType::TriggerTarget => "trigger_target",
-                        EdgeType::IndexTarget => "index_target",
-                        EdgeType::FunctionReference => "function_reference",
-                        EdgeType::EmbeddedSql => "embedded_sql",
-                        EdgeType::OrmModel => "orm_model",
-                        EdgeType::MigrationSequence => "migration_sequence",
+                        EdgeType::ForeignKey => "foreign_key".to_string(),
+                        EdgeType::ViewReference => "view_reference".to_string(),
+                        EdgeType::TriggerTarget => "trigger_target".to_string(),
+                        EdgeType::IndexTarget => "index_target".to_string(),
+                        EdgeType::FunctionReference => "function_reference".to_string(),
+                        EdgeType::EmbeddedSql => "embedded_sql".to_string(),
+                        EdgeType::OrmModel => "orm_model".to_string(),
+                        EdgeType::MigrationSequence => "migration_sequence".to_string(),
+                        EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
                         EdgeType::Import => unreachable!(),
                     };
                     full.push_str(&format!("- {} ({})\n", edge.target, label));

@@ -29,6 +29,12 @@ pub struct CodebaseIndex {
     pub conventions: ConventionProfile,
     pub call_graph: CallGraph,
     pub co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
+    /// Cross-language boundary edges detected during index build (v1.5.0).
+    ///
+    /// Each edge is also injected into `graph` as an
+    /// [`crate::index::graph::EdgeType::CrossLanguage`] edge so existing
+    /// blast-radius / PageRank / auto_context pipelines pick them up.
+    pub cross_lang_edges: Vec<crate::intelligence::cross_lang::CrossLangEdge>,
     #[cfg(feature = "embeddings")]
     pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
 }
@@ -159,6 +165,7 @@ impl CodebaseIndex {
             call_graph: CallGraph::default(),
             conventions: ConventionProfile::default(),
             co_changes: Vec::new(),
+            cross_lang_edges: Vec::new(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
         };
@@ -173,6 +180,20 @@ impl CodebaseIndex {
             .collect();
         index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
         index.call_graph = crate::intelligence::call_graph::build_call_graph(&index);
+
+        // v1.5.0: detect cross-language boundaries (HTTP, FFI, gRPC, GraphQL,
+        // SharedSchema, CommandExec) and inject them as CrossLanguage edges
+        // so PageRank, blast-radius, and auto_context all see them.
+        let cross_edges = crate::intelligence::cross_lang::detect_cross_lang_edges(&index);
+        for e in &cross_edges {
+            index.graph.add_edge(
+                &e.source_file,
+                &e.target_file,
+                crate::index::graph::EdgeType::CrossLanguage(e.bridge_type.clone()),
+            );
+        }
+        index.cross_lang_edges = cross_edges;
+
         // NOTE: embedding_index is NOT built here. It's built at server startup
         // via build_embedding_index() — model download should not block CLI commands.
         // NOTE: conventions is NOT built here. It's built after index construction
@@ -320,6 +341,7 @@ impl CodebaseIndex {
             call_graph: CallGraph::default(),
             conventions: ConventionProfile::default(),
             co_changes: Vec::new(),
+            cross_lang_edges: Vec::new(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
         };
@@ -334,6 +356,19 @@ impl CodebaseIndex {
             .collect();
         index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
         index.call_graph = crate::intelligence::call_graph::build_call_graph(&index);
+
+        // v1.5.0: detect cross-language boundaries and inject as CrossLanguage
+        // edges — see `build()` for the same logic.
+        let cross_edges = crate::intelligence::cross_lang::detect_cross_lang_edges(&index);
+        for e in &cross_edges {
+            index.graph.add_edge(
+                &e.source_file,
+                &e.target_file,
+                crate::index::graph::EdgeType::CrossLanguage(e.bridge_type.clone()),
+            );
+        }
+        index.cross_lang_edges = cross_edges;
+
         // NOTE: embedding_index is NOT built here. It's built at server startup
         // via build_embedding_index() — model download should not block CLI commands.
         // NOTE: conventions is NOT built here. It's built after index construction
@@ -533,6 +568,7 @@ impl CodebaseIndex {
             call_graph: CallGraph::default(),
             conventions: ConventionProfile::default(),
             co_changes: Vec::new(),
+            cross_lang_edges: Vec::new(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
         }
@@ -632,6 +668,63 @@ pub fn build_embedding_index(index: &CodebaseIndex) -> Option<crate::embeddings:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_codebase_index_cross_lang_field() {
+        // A two-file fixture: TypeScript calling fetch and Python exposing
+        // a matching Flask route. The build should populate cross_lang_edges
+        // and inject a CrossLanguage(HttpCall) edge into the graph.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let ts = dir.path().join("frontend/api.ts");
+        std::fs::create_dir_all(ts.parent().unwrap()).unwrap();
+        std::fs::write(&ts, r#"function load() { return fetch("/api/users"); }"#).unwrap();
+
+        let py = dir.path().join("backend/users.py");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(
+            &py,
+            "@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
+        )
+        .unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "frontend/api.ts".into(),
+                absolute_path: ts,
+                language: Some("typescript".into()),
+                size_bytes: 50,
+            },
+            ScannedFile {
+                relative_path: "backend/users.py".into(),
+                absolute_path: py,
+                language: Some("python".into()),
+                size_bytes: 50,
+            },
+        ];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        assert!(
+            !index.cross_lang_edges.is_empty(),
+            "expected at least one cross-lang edge"
+        );
+        assert!(index
+            .cross_lang_edges
+            .iter()
+            .any(|e| matches!(e.bridge_type, crate::index::graph::BridgeType::HttpCall)));
+
+        // The edge should also live in the dependency graph.
+        let deps = index.graph.dependencies("frontend/api.ts");
+        assert!(deps.is_some(), "expected outgoing edges from api.ts");
+        let has_cross_lang = deps
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.edge_type, crate::index::graph::EdgeType::CrossLanguage(_)));
+        assert!(
+            has_cross_lang,
+            "graph should contain the CrossLanguage edge"
+        );
+    }
 
     #[test]
     fn test_is_key_file() {

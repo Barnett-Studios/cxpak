@@ -2,27 +2,10 @@ pub mod detect;
 pub mod extract;
 pub mod link;
 
+pub use crate::index::graph::{EdgeType, TypedEdge};
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EdgeType {
-    Import,
-    ForeignKey,
-    ViewReference,
-    TriggerTarget,
-    IndexTarget,
-    FunctionReference,
-    EmbeddedSql,
-    OrmModel,
-    MigrationSequence,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TypedEdge {
-    pub target: String,
-    pub edge_type: EdgeType,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaIndex {
@@ -158,12 +141,14 @@ mod tests {
 
     #[test]
     fn test_edge_type_equality() {
+        // EdgeType is now re-exported from index::graph; verify the re-export works.
         assert_eq!(EdgeType::Import, EdgeType::Import);
         assert_ne!(EdgeType::Import, EdgeType::ForeignKey);
     }
 
     #[test]
     fn test_typed_edge_hash() {
+        // TypedEdge is now re-exported from index::graph; verify the re-export works.
         use std::collections::HashSet;
         let mut set = HashSet::new();
         set.insert(TypedEdge {

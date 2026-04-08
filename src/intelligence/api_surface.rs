@@ -604,7 +604,10 @@ pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
 }
 
 /// Extract gRPC services from proto file parse results.
-fn extract_grpc_services(index: &CodebaseIndex, focus: Option<&str>) -> Vec<GrpcService> {
+pub(crate) fn extract_grpc_services(
+    index: &CodebaseIndex,
+    focus: Option<&str>,
+) -> Vec<GrpcService> {
     let mut services: std::collections::HashMap<String, GrpcService> =
         std::collections::HashMap::new();
 
@@ -654,7 +657,10 @@ fn extract_grpc_services(index: &CodebaseIndex, focus: Option<&str>) -> Vec<Grpc
 }
 
 /// Extract GraphQL types from GraphQL file parse results.
-fn extract_graphql_types(index: &CodebaseIndex, focus: Option<&str>) -> Vec<GraphqlType> {
+pub(crate) fn extract_graphql_types(
+    index: &CodebaseIndex,
+    focus: Option<&str>,
+) -> Vec<GraphqlType> {
     let mut types = vec![];
 
     for file in &index.files {

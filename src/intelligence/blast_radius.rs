@@ -64,6 +64,7 @@ pub fn compute_risk(
         EdgeType::EmbeddedSql | EdgeType::ViewReference | EdgeType::FunctionReference => 0.8,
         EdgeType::TriggerTarget | EdgeType::IndexTarget => 0.6,
         EdgeType::MigrationSequence => 0.5,
+        EdgeType::CrossLanguage(_) => 0.5,
     };
 
     let test_penalty = if has_test_coverage { 1.0 } else { 1.2 };
@@ -347,6 +348,7 @@ fn edge_type_label(et: &EdgeType) -> String {
         EdgeType::EmbeddedSql => "embedded_sql".to_string(),
         EdgeType::OrmModel => "orm_model".to_string(),
         EdgeType::MigrationSequence => "migration_sequence".to_string(),
+        EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
     }
 }
 
