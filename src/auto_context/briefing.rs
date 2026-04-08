@@ -27,6 +27,11 @@ pub struct PackedSections {
     pub schema_context: PackedFileSection,
     pub api_surface: Option<serde_json::Value>,
     pub blast_radius: Option<serde_json::Value>,
+    /// Cross-language boundary edges (v1.5.0). Populated when the index has
+    /// detected cross-language bridges within the focus scope. Up to 500
+    /// tokens worth of edges are included; the rest are dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_language_edges: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,11 +66,37 @@ pub struct PackedFile {
 /// 4. API surface   — serialized and included if budget allows.
 /// 5. Blast radius  — serialized and included if budget allows.
 pub fn allocate_and_pack(
+    target_files: Vec<(String, f64, String)>,
+    test_files: Vec<(String, String)>,
+    schema_json: Option<serde_json::Value>,
+    api_surface_json: Option<serde_json::Value>,
+    blast_radius_json: Option<serde_json::Value>,
+    token_budget: usize,
+    briefing_mode: bool,
+) -> PackedBriefing {
+    allocate_and_pack_with_cross_lang(
+        target_files,
+        test_files,
+        schema_json,
+        api_surface_json,
+        blast_radius_json,
+        None,
+        token_budget,
+        briefing_mode,
+    )
+}
+
+/// Same as [`allocate_and_pack`] but with an extra cross-language edges
+/// section. Kept as a separate function so existing callers stay binary
+/// compatible.
+#[allow(clippy::too_many_arguments)]
+pub fn allocate_and_pack_with_cross_lang(
     mut target_files: Vec<(String, f64, String)>,
     test_files: Vec<(String, String)>,
     schema_json: Option<serde_json::Value>,
     api_surface_json: Option<serde_json::Value>,
     blast_radius_json: Option<serde_json::Value>,
+    cross_lang_json: Option<serde_json::Value>,
     token_budget: usize,
     briefing_mode: bool,
 ) -> PackedBriefing {
@@ -224,6 +255,28 @@ pub fn allocate_and_pack(
         None
     };
 
+    // --- Section 6: Cross-language edges (v1.5.0) --------------------------
+    // Dedicated section; capped at min(remaining, 500) tokens so it never
+    // starves the primary budget allocations above. Structured JSON is kept
+    // intact (no truncation) because LLMs rely on the structure for routing.
+    let resolved_cross_lang = if let Some(cross_val) = cross_lang_json {
+        let cap = remaining.min(500);
+        if cap > 0 {
+            let cross_str = serde_json::to_string_pretty(&cross_val).unwrap_or_default();
+            let cross_tok = counter.count(&cross_str);
+            if cross_tok <= cap {
+                remaining = remaining.saturating_sub(cross_tok);
+                Some(cross_val)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // --- Compute budget summary -------------------------------------------
     let used = token_budget - remaining;
 
@@ -251,6 +304,7 @@ pub fn allocate_and_pack(
             },
             api_surface: resolved_api,
             blast_radius: resolved_blast,
+            cross_language_edges: resolved_cross_lang,
         },
     }
 }

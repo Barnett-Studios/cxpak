@@ -170,14 +170,37 @@ pub fn auto_context(
         serde_json::to_value(&api).ok()
     };
 
+    // Step 9.5 (v1.5.0): serialize cross-language edges, optionally filtered
+    // by focus prefix. Edges where either endpoint falls within the focus
+    // scope are kept.
+    let cross_lang_json = {
+        let filtered: Vec<&crate::intelligence::cross_lang::CrossLangEdge> = if let Some(prefix) =
+            opts.focus.as_deref()
+        {
+            index
+                .cross_lang_edges
+                .iter()
+                .filter(|e| e.source_file.starts_with(prefix) || e.target_file.starts_with(prefix))
+                .collect()
+        } else {
+            index.cross_lang_edges.iter().collect()
+        };
+        if filtered.is_empty() {
+            None
+        } else {
+            serde_json::to_value(&filtered).ok()
+        }
+    };
+
     // Step 10: Pack with budget allocation (budget minus DNA tokens).
     let briefing_mode = opts.mode == "briefing";
-    let packed = crate::auto_context::briefing::allocate_and_pack(
+    let packed = crate::auto_context::briefing::allocate_and_pack_with_cross_lang(
         target_files,
         test_files,
         None,
         api_json,
         blast_json,
+        cross_lang_json,
         remaining_budget,
         briefing_mode,
     );
@@ -325,6 +348,55 @@ mod tests {
             result.health.composite
         );
         assert!(result.risks.len() <= 10, "risks should be capped at 10");
+    }
+
+    /// Build an index with per-file language for the cross-language test.
+    fn make_index_with_langs(paths: &[(&str, &str, &str)]) -> (CodebaseIndex, tempfile::TempDir) {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let files: Vec<ScannedFile> = paths
+            .iter()
+            .map(|(rel, lang, content)| {
+                let abs = dir.path().join(rel);
+                std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                std::fs::write(&abs, content).unwrap();
+                ScannedFile {
+                    relative_path: (*rel).into(),
+                    absolute_path: abs,
+                    language: Some((*lang).into()),
+                    size_bytes: content.len() as u64,
+                }
+            })
+            .collect();
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        (index, dir)
+    }
+
+    #[test]
+    fn test_auto_context_includes_cross_lang() {
+        let (index, _dir) = make_index_with_langs(&[
+            (
+                "frontend/api.ts",
+                "typescript",
+                r#"async function loadUsers() { return fetch("/api/users"); }"#,
+            ),
+            (
+                "backend/users.py",
+                "python",
+                "@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
+            ),
+        ]);
+        assert!(
+            !index.cross_lang_edges.is_empty(),
+            "fixture must detect cross-lang edges"
+        );
+
+        let opts = default_opts(10_000);
+        let result = auto_context("add error handling to the API", &index, &opts);
+        assert!(
+            result.sections.cross_language_edges.is_some(),
+            "expected cross_language_edges section to be populated"
+        );
     }
 
     // -----------------------------------------------------------------------
