@@ -141,8 +141,12 @@ pub fn scan_secret_patterns(content: &str, file_path: &str) -> Vec<SecretPattern
                 .count()
                 + 1;
             let matched = cap.as_str();
-            let snippet = if matched.len() > 4 {
-                format!("{}...", &matched[..4])
+            // Take the first 4 characters by Unicode scalar, not bytes — a
+            // multi-byte char (e.g. `…` = 3 bytes) inside the match will
+            // panic `&matched[..4]` on a char boundary.
+            let snippet_prefix: String = matched.chars().take(4).collect();
+            let snippet = if matched.chars().count() > 4 {
+                format!("{snippet_prefix}...")
             } else {
                 "...".to_string()
             };
