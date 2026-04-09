@@ -56,7 +56,7 @@ cxpak clean .                                         # Clear cache
 
 ### 2. MCP Server (for Claude Code, Cursor, and other AI tools)
 
-Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 19 codebase tools — including relevance scoring, query expansion, convention verification, health scoring, call graph analysis, and schema-aware context packing.
+Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 24 codebase tools — including relevance scoring, query expansion, convention verification, health scoring, call graph analysis, change impact prediction, architecture drift detection, security surface analysis, structural data flow tracing, cross-language symbol resolution, and schema-aware context packing.
 
 **Claude Code** — add to `.mcp.json` in your project root (or `~/.claude/.mcp.json` globally):
 
@@ -111,6 +111,11 @@ Once configured, your AI tool can call these tools:
 | `cxpak_call_graph` | Cross-file call graph with confidence levels |
 | `cxpak_dead_code` | Dead symbols ranked by importance |
 | `cxpak_architecture` | Architecture quality: coupling, cohesion, boundary violations |
+| `cxpak_predict` | Predict change impact with structural, historical, and call-based signals |
+| `cxpak_drift` | Detect architecture drift against a stored baseline |
+| `cxpak_security_surface` | Unprotected endpoints, secrets, SQL injection, validation gaps, exposure |
+| `cxpak_data_flow` | Trace how a value flows from source to sink through the call graph |
+| `cxpak_cross_lang` | List cross-language boundaries: HTTP, FFI, gRPC, GraphQL, shared schemas, exec |
 
 All tools support a `focus` path prefix parameter to scope results.
 
@@ -175,6 +180,11 @@ cxpak watch .
 | `POST /call_graph` | Cross-file call graph |
 | `POST /dead_code` | Dead symbol detection |
 | `POST /architecture` | Architecture quality report |
+| `POST /predict` | Change impact prediction with test predictions |
+| `POST /drift` | Architecture drift against a stored baseline |
+| `POST /security_surface` | Security surface analysis |
+| `POST /data_flow` | Structural data flow tracing |
+| `GET /cross_lang` | Cross-language boundary list |
 
 ## What You Get
 
@@ -236,6 +246,16 @@ cxpak includes graph-based intelligence features that go beyond static analysis.
 
 **Architecture Quality** — `cxpak_architecture` reports per-module metrics: coupling (inter-module dependencies), cohesion (intra-module relatedness), circular dependency count, boundary violations (cross-layer imports), and god files (files with excessive responsibility).
 
+**Change Prediction** — `cxpak_predict` takes a list of changed files and returns a ranked impact prediction using three signals: structural (blast radius), historical (git co-change within the last 180 days), and call-based (call graph proximity). Each prediction carries a confidence score between 0.3 and 0.9 computed from which signals fire. Test predictions tell you exactly which tests to run to validate a change, ranked by confidence.
+
+**Architecture Drift** — `cxpak_drift` compares the current architecture snapshot against a stored baseline in `.cxpak/baseline.json` and against historical snapshots in `.cxpak/snapshots/`. It reports new module boundaries, changed coupling and cohesion metrics, new circular dependencies, and new boundary violations. Set `save_baseline=true` to establish the current state as the new baseline. Use it in CI or release reviews to track architectural health over time. Snapshots are auto-saved on every call so you always have a record of where things were.
+
+**Security Surface** — `cxpak_security_surface` runs five deterministic detections: unprotected endpoints (HTTP handlers without auth guards across 12 frameworks, with real handler names extracted per framework), input validation gaps (public entry points that skip validation), secret patterns (AWS access keys, GitHub PATs, connection strings, Slack tokens, and hardcoded passwords), SQL injection risks (string-interpolated queries across 6 languages), and exposure scores (files ranked by public surface area and inbound dependency count). Authentication pattern matching is configurable.
+
+**Data Flow Analysis** — `cxpak_data_flow` traces how a named value flows through the system from a source symbol toward sinks by walking the call graph. Each node is classified as Source, Transform, Sink, or Passthrough by name heuristic, and each path is tagged with a confidence level: `Exact` (direct static calls), `Approximate` (name-resolved), or `Speculative` (closures, higher-order functions, trait objects, virtual methods, or dynamic dispatch). Paths report whether they cross a module boundary, a language boundary, or a security-sensitive file (via integration with the security surface). Max depth is 10 hops with cycle detection. Every response includes a `limitations` array so the LLM always sees what the trace cannot prove — no hidden assumptions.
+
+**Cross-Language Symbol Resolution** — `cxpak_cross_lang` detects six types of cross-language boundaries: HTTP calls (`fetch` / `axios` / `reqwest` matched to detected routes), FFI bindings (Rust `extern "C"` or Python `ctypes` matched to C/C++ symbol definitions), gRPC calls (client method invocations matched to `.proto` service methods), GraphQL queries (named operations matched to typed schema files), shared database schemas (two files in different languages touching the same table), and command exec bridges (`subprocess.run` / `exec.Command` / `std::process::Command::new` matched to indexed binaries or scripts). Detected edges are injected into the dependency graph as `EdgeType::CrossLanguage(BridgeType)` so blast radius, PageRank, and auto_context all pick them up. A language whitelist and test-path exclusion prevent documentation code examples and test fixtures from producing false positives.
+
 ## Auto Context
 
 `cxpak_auto_context` is the main entry point — one call that delivers optimal context for any task. Give it a task description and token budget; it returns everything the LLM needs.
@@ -251,8 +271,9 @@ cxpak includes graph-based intelligence features that go beyond static analysis.
 6. **Schema linking** — pulls in schema files connected to seeds via typed dependency edges
 7. **Blast radius** — identifies files at risk from the seed set, sorted by risk score
 8. **API surface** — extracts public symbols and HTTP routes from seed files
-9. **Budget allocation** — fill-then-overflow priority packing: seeds first, then tests, schema, blast radius, and API surface until the budget is exhausted
-10. **Annotations** — each packed file gets a language-aware comment header with score, role, signals, and detail level
+9. **Cross-language edges** — filters `cross_lang_edges` by focus and emits them as a dedicated section (capped at 500 tokens, structured JSON kept intact)
+10. **Budget allocation** — fill-then-overflow priority packing: seeds first, then tests, schema, blast radius, API surface, and cross-language edges until the budget is exhausted
+11. **Annotations** — each packed file gets a language-aware comment header with score, role, signals, and detail level
 
 **Noise filtering** applies three independent layers. The `filtered_out` field in the response lists every file removed and which layer caught it, so you can audit what was excluded and why.
 
@@ -277,7 +298,7 @@ cxpak understands the data layer of your codebase and uses that knowledge to bui
 
 **ORM Detection** — Django models, SQLAlchemy mapped classes, TypeORM entities, and ActiveRecord models are recognized and linked to their underlying table definitions.
 
-**Typed Dependency Graph** — Every edge in the dependency graph carries one of 9 semantic types:
+**Typed Dependency Graph** — Every edge in the dependency graph carries one of 10 semantic types:
 
 | Edge Type | Meaning |
 |-----------|---------|
@@ -290,6 +311,7 @@ cxpak understands the data layer of your codebase and uses that knowledge to bui
 | `embedded_sql` | Application code contains inline SQL referencing a table |
 | `orm_model` | ORM model class maps to a table file |
 | `migration_sequence` | Migration file depends on its predecessor |
+| `cross_language` | Cross-language boundary (HTTP, FFI, gRPC, GraphQL, shared schema, or command exec) — carries a `BridgeType` payload |
 
 Non-import edges are surfaced in the dependency graph output and in pack context annotations:
 
