@@ -51,12 +51,101 @@ pub fn detect_cross_lang_edges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
 // HTTP bridge detection
 // ---------------------------------------------------------------------------
 
+/// Languages that host web frameworks and therefore legitimately declare HTTP
+/// routes or make HTTP client calls. Markdown, JSON, YAML, TOML, SQL, etc.
+/// are excluded so documentation files containing code examples don't poison
+/// the route map or appear as spurious fetch callers.
+fn is_web_code_language(lang: Option<&str>) -> bool {
+    matches!(
+        lang,
+        Some(
+            "rust"
+                | "typescript"
+                | "javascript"
+                | "python"
+                | "go"
+                | "ruby"
+                | "java"
+                | "kotlin"
+                | "csharp"
+                | "swift"
+                | "php"
+                | "elixir"
+                | "scala"
+                | "dart"
+                | "cpp"
+                | "c"
+        )
+    )
+}
+
+/// Returns true when the file path suggests it's a test file whose string
+/// literals are test fixtures, not real code. Skipping these files prevents
+/// the HTTP bridge detector from treating `fetch("/api/users")` test
+/// fixtures as real client calls.
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    if lower.starts_with("tests/") || lower.contains("/tests/") {
+        return true;
+    }
+    if lower.contains("/__tests__/") {
+        return true;
+    }
+    let basename = lower.rsplit('/').next().unwrap_or(&lower);
+    if basename.starts_with("test_") {
+        return true;
+    }
+    for suffix in [
+        "_test.rs",
+        "_test.go",
+        "_test.py",
+        ".test.ts",
+        ".test.tsx",
+        ".test.js",
+        ".test.jsx",
+        ".spec.ts",
+        ".spec.tsx",
+        ".spec.js",
+        ".spec.jsx",
+    ] {
+        if basename.ends_with(suffix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return the portion of `content` that should be scanned for cross-language
+/// bridges. For Rust source files this strips the `#[cfg(test)] mod tests {
+/// ... }` suffix so inline test fixtures containing literal `fetch(...)`
+/// strings don't get treated as real HTTP calls.
+fn scannable_content<'a>(language: Option<&str>, content: &'a str) -> &'a str {
+    if language == Some("rust") {
+        if let Some(idx) = content.find("#[cfg(test)]") {
+            return &content[..idx];
+        }
+    }
+    content
+}
+
 /// Build a map of every route path → route endpoint, scanning every file in
 /// the index with [`detect_routes`]. Query strings are stripped from keys.
+///
+/// Only files with a web-framework-capable language are scanned, and test
+/// files are skipped. Inline tests (Rust `#[cfg(test)] mod tests`) are
+/// skipped by truncating the scanned content. This keeps documentation
+/// code examples and test fixtures from polluting the route map.
 fn build_route_map(index: &CodebaseIndex) -> HashMap<String, RouteEndpoint> {
     let mut map: HashMap<String, RouteEndpoint> = HashMap::new();
     for file in &index.files {
-        let routes = detect_routes(&file.content, &file.relative_path);
+        if !is_web_code_language(file.language.as_deref()) {
+            continue;
+        }
+        if is_test_path(&file.relative_path) {
+            continue;
+        }
+        let content = scannable_content(file.language.as_deref(), &file.content);
+        let routes = detect_routes(content, &file.relative_path);
         for r in routes {
             let key = normalize_route_path(&r.path);
             map.entry(key).or_insert(r);
@@ -102,21 +191,27 @@ pub fn detect_http_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
     let mut out = Vec::new();
 
     for file in &index.files {
-        // Skip files that ARE the route source — they don't HTTP-call themselves.
-        if detect_routes(&file.content, &file.relative_path).is_empty() {
-            // pass
-        } else {
-            // Server files can still call other services; continue scanning.
+        // Only scan code files — markdown / config / data files may contain
+        // example code that looks like a fetch call but isn't.
+        if !is_web_code_language(file.language.as_deref()) {
+            continue;
+        }
+        // Skip test files — their string literals are fixtures, not real calls.
+        if is_test_path(&file.relative_path) {
+            continue;
         }
 
         let source_language = file.language.clone().unwrap_or_else(|| "unknown".into());
         let source_symbol = guess_containing_symbol(file, 0);
+        // Strip the inline test module from Rust files so `fetch(...)` in
+        // test fixtures doesn't register as a real HTTP call.
+        let content = scannable_content(file.language.as_deref(), &file.content);
 
         for re in [fetch_re.as_ref(), axios_re.as_ref(), reqwest_re.as_ref()]
             .into_iter()
             .flatten()
         {
-            for cap in re.captures_iter(&file.content) {
+            for cap in re.captures_iter(content) {
                 let Some(url_match) = cap.get(1) else {
                     continue;
                 };
