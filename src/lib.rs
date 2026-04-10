@@ -12,6 +12,8 @@ pub mod embeddings;
 pub mod git;
 pub mod index;
 pub mod intelligence;
+#[cfg(feature = "lsp")]
+pub mod lsp;
 pub mod output;
 pub mod parser;
 pub mod relevance;
