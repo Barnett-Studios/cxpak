@@ -152,17 +152,17 @@ pub fn check_auth(expected: Option<&str>, provided: Option<&str>) -> bool {
 /// Public test helper: builds a router with the given shared state.
 /// Used by integration tests that cannot access the private `build_router`.
 pub fn build_router_for_test(shared: SharedIndex, repo_path: SharedPath) -> Router {
-    build_router(shared, repo_path)
+    build_router(shared, repo_path, None)
 }
 
 /// Build the axum Router for the HTTP server.
-fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
+fn build_router(shared: SharedIndex, repo_path: SharedPath, token: Option<String>) -> Router {
     let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
     let state = AppState {
         index: shared,
         repo_path: repo_path.clone(),
         snapshot,
-        expected_token: None,
+        expected_token: token,
         workspace_root: repo_path,
     };
     Router::new()
@@ -339,17 +339,22 @@ async fn v1_cross_lang_handler() -> Json<Value> {
 pub fn run(
     path: &Path,
     port: u16,
+    bind: &str,
+    token: Option<&str>,
     _token_budget: usize,
     _verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let addr: std::net::SocketAddr = format!("{bind}:{port}")
+        .parse()
+        .map_err(|e| format!("invalid bind address '{bind}:{port}': {e}"))?;
+
     let index = build_index(path)?;
 
     eprintln!(
-        "cxpak: serving {} ({} files indexed, {} tokens) on port {}",
+        "cxpak: serving {} ({} files indexed, {} tokens) on {addr}",
         path.display(),
         index.total_files,
         index.total_tokens,
-        port
     );
 
     let shared = Arc::new(RwLock::new(index));
@@ -377,11 +382,10 @@ pub fn run(
         }
     });
 
-    let app = build_router(shared, shared_path);
+    let app = build_router(shared, shared_path, token.map(|s| s.to_string()));
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         eprintln!("cxpak: listening on http://{addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
@@ -3304,7 +3308,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let body = serde_json::to_vec(&json!({"files": ["src/main.rs"]})).unwrap();
             let response = app
                 .oneshot(
@@ -3334,7 +3338,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let body = serde_json::to_vec(&json!({"files": []})).unwrap();
             let response = app
                 .oneshot(
@@ -3484,7 +3488,7 @@ mod tests {
     fn test_build_router_creates_router() {
         let shared = make_shared_index();
         let repo_path = Arc::new(std::path::PathBuf::from("/tmp"));
-        let _router = build_router(shared, repo_path);
+        let _router = build_router(shared, repo_path, None);
         // Router created without panic = success
     }
 
@@ -3495,7 +3499,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -3519,7 +3523,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -3543,7 +3547,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -3568,7 +3572,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -3592,7 +3596,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -3615,7 +3619,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -3638,7 +3642,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -5379,7 +5383,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -5411,7 +5415,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -5440,7 +5444,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let shared = make_shared_index();
-            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")));
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
             let response = app
                 .oneshot(
                     axum::http::Request::builder()

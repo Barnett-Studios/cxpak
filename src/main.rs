@@ -10,8 +10,10 @@ fn main() {
         #[cfg(feature = "daemon")]
         Commands::Serve {
             port,
+            bind,
             tokens,
             verbose,
+            token,
             mcp,
             path,
         } => {
@@ -29,7 +31,7 @@ fn main() {
             if *mcp {
                 commands::serve::run_mcp(path)
             } else {
-                commands::serve::run(path, *port, token_budget, *verbose)
+                commands::serve::run(path, *port, bind, token.as_deref(), token_budget, *verbose)
             }
         }
         #[cfg(feature = "daemon")]

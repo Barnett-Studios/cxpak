@@ -76,10 +76,16 @@ pub enum Commands {
     Serve {
         #[arg(long, default_value = "3000")]
         port: u16,
+        /// Bind address for the HTTP server
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
         #[arg(long, default_value = "50k")]
         tokens: String,
         #[arg(long)]
         verbose: bool,
+        /// Require Bearer token for /v1/ endpoints
+        #[arg(long)]
+        token: Option<String>,
         /// Run as MCP server over stdio instead of HTTP
         #[arg(long)]
         mcp: bool,
@@ -430,6 +436,58 @@ mod tests {
                 assert_eq!(tokens, "100k");
             }
             _ => panic!("expected Overview"),
+        }
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn cli_serve_default_bind() {
+        let cli =
+            Cli::try_parse_from(["cxpak", "serve"]).expect("should parse serve with defaults");
+        match cli.command {
+            Commands::Serve { bind, .. } => {
+                assert_eq!(bind, "127.0.0.1");
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn cli_serve_custom_bind() {
+        let cli = Cli::try_parse_from(["cxpak", "serve", "--bind", "0.0.0.0"])
+            .expect("should parse serve with custom bind");
+        match cli.command {
+            Commands::Serve { bind, .. } => {
+                assert_eq!(bind, "0.0.0.0");
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn cli_serve_token_flag() {
+        let cli = Cli::try_parse_from(["cxpak", "serve", "--token", "secret"])
+            .expect("should parse serve with token");
+        match cli.command {
+            Commands::Serve { token, .. } => {
+                assert_eq!(token.as_deref(), Some("secret"));
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn cli_serve_token_defaults_to_none() {
+        let cli =
+            Cli::try_parse_from(["cxpak", "serve"]).expect("should parse serve without token");
+        match cli.command {
+            Commands::Serve { token, .. } => {
+                assert!(token.is_none());
+            }
+            _ => panic!("expected Serve command"),
         }
     }
 }
