@@ -34,12 +34,12 @@ fn matches_focus(path: &str, focus: Option<&str>) -> bool {
 }
 
 /// Scan and parse all files in a path, returning a fully built CodebaseIndex.
-pub(crate) fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
+pub fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
     build_index_with_workspace(path, None)
 }
 
 /// Scan and parse files in a path, optionally scoped to a workspace prefix.
-pub(crate) fn build_index_with_workspace(
+pub fn build_index_with_workspace(
     path: &Path,
     workspace: Option<&str>,
 ) -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
@@ -112,6 +112,12 @@ impl axum::extract::FromRef<AppState> for SharedSnapshot {
     fn from_ref(state: &AppState) -> Self {
         state.snapshot.clone()
     }
+}
+
+/// Public test helper: builds a router with the given shared state.
+/// Used by integration tests that cannot access the private `build_router`.
+pub fn build_router_for_test(shared: SharedIndex, repo_path: SharedPath) -> Router {
+    build_router(shared, repo_path)
 }
 
 /// Build the axum Router for the HTTP server.
@@ -2264,7 +2270,7 @@ fn mcp_tool_result(id: Option<Value>, text: &str) -> Value {
 }
 
 /// Process a batch of watcher changes, updating the shared index.
-fn process_watcher_changes(
+pub(crate) fn process_watcher_changes(
     changes: &[crate::daemon::watcher::FileChange],
     base_path: &Path,
     shared: &SharedIndex,

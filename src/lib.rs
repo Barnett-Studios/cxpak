@@ -2,6 +2,7 @@ pub mod auto_context;
 pub mod budget;
 pub mod cache;
 pub mod cli;
+pub mod commands;
 pub mod context_quality;
 pub mod conventions;
 #[cfg(feature = "daemon")]
@@ -16,3 +17,4 @@ pub mod parser;
 pub mod relevance;
 pub mod scanner;
 pub mod schema;
+pub mod util;

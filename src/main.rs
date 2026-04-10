@@ -1,27 +1,6 @@
-mod cli;
-mod commands;
-
-pub mod auto_context;
-pub mod budget;
-pub mod cache;
-pub mod context_quality;
-pub mod conventions;
-#[cfg(feature = "daemon")]
-pub mod daemon;
-#[cfg(feature = "embeddings")]
-pub mod embeddings;
-pub mod git;
-pub mod index;
-pub mod intelligence;
-pub mod output;
-pub mod parser;
-pub mod relevance;
-pub mod scanner;
-pub mod schema;
-pub mod util;
-
 use clap::Parser;
-use cli::{parse_token_count, Cli, Commands};
+use cxpak::cli::{parse_token_count, Cli, Commands};
+use cxpak::commands;
 
 fn main() {
     let cli = Cli::parse();
