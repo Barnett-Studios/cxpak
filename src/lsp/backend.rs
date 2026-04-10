@@ -86,6 +86,62 @@ impl LanguageServer for CxpakLspBackend {
     async fn shutdown(&self) -> LspResult<()> {
         Ok(())
     }
+
+    async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
+        let uri = params.text_document.uri.to_string();
+        let idx = self.index.read().unwrap();
+        let lenses = super::methods::code_lens_for_file(&uri, &idx);
+        Ok(if lenses.is_empty() {
+            None
+        } else {
+            Some(lenses)
+        })
+    }
+
+    async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let word = params
+            .text_document_position_params
+            .position
+            .line
+            .to_string();
+        // In a real implementation we'd resolve the word under cursor from
+        // the document.  For now, use the URI path as a fallback and let
+        // hover_for_symbol return None if not found.
+        let _ = word;
+        Ok(None)
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> LspResult<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri.to_string();
+        let idx = self.index.read().unwrap();
+        let diags = super::methods::diagnostics_for_file(&uri, &idx);
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items: diags,
+                },
+            }),
+        ))
+    }
+
+    #[allow(deprecated)]
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> LspResult<Option<Vec<SymbolInformation>>> {
+        let idx = self.index.read().unwrap();
+        let symbols = super::methods::workspace_symbols(&params.query, &idx);
+        Ok(if symbols.is_empty() {
+            None
+        } else {
+            Some(symbols)
+        })
+    }
 }
 
 #[cfg(test)]

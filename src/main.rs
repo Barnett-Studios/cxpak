@@ -54,6 +54,8 @@ fn main() {
             };
             commands::watch::run(path, token_budget, format, *verbose)
         }
+        #[cfg(feature = "lsp")]
+        Commands::Lsp { path } => cxpak::lsp::run_stdio(path),
         #[cfg(feature = "daemon")]
         Commands::Conventions { subcommand } => match subcommand {
             cxpak::cli::ConventionsSubcommand::Export { path } => {

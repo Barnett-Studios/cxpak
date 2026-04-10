@@ -104,6 +104,12 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Run LSP server over stdio
+    #[cfg(feature = "lsp")]
+    Lsp {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Export and diff convention profiles
     #[cfg(feature = "daemon")]
     Conventions {
@@ -436,6 +442,32 @@ mod tests {
                 assert_eq!(tokens, "100k");
             }
             _ => panic!("expected Overview"),
+        }
+    }
+
+    #[cfg(feature = "lsp")]
+    #[test]
+    fn cli_lsp_parses() {
+        let cli =
+            Cli::try_parse_from(["cxpak", "lsp"]).expect("should parse lsp with default path");
+        match cli.command {
+            Commands::Lsp { path } => {
+                assert_eq!(path, std::path::PathBuf::from("."));
+            }
+            _ => panic!("expected Lsp command"),
+        }
+    }
+
+    #[cfg(feature = "lsp")]
+    #[test]
+    fn cli_lsp_custom_path() {
+        let cli = Cli::try_parse_from(["cxpak", "lsp", "/tmp/repo"])
+            .expect("should parse lsp with custom path");
+        match cli.command {
+            Commands::Lsp { path } => {
+                assert_eq!(path, std::path::PathBuf::from("/tmp/repo"));
+            }
+            _ => panic!("expected Lsp command"),
         }
     }
 
