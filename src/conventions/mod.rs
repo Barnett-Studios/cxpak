@@ -1,4 +1,5 @@
 pub mod deps;
+pub mod diff;
 pub mod errors;
 pub mod export;
 pub mod functions;
