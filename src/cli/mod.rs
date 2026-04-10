@@ -98,6 +98,12 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Export and diff convention profiles
+    #[cfg(feature = "daemon")]
+    Conventions {
+        #[command(subcommand)]
+        subcommand: ConventionsSubcommand,
+    },
     /// Trace from error/function, pack relevant code paths
     Trace {
         #[arg(long, default_value = "50k")]
@@ -120,6 +126,21 @@ pub enum Commands {
         #[arg(long)]
         workspace: Option<String>,
         target: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Subcommand)]
+pub enum ConventionsSubcommand {
+    /// Write .cxpak/conventions.json from the current codebase
+    Export {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Compare current conventions against .cxpak/conventions.json
+    Diff {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -365,6 +386,38 @@ mod tests {
                 assert!(!health);
             }
             _ => panic!("expected Overview command"),
+        }
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn cli_conventions_export_parses() {
+        let cli = Cli::try_parse_from(["cxpak", "conventions", "export", "."])
+            .expect("should parse conventions export");
+        match cli.command {
+            Commands::Conventions { subcommand } => match subcommand {
+                super::ConventionsSubcommand::Export { path } => {
+                    assert_eq!(path, std::path::PathBuf::from("."));
+                }
+                _ => panic!("expected Export subcommand"),
+            },
+            _ => panic!("expected Conventions command"),
+        }
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn cli_conventions_diff_parses() {
+        let cli = Cli::try_parse_from(["cxpak", "conventions", "diff", "."])
+            .expect("should parse conventions diff");
+        match cli.command {
+            Commands::Conventions { subcommand } => match subcommand {
+                super::ConventionsSubcommand::Diff { path } => {
+                    assert_eq!(path, std::path::PathBuf::from("."));
+                }
+                _ => panic!("expected Diff subcommand"),
+            },
+            _ => panic!("expected Conventions command"),
         }
     }
 

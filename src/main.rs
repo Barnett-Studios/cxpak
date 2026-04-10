@@ -52,6 +52,15 @@ fn main() {
             };
             commands::watch::run(path, token_budget, format, *verbose)
         }
+        #[cfg(feature = "daemon")]
+        Commands::Conventions { subcommand } => match subcommand {
+            cxpak::cli::ConventionsSubcommand::Export { path } => {
+                commands::conventions::run_export(path)
+            }
+            cxpak::cli::ConventionsSubcommand::Diff { path } => {
+                commands::conventions::run_diff(path)
+            }
+        },
         Commands::Diff {
             tokens,
             out,

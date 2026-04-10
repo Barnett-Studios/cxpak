@@ -1,4 +1,6 @@
 pub mod clean;
+#[cfg(feature = "daemon")]
+pub mod conventions;
 pub mod diff;
 pub mod overview;
 #[cfg(feature = "daemon")]
