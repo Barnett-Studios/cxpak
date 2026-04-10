@@ -52,6 +52,13 @@ cxpak diff --tokens 50k --git-ref main .              # Diff against a branch
 cxpak diff --tokens 50k --since "1 week" .            # Diff by time range
 cxpak overview --tokens 50k --timing .                # Show pipeline timing
 cxpak clean .                                         # Clear cache
+
+# Convention management
+cxpak conventions export .                            # Write .cxpak/conventions.json
+cxpak conventions diff .                              # Compare against baseline
+
+# LSP server (for IDE integration)
+cxpak lsp .                                           # Run LSP server over stdio
 ```
 
 ### 2. MCP Server (for Claude Code, Cursor, and other AI tools)
@@ -158,10 +165,16 @@ Run cxpak as a persistent HTTP server with a hot index:
 # Start HTTP server (default port 3000)
 cxpak serve .
 cxpak serve --port 8080 .
+cxpak serve --bind 0.0.0.0 --port 8080 .             # Bind to all interfaces
+
+# With authentication on /v1/ endpoints
+cxpak serve --token my-secret .
 
 # Watch for file changes and keep index hot
 cxpak watch .
 ```
+
+**Legacy endpoints** (no auth required):
 
 | Endpoint | Description |
 |----------|-------------|
@@ -185,6 +198,66 @@ cxpak watch .
 | `POST /security_surface` | Security surface analysis |
 | `POST /data_flow` | Structural data flow tracing |
 | `GET /cross_lang` | Cross-language boundary list |
+
+**Intelligence API v1** (requires `--token` when set):
+
+All `/v1/` endpoints are POST and accept JSON bodies. Pass the token as `Authorization: Bearer <token>`.
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/health` | Index stats (total_files, total_tokens) |
+| `POST /v1/conventions` | Full convention profile |
+| `POST /v1/briefing` | Compact orientation for a task (requires `task` field) |
+| `POST /v1/risks` | Top risky files (stub) |
+| `POST /v1/architecture` | Architecture quality (stub) |
+| `POST /v1/call_graph` | Cross-file call graph (stub) |
+| `POST /v1/dead_code` | Dead symbol detection (stub) |
+| `POST /v1/predict` | Change impact prediction (stub) |
+| `POST /v1/drift` | Architecture drift (stub) |
+| `POST /v1/security_surface` | Security surface analysis (stub) |
+| `POST /v1/data_flow` | Structural data flow tracing (stub) |
+| `POST /v1/cross_lang` | Cross-language boundaries (stub) |
+
+Stub endpoints return placeholder JSON; full analysis is available via the corresponding legacy endpoints.
+
+### 5. LSP Server (for IDE integration)
+
+Run cxpak as an LSP server over stdio for editor/IDE integration:
+
+```bash
+cxpak lsp .
+cxpak lsp /path/to/repo
+```
+
+**Standard LSP methods:**
+
+| Method | Description |
+|--------|-------------|
+| `textDocument/codeLens` | Code lenses showing symbol token counts |
+| `textDocument/hover` | Hover info (placeholder — returns nil) |
+| `textDocument/diagnostic` | Diagnostics for convention violations |
+| `workspace/symbol` | Workspace symbol search across the index |
+
+**Custom JSON-RPC methods (14):**
+
+| Method | Description |
+|--------|-------------|
+| `cxpak/health` | Index health stats |
+| `cxpak/conventions` | Convention profile |
+| `cxpak/blastRadius` | Change impact analysis |
+| `cxpak/overview` | Codebase overview (stub) |
+| `cxpak/trace` | Symbol tracing (stub) |
+| `cxpak/diff` | Change context (stub) |
+| `cxpak/search` | Code search (stub) |
+| `cxpak/apiSurface` | API surface (stub) |
+| `cxpak/deadCode` | Dead code detection (stub) |
+| `cxpak/callGraph` | Call graph (stub) |
+| `cxpak/predict` | Change prediction (stub) |
+| `cxpak/drift` | Architecture drift (stub) |
+| `cxpak/securitySurface` | Security surface (stub) |
+| `cxpak/dataFlow` | Data flow analysis (stub) |
+
+The LSP server builds the codebase index once at startup and serves requests synchronously over stdio.
 
 ## What You Get
 
@@ -221,6 +294,8 @@ cxpak extracts a quantified convention profile from the codebase — the pattern
 **8 convention categories:** naming, imports, errors, dependencies, testing, visibility, functions, git health. Each pattern includes counts, percentages, strength labels (Convention ≥90%, Trend ≥70%, Mixed), and exceptions.
 
 **Convention verification** — `cxpak_verify` checks code changes against observed conventions. It only flags violations in changed lines, not pre-existing debt. Reports include severity, evidence, and suggested fixes.
+
+**Convention export/diff** — `cxpak conventions export .` writes the full convention profile to `.cxpak/conventions.json` with a SHA256 checksum. `cxpak conventions diff .` compares the current profile against the stored baseline and reports which categories changed. Use this in CI to catch convention drift across PRs.
 
 **Repository DNA** — Every `auto_context` call includes a ~1000 token DNA section summarizing naming conventions, error handling patterns, import style, architecture layering, visibility defaults, function length stats, testing patterns, and git health. This gives the LLM implicit knowledge of "how we do things here" before it sees any code.
 
