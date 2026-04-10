@@ -9,13 +9,28 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     let index = crate::commands::serve::build_index(path)?;
     let shared = std::sync::Arc::new(std::sync::RwLock::new(index));
     let shared_path = std::sync::Arc::new(path.to_path_buf());
-    let (service, socket) = LspService::new(|client| {
+    let (service, socket) = LspService::build(|client| {
         CxpakLspBackend::new(
             client,
             std::sync::Arc::clone(&shared),
             std::sync::Arc::clone(&shared_path),
         )
-    });
+    })
+    .custom_method("cxpak/health", CxpakLspBackend::custom_health)
+    .custom_method("cxpak/conventions", CxpakLspBackend::custom_conventions)
+    .custom_method("cxpak/blastRadius", CxpakLspBackend::custom_blast_radius)
+    .custom_method("cxpak/overview", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/trace", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/diff", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/search", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/apiSurface", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/deadCode", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/callGraph", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/predict", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/drift", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/securitySurface", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/dataFlow", CxpakLspBackend::custom_stub)
+    .finish();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let stdin = tokio::io::stdin();

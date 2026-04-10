@@ -20,6 +20,64 @@ impl CxpakLspBackend {
             path,
         }
     }
+
+    pub async fn custom_health(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        let idx = self.index.read().unwrap();
+        match super::methods::handle_custom_method("cxpak/health", serde_json::Value::Null, &idx) {
+            Ok(Some(v)) => Ok(v),
+            Ok(None) => Ok(serde_json::Value::Null),
+            Err(e) => Err(tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+                message: e.into(),
+                data: None,
+            }),
+        }
+    }
+
+    pub async fn custom_conventions(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        let idx = self.index.read().unwrap();
+        match super::methods::handle_custom_method(
+            "cxpak/conventions",
+            serde_json::Value::Null,
+            &idx,
+        ) {
+            Ok(Some(v)) => Ok(v),
+            Ok(None) => Ok(serde_json::Value::Null),
+            Err(e) => Err(tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+                message: e.into(),
+                data: None,
+            }),
+        }
+    }
+
+    pub async fn custom_blast_radius(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        let idx = self.index.read().unwrap();
+        match super::methods::handle_custom_method(
+            "cxpak/blastRadius",
+            serde_json::Value::Null,
+            &idx,
+        ) {
+            Ok(Some(v)) => Ok(v),
+            Ok(None) => Ok(serde_json::Value::Null),
+            Err(e) => Err(tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+                message: e.into(),
+                data: None,
+            }),
+        }
+    }
+
+    pub async fn custom_stub(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        let method = params
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        Ok(serde_json::json!({"status": "available", "method": method}))
+    }
 }
 
 #[async_trait]

@@ -155,6 +155,15 @@ pub fn build_router_for_test(shared: SharedIndex, repo_path: SharedPath) -> Rout
     build_router(shared, repo_path, None)
 }
 
+/// Public test helper: builds a router with optional auth token.
+pub fn build_router_for_test_with_token(
+    shared: SharedIndex,
+    repo_path: SharedPath,
+    token: Option<String>,
+) -> Router {
+    build_router(shared, repo_path, token)
+}
+
 /// Build the axum Router for the HTTP server.
 fn build_router(shared: SharedIndex, repo_path: SharedPath, token: Option<String>) -> Router {
     let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
