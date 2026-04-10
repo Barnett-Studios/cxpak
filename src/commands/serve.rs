@@ -94,6 +94,9 @@ struct AppState {
     index: SharedIndex,
     repo_path: SharedPath,
     snapshot: SharedSnapshot,
+    expected_token: Option<String>,
+    #[allow(dead_code)]
+    workspace_root: Arc<std::path::PathBuf>,
 }
 
 impl axum::extract::FromRef<AppState> for SharedIndex {
@@ -157,8 +160,10 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
     let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
     let state = AppState {
         index: shared,
-        repo_path,
+        repo_path: repo_path.clone(),
         snapshot,
+        expected_token: None,
+        workspace_root: repo_path,
     };
     Router::new()
         .route("/health", get(health_handler))
@@ -184,7 +189,151 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath) -> Router {
         )
         .route("/data_flow", axum::routing::post(data_flow_handler))
         .route("/cross_lang", get(cross_lang_handler))
+        .merge(build_v1_router(state.clone()))
         .with_state(state)
+}
+
+fn build_v1_router(state: AppState) -> Router<AppState> {
+    use axum::extract::Request;
+    use axum::middleware::{self, Next};
+    use axum::response::Response;
+
+    async fn auth_layer(
+        axum::extract::State(state): axum::extract::State<AppState>,
+        req: Request,
+        next: Next,
+    ) -> Result<Response, StatusCode> {
+        let provided = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(extract_bearer_token);
+        if check_auth(state.expected_token.as_deref(), provided) {
+            Ok(next.run(req).await)
+        } else {
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    }
+
+    Router::new()
+        .route("/v1/health", axum::routing::post(v1_health_handler))
+        .route("/v1/risks", axum::routing::post(v1_risks_handler))
+        .route(
+            "/v1/architecture",
+            axum::routing::post(v1_architecture_handler),
+        )
+        .route("/v1/call_graph", axum::routing::post(v1_call_graph_handler))
+        .route("/v1/dead_code", axum::routing::post(v1_dead_code_handler))
+        .route("/v1/predict", axum::routing::post(v1_predict_handler))
+        .route("/v1/drift", axum::routing::post(v1_drift_handler))
+        .route(
+            "/v1/security_surface",
+            axum::routing::post(v1_security_surface_handler),
+        )
+        .route("/v1/data_flow", axum::routing::post(v1_data_flow_handler))
+        .route("/v1/cross_lang", axum::routing::post(v1_cross_lang_handler))
+        .route(
+            "/v1/conventions",
+            axum::routing::post(v1_conventions_handler),
+        )
+        .route("/v1/briefing", axum::routing::post(v1_briefing_handler))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer))
+        .with_state(state)
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct V1FocusParams {
+    focus: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct V1BriefingParams {
+    task: String,
+    tokens: Option<usize>,
+    focus: Option<String>,
+}
+
+async fn v1_health_handler(State(index): State<SharedIndex>) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({
+        "total_files": idx.total_files,
+        "total_tokens": idx.total_tokens,
+    })))
+}
+
+async fn v1_conventions_handler(
+    State(index): State<SharedIndex>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    serde_json::to_value(&idx.conventions)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn v1_briefing_handler(
+    State(index): State<SharedIndex>,
+    Json(params): Json<V1BriefingParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let idx = index
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let opts = crate::auto_context::AutoContextOpts {
+        tokens: params.tokens.unwrap_or(50_000),
+        focus: params.focus,
+        include_tests: true,
+        include_blast_radius: true,
+        mode: "briefing".to_string(),
+    };
+    let result = crate::auto_context::auto_context(&params.task, &idx, &opts);
+    serde_json::to_value(&result)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn v1_risks_handler() -> Json<Value> {
+    Json(serde_json::json!({"risks": [], "note": "full risk analysis available via /risks"}))
+}
+
+async fn v1_architecture_handler() -> Json<Value> {
+    Json(
+        serde_json::json!({"modules": [], "circular_deps": [], "note": "full analysis available via /architecture"}),
+    )
+}
+
+async fn v1_call_graph_handler() -> Json<Value> {
+    Json(serde_json::json!({"call_graph": {}, "note": "full analysis available via /call_graph"}))
+}
+
+async fn v1_dead_code_handler() -> Json<Value> {
+    Json(serde_json::json!({"dead_code": [], "note": "full analysis available via /dead_code"}))
+}
+
+async fn v1_predict_handler() -> Json<Value> {
+    Json(serde_json::json!({"predictions": [], "note": "full analysis available via /predict"}))
+}
+
+async fn v1_drift_handler() -> Json<Value> {
+    Json(serde_json::json!({"drift": {}, "note": "full analysis available via /drift"}))
+}
+
+async fn v1_security_surface_handler() -> Json<Value> {
+    Json(
+        serde_json::json!({"security": {}, "note": "full analysis available via /security_surface"}),
+    )
+}
+
+async fn v1_data_flow_handler() -> Json<Value> {
+    Json(serde_json::json!({"data_flow": {}, "note": "full analysis available via /data_flow"}))
+}
+
+async fn v1_cross_lang_handler() -> Json<Value> {
+    Json(serde_json::json!({"cross_lang": [], "note": "full analysis available via /cross_lang"}))
 }
 
 pub fn run(
@@ -5361,5 +5510,154 @@ mod tests {
     #[test]
     fn check_auth_accepts_matching_token() {
         assert!(check_auth(Some("secret"), Some("secret")));
+    }
+
+    // --- v1 router tests ---
+
+    fn make_app_state_with_token(token: Option<&str>) -> AppState {
+        AppState {
+            index: make_shared_index(),
+            repo_path: Arc::new(std::path::PathBuf::from("/tmp")),
+            snapshot: make_shared_snapshot(),
+            expected_token: token.map(|t| t.to_string()),
+            workspace_root: Arc::new(std::path::PathBuf::from("/tmp")),
+        }
+    }
+
+    fn build_full_router_with_state(state: AppState) -> Router {
+        Router::new()
+            .route("/health", get(health_handler))
+            .merge(build_v1_router(state.clone()))
+            .with_state(state)
+    }
+
+    #[test]
+    fn v1_router_has_health_route() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let state = make_app_state_with_token(None);
+            let app = build_full_router_with_state(state);
+            let body = serde_json::to_vec(&json!({})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/health")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert!(json["total_files"].is_number());
+            assert!(json["total_tokens"].is_number());
+        });
+    }
+
+    #[test]
+    fn v1_router_rejects_unauthorized() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let state = make_app_state_with_token(Some("secret"));
+            let app = build_full_router_with_state(state);
+            let body = serde_json::to_vec(&json!({})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/health")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        });
+    }
+
+    #[test]
+    fn v1_router_accepts_valid_token() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let state = make_app_state_with_token(Some("secret"));
+            let app = build_full_router_with_state(state);
+            let body = serde_json::to_vec(&json!({})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/health")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer secret")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn v1_conventions_returns_profile() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let state = make_app_state_with_token(None);
+            let app = build_full_router_with_state(state);
+            let body = serde_json::to_vec(&json!({})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/conventions")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn v1_stub_endpoints_return_ok() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let stubs = vec![
+                "/v1/risks",
+                "/v1/architecture",
+                "/v1/call_graph",
+                "/v1/dead_code",
+                "/v1/predict",
+                "/v1/drift",
+                "/v1/security_surface",
+                "/v1/data_flow",
+                "/v1/cross_lang",
+            ];
+            for uri in stubs {
+                let state = make_app_state_with_token(None);
+                let app = build_full_router_with_state(state);
+                let body = serde_json::to_vec(&json!({})).unwrap();
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "expected 200 for {uri}");
+            }
+        });
     }
 }
