@@ -72,6 +72,8 @@ candle-transformers = { version = "0.9", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 reqwest = { version = "0.12", features = ["json", "blocking"], optional = true }
 bincode = { version = "1", optional = true }
+tower-lsp = { version = "0.20", optional = true }
+sha2 = "0.10"
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -91,6 +93,7 @@ default = [
     "lang-sql", "lang-prisma",
     "daemon",
     "embeddings",
+    "lsp",
 ]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-typescript = ["dep:tree-sitter-typescript"]
@@ -135,6 +138,7 @@ lang-xml = ["dep:tree-sitter-xml"]
 lang-sql = ["dep:tree-sitter-sequel"]
 lang-prisma = ["dep:tree-sitter-prisma-io"]
 daemon = ["dep:notify", "dep:axum", "dep:tokio"]
+lsp = ["dep:tower-lsp", "daemon"]
 embeddings = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-transformers",
     "dep:tokenizers", "dep:reqwest", "dep:bincode",
