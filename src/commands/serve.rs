@@ -114,6 +114,38 @@ impl axum::extract::FromRef<AppState> for SharedSnapshot {
     }
 }
 
+pub fn validate_workspace_path(
+    workspace: &std::path::Path,
+    requested: &str,
+) -> Result<std::path::PathBuf, String> {
+    if requested.contains("..") {
+        return Err(format!("path traversal rejected: {requested}"));
+    }
+    let p = std::path::Path::new(requested);
+    if p.is_absolute() {
+        return Err(format!("absolute paths rejected: {requested}"));
+    }
+    let candidate = workspace.join(p);
+    let ws_canon = workspace
+        .canonicalize()
+        .map_err(|e| format!("workspace canonicalize failed: {e}"))?;
+    if !candidate.starts_with(&ws_canon) && !candidate.starts_with(workspace) {
+        return Err(format!("path escapes workspace: {requested}"));
+    }
+    Ok(candidate)
+}
+
+pub fn extract_bearer_token(header: &str) -> Option<&str> {
+    header.strip_prefix("Bearer ")
+}
+
+pub fn check_auth(expected: Option<&str>, provided: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(tok) => provided == Some(tok),
+    }
+}
+
 /// Public test helper: builds a router with the given shared state.
 /// Used by integration tests that cannot access the private `build_router`.
 pub fn build_router_for_test(shared: SharedIndex, repo_path: SharedPath) -> Router {
@@ -5277,5 +5309,57 @@ mod tests {
             let risks = json.as_array().unwrap();
             assert!(risks.len() <= 1, "limit=1 should return at most 1 entry");
         });
+    }
+
+    #[test]
+    fn path_validation_rejects_traversal() {
+        let ws = std::path::Path::new("/tmp");
+        assert!(validate_workspace_path(ws, "../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn path_validation_rejects_absolute() {
+        let ws = std::path::Path::new("/tmp");
+        assert!(validate_workspace_path(ws, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn path_validation_accepts_relative_subpath() {
+        let ws = std::path::Path::new("/tmp");
+        assert!(validate_workspace_path(ws, "src/main.rs").is_ok());
+    }
+
+    #[test]
+    fn bearer_token_extracted_correctly() {
+        assert_eq!(
+            extract_bearer_token("Bearer mytoken123"),
+            Some("mytoken123")
+        );
+    }
+
+    #[test]
+    fn bearer_token_returns_none_for_missing() {
+        assert_eq!(extract_bearer_token("Basic abc"), None);
+    }
+
+    #[test]
+    fn check_auth_allows_when_no_token_expected() {
+        assert!(check_auth(None, None));
+        assert!(check_auth(None, Some("anything")));
+    }
+
+    #[test]
+    fn check_auth_rejects_when_token_missing() {
+        assert!(!check_auth(Some("secret"), None));
+    }
+
+    #[test]
+    fn check_auth_rejects_wrong_token() {
+        assert!(!check_auth(Some("secret"), Some("wrong")));
+    }
+
+    #[test]
+    fn check_auth_accepts_matching_token() {
+        assert!(check_auth(Some("secret"), Some("secret")));
     }
 }
