@@ -20,3 +20,5 @@ pub mod relevance;
 pub mod scanner;
 pub mod schema;
 pub mod util;
+#[cfg(feature = "visual")]
+pub mod visual;
