@@ -74,6 +74,8 @@ reqwest = { version = "0.12", features = ["json", "blocking"], optional = true }
 bincode = { version = "1", optional = true }
 tower-lsp = { version = "0.20", optional = true }
 sha2 = "0.10"
+resvg = { version = "0.47", optional = true }
+wasmtime = { version = "43", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -94,6 +96,8 @@ default = [
     "daemon",
     "embeddings",
     "lsp",
+    "visual",
+    "plugins",
 ]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-typescript = ["dep:tree-sitter-typescript"]
@@ -143,3 +147,5 @@ embeddings = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-transformers",
     "dep:tokenizers", "dep:reqwest", "dep:bincode",
 ]
+visual = ["dep:resvg"]
+plugins = ["dep:wasmtime"]
