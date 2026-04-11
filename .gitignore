@@ -2,3 +2,4 @@
 coverage/
 .cxpak/
 references/
+tarpaulin-report.*
