@@ -2,12 +2,55 @@
 //! reading-time formatting.
 //!
 //! These functions implement Tasks 16-20 of the v2.0.0 onboarding pipeline.
-//! The entry point for callers is [`build_onboarding_map`] in
+//! The entry point for callers is [`compute_onboarding_map`] in
 //! `src/visual/onboard.rs`, which delegates to these functions.
 
 use crate::index::graph::DependencyGraph;
-use crate::visual::onboard::{OnboardingFile, OnboardingPhase};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+// ---------------------------------------------------------------------------
+// Onboarding types (canonical home; re-exported from visual::onboard)
+// ---------------------------------------------------------------------------
+
+/// A file included in an onboarding phase with focus guidance.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OnboardingFile {
+    /// Relative path to the file within the repository.
+    pub path: String,
+    /// PageRank importance score for this file (0.0–1.0).
+    pub pagerank: f64,
+    /// Key symbols a new developer should focus on when reading this file.
+    pub symbols_to_focus_on: Vec<String>,
+    /// Approximate token count for reading-time estimation.
+    pub estimated_tokens: usize,
+}
+
+/// A logical grouping of files that a developer should read together.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OnboardingPhase {
+    /// Human-readable phase name (e.g. "Entry Points", "Core Logic").
+    pub name: String,
+    /// Module or directory prefix for this phase (e.g. "src/commands").
+    pub module: String,
+    /// Why this phase should be read at this point in the learning journey.
+    pub rationale: String,
+    /// Files to read in this phase, ordered by reading priority.
+    pub files: Vec<OnboardingFile>,
+}
+
+/// A guided onboarding map for navigating an unfamiliar codebase.
+///
+/// Produced by [`compute_onboarding_map`] in `visual::onboard` and consumed
+/// by the MCP tool and the interactive onboarding UI (Task 7 dashboard).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OnboardingMap {
+    /// Total number of files included across all phases.
+    pub total_files: usize,
+    /// Human-readable estimate of reading time (e.g. "~4 hours").
+    pub estimated_reading_time: String,
+    /// Phases in recommended reading order.
+    pub phases: Vec<OnboardingPhase>,
+}
 
 // ---------------------------------------------------------------------------
 // Task 18: Topological sort
@@ -212,7 +255,7 @@ pub fn group_into_phases(
                         .cloned()
                         .unwrap_or_default()
                         .into_iter()
-                        .take(3)
+                        .take(5)
                         .collect(),
                     estimated_tokens: file_tokens.get(path).copied().unwrap_or(0),
                 })

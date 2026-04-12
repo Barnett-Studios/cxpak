@@ -11,45 +11,8 @@
 //! - Task 19: Phase grouping with 7±2 constraint
 //! - Task 20: Estimated reading time calculation
 
-/// A file included in an onboarding phase with focus guidance.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct OnboardingFile {
-    /// Relative path to the file within the repository.
-    pub path: String,
-    /// PageRank importance score for this file (0.0–1.0).
-    pub pagerank: f64,
-    /// Key symbols a new developer should focus on when reading this file.
-    pub symbols_to_focus_on: Vec<String>,
-    /// Approximate token count for reading-time estimation.
-    pub estimated_tokens: usize,
-}
-
-/// A logical grouping of files that a developer should read together.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct OnboardingPhase {
-    /// Human-readable phase name (e.g. "Entry Points", "Core Logic").
-    pub name: String,
-    /// Module or directory prefix for this phase (e.g. "src/commands").
-    pub module: String,
-    /// Why this phase should be read at this point in the learning journey.
-    pub rationale: String,
-    /// Files to read in this phase, ordered by reading priority.
-    pub files: Vec<OnboardingFile>,
-}
-
-/// A guided onboarding map for navigating an unfamiliar codebase.
-///
-/// Produced by [`build_onboarding_map`] and consumed by the MCP tool
-/// and the interactive onboarding UI (Task 7 dashboard).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct OnboardingMap {
-    /// Total number of files included across all phases.
-    pub total_files: usize,
-    /// Human-readable estimate of reading time (e.g. "~4 hours").
-    pub estimated_reading_time: String,
-    /// Phases in recommended reading order.
-    pub phases: Vec<OnboardingPhase>,
-}
+// Types live in the intelligence module; re-export here for backward compatibility.
+pub use crate::intelligence::onboarding::{OnboardingFile, OnboardingMap, OnboardingPhase};
 
 /// Identify the module prefix (first two path components) for a file path.
 #[cfg(test)]
@@ -76,13 +39,13 @@ fn is_entry_point(path: &str) -> bool {
         || path.ends_with("/index.js")
 }
 
-/// Build an onboarding map from the index using the intelligence pipeline.
+/// Compute an onboarding map from the index using the intelligence pipeline.
 ///
 /// Entry points are placed first as their own phase. The remaining files are
 /// sorted topologically (dependency-first) and grouped into phases of ≤9
 /// files per module, ordered by aggregate PageRank. Reading time is
 /// estimated via [`crate::intelligence::onboarding::format_reading_time`].
-pub fn build_onboarding_map(
+pub fn compute_onboarding_map(
     index: &crate::index::CodebaseIndex,
     _focus: Option<&str>,
 ) -> OnboardingMap {
@@ -91,6 +54,21 @@ pub fn build_onboarding_map(
     };
     use std::collections::HashMap;
 
+    // Build exclusion set: test files (from test_map keys) and
+    // generated/vendored paths (noise filter blocklist).
+    let excluded: std::collections::HashSet<&str> = index
+        .test_map
+        .keys()
+        .map(|k| k.as_str())
+        .chain(
+            index
+                .files
+                .iter()
+                .map(|f| f.relative_path.as_str())
+                .filter(|p| crate::auto_context::noise::is_blocklisted(p)),
+        )
+        .collect();
+
     // Build per-file metadata maps for the intelligence functions.
     let mut file_tokens: HashMap<String, usize> = HashMap::new();
     let mut file_symbols: HashMap<String, Vec<String>> = HashMap::new();
@@ -98,6 +76,9 @@ pub fn build_onboarding_map(
     let mut non_entry_paths: Vec<String> = Vec::new();
 
     for file in &index.files {
+        if excluded.contains(file.relative_path.as_str()) {
+            continue;
+        }
         let path = &file.relative_path;
         let pagerank = *index.pagerank.get(path.as_str()).unwrap_or(&0.0);
 
@@ -111,7 +92,7 @@ pub fn build_onboarding_map(
                     .iter()
                     .filter(|s| matches!(s.visibility, crate::parser::language::Visibility::Public))
                     .map(|s| s.name.clone())
-                    .take(3)
+                    .take(5)
                     .collect()
             })
             .unwrap_or_default();
@@ -288,14 +269,14 @@ mod tests {
     #[test]
     fn test_onboarding_map_has_phases() {
         let index = make_test_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         assert!(!map.phases.is_empty(), "map should have at least one phase");
     }
 
     #[test]
     fn test_onboarding_map_entry_points_first() {
         let index = make_test_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         // Entry points phase should be first
         assert_eq!(
             map.phases[0].name, "Entry Points",
@@ -306,7 +287,7 @@ mod tests {
     #[test]
     fn test_onboarding_map_total_files() {
         let index = make_test_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         // total_files must equal sum of files across all phases
         let sum: usize = map.phases.iter().map(|p| p.files.len()).sum();
         assert_eq!(map.total_files, sum);
@@ -315,7 +296,7 @@ mod tests {
     #[test]
     fn test_onboarding_map_serialization() {
         let index = make_test_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         let json = render_onboarding_json(&map);
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(parsed["total_files"].is_number());
@@ -335,7 +316,7 @@ mod tests {
     #[test]
     fn test_render_onboarding_markdown() {
         let index = make_test_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         let md = render_onboarding_markdown(&map);
         assert!(
             md.contains("# Codebase Onboarding Map"),
@@ -351,7 +332,7 @@ mod tests {
     #[test]
     fn test_render_onboarding_json() {
         let index = make_test_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         let json = render_onboarding_json(&map);
         assert!(!json.is_empty());
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
@@ -363,7 +344,7 @@ mod tests {
         let counter = TokenCounter::new();
         let index =
             CodebaseIndex::build_with_content(vec![], HashMap::new(), &counter, HashMap::new());
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         assert_eq!(map.total_files, 0);
         assert!(map.phases.is_empty());
         // Reading time for 0 tokens
@@ -386,7 +367,7 @@ mod tests {
         let mut content_map = HashMap::new();
         content_map.insert("src/tiny.rs".to_string(), "fn x() {}".to_string());
         let index = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         // format_reading_time returns "~Nm" for sub-hour durations
         assert!(
             map.estimated_reading_time.starts_with('~'),

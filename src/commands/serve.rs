@@ -2619,7 +2619,25 @@ fn handle_tool_call(
                         _ => html, // html is the default
                     };
 
-                mcp_tool_result(id, &content)
+                const MCP_INLINE_LIMIT: usize = 1_048_576; // 1 MB
+                if format == "html" && content.len() > MCP_INLINE_LIMIT {
+                    let visual_dir = repo_path.join(".cxpak/visual");
+                    let _ = std::fs::create_dir_all(&visual_dir);
+                    let output_path = visual_dir.join(format!("cxpak-{visual_type}.html"));
+                    match std::fs::write(&output_path, &content) {
+                        Ok(()) => mcp_tool_result(
+                            id,
+                            &format!(
+                                "Output written to {} ({} bytes)",
+                                output_path.display(),
+                                content.len()
+                            ),
+                        ),
+                        Err(e) => mcp_tool_result(id, &format!("Error writing output: {e}")),
+                    }
+                } else {
+                    mcp_tool_result(id, &content)
+                }
             }
             #[cfg(not(feature = "visual"))]
             {
@@ -2639,7 +2657,7 @@ fn handle_tool_call(
 
             #[cfg(feature = "visual")]
             {
-                let map = crate::visual::onboard::build_onboarding_map(index, focus);
+                let map = crate::visual::onboard::compute_onboarding_map(index, focus);
                 let content = if format == "markdown" {
                     crate::visual::onboard::render_onboarding_markdown(&map)
                 } else {

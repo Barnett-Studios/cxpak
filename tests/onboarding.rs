@@ -1,6 +1,6 @@
 //! Integration tests for the onboarding map pipeline.
 //!
-//! These tests exercise `cxpak::visual::onboard::build_onboarding_map` directly
+//! These tests exercise `cxpak::visual::onboard::compute_onboarding_map` directly
 //! and also validate the `cxpak onboard` CLI command end-to-end.  All tests
 //! that touch the visual module are gated behind `#[cfg(feature = "visual")]`.
 
@@ -11,7 +11,7 @@ mod onboarding_tests {
     use cxpak::index::CodebaseIndex;
     use cxpak::parser::language::{Import, ParseResult, Symbol, SymbolKind, Visibility};
     use cxpak::scanner::ScannedFile;
-    use cxpak::visual::onboard::build_onboarding_map;
+    use cxpak::visual::onboard::compute_onboarding_map;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -100,15 +100,15 @@ mod onboarding_tests {
     #[test]
     fn onboarding_map_is_deterministic() {
         let index = make_multi_file_index();
-        let map1 = build_onboarding_map(&index, None);
-        let map2 = build_onboarding_map(&index, None);
+        let map1 = compute_onboarding_map(&index, None);
+        let map2 = compute_onboarding_map(&index, None);
 
         let json1 = serde_json::to_string(&map1).expect("serialization must succeed");
         let json2 = serde_json::to_string(&map2).expect("serialization must succeed");
 
         assert_eq!(
             json1, json2,
-            "Two calls to build_onboarding_map on the same index must produce identical output"
+            "Two calls to compute_onboarding_map on the same index must produce identical output"
         );
     }
 
@@ -119,7 +119,7 @@ mod onboarding_tests {
     #[test]
     fn every_phase_has_between_one_and_nine_files() {
         let index = make_multi_file_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
 
         assert!(
             !map.phases.is_empty(),
@@ -153,7 +153,7 @@ mod onboarding_tests {
             .collect();
         let index = build_index_from_files(files, HashMap::new(), content_map);
 
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
 
         for phase in &map.phases {
             assert!(
@@ -201,7 +201,7 @@ mod onboarding_tests {
         );
 
         let index = build_index_from_files(files, parse_results, content_map);
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
 
         for phase in &map.phases {
             for file in &phase.files {
@@ -223,7 +223,7 @@ mod onboarding_tests {
     fn reading_time_format_for_small_index_is_minutes() {
         // Small index → should be a few minutes, no hours.
         let index = make_multi_file_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         let rt = &map.estimated_reading_time;
 
         assert!(
@@ -263,7 +263,7 @@ mod onboarding_tests {
             .collect();
 
         let index = build_index_from_files(files, HashMap::new(), content_map);
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
         let rt = &map.estimated_reading_time;
 
         assert!(
@@ -287,7 +287,7 @@ mod onboarding_tests {
     #[test]
     fn total_files_equals_sum_of_phase_file_counts() {
         let index = make_multi_file_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
 
         let sum: usize = map.phases.iter().map(|p| p.files.len()).sum();
         assert_eq!(
@@ -303,7 +303,7 @@ mod onboarding_tests {
     #[test]
     fn entry_points_phase_is_first_when_present() {
         let index = make_multi_file_index();
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
 
         // The index contains src/main.rs and src/lib.rs which are entry points.
         let first_phase_name = &map.phases[0].name;
@@ -322,7 +322,7 @@ mod onboarding_tests {
         let counter = TokenCounter::new();
         let index =
             CodebaseIndex::build_with_content(vec![], HashMap::new(), &counter, HashMap::new());
-        let map = build_onboarding_map(&index, None);
+        let map = compute_onboarding_map(&index, None);
 
         assert_eq!(map.total_files, 0, "empty index must have 0 total_files");
         assert!(map.phases.is_empty(), "empty index must have no phases");
