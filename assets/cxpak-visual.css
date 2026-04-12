@@ -1,0 +1,186 @@
+/* cxpak visual — minimal dashboard stylesheet */
+/* Dark mode default, OKLab-inspired palette */
+
+:root {
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-card: #1e2a3a;
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0b0;
+  --accent-blue: #4cc9f0;
+  --accent-green: #06d6a0;
+  --accent-yellow: #ffd166;
+  --accent-red: #ef476f;
+  --accent-purple: #7b68ee;
+  --border: #2a3a4a;
+  --node-default: #3a4a5a;
+  --edge-default: #4a5a6a;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+}
+
+#cxpak-app {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.cxpak-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.cxpak-header h1 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--accent-blue);
+}
+
+.cxpak-header .meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.cxpak-canvas {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.cxpak-canvas svg {
+  width: 100%;
+  height: 100%;
+}
+
+/* Node styles */
+.node rect {
+  fill: var(--node-default);
+  stroke: var(--border);
+  stroke-width: 1;
+  rx: 4;
+  cursor: pointer;
+  transition: fill 0.2s;
+}
+
+.node rect:hover {
+  fill: var(--accent-blue);
+  stroke: var(--accent-blue);
+}
+
+.node text {
+  fill: var(--text-primary);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.node.risk-high rect { stroke: var(--accent-red); stroke-width: 2; }
+.node.risk-medium rect { stroke: var(--accent-yellow); stroke-width: 2; }
+.node.god-file rect { fill: var(--accent-red); opacity: 0.8; }
+.node.circular rect { stroke: var(--accent-purple); stroke-dasharray: 4 2; }
+
+/* Edge styles */
+.edge path {
+  fill: none;
+  stroke: var(--edge-default);
+  stroke-width: 1.5;
+  opacity: 0.6;
+}
+
+.edge path:hover { stroke: var(--accent-blue); opacity: 1; }
+.edge.cycle path { stroke: var(--accent-purple); stroke-dasharray: 4 2; }
+
+/* Cluster styles */
+.cluster rect {
+  fill: var(--bg-card);
+  stroke: var(--border);
+  stroke-dasharray: 6 3;
+  rx: 8;
+}
+
+/* Tooltip */
+.cxpak-tooltip {
+  position: absolute;
+  padding: 8px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text-primary);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+  max-width: 300px;
+  z-index: 100;
+}
+
+.cxpak-tooltip.visible { opacity: 1; }
+
+/* Metrics panel */
+.cxpak-metrics {
+  display: flex;
+  gap: 16px;
+  padding: 8px 20px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.metric-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--accent-blue);
+}
+
+.metric-label {
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+}
+
+/* Treemap (risk heatmap) */
+.treemap-cell {
+  stroke: var(--bg-primary);
+  stroke-width: 2;
+  cursor: pointer;
+}
+
+.treemap-label {
+  fill: var(--text-primary);
+  font-size: 10px;
+  pointer-events: none;
+}
+
+/* Timeline */
+.timeline-bar {
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.timeline-bar:hover { opacity: 0.8; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
