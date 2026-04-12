@@ -110,6 +110,40 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Generate interactive visual dashboard
+    #[cfg(feature = "visual")]
+    Visual {
+        /// dashboard | architecture | risk | flow | timeline | diff
+        #[arg(long, default_value = "dashboard")]
+        visual_type: VisualTypeArg,
+        /// html | mermaid | svg | png | c4 | json
+        #[arg(long, default_value = "html")]
+        format: VisualFormatArg,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// For flow type: the symbol to trace
+        #[arg(long)]
+        symbol: Option<String>,
+        /// For diff type: comma-separated changed file paths
+        #[arg(long)]
+        files: Option<String>,
+        #[arg(long)]
+        focus: Option<String>,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Generate onboarding guide for the codebase
+    #[cfg(feature = "visual")]
+    Onboard {
+        #[arg(long)]
+        focus: Option<String>,
+        #[arg(long, default_value = "markdown")]
+        format: OutputFormat,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Export and diff convention profiles
     #[cfg(feature = "daemon")]
     Conventions {
@@ -156,6 +190,30 @@ pub enum ConventionsSubcommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+}
+
+/// CLI argument type for visual type selection
+#[cfg(feature = "visual")]
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum VisualTypeArg {
+    Dashboard,
+    Architecture,
+    Risk,
+    Flow,
+    Timeline,
+    Diff,
+}
+
+/// CLI argument type for visual format selection
+#[cfg(feature = "visual")]
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum VisualFormatArg {
+    Html,
+    Mermaid,
+    Svg,
+    Png,
+    C4,
+    Json,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -520,6 +578,58 @@ mod tests {
                 assert!(token.is_none());
             }
             _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[cfg(feature = "visual")]
+    #[test]
+    fn test_visual_command_parses() {
+        let cli = Cli::try_parse_from(["cxpak", "visual", "--visual-type", "dashboard"])
+            .expect("should parse visual command");
+        match cli.command {
+            Commands::Visual { visual_type, .. } => {
+                assert!(matches!(visual_type, VisualTypeArg::Dashboard));
+            }
+            _ => panic!("expected Visual command"),
+        }
+    }
+
+    #[cfg(feature = "visual")]
+    #[test]
+    fn test_visual_command_flow_with_symbol() {
+        let cli = Cli::try_parse_from([
+            "cxpak",
+            "visual",
+            "--visual-type",
+            "flow",
+            "--format",
+            "html",
+            "--symbol",
+            "main",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Commands::Visual {
+                visual_type,
+                symbol,
+                ..
+            } => {
+                assert!(matches!(visual_type, VisualTypeArg::Flow));
+                assert_eq!(symbol.as_deref(), Some("main"));
+            }
+            _ => panic!("expected Visual"),
+        }
+    }
+
+    #[cfg(feature = "visual")]
+    #[test]
+    fn test_onboard_command_parses() {
+        let cli = Cli::try_parse_from(["cxpak", "onboard"]).expect("should parse onboard command");
+        match cli.command {
+            Commands::Onboard { format, .. } => {
+                assert!(matches!(format, OutputFormat::Markdown));
+            }
+            _ => panic!("expected Onboard"),
         }
     }
 }

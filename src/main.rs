@@ -181,6 +181,31 @@ fn main() {
                 workspace.as_deref(),
             )
         }
+        #[cfg(feature = "visual")]
+        Commands::Visual {
+            visual_type,
+            format,
+            out,
+            symbol,
+            files,
+            focus,
+            path,
+        } => commands::visual::run(
+            path,
+            visual_type,
+            format,
+            out.as_deref(),
+            symbol.as_deref(),
+            files.as_deref(),
+            focus.as_deref(),
+        ),
+        #[cfg(feature = "visual")]
+        Commands::Onboard {
+            focus,
+            format,
+            out,
+            path,
+        } => commands::onboard::run(path, focus.as_deref(), format, out.as_deref()),
     };
 
     if let Err(e) = result {
