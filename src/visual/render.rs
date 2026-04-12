@@ -652,6 +652,260 @@ pub fn render_architecture_explorer(
     ))
 }
 
+// ── Risk Heatmap types ────────────────────────────────────────────────────────
+
+/// Full data payload for the Risk Heatmap view, embedded in the HTML page as
+/// `<script id="cxpak-heatmap" type="application/json">`.
+///
+/// The treemap is rendered client-side by D3.  The Rust side pre-computes the
+/// tree structure and all metrics; the JS only needs to lay out rectangles.
+#[derive(Debug, serde::Serialize)]
+pub struct RiskHeatmapData {
+    /// Root of the module → file tree used by `d3.treemap()`.
+    pub root: TreemapNode,
+    /// Number of files with risk_score above 0.0 (i.e. all files that appear).
+    pub total_risk_files: usize,
+    /// Highest risk_score across all leaf nodes.
+    pub max_risk: f64,
+}
+
+/// One node in the treemap hierarchy (module group or individual file leaf).
+///
+/// D3 uses `area_value` to size rectangles and `risk_score` to colour them.
+#[derive(Debug, serde::Serialize)]
+pub struct TreemapNode {
+    /// Stable identifier (module prefix or file path).
+    pub id: String,
+    /// Human-readable label shown inside the rectangle.
+    pub label: String,
+    /// Sizing value for D3 treemap: `blast_radius` for leaves (floor 1),
+    /// sum of children for module groups.
+    pub area_value: f64,
+    /// Risk score in [0, 1]; 0.0 for non-leaf (group) nodes.
+    pub risk_score: f64,
+    /// `"high"` | `"medium"` | `"low"` per [`risk_severity`].
+    pub severity: String,
+    /// Child nodes.  Empty for leaf nodes.
+    pub children: Vec<TreemapNode>,
+    /// Present on leaf nodes: the file's own path (stored as a single-element
+    /// vec so the JS tooltip can list files in the blast radius without an
+    /// extra API call).
+    pub blast_radius_files: Vec<String>,
+    /// Data for the hover tooltip.
+    pub tooltip: RiskTooltip,
+}
+
+/// Hover-tooltip payload for a single file leaf node.
+#[derive(Debug, serde::Serialize)]
+pub struct RiskTooltip {
+    /// Relative file path.
+    pub path: String,
+    /// Number of git commits touching this file in the last 30 days.
+    pub churn_30d: u32,
+    /// Number of files that depend on this file (direct, 1 hop).
+    pub blast_radius: usize,
+    /// Number of test files mapped to this source file.
+    pub test_count: usize,
+    /// Simplified coupling score (0.0 in this release).
+    pub coupling: f64,
+}
+
+// ── Risk Heatmap builder ──────────────────────────────────────────────────────
+
+/// Build the treemap data from a `CodebaseIndex`.
+///
+/// Files are grouped by their first two path segments (e.g., `src/index`).
+/// Files with no natural two-segment prefix are grouped under `"other"`.
+pub fn build_risk_heatmap_data(index: &CodebaseIndex) -> RiskHeatmapData {
+    let risk_entries = crate::intelligence::risk::compute_risk_ranking(index);
+
+    // Group risk entries by two-segment module prefix.
+    let mut groups: std::collections::HashMap<String, Vec<crate::intelligence::risk::RiskEntry>> =
+        std::collections::HashMap::new();
+
+    for entry in &risk_entries {
+        let prefix = module_prefix(&entry.path);
+        groups.entry(prefix).or_default().push(entry.clone());
+    }
+
+    // Build module-level TreemapNodes.
+    let mut module_nodes: Vec<TreemapNode> = groups
+        .into_iter()
+        .map(|(prefix, entries)| {
+            let children: Vec<TreemapNode> = entries
+                .iter()
+                .map(|e| {
+                    let area_value = (e.blast_radius as f64).max(1.0);
+                    let severity = risk_severity(e.risk_score).to_string();
+                    let test_count = index.test_map.get(e.path.as_str()).map_or(0, |v| v.len());
+                    let label = short_label(&e.path);
+                    TreemapNode {
+                        id: e.path.clone(),
+                        label,
+                        area_value,
+                        risk_score: e.risk_score,
+                        severity,
+                        children: vec![],
+                        blast_radius_files: vec![e.path.clone()],
+                        tooltip: RiskTooltip {
+                            path: e.path.clone(),
+                            churn_30d: e.churn_30d,
+                            blast_radius: e.blast_radius,
+                            test_count,
+                            coupling: 0.0,
+                        },
+                    }
+                })
+                .collect();
+
+            let area_value: f64 = children.iter().map(|c| c.area_value).sum();
+            let max_risk = children
+                .iter()
+                .map(|c| c.risk_score)
+                .fold(0.0_f64, f64::max);
+            let severity = risk_severity(max_risk).to_string();
+
+            TreemapNode {
+                id: prefix.clone(),
+                label: prefix,
+                area_value,
+                risk_score: 0.0,
+                severity,
+                children,
+                blast_radius_files: vec![],
+                tooltip: RiskTooltip {
+                    path: String::new(),
+                    churn_30d: 0,
+                    blast_radius: 0,
+                    test_count: 0,
+                    coupling: 0.0,
+                },
+            }
+        })
+        .collect();
+
+    // Sort module nodes by descending area_value for a stable, deterministic layout.
+    module_nodes.sort_by(|a, b| {
+        b.area_value
+            .partial_cmp(&a.area_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let root_area: f64 = module_nodes.iter().map(|n| n.area_value).sum();
+    let max_risk = risk_entries
+        .iter()
+        .map(|e| e.risk_score)
+        .fold(0.0_f64, f64::max);
+    let total_risk_files = risk_entries.len();
+
+    let root = TreemapNode {
+        id: "root".to_string(),
+        label: "Repository".to_string(),
+        area_value: root_area,
+        risk_score: 0.0,
+        severity: risk_severity(max_risk).to_string(),
+        children: module_nodes,
+        blast_radius_files: vec![],
+        tooltip: RiskTooltip {
+            path: String::new(),
+            churn_30d: 0,
+            blast_radius: 0,
+            test_count: 0,
+            coupling: 0.0,
+        },
+    };
+
+    RiskHeatmapData {
+        root,
+        total_risk_files,
+        max_risk,
+    }
+}
+
+/// Extract the first two path segments as the module prefix.
+///
+/// - `"src/index/mod.rs"` → `"src/index"`
+/// - `"main.rs"` → `"other"`
+fn module_prefix(path: &str) -> String {
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
+    match parts.as_slice() {
+        [a, b, _] => format!("{a}/{b}"),
+        [a, _] => a.to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// Derive a short label from a file path (the file name without directory).
+fn short_label(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+// ── Risk Heatmap renderer ─────────────────────────────────────────────────────
+
+/// Renders a self-contained Risk Heatmap HTML page.
+///
+/// The page embeds:
+/// - `cxpak-data` — an empty `ComputedLayout` (required by the base JS
+///   controller; the treemap is rendered client-side from `cxpak-heatmap`).
+/// - `cxpak-heatmap` — the full `RiskHeatmapData` consumed by D3.
+/// - `cxpak-meta` — `RenderMetadata` (repo name, version, etc.).
+pub fn render_risk_heatmap(index: &CodebaseIndex, metadata: &RenderMetadata) -> String {
+    let heatmap = build_risk_heatmap_data(index);
+    let heatmap_json = serde_json::to_string(&heatmap).unwrap();
+
+    // Provide an empty layout so the base graph renderer has valid (no-op) data.
+    let empty_layout = super::layout::ComputedLayout {
+        nodes: vec![],
+        edges: vec![],
+        width: 0.0,
+        height: 0.0,
+        layers: vec![],
+    };
+    let layout_json = serde_json::to_string(&empty_layout).unwrap();
+
+    let title = visual_type_name(&super::VisualType::Risk);
+
+    #[derive(serde::Serialize)]
+    struct MetaWithDisplay<'a> {
+        #[serde(flatten)]
+        inner: &'a RenderMetadata,
+        visual_type_display: &'static str,
+    }
+    let meta_with_display = MetaWithDisplay {
+        inner: metadata,
+        visual_type_display: title,
+    };
+    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let controller_js = view_controller_js(&super::VisualType::Risk);
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>cxpak — {title}</title>
+  <style>{css}</style>
+</head>
+<body>
+  <div id="cxpak-app"></div>
+  <script id="cxpak-data" type="application/json">{layout_json}</script>
+  <script id="cxpak-heatmap" type="application/json">{heatmap_json}</script>
+  <script id="cxpak-meta" type="application/json">{meta_json}</script>
+  <script>{d3}</script>
+  <script>{controller}</script>
+</body>
+</html>
+"#,
+        title = title,
+        css = VISUAL_CSS,
+        layout_json = layout_json,
+        heatmap_json = heatmap_json,
+        meta_json = meta_json,
+        d3 = D3_BUNDLE,
+        controller = controller_js,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,5 +1208,105 @@ mod tests {
                 assert!(json.contains("\"level\""));
             }
         }
+    }
+
+    // ── Risk Heatmap tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_risk_heatmap_area_values_positive() {
+        let index = make_minimal_index();
+        let data = build_risk_heatmap_data(&index);
+        // Walk all leaf nodes and verify area_value > 0.
+        for module_node in &data.root.children {
+            for leaf in &module_node.children {
+                assert!(
+                    leaf.area_value > 0.0,
+                    "leaf '{}' has area_value <= 0: {}",
+                    leaf.id,
+                    leaf.area_value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_risk_heatmap_high_risk_severity() {
+        // Construct a RiskTooltip and TreemapNode manually to verify that a file
+        // with risk_score > 0.8 receives severity "high" from risk_severity().
+        assert_eq!(risk_severity(0.85), "high");
+        assert_eq!(risk_severity(0.7), "high");
+
+        // Build real data and confirm all severity strings are one of the three
+        // valid values.
+        let index = make_minimal_index();
+        let data = build_risk_heatmap_data(&index);
+        for module_node in &data.root.children {
+            for leaf in &module_node.children {
+                assert!(
+                    matches!(leaf.severity.as_str(), "high" | "medium" | "low"),
+                    "unexpected severity '{}' for '{}'",
+                    leaf.severity,
+                    leaf.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_risk_heatmap_zero_blast_radius_gets_floor() {
+        // A file with blast_radius == 0 must still have area_value >= 1.0
+        // (the floor prevents zero-area rectangles in the treemap).
+        let index = make_minimal_index();
+        let data = build_risk_heatmap_data(&index);
+        // The minimal index has a single file with no dependents → blast_radius == 0.
+        for module_node in &data.root.children {
+            for leaf in &module_node.children {
+                assert!(
+                    leaf.area_value >= 1.0,
+                    "leaf '{}' area_value {} is below floor of 1.0",
+                    leaf.id,
+                    leaf.area_value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_render_risk_heatmap_contains_heatmap_data() {
+        let index = make_minimal_index();
+        let meta = make_test_metadata();
+        let html = render_risk_heatmap(&index, &meta);
+        // Must be a well-formed HTML document.
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("</html>"));
+        // Must embed the heatmap JSON in the expected script tag.
+        assert!(
+            html.contains(r#"id="cxpak-heatmap""#),
+            "HTML must contain cxpak-heatmap script tag"
+        );
+        // Script tag counts must balance.
+        let opens = html.matches("<script").count();
+        let closes = html.matches("</script>").count();
+        assert_eq!(opens, closes, "mismatched script tags");
+        // Heatmap JSON must be parseable and contain the root key.
+        let marker = r#"<script id="cxpak-heatmap" type="application/json">"#;
+        let start = html.find(marker).expect("cxpak-heatmap tag missing");
+        let content_start = start + marker.len();
+        let content_end = html[content_start..].find("</script>").unwrap() + content_start;
+        let json_str = &html[content_start..content_end];
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("heatmap JSON must be valid");
+        assert!(
+            parsed.get("root").is_some(),
+            "heatmap JSON must have 'root'"
+        );
+        assert!(
+            parsed.get("total_risk_files").is_some(),
+            "heatmap JSON must have 'total_risk_files'"
+        );
+        assert!(
+            parsed.get("max_risk").is_some(),
+            "heatmap JSON must have 'max_risk'"
+        );
     }
 }
