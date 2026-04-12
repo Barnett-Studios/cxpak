@@ -41,130 +41,561 @@ fn visual_type_name(vt: &super::VisualType) -> &'static str {
     }
 }
 
-/// Maps a `VisualType` to the string identifier used in the JS controller.
-fn visual_type_id(vt: &super::VisualType) -> &'static str {
-    match vt {
-        super::VisualType::Dashboard => "dashboard",
-        super::VisualType::Architecture => "architecture",
-        super::VisualType::Risk => "risk",
-        super::VisualType::Flow => "flow",
-        super::VisualType::Timeline => "timeline",
-        super::VisualType::Diff => "diff",
-    }
+/// Common JS utilities shared by all view controllers: header bar, tooltip,
+/// graph renderer, and helper functions.
+///
+/// Returned as a string that is prepended to each view-specific controller.
+fn common_js() -> &'static str {
+    r#"
+var CX = {};
+CX.layout = JSON.parse(document.getElementById('cxpak-data').textContent);
+CX.meta = JSON.parse(document.getElementById('cxpak-meta').textContent);
+CX.app = document.getElementById('cxpak-app');
+
+CX.esc = function(s) { var d = document.createElement('span'); d.textContent = s; return d.innerHTML; };
+
+CX.header = function() {
+  var h = document.createElement('div');
+  h.id = 'cxpak-header';
+  var hs = CX.meta.health_score;
+  var hc = hs == null ? '' : (hs >= 7 ? 'good' : hs >= 4 ? 'warn' : 'bad');
+  h.innerHTML =
+    '<span class="cxpak-logo">cxpak</span>' +
+    '<span class="cxpak-repo">' + CX.esc(CX.meta.repo_name) + '</span>' +
+    '<span class="cxpak-type">' + CX.esc(CX.meta.visual_type_display) + '</span>' +
+    (hs != null ? '<span class="cxpak-health ' + hc + '">' + hs.toFixed(1) + '/10</span>' : '') +
+    '<span class="cxpak-timestamp">' + CX.esc(CX.meta.generated_at) + '</span>';
+  CX.app.appendChild(h);
+};
+
+CX.tooltip = (function() {
+  var el = document.createElement('div');
+  el.className = 'cxpak-tooltip';
+  document.body.appendChild(el);
+  return {
+    show: function(html, ev) {
+      el.innerHTML = html;
+      el.classList.add('visible');
+      var x = ev.clientX + 12, y = ev.clientY + 12;
+      if (x + 320 > window.innerWidth) x = ev.clientX - 320;
+      if (y + 200 > window.innerHeight) y = ev.clientY - 200;
+      el.style.left = x + 'px'; el.style.top = y + 'px';
+    },
+    hide: function() { el.classList.remove('visible'); }
+  };
+})();
+
+CX.svgCanvas = function(parent, w, h) {
+  var svg = d3.select(parent || '#cxpak-app')
+    .append('svg')
+    .attr('width', '100%')
+    .attr('height', '100%')
+    .attr('viewBox', '0 0 ' + (w || 1200) + ' ' + (h || 800));
+  var zg = svg.append('g');
+  svg.call(d3.zoom().scaleExtent([0.1, 10]).on('zoom', function(ev) {
+    zg.attr('transform', ev.transform);
+  }));
+  return { svg: svg, g: zg };
+};
+
+CX.nodeClass = function(d) {
+  var c = 'cxpak-node';
+  if (d.metadata) {
+    if (d.metadata.risk_score >= 0.7) c += ' risk-high';
+    else if (d.metadata.risk_score >= 0.4) c += ' risk-medium';
+    if (d.metadata.is_god_file) c += ' god-file';
+    if (d.metadata.is_circular) c += ' circular';
+  }
+  return c;
+};
+
+CX.renderGraph = function(root, data, opts) {
+  opts = opts || {};
+  var nodes = data.nodes || [];
+  var edges = data.edges || [];
+  var nmap = {};
+  nodes.forEach(function(n) { nmap[n.id] = n; });
+  function nx(id) { var n = nmap[id]; return n ? n.position.x + n.width/2 : 0; }
+  function ny(id) { var n = nmap[id]; return n ? n.position.y + n.height/2 : 0; }
+
+  root.append('g').attr('class','cxpak-edges').selectAll('line').data(edges).join('line')
+    .attr('class', function(d) { return 'cxpak-edge' + (d.is_cycle ? ' cycle' : ''); })
+    .attr('x1', function(d) { return nx(d.source); })
+    .attr('y1', function(d) { return ny(d.source); })
+    .attr('x2', function(d) { return nx(d.target); })
+    .attr('y2', function(d) { return ny(d.target); })
+    .attr('stroke-width', function(d) { return Math.max(1, Math.min(3, d.weight)); });
+
+  var ng = root.append('g').attr('class','cxpak-nodes').selectAll('g').data(nodes).join('g')
+    .attr('class', opts.nodeClass || CX.nodeClass)
+    .attr('transform', function(d) { return 'translate(' + d.position.x + ',' + d.position.y + ')'; });
+
+  ng.append('rect')
+    .attr('width', function(d) { return d.width; })
+    .attr('height', function(d) { return d.height; })
+    .attr('rx', 6).attr('ry', 6);
+
+  ng.append('text')
+    .attr('x', function(d) { return d.width/2; })
+    .attr('y', function(d) { return d.height/2; })
+    .attr('text-anchor','middle').attr('dominant-baseline','middle')
+    .text(function(d) { return d.label; });
+
+  if (opts.onNodeClick) ng.on('click', function(ev, d) { opts.onNodeClick(d, ev); });
+
+  ng.on('mouseover', function(ev, d) {
+    var m = d.metadata || {};
+    var html = '<div class="tt-title">' + CX.esc(d.id) + '</div>' +
+      '<div class="tt-row"><span class="tt-label">Type</span><span class="tt-value">' + CX.esc(d.node_type) + '</span></div>' +
+      '<div class="tt-row"><span class="tt-label">PageRank</span><span class="tt-value">' + (m.pagerank || 0).toFixed(3) + '</span></div>' +
+      '<div class="tt-row"><span class="tt-label">Risk</span><span class="tt-value tt-' +
+        (m.risk_score >= 0.7 ? 'high' : m.risk_score >= 0.4 ? 'medium' : 'low') + '">' +
+        (m.risk_score || 0).toFixed(2) + '</span></div>' +
+      '<div class="tt-row"><span class="tt-label">Tokens</span><span class="tt-value">' + (m.token_count || 0) + '</span></div>';
+    CX.tooltip.show(html, ev);
+  }).on('mouseout', function() { CX.tooltip.hide(); });
+
+  return ng;
+};
+
+CX.dimColor = function(score) {
+  return score >= 7 ? '#06d6a0' : score >= 4 ? '#ffd166' : '#ef476f';
+};
+"#
 }
 
-/// Inline JS controller that reads layout/meta from the page and initialises a D3 graph.
+/// Inline JS controller that reads layout/meta from the page and initialises
+/// the appropriate D3 view.
 ///
-/// Tasks 7-12 will replace the `switch` branches with type-specific renderers.
-/// For now every type falls through to the base graph renderer.
+/// Each visual type gets a dedicated renderer that reads its own embedded
+/// `<script>` data tag and builds the correct DOM/SVG elements.
 fn view_controller_js(visual_type: &super::VisualType) -> String {
-    let type_id = visual_type_id(visual_type);
+    let common = common_js();
+    let view_js = match visual_type {
+        super::VisualType::Dashboard => dashboard_js(),
+        super::VisualType::Architecture => architecture_js(),
+        super::VisualType::Risk => risk_js(),
+        super::VisualType::Flow => flow_js(),
+        super::VisualType::Timeline => timeline_js(),
+        super::VisualType::Diff => diff_js(),
+    };
     format!(
-        r#"(function () {{
-  'use strict';
-
-  var layout = JSON.parse(document.getElementById('cxpak-data').textContent);
-  var meta   = JSON.parse(document.getElementById('cxpak-meta').textContent);
-  var type_  = {type_id_json};
-
-  /* ── header ───────────────────────────────────────────────────── */
-  var header = document.createElement('div');
-  header.id = 'cxpak-header';
-  header.innerHTML =
-    '<span class="cxpak-repo">' + meta.repo_name + '</span>' +
-    '<span class="cxpak-type">' + meta.visual_type_display + '</span>';
-  document.getElementById('cxpak-app').appendChild(header);
-
-  /* ── SVG canvas ────────────────────────────────────────────────── */
-  var W = layout.width  || 1200;
-  var H = layout.height || 800;
-
-  var svg = d3.select('#cxpak-app')
-    .append('svg')
-    .attr('id', 'cxpak-svg')
-    .attr('width',  '100%')
-    .attr('height', '100%')
-    .attr('viewBox', '0 0 ' + W + ' ' + H);
-
-  /* zoom */
-  var zoomG = svg.append('g').attr('id', 'cxpak-zoom-group');
-  svg.call(
-    d3.zoom()
-      .scaleExtent([0.1, 10])
-      .on('zoom', function (event) {{
-        zoomG.attr('transform', event.transform);
-      }})
-  );
-
-  /* ── dispatch to type-specific renderer ───────────────────────── */
-  switch (type_) {{
-    case 'dashboard':
-    case 'architecture':
-    case 'risk':
-    case 'flow':
-    case 'timeline':
-    case 'diff':
-    default:
-      renderBaseGraph(zoomG, layout);
-      break;
-  }}
-
-  /* ── base graph renderer ──────────────────────────────────────── */
-  function renderBaseGraph(root, data) {{
-    var nodes = data.nodes || [];
-    var edges = data.edges || [];
-
-    /* edges */
-    root.append('g').attr('class', 'cxpak-edges')
-      .selectAll('line')
-      .data(edges)
-      .join('line')
-        .attr('class', 'cxpak-edge')
-        .attr('x1', function (d) {{ return nodeX(d.source, nodes); }})
-        .attr('y1', function (d) {{ return nodeY(d.source, nodes); }})
-        .attr('x2', function (d) {{ return nodeX(d.target, nodes); }})
-        .attr('y2', function (d) {{ return nodeY(d.target, nodes); }});
-
-    /* node groups */
-    var nodeG = root.append('g').attr('class', 'cxpak-nodes')
-      .selectAll('g')
-      .data(nodes)
-      .join('g')
-        .attr('class', 'cxpak-node')
-        .attr('transform', function (d) {{
-          return 'translate(' + d.position.x + ',' + d.position.y + ')';
-        }});
-
-    nodeG.append('rect')
-      .attr('width',  function (d) {{ return d.width; }})
-      .attr('height', function (d) {{ return d.height; }})
-      .attr('rx', 4)
-      .attr('ry', 4);
-
-    nodeG.append('text')
-      .attr('x', function (d) {{ return d.width / 2; }})
-      .attr('y', function (d) {{ return d.height / 2; }})
-      .attr('text-anchor', 'middle')
-      .attr('dominant-baseline', 'middle')
-      .text(function (d) {{ return d.label; }});
-  }}
-
-  /* helpers */
-  function findNode(id, nodes) {{
-    return nodes.find(function (n) {{ return n.id === id; }}) || null;
-  }}
-  function nodeX(id, nodes) {{
-    var n = findNode(id, nodes);
-    return n ? n.position.x + n.width / 2 : 0;
-  }}
-  function nodeY(id, nodes) {{
-    var n = findNode(id, nodes);
-    return n ? n.position.y + n.height / 2 : 0;
-  }}
-}})();
-"#,
-        type_id_json = serde_json::to_string(type_id).unwrap(),
+        "(function(){{\n'use strict';\n{common}\n{view_js}\n}})();\n",
+        common = common,
+        view_js = view_js,
     )
+}
+
+/// Dashboard view: 4-quadrant grid with health gauge, risk table,
+/// architecture mini-map, and alerts list.
+fn dashboard_js() -> &'static str {
+    r#"
+CX.header();
+var dash = JSON.parse(document.getElementById('cxpak-dashboard').textContent);
+
+var grid = document.createElement('div');
+grid.className = 'cxpak-dashboard';
+CX.app.appendChild(grid);
+
+/* Q1: Health gauge */
+var q1 = document.createElement('div'); q1.className = 'cxpak-quadrant';
+q1.innerHTML = '<div class="cxpak-quadrant-title">Health Score</div>';
+var gw = document.createElement('div'); gw.className = 'cxpak-gauge-wrap';
+var sc = dash.health.composite;
+var gc = sc >= 7 ? 'good' : sc >= 4 ? 'warn' : 'bad';
+gw.innerHTML = '<div class="cxpak-gauge-score ' + gc + '">' + sc.toFixed(1) + '</div>';
+
+var gSvg = d3.select(gw).append('svg').attr('width', 160).attr('height', 160)
+  .append('g').attr('transform','translate(80,80)');
+var arc = d3.arc().innerRadius(60).outerRadius(72).startAngle(0);
+gSvg.append('path').datum({ endAngle: Math.PI * 2 })
+  .attr('d', arc).attr('fill','#252545');
+gSvg.append('path').datum({ endAngle: 0 })
+  .attr('fill', CX.dimColor(sc))
+  .transition().duration(800)
+  .attrTween('d', function() {
+    var i = d3.interpolate(0, Math.PI * 2 * sc / 10);
+    return function(t) { return arc({ startAngle: 0, endAngle: i(t) }); };
+  });
+
+var bars = document.createElement('div'); bars.className = 'cxpak-dim-bars';
+(dash.health.dimensions || []).forEach(function(dim) {
+  var name = dim[0], val = dim[1];
+  bars.innerHTML += '<div class="cxpak-dim-row">' +
+    '<span class="cxpak-dim-label">' + CX.esc(name.replace(/_/g, ' ')) + '</span>' +
+    '<div class="cxpak-dim-bar"><div class="cxpak-dim-fill" style="width:' + (val*10) + '%;background:' + CX.dimColor(val) + '"></div></div>' +
+    '<span class="cxpak-dim-val" style="color:' + CX.dimColor(val) + '">' + val.toFixed(1) + '</span></div>';
+});
+gw.appendChild(bars);
+q1.appendChild(gw);
+grid.appendChild(q1);
+
+/* Q2: Risk table */
+var q2 = document.createElement('div'); q2.className = 'cxpak-quadrant';
+q2.innerHTML = '<div class="cxpak-quadrant-title">Top Risks</div>';
+var risks = dash.risks.top_risks || [];
+if (risks.length === 0) {
+  q2.innerHTML += '<div class="cxpak-empty">No risk data</div>';
+} else {
+  var tbl = '<table class="cxpak-risk-table"><thead><tr><th>File</th><th>Risk</th><th>Churn</th><th>Blast</th><th>Tests</th></tr></thead><tbody>';
+  risks.forEach(function(r) {
+    tbl += '<tr><td><span class="cxpak-severity-dot ' + r.severity + '"></span>' + CX.esc(r.path) + '</td>' +
+      '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
+      '<td>' + r.churn_30d + '</td><td>' + r.blast_radius + '</td>' +
+      '<td>' + (r.has_tests ? 'Y' : 'N') + '</td></tr>';
+  });
+  tbl += '</tbody></table>';
+  q2.innerHTML += tbl;
+}
+grid.appendChild(q2);
+
+/* Q3: Architecture mini-map */
+var q3 = document.createElement('div'); q3.className = 'cxpak-quadrant';
+q3.innerHTML = '<div class="cxpak-quadrant-title">Architecture (' +
+  (dash.architecture_preview.module_count || 0) + ' modules, ' +
+  (dash.architecture_preview.circular_dep_count || 0) + ' cycles)</div>';
+var mm = document.createElement('div'); mm.className = 'cxpak-minimap';
+q3.appendChild(mm);
+grid.appendChild(q3);
+var pl = dash.architecture_preview.layout || CX.layout;
+var cv = CX.svgCanvas(mm, pl.width || 600, pl.height || 400);
+CX.renderGraph(cv.g, pl);
+
+/* Q4: Alerts */
+var q4 = document.createElement('div'); q4.className = 'cxpak-quadrant';
+q4.innerHTML = '<div class="cxpak-quadrant-title">Alerts</div>';
+var al = document.createElement('div'); al.className = 'cxpak-alerts';
+var alerts = (dash.alerts && dash.alerts.alerts) || [];
+if (alerts.length === 0) {
+  al.innerHTML = '<div class="cxpak-empty">No alerts</div>';
+} else {
+  alerts.forEach(function(a) {
+    var sev = a.severity || 'Low';
+    var icon = sev === 'High' ? '!!' : sev === 'Medium' ? '!' : 'i';
+    al.innerHTML += '<div class="cxpak-alert-item sev-' + sev + '">' +
+      '<span class="cxpak-alert-icon">' + icon + '</span>' +
+      '<span class="cxpak-alert-msg">' + CX.esc(a.message) + '</span></div>';
+  });
+}
+q4.appendChild(al);
+grid.appendChild(q4);
+"#
+}
+
+/// Architecture Explorer: 3-level click-to-zoom with breadcrumb navigation.
+fn architecture_js() -> &'static str {
+    r#"
+CX.header();
+var exp = JSON.parse(document.getElementById('cxpak-explorer').textContent);
+var bc = [{ label: 'Repository', level: 1, target_id: 'root' }];
+var curLevel = 1, curTarget = 'root';
+
+var bcBar = document.createElement('div'); bcBar.className = 'cxpak-breadcrumbs';
+CX.app.appendChild(bcBar);
+
+var wrap = document.createElement('div'); wrap.className = 'cxpak-canvas';
+CX.app.appendChild(wrap);
+
+function renderBreadcrumbs() {
+  bcBar.innerHTML = '';
+  bc.forEach(function(b, i) {
+    if (i > 0) { var sep = document.createElement('span'); sep.className = 'cxpak-breadcrumb-sep'; sep.textContent = '/'; bcBar.appendChild(sep); }
+    var el = document.createElement('span'); el.className = 'cxpak-breadcrumb';
+    el.textContent = b.label;
+    if (i === bc.length - 1) { el.classList.add('active'); }
+    else { el.onclick = function() { bc = bc.slice(0, i+1); navigate(b.level, b.target_id); }; }
+    bcBar.appendChild(el);
+  });
+}
+
+function navigate(level, targetId) {
+  curLevel = level; curTarget = targetId;
+  wrap.innerHTML = '';
+  var data;
+  if (level === 1) data = exp.level1;
+  else if (level === 2) data = exp.level2[targetId] || exp.level1;
+  else data = exp.level3[targetId] || exp.level1;
+  if (!data || !data.nodes || data.nodes.length === 0) { wrap.innerHTML = '<div class="cxpak-empty">No data at this level</div>'; renderBreadcrumbs(); return; }
+  var cv = CX.svgCanvas(wrap, data.width || 1200, data.height || 800);
+  CX.renderGraph(cv.g, data, {
+    onNodeClick: function(d) {
+      if (level === 1 && exp.level2[d.id]) {
+        bc.push({ label: d.label, level: 2, target_id: d.id });
+        navigate(2, d.id);
+      } else if (level === 2 && exp.level3[d.id]) {
+        bc.push({ label: d.label, level: 3, target_id: d.id });
+        navigate(3, d.id);
+      }
+    }
+  });
+  renderBreadcrumbs();
+}
+
+navigate(1, 'root');
+"#
+}
+
+/// Risk Heatmap: D3 treemap with risk-score coloring and tooltips.
+fn risk_js() -> &'static str {
+    r#"
+CX.header();
+var hm = JSON.parse(document.getElementById('cxpak-heatmap').textContent);
+
+var wrap = document.createElement('div'); wrap.className = 'cxpak-treemap';
+CX.app.appendChild(wrap);
+
+var W = wrap.clientWidth || window.innerWidth;
+var H = (wrap.clientHeight || window.innerHeight) - 52;
+
+var svg = d3.select(wrap).append('svg').attr('width', W).attr('height', H);
+
+var color = d3.scaleLinear().domain([0, 0.4, 0.7, 1.0])
+  .range(['#06d6a0', '#ffd166', '#ef476f', '#cc1144'])
+  .clamp(true);
+
+var root = d3.hierarchy(hm.root).sum(function(d) { return d.children && d.children.length ? 0 : d.area_value; });
+
+d3.treemap().size([W, H]).padding(2).paddingTop(18).round(true)(root);
+
+var groups = svg.selectAll('g').data(root.descendants().filter(function(d) { return d.depth > 0; }))
+  .join('g').attr('transform', function(d) { return 'translate(' + d.x0 + ',' + d.y0 + ')'; });
+
+groups.append('rect').attr('class', 'treemap-cell')
+  .attr('width', function(d) { return Math.max(0, d.x1 - d.x0); })
+  .attr('height', function(d) { return Math.max(0, d.y1 - d.y0); })
+  .attr('fill', function(d) { return d.children ? '#1a1a3e' : color(d.data.risk_score); })
+  .attr('stroke', '#0f0f23').attr('stroke-width', d.children ? 0 : 1)
+  .attr('rx', 2);
+
+groups.filter(function(d) { return !d.children; }).append('text').attr('class', 'treemap-label')
+  .attr('x', 4).attr('y', 14)
+  .text(function(d) { var w = d.x1 - d.x0; return w > 40 ? d.data.label : ''; })
+  .each(function(d) { var w = d.x1 - d.x0 - 8; if (this.getComputedTextLength() > w) { var t = d.data.label; while (t.length > 2 && this.getComputedTextLength() > w) { t = t.slice(0, -1); this.textContent = t + '..'; } } });
+
+groups.filter(function(d) { return d.children && d.depth === 1; }).append('text').attr('class', 'treemap-group-label')
+  .attr('x', 4).attr('y', 12)
+  .text(function(d) { return d.data.label; });
+
+groups.filter(function(d) { return !d.children; })
+  .on('mouseover', function(ev, d) {
+    var t = d.data.tooltip || {};
+    var sev = d.data.severity || 'low';
+    var html = '<div class="tt-title">' + CX.esc(t.path || d.data.label) + '</div>' +
+      '<div class="tt-row"><span class="tt-label">Risk</span><span class="tt-value tt-' + sev + '">' + d.data.risk_score.toFixed(2) + '</span></div>' +
+      '<div class="tt-row"><span class="tt-label">Churn (30d)</span><span class="tt-value">' + (t.churn_30d || 0) + '</span></div>' +
+      '<div class="tt-row"><span class="tt-label">Blast Radius</span><span class="tt-value">' + (t.blast_radius || 0) + '</span></div>' +
+      '<div class="tt-row"><span class="tt-label">Tests</span><span class="tt-value">' + (t.test_count || 0) + '</span></div>';
+    CX.tooltip.show(html, ev);
+  })
+  .on('mouseout', function() { CX.tooltip.hide(); });
+
+window.addEventListener('resize', function() {
+  var nw = wrap.clientWidth, nh = wrap.clientHeight;
+  svg.attr('width', nw).attr('height', nh);
+  d3.treemap().size([nw, nh]).padding(2).paddingTop(18).round(true)(root);
+  groups.attr('transform', function(d) { return 'translate(' + d.x0 + ',' + d.y0 + ')'; });
+  groups.select('rect').attr('width', function(d) { return Math.max(0, d.x1 - d.x0); })
+    .attr('height', function(d) { return Math.max(0, d.y1 - d.y0); });
+});
+"#
+}
+
+/// Flow Diagram: horizontal graph with cross-language dividers and
+/// confidence badge.
+fn flow_js() -> &'static str {
+    r#"
+CX.header();
+var fl = JSON.parse(document.getElementById('cxpak-flow').textContent);
+
+var badge = document.createElement('div'); badge.className = 'cxpak-flow-badge';
+badge.innerHTML = '<span class="cxpak-flow-symbol">' + CX.esc(fl.symbol) + '</span>' +
+  '<span class="cxpak-confidence ' + fl.confidence.toLowerCase() + '">' + CX.esc(fl.confidence) + '</span>' +
+  (fl.truncated ? '<span class="cxpak-flow-truncated">Truncated</span>' : '');
+CX.app.appendChild(badge);
+
+var wrap = document.createElement('div'); wrap.className = 'cxpak-canvas';
+CX.app.appendChild(wrap);
+
+var data = fl.layout || CX.layout;
+var cv = CX.svgCanvas(wrap, data.width || 1200, data.height || 800);
+
+/* cross-language dividers */
+var dividers = fl.dividers || [];
+var dH = data.height || 800;
+dividers.forEach(function(div) {
+  cv.g.append('line').attr('class','cxpak-divider-line')
+    .attr('x1', div.x_position).attr('y1', 0)
+    .attr('x2', div.x_position).attr('y2', dH);
+  cv.g.append('text').attr('class','cxpak-divider-label')
+    .attr('x', div.x_position - 4).attr('y', 12).attr('text-anchor','end')
+    .text(div.left_language);
+  cv.g.append('text').attr('class','cxpak-divider-label')
+    .attr('x', div.x_position + 4).attr('y', 12).attr('text-anchor','start')
+    .text(div.right_language);
+});
+
+/* render the graph with flow-specific node coloring */
+CX.renderGraph(cv.g, data, {
+  nodeClass: function(d) {
+    var c = 'cxpak-node';
+    if (d.label && d.label.indexOf('...') === 0) return c;
+    var idx = (data.nodes || []).indexOf(d);
+    if (idx === 0) c += ' cxpak-flow-source';
+    else if (idx === (data.nodes || []).length - 1) c += ' cxpak-flow-sink';
+    else c += ' cxpak-flow-transform';
+    return c;
+  }
+});
+"#
+}
+
+/// Timeline view: health sparkline, commit dots, and per-step graph.
+fn timeline_js() -> &'static str {
+    r#"
+CX.header();
+var tl = JSON.parse(document.getElementById('cxpak-timeline').textContent);
+var steps = tl.steps || [];
+var curIdx = tl.current_index || 0;
+
+var wrap = document.createElement('div'); wrap.className = 'cxpak-timeline-wrap';
+CX.app.appendChild(wrap);
+
+/* sparkline area */
+var spark = document.createElement('div'); spark.className = 'cxpak-sparkline-area';
+wrap.appendChild(spark);
+var sp = tl.health_sparkline || [];
+if (sp.length > 1) {
+  var sw = spark.clientWidth || (window.innerWidth - 48), sh = 64;
+  var sSvg = d3.select(spark).append('svg').attr('width', sw).attr('height', sh);
+  var xS = d3.scaleLinear().domain([0, sp.length - 1]).range([0, sw]);
+  var yS = d3.scaleLinear().domain([0, 10]).range([sh, 0]);
+  var ln = d3.line().x(function(d, i) { return xS(i); }).y(function(d) { return yS(d[1]); }).curve(d3.curveMonotoneX);
+  var area = d3.area().x(function(d, i) { return xS(i); }).y0(sh).y1(function(d) { return yS(d[1]); }).curve(d3.curveMonotoneX);
+  sSvg.append('path').datum(sp).attr('class','cxpak-sparkline-fill').attr('d', area);
+  sSvg.append('path').datum(sp).attr('class','cxpak-sparkline-path').attr('d', ln);
+}
+
+/* graph area */
+var graphArea = document.createElement('div'); graphArea.className = 'cxpak-timeline-graph';
+wrap.appendChild(graphArea);
+
+/* timeline bar */
+var bar = document.createElement('div'); bar.className = 'cxpak-timeline-bar';
+wrap.appendChild(bar);
+
+function renderStep(idx) {
+  if (idx < 0 || idx >= steps.length) return;
+  curIdx = idx;
+  graphArea.innerHTML = '';
+  var step = steps[idx];
+  var data = step.layout || CX.layout;
+  var cv = CX.svgCanvas(graphArea, data.width || 1200, data.height || 800);
+  CX.renderGraph(cv.g, data);
+  renderBar();
+}
+
+function renderBar() {
+  bar.innerHTML = '';
+  if (steps.length === 0) return;
+  var bw = bar.clientWidth || (window.innerWidth - 48), bh = 44;
+  var bSvg = d3.select(bar).append('svg').attr('width', bw).attr('height', bh);
+  var xB = d3.scaleLinear().domain([0, Math.max(1, steps.length - 1)]).range([20, bw - 20]);
+
+  bSvg.append('line').attr('x1', 20).attr('y1', bh/2).attr('x2', bw-20).attr('y2', bh/2)
+    .attr('stroke', '#353565').attr('stroke-width', 2);
+
+  bSvg.selectAll('circle').data(steps).join('circle')
+    .attr('class', function(d, i) { return 'cxpak-commit-dot' + (i === curIdx ? ' active' : ''); })
+    .attr('cx', function(d, i) { return xB(i); })
+    .attr('cy', bh/2).attr('r', function(d, i) { return i === curIdx ? 6 : 4; })
+    .attr('fill', function(d, i) { return i === curIdx ? '#4cc9f0' : '#3a3a60'; })
+    .on('click', function(ev, d) { renderStep(steps.indexOf(d)); })
+    .on('mouseover', function(ev, d) {
+      var s = d.snapshot;
+      CX.tooltip.show('<div class="tt-title">' + CX.esc(s.commit_sha.slice(0,8)) + '</div>' +
+        '<div class="tt-row"><span class="tt-label">Date</span><span class="tt-value">' + CX.esc(s.commit_date) + '</span></div>' +
+        '<div class="tt-row"><span class="tt-label">Files</span><span class="tt-value">' + s.files.length + '</span></div>' +
+        '<div class="tt-row"><span class="tt-label">Message</span><span class="tt-value">' + CX.esc(s.commit_message) + '</span></div>', ev);
+    })
+    .on('mouseout', function() { CX.tooltip.hide(); });
+
+  /* key events */
+  var evts = tl.key_events || [];
+  var evtColors = { CycleIntroduced: '#ef476f', CycleResolved: '#06d6a0', LargeChurn: '#ffd166', HealthDropped: '#ef476f', NewModule: '#4cc9f0', ModuleRemoved: '#ff9f43' };
+  bSvg.selectAll('.cxpak-event-flag').data(evts).join('g').attr('class', 'cxpak-event-flag')
+    .attr('transform', function(d) { return 'translate(' + xB(d.step_index) + ',' + (bh/2 - 14) + ')'; })
+    .append('polygon').attr('points', '0,0 4,-8 -4,-8')
+    .attr('fill', function(d) { return evtColors[d.kind] || '#7b68ee'; })
+    .on('mouseover', function(ev, d) { CX.tooltip.show('<div class="tt-title">' + CX.esc(d.kind) + '</div><div>' + CX.esc(d.message) + '</div>', ev); })
+    .on('mouseout', function() { CX.tooltip.hide(); });
+}
+
+renderStep(curIdx);
+"#
+}
+
+/// Diff view: side-by-side before/after with highlighted changes.
+fn diff_js() -> &'static str {
+    r#"
+CX.header();
+var df = JSON.parse(document.getElementById('cxpak-diff').textContent);
+
+var dw = document.createElement('div'); dw.className = 'cxpak-diff-wrap';
+CX.app.appendChild(dw);
+
+/* impact header */
+var dh = document.createElement('div'); dh.className = 'cxpak-diff-header';
+var impSev = df.impact_score >= 0.5 ? 'high' : df.impact_score >= 0.15 ? 'medium' : 'low';
+dh.innerHTML = '<span>Changed: <b>' + df.changed_files.length + '</b> files</span>' +
+  '<span>Blast radius: <b>' + df.blast_radius_files.length + '</b> files</span>' +
+  '<span class="cxpak-impact-badge ' + impSev + '">Impact ' + (df.impact_score * 100).toFixed(0) + '%</span>';
+dw.appendChild(dh);
+
+/* panels */
+var panels = document.createElement('div'); panels.className = 'cxpak-diff-panels';
+dw.appendChild(panels);
+
+var changedSet = {}; df.changed_files.forEach(function(f) { changedSet[f] = true; });
+var blastSet = {}; df.blast_radius_files.forEach(function(f) { blastSet[f] = true; });
+
+function diffNodeClass(d) {
+  var c = CX.nodeClass(d);
+  if (changedSet[d.id]) c += ' changed';
+  else if (blastSet[d.id]) c += ' blast';
+  return c;
+}
+
+/* before panel */
+var p1 = document.createElement('div'); p1.className = 'cxpak-diff-panel';
+p1.innerHTML = '<div class="cxpak-diff-label">Before</div>';
+panels.appendChild(p1);
+var b = df.before || CX.layout;
+var cv1 = CX.svgCanvas(p1, b.width || 1200, b.height || 800);
+CX.renderGraph(cv1.g, b, { nodeClass: CX.nodeClass });
+
+/* after panel */
+var p2 = document.createElement('div'); p2.className = 'cxpak-diff-panel';
+p2.innerHTML = '<div class="cxpak-diff-label">After</div>';
+panels.appendChild(p2);
+var a = df.after || CX.layout;
+var cv2 = CX.svgCanvas(p2, a.width || 1200, a.height || 800);
+CX.renderGraph(cv2.g, a, { nodeClass: diffNodeClass });
+
+/* risk list */
+if (df.new_risks && df.new_risks.length > 0) {
+  var rl = document.createElement('div'); rl.className = 'cxpak-diff-risks';
+  rl.innerHTML = '<div class="cxpak-diff-risks-title">Affected Files</div>';
+  var tbl = '<table class="cxpak-risk-table"><thead><tr><th>File</th><th>Risk</th><th>Blast</th></tr></thead><tbody>';
+  df.new_risks.slice(0, 10).forEach(function(r) {
+    tbl += '<tr><td><span class="cxpak-severity-dot ' + r.severity + '"></span>' + CX.esc(r.path) + '</td>' +
+      '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
+      '<td>' + r.blast_radius + '</td></tr>';
+  });
+  tbl += '</tbody></table>';
+  rl.innerHTML += tbl;
+  dw.appendChild(rl);
+}
+"#
 }
 
 /// Renders a self-contained HTML file.  All JS/CSS is inlined — no CDN dependencies.

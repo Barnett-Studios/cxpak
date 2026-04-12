@@ -1,20 +1,31 @@
-/* cxpak visual — minimal dashboard stylesheet */
-/* Dark mode default, OKLab-inspired palette */
+/* cxpak visual -- production dashboard stylesheet */
+/* Dark mode, OKLab-inspired vibrant palette on deep navy */
 
 :root {
-  --bg-primary: #1a1a2e;
-  --bg-secondary: #16213e;
-  --bg-card: #1e2a3a;
-  --text-primary: #e0e0e0;
-  --text-secondary: #a0a0b0;
+  --bg-primary: #0f0f23;
+  --bg-secondary: #131330;
+  --bg-card: #1a1a3e;
+  --bg-card-hover: #222255;
+  --text-primary: #e8e8f0;
+  --text-secondary: #8888aa;
+  --text-dim: #55557a;
   --accent-blue: #4cc9f0;
   --accent-green: #06d6a0;
   --accent-yellow: #ffd166;
   --accent-red: #ef476f;
   --accent-purple: #7b68ee;
-  --border: #2a3a4a;
-  --node-default: #3a4a5a;
-  --edge-default: #4a5a6a;
+  --accent-orange: #ff9f43;
+  --accent-cyan: #00e5ff;
+  --border: #252545;
+  --border-light: #353565;
+  --node-default: #2a2a50;
+  --node-hover: #3a3a6a;
+  --edge-default: #3a3a60;
+  --edge-hover: #6a6aaa;
+  --shadow: rgba(0, 0, 0, 0.4);
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -24,9 +35,10 @@ html, body {
   height: 100%;
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
   font-size: 14px;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
 #cxpak-app {
@@ -36,26 +48,62 @@ html, body {
   flex-direction: column;
 }
 
-.cxpak-header {
+/* ── Header bar ──────────────────────────────────────────────────── */
+
+#cxpak-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 12px 20px;
-  background: var(--bg-secondary);
+  gap: 16px;
+  padding: 10px 24px;
+  background: linear-gradient(180deg, var(--bg-secondary), var(--bg-primary));
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  z-index: 50;
 }
 
-.cxpak-header h1 {
-  font-size: 16px;
+#cxpak-header .cxpak-logo {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent-purple);
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+
+#cxpak-header .cxpak-repo {
+  font-size: 15px;
   font-weight: 600;
-  color: var(--accent-blue);
+  color: var(--text-primary);
 }
 
-.cxpak-header .meta {
-  font-size: 12px;
-  color: var(--text-secondary);
+#cxpak-header .cxpak-type {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 10px;
+  background: var(--accent-purple);
+  color: #fff;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
 }
+
+#cxpak-header .cxpak-health {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 10px;
+  margin-left: auto;
+}
+
+#cxpak-header .cxpak-health.good { background: rgba(6, 214, 160, 0.2); color: var(--accent-green); }
+#cxpak-header .cxpak-health.warn { background: rgba(255, 209, 102, 0.2); color: var(--accent-yellow); }
+#cxpak-header .cxpak-health.bad { background: rgba(239, 71, 111, 0.2); color: var(--accent-red); }
+
+#cxpak-header .cxpak-timestamp {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* ── Canvas (SVG views) ──────────────────────────────────────────── */
 
 .cxpak-canvas {
   flex: 1;
@@ -66,121 +114,530 @@ html, body {
 .cxpak-canvas svg {
   width: 100%;
   height: 100%;
+  cursor: grab;
 }
 
-/* Node styles */
-.node rect {
+.cxpak-canvas svg:active { cursor: grabbing; }
+
+/* ── Node styles ─────────────────────────────────────────────────── */
+
+.cxpak-node rect {
   fill: var(--node-default);
-  stroke: var(--border);
+  stroke: var(--border-light);
   stroke-width: 1;
-  rx: 4;
+  rx: 6;
   cursor: pointer;
-  transition: fill 0.2s;
+  transition: fill 0.15s, stroke 0.15s, filter 0.15s;
 }
 
-.node rect:hover {
-  fill: var(--accent-blue);
+.cxpak-node rect:hover {
+  fill: var(--node-hover);
   stroke: var(--accent-blue);
+  filter: drop-shadow(0 0 6px rgba(76, 201, 240, 0.3));
 }
 
-.node text {
+.cxpak-node text {
   fill: var(--text-primary);
   font-size: 11px;
+  font-weight: 500;
   pointer-events: none;
 }
 
-.node.risk-high rect { stroke: var(--accent-red); stroke-width: 2; }
-.node.risk-medium rect { stroke: var(--accent-yellow); stroke-width: 2; }
-.node.god-file rect { fill: var(--accent-red); opacity: 0.8; }
-.node.circular rect { stroke: var(--accent-purple); stroke-dasharray: 4 2; }
+.cxpak-node.risk-high rect { stroke: var(--accent-red); stroke-width: 2; }
+.cxpak-node.risk-medium rect { stroke: var(--accent-yellow); stroke-width: 2; }
+.cxpak-node.god-file rect { fill: rgba(239, 71, 111, 0.25); stroke: var(--accent-red); stroke-width: 2; }
+.cxpak-node.circular rect { stroke: var(--accent-purple); stroke-dasharray: 5 3; stroke-width: 2; }
+.cxpak-node.changed rect { fill: rgba(255, 209, 102, 0.2); stroke: var(--accent-yellow); stroke-width: 2; }
+.cxpak-node.blast rect { fill: rgba(255, 159, 67, 0.15); stroke: var(--accent-orange); stroke-width: 1.5; }
 
-/* Edge styles */
-.edge path {
+/* ── Edge styles ─────────────────────────────────────────────────── */
+
+.cxpak-edge line,
+.cxpak-edge path {
   fill: none;
   stroke: var(--edge-default);
   stroke-width: 1.5;
-  opacity: 0.6;
+  opacity: 0.5;
+  transition: stroke 0.15s, opacity 0.15s;
 }
 
-.edge path:hover { stroke: var(--accent-blue); opacity: 1; }
-.edge.cycle path { stroke: var(--accent-purple); stroke-dasharray: 4 2; }
+.cxpak-edge line:hover,
+.cxpak-edge path:hover { stroke: var(--accent-blue); opacity: 1; }
+.cxpak-edge.cycle line,
+.cxpak-edge.cycle path { stroke: var(--accent-purple); stroke-dasharray: 5 3; opacity: 0.7; }
+.cxpak-edge.cross-lang line,
+.cxpak-edge.cross-lang path { stroke: var(--accent-orange); stroke-dasharray: 8 4; opacity: 0.6; }
 
-/* Cluster styles */
-.cluster rect {
-  fill: var(--bg-card);
-  stroke: var(--border);
-  stroke-dasharray: 6 3;
-  rx: 8;
-}
+/* Edge arrowheads */
+.cxpak-arrowhead { fill: var(--edge-default); }
 
-/* Tooltip */
+/* ── Tooltip ─────────────────────────────────────────────────────── */
+
 .cxpak-tooltip {
-  position: absolute;
-  padding: 8px 12px;
+  position: fixed;
+  padding: 10px 14px;
   background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
   font-size: 12px;
+  line-height: 1.5;
   color: var(--text-primary);
   pointer-events: none;
   opacity: 0;
-  transition: opacity 0.15s;
-  max-width: 300px;
-  z-index: 100;
+  transition: opacity 0.12s;
+  max-width: 320px;
+  z-index: 200;
+  box-shadow: 0 4px 20px var(--shadow);
 }
 
 .cxpak-tooltip.visible { opacity: 1; }
+.cxpak-tooltip .tt-title { font-weight: 600; margin-bottom: 4px; color: var(--accent-blue); }
+.cxpak-tooltip .tt-row { display: flex; justify-content: space-between; gap: 16px; }
+.cxpak-tooltip .tt-label { color: var(--text-secondary); }
+.cxpak-tooltip .tt-value { font-weight: 600; text-align: right; }
+.cxpak-tooltip .tt-high { color: var(--accent-red); }
+.cxpak-tooltip .tt-medium { color: var(--accent-yellow); }
+.cxpak-tooltip .tt-low { color: var(--accent-green); }
 
-/* Metrics panel */
-.cxpak-metrics {
+/* ── Dashboard: 4-quadrant grid ──────────────────────────────────── */
+
+.cxpak-dashboard {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.cxpak-quadrant {
+  background: var(--bg-primary);
+  padding: 20px;
   display: flex;
-  gap: 16px;
-  padding: 8px 20px;
-  background: var(--bg-secondary);
-  border-top: 1px solid var(--border);
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.cxpak-quadrant-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
   flex-shrink: 0;
 }
 
-.metric {
+/* Health gauge */
+.cxpak-gauge-wrap {
   display: flex;
   flex-direction: column;
   align-items: center;
+  gap: 16px;
+  flex: 1;
 }
 
-.metric-value {
-  font-size: 18px;
-  font-weight: 700;
-  color: var(--accent-blue);
+.cxpak-gauge-score {
+  font-size: 48px;
+  font-weight: 800;
+  line-height: 1;
 }
 
-.metric-label {
-  font-size: 10px;
+.cxpak-gauge-score.good { color: var(--accent-green); }
+.cxpak-gauge-score.warn { color: var(--accent-yellow); }
+.cxpak-gauge-score.bad { color: var(--accent-red); }
+
+.cxpak-dim-bars {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cxpak-dim-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.cxpak-dim-label {
+  width: 110px;
   color: var(--text-secondary);
+  text-transform: capitalize;
+  flex-shrink: 0;
+}
+
+.cxpak-dim-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-card);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.cxpak-dim-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.6s ease-out;
+}
+
+.cxpak-dim-val {
+  width: 32px;
+  text-align: right;
+  font-weight: 600;
+  font-size: 11px;
+}
+
+/* Risk table */
+.cxpak-risk-table {
+  width: 100%;
+  font-size: 12px;
+  border-collapse: collapse;
+  flex: 1;
+}
+
+.cxpak-risk-table th {
+  text-align: left;
+  padding: 6px 8px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.cxpak-risk-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.cxpak-risk-table tr:hover td { background: var(--bg-card); }
+
+.cxpak-severity-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+
+.cxpak-severity-dot.high { background: var(--accent-red); box-shadow: 0 0 4px var(--accent-red); }
+.cxpak-severity-dot.medium { background: var(--accent-yellow); box-shadow: 0 0 4px var(--accent-yellow); }
+.cxpak-severity-dot.low { background: var(--accent-green); box-shadow: 0 0 4px var(--accent-green); }
+
+/* Alerts list */
+.cxpak-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.cxpak-alert-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--border);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.cxpak-alert-item.sev-High { border-left-color: var(--accent-red); }
+.cxpak-alert-item.sev-Medium { border-left-color: var(--accent-yellow); }
+.cxpak-alert-item.sev-Low { border-left-color: var(--accent-green); }
+
+.cxpak-alert-icon {
+  flex-shrink: 0;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.cxpak-alert-msg { color: var(--text-primary); }
+
+.cxpak-empty {
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 20px;
+  text-align: center;
+}
+
+/* Architecture mini-map (inside dashboard quadrant) */
+.cxpak-minimap {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+}
+
+.cxpak-minimap svg { width: 100%; height: 100%; }
+
+/* ── Breadcrumbs (Architecture Explorer) ─────────────────────────── */
+
+.cxpak-breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.cxpak-breadcrumb {
+  color: var(--accent-blue);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+
+.cxpak-breadcrumb:hover { background: var(--bg-card); }
+.cxpak-breadcrumb.active { color: var(--text-primary); cursor: default; }
+.cxpak-breadcrumb-sep { color: var(--text-dim); }
+
+/* ── Treemap (Risk Heatmap) ──────────────────────────────────────── */
+
+.cxpak-treemap {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.treemap-cell {
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.treemap-cell:hover { opacity: 0.85; filter: brightness(1.15); }
+
+.treemap-label {
+  fill: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+}
+
+.treemap-group-label {
+  fill: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  pointer-events: none;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ── Flow Diagram ────────────────────────────────────────────────── */
+
+.cxpak-flow-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.cxpak-flow-symbol {
+  font-weight: 700;
+  color: var(--accent-cyan);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.cxpak-confidence {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
   text-transform: uppercase;
 }
 
-/* Treemap (risk heatmap) */
-.treemap-cell {
-  stroke: var(--bg-primary);
-  stroke-width: 2;
+.cxpak-confidence.exact { background: rgba(6, 214, 160, 0.2); color: var(--accent-green); }
+.cxpak-confidence.approximate { background: rgba(255, 209, 102, 0.2); color: var(--accent-yellow); }
+.cxpak-confidence.speculative { background: rgba(239, 71, 111, 0.2); color: var(--accent-red); }
+
+.cxpak-flow-truncated {
+  color: var(--accent-orange);
+  font-size: 11px;
+}
+
+.cxpak-divider-line {
+  stroke: var(--accent-orange);
+  stroke-width: 1;
+  stroke-dasharray: 6 4;
+  opacity: 0.5;
+}
+
+.cxpak-divider-label {
+  fill: var(--text-dim);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.cxpak-flow-source rect { fill: rgba(6, 214, 160, 0.2); stroke: var(--accent-green); }
+.cxpak-flow-sink rect { fill: rgba(239, 71, 111, 0.2); stroke: var(--accent-red); }
+.cxpak-flow-transform rect { fill: rgba(76, 201, 240, 0.2); stroke: var(--accent-blue); }
+
+/* ── Timeline ────────────────────────────────────────────────────── */
+
+.cxpak-timeline-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.cxpak-sparkline-area {
+  flex-shrink: 0;
+  height: 80px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 24px;
+}
+
+.cxpak-sparkline-path {
+  fill: none;
+  stroke: var(--accent-blue);
+  stroke-width: 1.5;
+}
+
+.cxpak-sparkline-fill {
+  fill: rgba(76, 201, 240, 0.08);
+}
+
+.cxpak-timeline-graph {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.cxpak-timeline-bar {
+  flex-shrink: 0;
+  height: 60px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  padding: 8px 24px;
+  display: flex;
+  align-items: center;
+}
+
+.cxpak-commit-dot {
+  cursor: pointer;
+  transition: r 0.15s, fill 0.15s;
+}
+
+.cxpak-commit-dot:hover { r: 6; }
+.cxpak-commit-dot.active { fill: var(--accent-blue); r: 6; }
+
+.cxpak-event-flag {
   cursor: pointer;
 }
 
-.treemap-label {
-  fill: var(--text-primary);
+.cxpak-event-flag polygon { transition: opacity 0.15s; }
+.cxpak-event-flag polygon:hover { opacity: 0.8; }
+
+.cxpak-slider-label {
   font-size: 10px;
-  pointer-events: none;
+  color: var(--text-dim);
 }
 
-/* Timeline */
-.timeline-bar {
-  cursor: pointer;
-  transition: opacity 0.2s;
+/* ── Diff View ───────────────────────────────────────────────────── */
+
+.cxpak-diff-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
-.timeline-bar:hover { opacity: 0.8; }
+.cxpak-diff-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  flex-shrink: 0;
+}
 
-/* Scrollbar */
-::-webkit-scrollbar { width: 6px; }
+.cxpak-impact-badge {
+  padding: 3px 10px;
+  border-radius: 10px;
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.cxpak-impact-badge.low { background: rgba(6, 214, 160, 0.2); color: var(--accent-green); }
+.cxpak-impact-badge.medium { background: rgba(255, 209, 102, 0.2); color: var(--accent-yellow); }
+.cxpak-impact-badge.high { background: rgba(239, 71, 111, 0.2); color: var(--accent-red); }
+
+.cxpak-diff-panels {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.cxpak-diff-panel {
+  background: var(--bg-primary);
+  overflow: hidden;
+  position: relative;
+}
+
+.cxpak-diff-label {
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  z-index: 10;
+  background: var(--bg-primary);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.cxpak-diff-risks {
+  flex-shrink: 0;
+  max-height: 120px;
+  overflow-y: auto;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  padding: 8px 24px;
+}
+
+.cxpak-diff-risks-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+/* ── Scrollbar ───────────────────────────────────────────────────── */
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: var(--bg-primary); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
