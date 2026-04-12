@@ -52,6 +52,7 @@ pub struct OnboardingMap {
 }
 
 /// Identify the module prefix (first two path components) for a file path.
+#[cfg(test)]
 fn module_prefix(path: &str) -> String {
     let parts: Vec<&str> = path.splitn(3, '/').collect();
     if parts.len() >= 2 {
@@ -75,29 +76,34 @@ fn is_entry_point(path: &str) -> bool {
         || path.ends_with("/index.js")
 }
 
-/// Build a basic onboarding map from the index.
+/// Build an onboarding map from the index using the intelligence pipeline.
 ///
-/// Groups files by module prefix, sorts each group by PageRank, and creates
-/// a phase per module. Entry points always come first as their own phase.
-///
-/// Tasks 16-20 will replace this with the full topological-sort pipeline
-/// including 7±2 phase grouping and precise reading-time calculation.
+/// Entry points are placed first as their own phase. The remaining files are
+/// sorted topologically (dependency-first) and grouped into phases of ≤9
+/// files per module, ordered by aggregate PageRank. Reading time is
+/// estimated via [`crate::intelligence::onboarding::format_reading_time`].
 pub fn build_onboarding_map(
     index: &crate::index::CodebaseIndex,
     _focus: Option<&str>,
 ) -> OnboardingMap {
+    use crate::intelligence::onboarding::{
+        format_reading_time, group_into_phases, topological_sort_files,
+    };
     use std::collections::HashMap;
 
-    // Separate entry points from the rest.
+    // Build per-file metadata maps for the intelligence functions.
+    let mut file_tokens: HashMap<String, usize> = HashMap::new();
+    let mut file_symbols: HashMap<String, Vec<String>> = HashMap::new();
     let mut entry_files: Vec<OnboardingFile> = Vec::new();
-    let mut module_files: HashMap<String, Vec<OnboardingFile>> = HashMap::new();
+    let mut non_entry_paths: Vec<String> = Vec::new();
 
     for file in &index.files {
         let path = &file.relative_path;
         let pagerank = *index.pagerank.get(path.as_str()).unwrap_or(&0.0);
 
-        // Collect public symbol names to suggest as focus points.
-        let symbols_to_focus_on: Vec<String> = file
+        file_tokens.insert(path.clone(), file.token_count);
+
+        let symbols: Vec<String> = file
             .parse_result
             .as_ref()
             .map(|pr| {
@@ -109,19 +115,17 @@ pub fn build_onboarding_map(
                     .collect()
             })
             .unwrap_or_default();
-
-        let onboard_file = OnboardingFile {
-            path: path.clone(),
-            pagerank,
-            symbols_to_focus_on,
-            estimated_tokens: file.token_count,
-        };
+        file_symbols.insert(path.clone(), symbols.clone());
 
         if is_entry_point(path) {
-            entry_files.push(onboard_file);
+            entry_files.push(OnboardingFile {
+                path: path.clone(),
+                pagerank,
+                symbols_to_focus_on: symbols,
+                estimated_tokens: file.token_count,
+            });
         } else {
-            let module = module_prefix(path);
-            module_files.entry(module).or_default().push(onboard_file);
+            non_entry_paths.push(path.clone());
         }
     }
 
@@ -132,77 +136,37 @@ pub fn build_onboarding_map(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Build phases: entry points first, then modules sorted by total pagerank.
+    // Build phases: entry points first.
     let mut phases: Vec<OnboardingPhase> = Vec::new();
 
     if !entry_files.is_empty() {
-        let total_entry_tokens: usize = entry_files.iter().map(|f| f.estimated_tokens).sum();
         phases.push(OnboardingPhase {
             name: "Entry Points".to_string(),
             module: "entry".to_string(),
             rationale: "Start here to understand how the codebase is structured and where execution begins. These files define the public interface and top-level flow.".to_string(),
             files: entry_files,
         });
-        let _ = total_entry_tokens;
     }
 
-    // Sort module groups by cumulative pagerank (most important modules first).
-    let mut module_vec: Vec<(String, Vec<OnboardingFile>)> = module_files.into_iter().collect();
-    module_vec.sort_by(|(_, files_a), (_, files_b)| {
-        let rank_a: f64 = files_a.iter().map(|f| f.pagerank).sum();
-        let rank_b: f64 = files_b.iter().map(|f| f.pagerank).sum();
-        rank_b
-            .partial_cmp(&rank_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Sort remaining files topologically and group into phases.
+    let non_entry_refs: Vec<&str> = non_entry_paths.iter().map(|s| s.as_str()).collect();
+    let sorted = topological_sort_files(&non_entry_refs, &index.graph);
+    let mut module_phases = group_into_phases(
+        &sorted,
+        &index.pagerank,
+        &index.graph,
+        &file_tokens,
+        &file_symbols,
+    );
+    phases.append(&mut module_phases);
 
-    for (module, mut files) in module_vec {
-        // Sort files within the module by pagerank descending.
-        files.sort_by(|a, b| {
-            b.pagerank
-                .partial_cmp(&a.pagerank)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let name = module
-            .split('/')
-            .next_back()
-            .map(|s| {
-                let mut chars = s.chars();
-                match chars.next() {
-                    None => String::new(),
-                    Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-                }
-            })
-            .unwrap_or_else(|| module.clone());
-        phases.push(OnboardingPhase {
-            name,
-            module: module.clone(),
-            rationale: format!("Understand the `{module}` module, which contains related functionality grouped together."),
-            files,
-        });
-    }
-
-    // Calculate total tokens across all phases for reading-time estimation.
+    // Calculate total tokens and reading time.
     let total_tokens: usize = phases
         .iter()
         .flat_map(|p| p.files.iter())
         .map(|f| f.estimated_tokens)
         .sum();
-
-    // Estimate reading time: ~200 tokens per minute for code.
-    let minutes = (total_tokens as f64 / 200.0).ceil() as usize;
-    let estimated_reading_time = if minutes < 60 {
-        format!("~{minutes} minutes")
-    } else {
-        let hours = minutes / 60;
-        let remaining = minutes % 60;
-        if remaining == 0 {
-            format!("~{hours} hour{}", if hours == 1 { "" } else { "s" })
-        } else {
-            format!("~{hours}h {remaining}m")
-        }
-    };
-
+    let estimated_reading_time = format_reading_time(total_tokens);
     let total_files: usize = phases.iter().map(|p| p.files.len()).sum();
 
     OnboardingMap {
@@ -379,7 +343,7 @@ mod tests {
         );
         assert!(md.contains("Phase 1:"), "should have Phase 1");
         assert!(
-            md.contains("estimated_reading_time") || md.contains("minutes") || md.contains("hour"),
+            md.contains("Estimated reading time:"),
             "should mention reading time"
         );
     }
@@ -412,7 +376,7 @@ mod tests {
     #[test]
     fn test_estimated_reading_time_minutes() {
         let counter = TokenCounter::new();
-        // A tiny index: reading time should be in minutes
+        // A tiny index: reading time should be a small number of minutes
         let files = vec![ScannedFile {
             relative_path: "src/tiny.rs".to_string(),
             absolute_path: PathBuf::from("/tmp/src/tiny.rs"),
@@ -423,10 +387,15 @@ mod tests {
         content_map.insert("src/tiny.rs".to_string(), "fn x() {}".to_string());
         let index = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
         let map = build_onboarding_map(&index, None);
-        // Should be a very small reading time
+        // format_reading_time returns "~Nm" for sub-hour durations
         assert!(
-            map.estimated_reading_time.contains("minute"),
-            "small index should show minutes, got: {}",
+            map.estimated_reading_time.starts_with('~'),
+            "reading time should start with ~, got: {}",
+            map.estimated_reading_time
+        );
+        assert!(
+            !map.estimated_reading_time.contains('h'),
+            "small index should not show hours, got: {}",
             map.estimated_reading_time
         );
     }

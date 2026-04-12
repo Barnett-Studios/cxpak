@@ -8,6 +8,8 @@ pub mod data_flow;
 pub mod dead_code;
 pub mod drift;
 pub mod health;
+#[cfg(feature = "visual")]
+pub mod onboarding;
 pub mod pagerank;
 pub mod predict;
 pub mod recent_changes;
