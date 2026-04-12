@@ -368,7 +368,11 @@ pub(crate) fn barycenter_sort(
                 })
                 .collect();
 
-            barycenters.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            barycenters.sort_by(|a, b| {
+                a.0.partial_cmp(&b.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
             layer_order[layer_idx] = barycenters.into_iter().map(|(_, id)| id).collect();
         }
     }
@@ -447,6 +451,11 @@ pub fn compute_layout(
         layer_order[l].push(node.id.clone());
     }
 
+    // Sort each layer alphabetically for deterministic initial ordering.
+    for layer in &mut layer_order {
+        layer.sort();
+    }
+
     // 5. Build adjacency / reverse_adjacency from augmented edges.
     let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
     let mut reverse_adjacency: HashMap<String, Vec<String>> = HashMap::new();
@@ -523,15 +532,8 @@ pub fn compute_layout(
         })
         .collect();
 
-    // Also carry over any position/layer updates for nodes that were in the original list.
-    // (aug_nodes started from nodes, so this is already handled above.)
-    // Ensure ordering matches original node order for stability.
-    let orig_order: HashMap<&str, usize> = nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.id.as_str(), i))
-        .collect();
-    final_nodes.sort_by_key(|n| orig_order.get(n.id.as_str()).copied().unwrap_or(usize::MAX));
+    // Sort final nodes by id for deterministic output regardless of input order.
+    final_nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
     // 11. Compute overall width and height from node positions.
     let width = final_nodes

@@ -252,10 +252,14 @@ mod visual_tests {
         let first = run_visual_to_file(repo.path(), "architecture", "json");
         let second = run_visual_to_file(repo.path(), "architecture", "json");
 
-        // JSON layout doesn't embed timestamps, so the comparison is exact.
+        // Compare as parsed JSON values to avoid HashMap iteration-order flakiness.
+        let v1: serde_json::Value =
+            serde_json::from_str(&first).expect("first run must produce valid JSON");
+        let v2: serde_json::Value =
+            serde_json::from_str(&second).expect("second run must produce valid JSON");
         assert_eq!(
-            first, second,
-            "Two runs of `cxpak visual --format json` must produce identical output"
+            v1, v2,
+            "Two runs of `cxpak visual --format json` must produce identical layout data"
         );
     }
 
