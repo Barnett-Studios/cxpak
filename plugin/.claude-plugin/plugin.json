@@ -1,6 +1,6 @@
 {
   "name": "cxpak",
-  "description": "Structured codebase context for Claude Code, powered by cxpak",
+  "description": "26 MCP tools for codebase intelligence — visual dashboards, architecture explorer, risk heatmaps, onboarding maps, convention verification, health scoring, call graphs, blast radius, change prediction, drift detection, security surface, data flow tracing, cross-language resolution, and WASM plugin SDK. Powered by tree-sitter across 42 languages.",
   "version": "2.0.0",
   "author": {
     "name": "Barnett Studios"

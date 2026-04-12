@@ -27,6 +27,9 @@ Pipeline: **Scanner → Parser → Schema → Index → Conventions → Budget �
 10. **Embeddings** (`src/embeddings/`) — local candle inference with all-MiniLM-L6-v2 and remote API providers (OpenAI, Voyage AI, Cohere); builds and queries the vector index for semantic similarity scoring
 11. **Output** (`src/output/`) — renders to markdown, JSON, or XML
 12. **LSP** (`src/lsp/`) — LSP server over stdio (`cxpak lsp`). `backend.rs` implements `tower_lsp::LanguageServer` with 4 standard methods (codeLens, hover, diagnostic, workspace/symbol) and 14 custom `cxpak/*` JSON-RPC methods. `methods.rs` holds the dispatch logic for custom methods. Reuses `build_index` from the daemon module. Feature flag: `lsp = ["dep:tower-lsp", "daemon"]`
+13. **Visual** (`src/visual/`) — interactive dashboards and static diagrams. `layout.rs` implements the Sugiyama layout engine (layer assignment with SCC condensation, barycenter crossing minimization, Brandes-Kopf coordinate assignment, 3-level builders for module/file/symbol graphs, 7±2 cognitive limit clustering). `render.rs` has 6 view renderers (Dashboard, Architecture Explorer, Risk Heatmap, Flow Diagram, Time Machine, Diff View) producing self-contained HTML with inlined D3.js. `export.rs` provides multi-format output (Mermaid, SVG, PNG via resvg, C4 DSL, JSON). `timeline.rs` computes git history snapshots. `onboard.rs` renders onboarding maps as markdown/JSON. Feature flag: `visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]`
+14. **Plugin** (`src/plugin/`) — WASM plugin SDK. `mod.rs` defines the always-compiled types (`PluginCapability`, `IndexSnapshot`, `FileSnapshot`, `Finding`, `Detection`, `CxpakPlugin` trait). `loader.rs` (feature-gated `plugins`) wraps wasmtime with 10MB size limit. `manifest.rs` handles `.cxpak/plugins.json` with SHA-256 checksum verification and file pattern scoping. `security.rs` enforces 1MB return payload limits and content access warnings. Feature flag: `plugins = ["dep:wasmtime"]`
+15. **Onboarding** (`src/intelligence/onboarding.rs`) — canonical onboarding logic (feature-gated `visual`). `topological_sort_files` (Kahn's algorithm with lexicographic cycle-break), `group_into_phases` (module grouping, PageRank ordering, 7±2 splitting), `format_reading_time` (200 tokens/min). The visual/onboard.rs module delegates to these functions.
 
 ## Commands
 
@@ -35,8 +38,10 @@ Pipeline: **Scanner → Parser → Schema → Index → Conventions → Budget �
 - `conventions export <path>` — writes `.cxpak/conventions.json` (`ConventionExport` with SHA256 checksum)
 - `conventions diff <path>` — compares current conventions against `.cxpak/conventions.json` baseline, reports changes
 - `lsp [path]` — runs LSP server over stdio (requires `lsp` feature flag)
+- `visual [path]` — generates visual dashboards/diagrams. `--visual-type` (dashboard|architecture|risk|flow|timeline|diff), `--format` (html|mermaid|svg|png|c4|json), `--out`, `--symbol` (flow), `--files` (diff). Requires `visual` feature flag.
+- `onboard [path]` — generates onboarding reading order. `--format` (markdown|json|xml), `--out`. Requires `visual` feature flag.
 
-### MCP Tools (v1.4.0)
+### MCP Tools (v2.0.0 — 26 tools)
 
 - `cxpak_predict` — POST, params: `files` (required list), `depth`, `focus`. Predicts change impact with structural/historical/call-based signals.
 - `cxpak_drift` — POST, params: `save_baseline` (bool), `focus`. Compares architecture snapshot against baseline and historical snapshots.
@@ -45,6 +50,9 @@ Pipeline: **Scanner → Parser → Schema → Index → Conventions → Budget �
 `RouteEndpoint.handler` now extracts real handler function names per framework (12 frameworks); fallback `"<anonymous>"` for inline closures.
 
 `AutoContextResult.predictions` is populated when the task string mentions specific file paths matching the index.
+
+- `cxpak_visual` — POST, params: `type` (dashboard|architecture|risk|flow|timeline|diff), `format` (html|mermaid|svg|png|c4|json), `focus`, `symbol` (required for flow), `files` (required for diff). Generates visual output inline or writes to `.cxpak/visual/` if >1MB.
+- `cxpak_onboard` — POST, params: `focus`. Returns onboarding map with phases, file ordering, and reading time.
 
 ### Intelligence API (v1.6.0)
 

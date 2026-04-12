@@ -63,7 +63,7 @@ cxpak lsp .                                           # Run LSP server over stdi
 
 ### 2. MCP Server (for Claude Code, Cursor, and other AI tools)
 
-Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 24 codebase tools — including relevance scoring, query expansion, convention verification, health scoring, call graph analysis, change impact prediction, architecture drift detection, security surface analysis, structural data flow tracing, cross-language symbol resolution, and schema-aware context packing.
+Run cxpak as an [MCP](https://modelcontextprotocol.io/) server so your AI tool gets live access to 26 codebase tools — including relevance scoring, query expansion, convention verification, health scoring, call graph analysis, change impact prediction, architecture drift detection, security surface analysis, structural data flow tracing, cross-language symbol resolution, visual intelligence dashboards, onboarding maps, and schema-aware context packing.
 
 **Claude Code** — add to `.mcp.json` in your project root (or `~/.claude/.mcp.json` globally):
 
@@ -123,6 +123,8 @@ Once configured, your AI tool can call these tools:
 | `cxpak_security_surface` | Unprotected endpoints, secrets, SQL injection, validation gaps, exposure |
 | `cxpak_data_flow` | Trace how a value flows from source to sink through the call graph |
 | `cxpak_cross_lang` | List cross-language boundaries: HTTP, FFI, gRPC, GraphQL, shared schemas, exec |
+| `cxpak_visual` | Generate visual intelligence dashboard (HTML, Mermaid, SVG, PNG, C4, JSON) |
+| `cxpak_onboard` | Generate guided onboarding reading order for new engineers |
 
 All tools support a `focus` path prefix parameter to scope results.
 
@@ -438,6 +440,58 @@ Supported providers: `openai`, `voyageai`, `cohere`. Set `api_key_env` to the en
 - **Graph edge changes** — new or removed dependency relationships
 
 The output includes a human-readable recommendation summarizing what changed and whether a fresh `auto_context` call is warranted.
+
+## Visual Intelligence
+
+cxpak generates interactive visual dashboards and static diagrams from the codebase index — no browser-side build step, no CDN dependency. Every output is self-contained.
+
+```bash
+# Interactive HTML dashboard (default)
+cxpak visual --visual-type dashboard .
+
+# Architecture explorer with 3-level semantic zoom (module → file → symbol)
+cxpak visual --visual-type architecture .
+
+# Risk heatmap — treemap sized by blast radius, colored by risk score
+cxpak visual --visual-type risk .
+
+# Data flow diagram for a symbol
+cxpak visual --visual-type flow --symbol handle_request .
+
+# Git history time machine
+cxpak visual --visual-type timeline .
+
+# Change impact diff view
+cxpak visual --visual-type diff --files "src/api.rs,src/db.rs" .
+```
+
+**6 view types:** Dashboard (4-quadrant overview with health, risks, architecture, alerts), Architecture Explorer (3-level zoom: modules → files → symbols), Risk Heatmap (D3 treemap), Flow Diagram (left-to-right with cross-language dividers), Time Machine (git history snapshots with key event detection), Diff View (before/after with blast radius overlay).
+
+**6 export formats:** HTML (self-contained with inlined D3.js), Mermaid, SVG, PNG (via resvg rasterization), C4 DSL (Structurizr), JSON.
+
+**Layout engine:** Sugiyama method with SCC condensation, barycenter crossing minimization, and Brandes-Kopf coordinate assignment. Cognitive load capped at 7±2 nodes per layer via automatic clustering.
+
+## Onboarding Map
+
+Generate a dependency-ordered reading guide for new engineers:
+
+```bash
+cxpak onboard .
+cxpak onboard --format json .
+```
+
+Files are topologically sorted so dependencies appear before dependents, then grouped into phases by module (one module per phase, max 9 files per phase). Phases are ordered by aggregate PageRank — most important module first. Each file lists up to 5 key symbols to focus on and an estimated reading time at 200 tokens/minute.
+
+## WASM Plugin SDK
+
+Extend cxpak with custom analyzers and detectors via WASM plugins:
+
+- **Plugin manifest** — `.cxpak/plugins.json` declares plugins with file pattern scoping, content access control, and SHA-256 checksum verification
+- **Analyzer plugins** — receive an `IndexSnapshot` (filtered by declared patterns), return `Vec<Finding>` with severity levels and metadata
+- **Detector plugins** — receive individual `FileSnapshot` per matching file, return `Vec<Detection>` with line-level precision
+- **Security** — 10 MB plugin size limit, 1 MB return payload cap, content access warnings displayed on first load
+
+The plugin loader uses wasmtime for sandboxed execution. Plugin types (`PluginCapability`, `Finding`, `Detection`, `IndexSnapshot`, `FileSnapshot`) are always compiled; the wasmtime runtime is behind the `plugins` feature flag.
 
 ## Stable API
 
