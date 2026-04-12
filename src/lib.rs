@@ -16,6 +16,7 @@ pub mod intelligence;
 pub mod lsp;
 pub mod output;
 pub mod parser;
+pub mod plugin;
 pub mod relevance;
 pub mod scanner;
 pub mod schema;
