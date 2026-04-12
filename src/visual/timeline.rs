@@ -308,4 +308,34 @@ mod tests {
             assert!(window[0].commit_date <= window[1].commit_date);
         }
     }
+
+    #[test]
+    fn test_snapshot_cache_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let snapshots = vec![TimelineSnapshot {
+            commit_sha: "abc123".into(),
+            commit_date: "2026-01-01T00:00:00Z".into(),
+            commit_message: "test commit".into(),
+            files: vec![SnapshotFile {
+                path: "src/main.rs".into(),
+                imports: vec!["src/lib.rs".into()],
+            }],
+            edge_count: 2,
+            module_count: 1,
+            health_composite: Some(0.85),
+            circular_dep_count: 0,
+        }];
+        save_snapshots(dir.path(), &snapshots).unwrap();
+        let loaded = load_cached_snapshots(dir.path()).expect("should load cached snapshots");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].commit_sha, "abc123");
+        assert_eq!(loaded[0].files.len(), 1);
+        assert_eq!(loaded[0].files[0].imports, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_load_cached_snapshots_missing_returns_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(load_cached_snapshots(dir.path()).is_none());
+    }
 }

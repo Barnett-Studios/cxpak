@@ -308,4 +308,141 @@ mod visual_tests {
         let _: serde_json::Value =
             serde_json::from_str(&stdout).expect("stdout must be valid JSON");
     }
+
+    // -------------------------------------------------------------------------
+    // Timeline — well-formed HTML
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn visual_html_timeline_is_well_formed() {
+        // Timeline requires cached snapshots to render — seed the cache by
+        // running compute_timeline_snapshots on the test repo first.
+        let repo = make_test_repo();
+
+        let snapshots =
+            cxpak::visual::timeline::compute_timeline_snapshots(repo.path(), 10).unwrap();
+        assert!(
+            !snapshots.is_empty(),
+            "test repo must have at least one commit"
+        );
+        cxpak::visual::timeline::save_snapshots(repo.path(), &snapshots)
+            .expect("should save timeline snapshots");
+
+        let out_dir = TempDir::new().unwrap();
+        let out_path = out_dir.path().join("out.html");
+
+        cxpak()
+            .args([
+                "visual",
+                "--visual-type",
+                "timeline",
+                "--format",
+                "html",
+                "--out",
+                out_path.to_str().unwrap(),
+            ])
+            .arg(repo.path())
+            .assert()
+            .success();
+
+        let content =
+            std::fs::read_to_string(&out_path).expect("output file should exist after success");
+        assert!(
+            content.contains("<!DOCTYPE html>"),
+            "timeline HTML must have DOCTYPE"
+        );
+        assert!(content.contains("<html"), "timeline HTML must have <html");
+        assert!(
+            content.contains("</html>"),
+            "timeline HTML must have </html>"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Flow — does not panic, exits cleanly
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn visual_html_flow_produces_output() {
+        // The simple fixture repo has no call graph edges, so the flow diagram
+        // will have no paths, but the command must not panic and must exit with
+        // code 0 or 1 (a legitimate "no data" error), never a signal/crash.
+        let repo = make_test_repo();
+        let out_dir = TempDir::new().unwrap();
+        let out_path = out_dir.path().join("out.html");
+
+        let output = cxpak()
+            .args([
+                "visual",
+                "--visual-type",
+                "flow",
+                "--symbol",
+                "main",
+                "--format",
+                "html",
+                "--out",
+                out_path.to_str().unwrap(),
+            ])
+            .arg(repo.path())
+            .output()
+            .expect("failed to spawn cxpak visual flow");
+
+        // The command must not crash (signal) — exit code 0 or 1 are both acceptable.
+        let code = output
+            .status
+            .code()
+            .expect("process must exit normally, not via signal");
+        assert!(
+            code == 0 || code == 1,
+            "cxpak visual flow must exit 0 or 1, got {code}"
+        );
+
+        // If it succeeded, the file must contain valid HTML.
+        if code == 0 {
+            if let Ok(content) = std::fs::read_to_string(&out_path) {
+                assert!(
+                    content.contains("<!DOCTYPE html>"),
+                    "flow HTML output must have DOCTYPE"
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Diff — well-formed HTML
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn visual_html_diff_produces_output() {
+        // Diff with a known file path renders a diff view comparing that file
+        // against the current index.
+        let repo = make_test_repo();
+        let out_dir = TempDir::new().unwrap();
+        let out_path = out_dir.path().join("out.html");
+
+        cxpak()
+            .args([
+                "visual",
+                "--visual-type",
+                "diff",
+                "--files",
+                "src/main.rs",
+                "--format",
+                "html",
+                "--out",
+                out_path.to_str().unwrap(),
+            ])
+            .arg(repo.path())
+            .assert()
+            .success();
+
+        let content =
+            std::fs::read_to_string(&out_path).expect("output file should exist after success");
+        assert!(
+            content.contains("<!DOCTYPE html>"),
+            "diff HTML must have DOCTYPE"
+        );
+        assert!(content.contains("<html"), "diff HTML must have <html");
+        assert!(content.contains("</html>"), "diff HTML must have </html>");
+    }
 }

@@ -386,4 +386,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["nodes"].as_array().unwrap().len(), 3);
     }
+
+    #[test]
+    fn test_mermaid_id_truncation() {
+        let long_id = "a".repeat(50);
+        let result = mermaid_id(&long_id);
+        assert!(result.len() <= 32);
+    }
 }
