@@ -1451,6 +1451,58 @@ fn mcp_stdio_loop_with_io(
                                     "focus": { "type": "string", "description": "Path prefix to scope results" }
                                 }
                             }
+                        },
+                        {
+                            "name": "cxpak_visual",
+                            "description": "Generate an interactive visual diagram of the codebase. Supports dashboard, architecture explorer, risk heatmap, data flow diagram, time machine, and diff views in HTML, Mermaid, SVG, C4, or JSON format.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {
+                                        "type": "string",
+                                        "description": "Visualization type: 'dashboard' (default), 'architecture', 'risk', 'flow', 'timeline', 'diff'",
+                                        "default": "dashboard",
+                                        "enum": ["dashboard", "architecture", "risk", "flow", "timeline", "diff"]
+                                    },
+                                    "format": {
+                                        "type": "string",
+                                        "description": "Output format: 'html' (default), 'mermaid', 'svg', 'c4', 'json'",
+                                        "default": "html",
+                                        "enum": ["html", "mermaid", "svg", "c4", "json"]
+                                    },
+                                    "focus": {
+                                        "type": "string",
+                                        "description": "Path prefix to scope the visualization (e.g. 'src/')"
+                                    },
+                                    "symbol": {
+                                        "type": "string",
+                                        "description": "Starting symbol for flow diagram (required when type='flow')"
+                                    },
+                                    "files": {
+                                        "type": "string",
+                                        "description": "Comma-separated file paths for diff view (required when type='diff')"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "name": "cxpak_onboard",
+                            "description": "Generate a guided onboarding map for navigating the codebase. Returns a phase-by-phase reading plan with file prioritization, estimated reading time, and key symbols to focus on in each file.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "focus": {
+                                        "type": "string",
+                                        "description": "Path prefix to scope the onboarding map (e.g. 'src/')"
+                                    },
+                                    "format": {
+                                        "type": "string",
+                                        "description": "Output format: 'json' (default) or 'markdown'",
+                                        "default": "json",
+                                        "enum": ["json", "markdown"]
+                                    }
+                                }
+                            }
                         }
                     ]
                 }),
@@ -2435,6 +2487,175 @@ fn handle_tool_call(
                 .unwrap_or_default(),
             )
         }
+        "cxpak_visual" => {
+            let visual_type = args
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("dashboard");
+            let format = args
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("html");
+            let focus = args.get("focus").and_then(|v| v.as_str());
+            let symbol = args.get("symbol").and_then(|v| v.as_str());
+            let files_arg = args.get("files").and_then(|v| v.as_str());
+
+            // Validate parameter requirements before rendering.
+            if visual_type == "flow" && symbol.is_none() {
+                return mcp_tool_result(
+                    id,
+                    "Error: 'symbol' argument is required when type='flow'",
+                );
+            }
+            if visual_type == "diff" && files_arg.is_none() {
+                return mcp_tool_result(id, "Error: 'files' argument is required when type='diff'");
+            }
+
+            #[cfg(feature = "visual")]
+            {
+                use crate::visual::export;
+                use crate::visual::layout::{self, LayoutConfig};
+                use crate::visual::render::{self, RenderMetadata};
+
+                let _ = focus; // focus reserved for future scoped rendering
+
+                let repo_name = repo_path
+                    .canonicalize()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .unwrap_or_else(|| "codebase".to_string());
+                let metadata = RenderMetadata {
+                    repo_name,
+                    generated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    health_score: None,
+                    node_count: index.files.len(),
+                    edge_count: index.graph.edges.values().map(|v| v.len()).sum::<usize>(),
+                    cxpak_version: env!("CARGO_PKG_VERSION").to_string(),
+                };
+                let config = LayoutConfig::default();
+
+                let html_result: Result<String, Box<dyn std::error::Error>> = match visual_type {
+                    "architecture" => {
+                        render::render_architecture_explorer(index, &metadata).map_err(|e| e.into())
+                    }
+                    "risk" => Ok(render::render_risk_heatmap(index, &metadata)),
+                    "flow" => {
+                        let sym = symbol.unwrap_or("main");
+                        let flow_result =
+                            crate::intelligence::data_flow::trace_data_flow(sym, None, 6, index);
+                        render::render_flow_diagram(&flow_result, index, &metadata)
+                            .map_err(|e| e.into())
+                    }
+                    "timeline" => {
+                        let snapshots = crate::visual::timeline::load_cached_snapshots(repo_path)
+                            .unwrap_or_default();
+                        render::render_time_machine(snapshots, &metadata, &config)
+                            .map_err(|e| e.into())
+                    }
+                    "diff" => {
+                        let changed: Vec<String> = files_arg
+                            .unwrap_or("")
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        render::render_diff_view(index, &changed, &metadata, &config)
+                            .map_err(|e| e.into())
+                    }
+                    _ => Ok(render::render_dashboard(index, &metadata)),
+                };
+
+                let html = match html_result {
+                    Ok(h) => h,
+                    Err(e) => return mcp_tool_result(id, &format!("Error: {e}")),
+                };
+
+                let content =
+                    match format {
+                        "mermaid" => {
+                            let computed = layout::build_module_layout(index, &config)
+                                .unwrap_or_else(|_| crate::visual::layout::ComputedLayout {
+                                    nodes: vec![],
+                                    edges: vec![],
+                                    width: 0.0,
+                                    height: 0.0,
+                                    layers: vec![],
+                                });
+                            export::to_mermaid(&computed)
+                        }
+                        "svg" => {
+                            let computed = layout::build_module_layout(index, &config)
+                                .unwrap_or_else(|_| crate::visual::layout::ComputedLayout {
+                                    nodes: vec![],
+                                    edges: vec![],
+                                    width: 0.0,
+                                    height: 0.0,
+                                    layers: vec![],
+                                });
+                            export::to_svg(&computed, &metadata)
+                        }
+                        "c4" => {
+                            let computed = layout::build_module_layout(index, &config)
+                                .unwrap_or_else(|_| crate::visual::layout::ComputedLayout {
+                                    nodes: vec![],
+                                    edges: vec![],
+                                    width: 0.0,
+                                    height: 0.0,
+                                    layers: vec![],
+                                });
+                            export::to_c4(&computed, &metadata)
+                        }
+                        "json" => {
+                            let computed = layout::build_module_layout(index, &config)
+                                .unwrap_or_else(|_| crate::visual::layout::ComputedLayout {
+                                    nodes: vec![],
+                                    edges: vec![],
+                                    width: 0.0,
+                                    height: 0.0,
+                                    layers: vec![],
+                                });
+                            export::to_json(&computed)
+                        }
+                        _ => html, // html is the default
+                    };
+
+                mcp_tool_result(id, &content)
+            }
+            #[cfg(not(feature = "visual"))]
+            {
+                let _ = (visual_type, format, focus, symbol, files_arg);
+                mcp_tool_result(
+                    id,
+                    "Error: cxpak_visual requires the 'visual' feature flag. Rebuild with: cargo build --features visual",
+                )
+            }
+        }
+        "cxpak_onboard" => {
+            let focus = args.get("focus").and_then(|v| v.as_str());
+            let format = args
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("json");
+
+            #[cfg(feature = "visual")]
+            {
+                let map = crate::visual::onboard::build_onboarding_map(index, focus);
+                let content = if format == "markdown" {
+                    crate::visual::onboard::render_onboarding_markdown(&map)
+                } else {
+                    crate::visual::onboard::render_onboarding_json(&map)
+                };
+                mcp_tool_result(id, &content)
+            }
+            #[cfg(not(feature = "visual"))]
+            {
+                let _ = (focus, format);
+                mcp_tool_result(
+                    id,
+                    "Error: cxpak_onboard requires the 'visual' feature flag. Rebuild with: cargo build --features visual",
+                )
+            }
+        }
         _ => mcp_response(
             id,
             json!({
@@ -3079,7 +3300,7 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 26);
     }
 
     #[test]
@@ -3845,8 +4066,8 @@ mod tests {
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            24,
-            "should have 24 tools (13 existing + 3 v1.2.0 + 3 v1.3.0 + 3 v1.4.0 + 2 v1.5.0)"
+            26,
+            "should have 26 tools (13 existing + 3 v1.2.0 + 3 v1.3.0 + 3 v1.4.0 + 2 v1.5.0 + 2 v2.0.0)"
         );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"cxpak_context_for_task"));
@@ -5220,7 +5441,7 @@ mod tests {
             tool_names.contains(&"cxpak_context_diff"),
             "tools/list should include cxpak_context_diff"
         );
-        assert_eq!(tools.len(), 24, "total tool count should be 24");
+        assert_eq!(tools.len(), 26, "total tool count should be 26");
     }
 
     // --- Task 11: cxpak_health MCP tool ---
@@ -5672,5 +5893,242 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::OK, "expected 200 for {uri}");
             }
         });
+    }
+
+    // --- Task 15: cxpak_visual MCP tool ---
+
+    #[test]
+    fn test_mcp_tools_list_includes_visual_and_onboard() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let repo = std::path::Path::new("/tmp");
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo, &index, &snap, input.as_bytes(), &mut output).unwrap();
+        let resp: Value = serde_json::from_slice(&output).unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(
+            tool_names.contains(&"cxpak_visual"),
+            "tools/list must include cxpak_visual, got: {tool_names:?}"
+        );
+        assert!(
+            tool_names.contains(&"cxpak_onboard"),
+            "tools/list must include cxpak_onboard, got: {tool_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_visual_schema_has_expected_params() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let repo = std::path::Path::new("/tmp");
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo, &index, &snap, input.as_bytes(), &mut output).unwrap();
+        let resp: Value = serde_json::from_slice(&output).unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let visual_tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("cxpak_visual"))
+            .expect("cxpak_visual must be in the tool list");
+        let props = &visual_tool["inputSchema"]["properties"];
+        assert!(
+            props["type"].is_object(),
+            "cxpak_visual must have 'type' param"
+        );
+        assert!(
+            props["format"].is_object(),
+            "cxpak_visual must have 'format' param"
+        );
+        assert!(
+            props["focus"].is_object(),
+            "cxpak_visual must have 'focus' param"
+        );
+        assert!(
+            props["symbol"].is_object(),
+            "cxpak_visual must have 'symbol' param"
+        );
+        assert!(
+            props["files"].is_object(),
+            "cxpak_visual must have 'files' param"
+        );
+    }
+
+    #[test]
+    fn test_mcp_onboard_schema_has_expected_params() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let repo = std::path::Path::new("/tmp");
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(repo, &index, &snap, input.as_bytes(), &mut output).unwrap();
+        let resp: Value = serde_json::from_slice(&output).unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let onboard_tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("cxpak_onboard"))
+            .expect("cxpak_onboard must be in the tool list");
+        let props = &onboard_tool["inputSchema"]["properties"];
+        assert!(
+            props["focus"].is_object(),
+            "cxpak_onboard must have 'focus' param"
+        );
+        assert!(
+            props["format"].is_object(),
+            "cxpak_onboard must have 'format' param"
+        );
+    }
+
+    #[test]
+    fn test_mcp_visual_flow_requires_symbol() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(10)),
+            "cxpak_visual",
+            &json!({"type": "flow"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Error") && text.contains("symbol"),
+            "flow without symbol must return error mentioning 'symbol', got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_visual_diff_requires_files() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(11)),
+            "cxpak_visual",
+            &json!({"type": "diff"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Error") && text.contains("files"),
+            "diff without files must return error mentioning 'files', got: {text}"
+        );
+    }
+
+    #[cfg(feature = "visual")]
+    #[test]
+    fn test_mcp_visual_dashboard_returns_content() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(12)),
+            "cxpak_visual",
+            &json!({"type": "dashboard", "format": "html"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.starts_with("Error"),
+            "dashboard should not return error, got: {text}"
+        );
+        assert!(
+            text.len() > 100,
+            "dashboard HTML should have substantial content"
+        );
+    }
+
+    #[cfg(feature = "visual")]
+    #[test]
+    fn test_mcp_visual_mermaid_format() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(13)),
+            "cxpak_visual",
+            &json!({"type": "dashboard", "format": "mermaid"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.starts_with("Error"),
+            "mermaid format should not error, got: {text}"
+        );
+        // Mermaid output starts with "graph TD"
+        assert!(
+            text.starts_with("graph TD"),
+            "mermaid output should start with 'graph TD', got: {text}"
+        );
+    }
+
+    // --- Task 15: cxpak_onboard MCP tool ---
+
+    #[cfg(feature = "visual")]
+    #[test]
+    fn test_mcp_onboard_returns_phases() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(20)),
+            "cxpak_onboard",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.starts_with("Error"),
+            "onboard should not return error, got: {text}"
+        );
+        let parsed: Value = serde_json::from_str(text).expect("onboard result must be valid JSON");
+        assert!(
+            parsed["phases"].is_array(),
+            "onboard result must have 'phases' array"
+        );
+        assert!(
+            parsed["total_files"].is_number(),
+            "onboard result must have 'total_files'"
+        );
+        assert!(
+            parsed["estimated_reading_time"].is_string(),
+            "onboard result must have 'estimated_reading_time'"
+        );
+    }
+
+    #[cfg(feature = "visual")]
+    #[test]
+    fn test_mcp_onboard_markdown_format() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(21)),
+            "cxpak_onboard",
+            &json!({"format": "markdown"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(resp["jsonrpc"], "2.0");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.starts_with("Error"),
+            "onboard markdown should not error, got: {text}"
+        );
+        assert!(
+            text.contains("# Codebase Onboarding Map"),
+            "markdown output should contain h1 title"
+        );
     }
 }
