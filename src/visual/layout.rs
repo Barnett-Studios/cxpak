@@ -220,9 +220,402 @@ pub(crate) fn layer_assign(
     Ok(result)
 }
 
+/// Inserts virtual (dummy) nodes on edges spanning multiple layers.
+/// Returns augmented node list, augmented edge list, and dummy node ids.
+pub(crate) fn insert_dummy_nodes(
+    nodes: &[LayoutNode],
+    edges: &[LayoutEdge],
+    layers: &HashMap<String, usize>,
+) -> (Vec<LayoutNode>, Vec<LayoutEdge>, Vec<String>) {
+    let mut aug_nodes: Vec<LayoutNode> = nodes.to_vec();
+    let mut aug_edges: Vec<LayoutEdge> = Vec::new();
+    let mut dummy_ids: Vec<String> = Vec::new();
+
+    for edge in edges {
+        let src_layer = match layers.get(&edge.source) {
+            Some(&l) => l,
+            None => {
+                aug_edges.push(edge.clone());
+                continue;
+            }
+        };
+        let dst_layer = match layers.get(&edge.target) {
+            Some(&l) => l,
+            None => {
+                aug_edges.push(edge.clone());
+                continue;
+            }
+        };
+
+        let span = dst_layer.saturating_sub(src_layer);
+
+        if span <= 1 {
+            aug_edges.push(edge.clone());
+            continue;
+        }
+
+        // Insert dummy nodes at each intermediate layer.
+        let mut prev_id = edge.source.clone();
+        for intermediate_layer in (src_layer + 1)..dst_layer {
+            let dummy_id = format!(
+                "__dummy_{}_{}_{}",
+                edge.source, edge.target, intermediate_layer
+            );
+            let dummy_node = LayoutNode {
+                id: dummy_id.clone(),
+                label: String::new(),
+                layer: intermediate_layer,
+                position: Point::default(),
+                width: 0.0,
+                height: 0.0,
+                node_type: NodeType::Symbol,
+                metadata: NodeMetadata::default(),
+            };
+            aug_nodes.push(dummy_node);
+            dummy_ids.push(dummy_id.clone());
+
+            aug_edges.push(LayoutEdge {
+                source: prev_id.clone(),
+                target: dummy_id.clone(),
+                edge_type: edge.edge_type.clone(),
+                weight: edge.weight,
+                is_cycle: edge.is_cycle,
+                waypoints: vec![],
+            });
+            prev_id = dummy_id;
+        }
+
+        // Final segment: last dummy → target.
+        aug_edges.push(LayoutEdge {
+            source: prev_id,
+            target: edge.target.clone(),
+            edge_type: edge.edge_type.clone(),
+            weight: edge.weight,
+            is_cycle: edge.is_cycle,
+            waypoints: vec![],
+        });
+    }
+
+    (aug_nodes, aug_edges, dummy_ids)
+}
+
+/// One-sided barycenter crossing minimization.
+/// Mutates layer ordering in place; 4 passes alternating top-down/bottom-up.
+pub(crate) fn barycenter_sort(
+    layer_order: &mut [Vec<String>],
+    adjacency: &HashMap<String, Vec<String>>,
+    reverse_adjacency: &HashMap<String, Vec<String>>,
+) {
+    let n_layers = layer_order.len();
+    if n_layers < 2 {
+        return;
+    }
+
+    for pass in 0..4 {
+        let top_down = pass % 2 == 0;
+
+        let indices: Vec<usize> = if top_down {
+            (1..n_layers).collect()
+        } else {
+            (0..(n_layers - 1)).rev().collect()
+        };
+
+        for layer_idx in indices {
+            // Build a position map for the fixed (adjacent) layer.
+            let fixed_layer_idx = if top_down {
+                layer_idx - 1
+            } else {
+                layer_idx + 1
+            };
+            let fixed_positions: HashMap<&str, f64> = layer_order[fixed_layer_idx]
+                .iter()
+                .enumerate()
+                .map(|(pos, id)| (id.as_str(), pos as f64))
+                .collect();
+
+            // Compute barycenter for each node in the current layer.
+            let current_positions: HashMap<&str, f64> = layer_order[layer_idx]
+                .iter()
+                .enumerate()
+                .map(|(pos, id)| (id.as_str(), pos as f64))
+                .collect();
+
+            let neighbor_map = if top_down {
+                reverse_adjacency
+            } else {
+                adjacency
+            };
+
+            let mut barycenters: Vec<(f64, String)> = layer_order[layer_idx]
+                .iter()
+                .map(|id| {
+                    let neighbors = neighbor_map
+                        .get(id.as_str())
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    let fixed_neighbor_positions: Vec<f64> = neighbors
+                        .iter()
+                        .filter_map(|nb| fixed_positions.get(nb.as_str()).copied())
+                        .collect();
+                    let barycenter = if fixed_neighbor_positions.is_empty() {
+                        // No neighbors in the fixed layer — keep current position.
+                        *current_positions.get(id.as_str()).unwrap_or(&0.0)
+                    } else {
+                        fixed_neighbor_positions.iter().sum::<f64>()
+                            / fixed_neighbor_positions.len() as f64
+                    };
+                    (barycenter, id.clone())
+                })
+                .collect();
+
+            barycenters.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            layer_order[layer_idx] = barycenters.into_iter().map(|(_, id)| id).collect();
+        }
+    }
+}
+
+/// Brandes-Kopf simplified coordinate assignment.
+/// Returns x,y for each node id. y is determined by layer × layer_sep.
+/// Layers are centered horizontally relative to each other; the global x minimum is
+/// shifted to 0 so all positions are non-negative.
+pub(crate) fn assign_coordinates(
+    layer_order: &[Vec<String>],
+    config: &LayoutConfig,
+) -> HashMap<String, Point> {
+    let mut coords: HashMap<String, Point> = HashMap::new();
+
+    for (layer_idx, layer) in layer_order.iter().enumerate() {
+        let y = layer_idx as f64 * config.layer_sep;
+        let n = layer.len() as f64;
+        // Total width of the layer: n nodes each of width node_width, separated by node_sep.
+        let total_width = n * config.node_width + (n - 1.0).max(0.0) * config.node_sep;
+        // Center horizontally: start at half the total width offset from 0.
+        let x_start = -total_width / 2.0 + config.node_width / 2.0;
+
+        for (pos, id) in layer.iter().enumerate() {
+            let x = x_start + pos as f64 * (config.node_width + config.node_sep);
+            coords.insert(id.clone(), Point { x, y });
+        }
+    }
+
+    // Shift all x-coordinates so the global minimum is 0.
+    if let Some(min_x) = coords.values().map(|p| p.x).reduce(f64::min) {
+        if min_x < 0.0 {
+            for point in coords.values_mut() {
+                point.x -= min_x;
+            }
+        }
+    }
+
+    coords
+}
+
+/// Entry point — computes full Sugiyama layout.
+pub fn compute_layout(
+    nodes: Vec<LayoutNode>,
+    edges: Vec<LayoutEdge>,
+    config: &LayoutConfig,
+) -> Result<ComputedLayout, LayoutError> {
+    if nodes.is_empty() {
+        return Err(LayoutError::Empty);
+    }
+
+    // 1. Collect node ids and edge pairs.
+    let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let edge_pairs: Vec<(String, String)> = edges
+        .iter()
+        .map(|e| (e.source.clone(), e.target.clone()))
+        .collect();
+
+    // 2. Layer assignment.
+    let layers = layer_assign(&node_ids, &edge_pairs)?;
+
+    // 3. Insert dummy nodes for multi-layer spanning edges.
+    let (aug_nodes, aug_edges, dummy_ids) = insert_dummy_nodes(&nodes, &edges, &layers);
+
+    // Update the layers map to include dummy nodes (they carry their layer from insert_dummy_nodes).
+    let mut all_layers = layers;
+    for node in &aug_nodes {
+        all_layers.entry(node.id.clone()).or_insert(node.layer);
+    }
+
+    // 4. Build layer_order: group node ids by layer.
+    let max_layer = all_layers.values().copied().max().unwrap_or(0);
+    let mut layer_order: Vec<Vec<String>> = vec![Vec::new(); max_layer + 1];
+    for node in &aug_nodes {
+        let l = all_layers[&node.id];
+        layer_order[l].push(node.id.clone());
+    }
+
+    // 5. Build adjacency / reverse_adjacency from augmented edges.
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    let mut reverse_adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in &aug_edges {
+        adjacency
+            .entry(edge.source.clone())
+            .or_default()
+            .push(edge.target.clone());
+        reverse_adjacency
+            .entry(edge.target.clone())
+            .or_default()
+            .push(edge.source.clone());
+    }
+
+    // 6. Crossing minimization.
+    barycenter_sort(&mut layer_order, &adjacency, &reverse_adjacency);
+
+    // 7. Coordinate assignment.
+    let coords = assign_coordinates(&layer_order, config);
+
+    // 8. Build the dummy id set for fast lookup.
+    let dummy_set: std::collections::HashSet<&str> = dummy_ids.iter().map(|s| s.as_str()).collect();
+
+    // 9. Collect dummy positions as waypoints on original edges, then build final edges.
+    // Map each dummy node id → its position.
+    let dummy_positions: HashMap<&str, Point> = dummy_ids
+        .iter()
+        .filter_map(|id| coords.get(id.as_str()).map(|&p| (id.as_str(), p)))
+        .collect();
+
+    // Reconstruct original edges with waypoints threaded through dummy chain.
+    // For each original edge, find the dummy chain by traversing aug_edges.
+    let mut final_edges: Vec<LayoutEdge> = Vec::new();
+    for orig_edge in &edges {
+        let src_layer = all_layers.get(&orig_edge.source).copied().unwrap_or(0);
+        let dst_layer = all_layers.get(&orig_edge.target).copied().unwrap_or(0);
+        let span = dst_layer.saturating_sub(src_layer);
+
+        let mut waypoints: Vec<Point> = Vec::new();
+        if span > 1 {
+            for intermediate_layer in (src_layer + 1)..dst_layer {
+                let dummy_id = format!(
+                    "__dummy_{}_{}_{}",
+                    orig_edge.source, orig_edge.target, intermediate_layer
+                );
+                if let Some(&pt) = dummy_positions.get(dummy_id.as_str()) {
+                    waypoints.push(pt);
+                }
+            }
+        }
+
+        final_edges.push(LayoutEdge {
+            source: orig_edge.source.clone(),
+            target: orig_edge.target.clone(),
+            edge_type: orig_edge.edge_type.clone(),
+            weight: orig_edge.weight,
+            is_cycle: orig_edge.is_cycle,
+            waypoints,
+        });
+    }
+
+    // 10. Build final node list — remove dummies, assign positions and layers.
+    let mut final_nodes: Vec<LayoutNode> = aug_nodes
+        .into_iter()
+        .filter(|n| !dummy_set.contains(n.id.as_str()))
+        .map(|mut n| {
+            if let Some(&pt) = coords.get(&n.id) {
+                n.position = pt;
+            }
+            if let Some(&l) = all_layers.get(&n.id) {
+                n.layer = l;
+            }
+            n
+        })
+        .collect();
+
+    // Also carry over any position/layer updates for nodes that were in the original list.
+    // (aug_nodes started from nodes, so this is already handled above.)
+    // Ensure ordering matches original node order for stability.
+    let orig_order: HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
+    final_nodes.sort_by_key(|n| orig_order.get(n.id.as_str()).copied().unwrap_or(usize::MAX));
+
+    // 11. Compute overall width and height from node positions.
+    let width = final_nodes
+        .iter()
+        .map(|n| n.position.x + n.width / 2.0)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - final_nodes
+            .iter()
+            .map(|n| n.position.x - n.width / 2.0)
+            .fold(f64::INFINITY, f64::min);
+
+    let height = final_nodes
+        .iter()
+        .map(|n| n.position.y + n.height / 2.0)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - final_nodes
+            .iter()
+            .map(|n| n.position.y - n.height / 2.0)
+            .fold(f64::INFINITY, f64::min);
+
+    let final_layer_order: Vec<Vec<String>> = layer_order
+        .into_iter()
+        .map(|layer| {
+            layer
+                .into_iter()
+                .filter(|id| !dummy_set.contains(id.as_str()))
+                .collect()
+        })
+        .collect();
+
+    Ok(ComputedLayout {
+        nodes: final_nodes,
+        edges: final_edges,
+        width: width.max(0.0),
+        height: height.max(0.0),
+        layers: final_layer_order,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_node(id: &str, layer: usize) -> LayoutNode {
+        LayoutNode {
+            id: id.to_string(),
+            label: id.to_string(),
+            layer,
+            position: Point::default(),
+            width: 160.0,
+            height: 48.0,
+            node_type: NodeType::Module,
+            metadata: NodeMetadata::default(),
+        }
+    }
+
+    fn make_edge(source: &str, target: &str) -> LayoutEdge {
+        LayoutEdge {
+            source: source.to_string(),
+            target: target.to_string(),
+            edge_type: EdgeVisualType::Import,
+            weight: 1.0,
+            is_cycle: false,
+            waypoints: vec![],
+        }
+    }
+
+    fn make_test_graph_5_nodes() -> (Vec<LayoutNode>, Vec<LayoutEdge>) {
+        let nodes = vec![
+            make_node("1", 0),
+            make_node("2", 0),
+            make_node("3", 0),
+            make_node("4", 0),
+            make_node("5", 0),
+        ];
+        let edges = vec![
+            make_edge("1", "2"),
+            make_edge("1", "3"),
+            make_edge("2", "4"),
+            make_edge("3", "4"),
+            make_edge("4", "5"),
+        ];
+        (nodes, edges)
+    }
 
     #[test]
     fn test_layer_assign_linear_chain() {
@@ -301,5 +694,67 @@ mod tests {
     fn test_layer_assign_unknown_node_in_edge_errors() {
         let result = layer_assign(&["a".into()], &[("a".into(), "ghost".into())]);
         assert!(matches!(result, Err(LayoutError::NodeNotFound(_))));
+    }
+
+    #[test]
+    fn test_insert_dummy_nodes_creates_intermediates() {
+        let nodes = vec![
+            make_node("a", 0),
+            make_node("b", 2), // layer 2, so edge a->b spans 2 layers
+        ];
+        let edges = vec![make_edge("a", "b")];
+        let mut layers = HashMap::new();
+        layers.insert("a".to_string(), 0);
+        layers.insert("b".to_string(), 2);
+        let (aug_nodes, aug_edges, dummy_ids) = insert_dummy_nodes(&nodes, &edges, &layers);
+        assert_eq!(dummy_ids.len(), 1); // one dummy at layer 1
+        assert_eq!(aug_nodes.len(), 3); // a, dummy, b
+        assert_eq!(aug_edges.len(), 2); // a->dummy, dummy->b
+    }
+
+    #[test]
+    fn test_assign_coordinates_no_horizontal_overlaps() {
+        let layer_order = vec![
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            vec!["d".to_string(), "e".to_string()],
+        ];
+        let config = LayoutConfig::default();
+        let coords = assign_coordinates(&layer_order, &config);
+        let x_a = coords["a"].x;
+        let x_b = coords["b"].x;
+        let x_c = coords["c"].x;
+        assert!(x_b > x_a + config.node_width);
+        assert!(x_c > x_b + config.node_width);
+    }
+
+    #[test]
+    fn test_compute_layout_produces_valid_positions() {
+        let (nodes, edges) = make_test_graph_5_nodes();
+        let layout = compute_layout(nodes, edges, &LayoutConfig::default()).unwrap();
+        assert_eq!(layout.nodes.len(), 5);
+        for node in &layout.nodes {
+            assert!(node.position.x >= 0.0);
+            assert!(node.position.y >= 0.0);
+        }
+        assert!(layout.width > 0.0);
+        assert!(layout.height > 0.0);
+    }
+
+    #[test]
+    fn test_barycenter_sort_preserves_optimal_order() {
+        // Two parallel chains: a->c, b->d. Already optimal — should not swap.
+        let mut layer_order = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["c".to_string(), "d".to_string()],
+        ];
+        let mut adj = HashMap::new();
+        adj.insert("a".to_string(), vec!["c".to_string()]);
+        adj.insert("b".to_string(), vec!["d".to_string()]);
+        let mut rev_adj = HashMap::new();
+        rev_adj.insert("c".to_string(), vec!["a".to_string()]);
+        rev_adj.insert("d".to_string(), vec!["b".to_string()]);
+        let original = layer_order.clone();
+        barycenter_sort(&mut layer_order, &adj, &rev_adj);
+        assert_eq!(layer_order, original);
     }
 }
