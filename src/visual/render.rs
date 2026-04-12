@@ -1197,6 +1197,349 @@ pub fn render_flow_diagram(
     ))
 }
 
+// ── Time Machine types ────────────────────────────────────────────────────────
+
+use super::timeline::TimelineSnapshot;
+
+/// Full data payload for the Time Machine view, embedded in the HTML page as
+/// `<script id="cxpak-timeline" type="application/json">`.
+#[derive(Debug, serde::Serialize)]
+pub struct TimeMachineData {
+    pub steps: Vec<TimeMachineStep>,
+    pub current_index: usize,
+    /// `(commit_date, health_composite)` pairs for snapshots that have a score.
+    pub health_sparkline: Vec<(String, f64)>,
+    pub key_events: Vec<KeyEvent>,
+}
+
+/// One step in the Time Machine — a snapshot plus the diff vs the previous step.
+#[derive(Debug, serde::Serialize)]
+pub struct TimeMachineStep {
+    pub snapshot: TimelineSnapshot,
+    pub added_files: Vec<String>,
+    pub removed_files: Vec<String>,
+    pub added_edges: usize,
+    pub removed_edges: usize,
+    pub layout: super::layout::ComputedLayout,
+}
+
+/// A notable event detected when moving between two consecutive snapshots.
+#[derive(Debug, serde::Serialize)]
+pub struct KeyEvent {
+    pub step_index: usize,
+    pub commit_sha: String,
+    pub kind: KeyEventKind,
+    pub message: String,
+}
+
+/// Categories of notable event detectable from heuristic snapshot data.
+#[derive(Debug, serde::Serialize)]
+pub enum KeyEventKind {
+    CycleIntroduced,
+    CycleResolved,
+    LargeChurn,
+    HealthDropped,
+    NewModule,
+    ModuleRemoved,
+}
+
+// ── Time Machine builder ──────────────────────────────────────────────────────
+
+/// Build a `ComputedLayout` from a list of file paths (no import data).
+///
+/// Files in the same directory are treated as connected via heuristic edges.
+/// Returns an empty layout when `files` is empty.
+fn layout_from_snapshot(
+    files: &[super::timeline::SnapshotFile],
+    config: &super::layout::LayoutConfig,
+) -> super::layout::ComputedLayout {
+    use super::layout::{
+        ComputedLayout, EdgeVisualType, LayoutEdge, LayoutNode, NodeMetadata, NodeType, Point,
+    };
+    use std::collections::HashMap;
+
+    if files.is_empty() {
+        return ComputedLayout {
+            nodes: vec![],
+            edges: vec![],
+            width: 0.0,
+            height: 0.0,
+            layers: vec![],
+        };
+    }
+
+    // Build one LayoutNode per file.
+    let nodes: Vec<LayoutNode> = files
+        .iter()
+        .map(|f| LayoutNode {
+            id: f.path.clone(),
+            label: f.path.rsplit('/').next().unwrap_or(&f.path).to_string(),
+            layer: 0,
+            position: Point { x: 0.0, y: 0.0 },
+            width: config.node_width,
+            height: config.node_height,
+            node_type: NodeType::File,
+            metadata: NodeMetadata::default(),
+        })
+        .collect();
+
+    // Heuristic edges: connect files that share the same directory.
+    let mut dir_to_files: HashMap<String, Vec<String>> = HashMap::new();
+    for f in files {
+        let dir = f
+            .path
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default();
+        dir_to_files.entry(dir).or_default().push(f.path.clone());
+    }
+
+    let mut edges: Vec<LayoutEdge> = Vec::new();
+    for dir_files in dir_to_files.values() {
+        for i in 0..dir_files.len() {
+            for j in (i + 1)..dir_files.len() {
+                edges.push(LayoutEdge {
+                    source: dir_files[i].clone(),
+                    target: dir_files[j].clone(),
+                    edge_type: EdgeVisualType::Import,
+                    weight: 1.0,
+                    is_cycle: false,
+                    waypoints: vec![],
+                });
+            }
+        }
+    }
+
+    // Attempt a proper layout; fall back to a simple grid on failure.
+    super::layout::compute_layout(nodes.clone(), edges.clone(), config).unwrap_or_else(|_| {
+        // Grid fallback: place nodes in rows.
+        let cols = ((nodes.len() as f64).sqrt().ceil() as usize).max(1);
+        let positioned_nodes: Vec<LayoutNode> = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut n)| {
+                let col = i % cols;
+                let row = i / cols;
+                n.position = Point {
+                    x: col as f64 * (config.node_width + config.node_sep),
+                    y: row as f64 * (config.node_height + config.layer_sep),
+                };
+                n
+            })
+            .collect();
+        let w = cols as f64 * (config.node_width + config.node_sep);
+        let rows = positioned_nodes.len().div_ceil(cols);
+        let h = rows as f64 * (config.node_height + config.layer_sep);
+        ComputedLayout {
+            nodes: positioned_nodes,
+            edges,
+            width: w,
+            height: h,
+            layers: vec![],
+        }
+    })
+}
+
+/// Build [`TimeMachineData`] from an ordered list of [`TimelineSnapshot`]s
+/// (oldest first, as returned by [`super::timeline::compute_timeline_snapshots`]).
+///
+/// # Errors
+/// Returns `LayoutError::Empty` when `snapshots` is empty.
+pub fn build_time_machine_data(
+    snapshots: Vec<TimelineSnapshot>,
+    config: &super::layout::LayoutConfig,
+) -> Result<TimeMachineData, super::layout::LayoutError> {
+    use std::collections::HashSet;
+
+    if snapshots.is_empty() {
+        return Err(super::layout::LayoutError::Empty);
+    }
+
+    let mut steps: Vec<TimeMachineStep> = Vec::with_capacity(snapshots.len());
+    let mut key_events: Vec<KeyEvent> = Vec::new();
+    let mut health_sparkline: Vec<(String, f64)> = Vec::new();
+
+    let mut prev_files: HashSet<String> = HashSet::new();
+    let mut prev_edge_count: usize = 0;
+    let mut prev_circular: usize = 0;
+    let mut prev_modules: usize = 0;
+
+    for (idx, snap) in snapshots.into_iter().enumerate() {
+        let cur_files: HashSet<String> = snap.files.iter().map(|f| f.path.clone()).collect();
+
+        let added_files: Vec<String> = cur_files.difference(&prev_files).cloned().collect();
+        let removed_files: Vec<String> = prev_files.difference(&cur_files).cloned().collect();
+
+        let added_edges = snap.edge_count.saturating_sub(prev_edge_count);
+        let removed_edges = prev_edge_count.saturating_sub(snap.edge_count);
+
+        // ── Key event detection ────────────────────────────────────────────────
+        if idx > 0 {
+            let total_changed = added_files.len() + removed_files.len();
+            let total_prev = prev_files.len().max(1);
+            if total_changed * 5 > total_prev {
+                // >20% churn
+                key_events.push(KeyEvent {
+                    step_index: idx,
+                    commit_sha: snap.commit_sha.clone(),
+                    kind: KeyEventKind::LargeChurn,
+                    message: format!(
+                        "{} files added, {} removed ({:.0}% churn)",
+                        added_files.len(),
+                        removed_files.len(),
+                        total_changed as f64 / total_prev as f64 * 100.0
+                    ),
+                });
+            }
+
+            if prev_circular == 0 && snap.circular_dep_count > 0 {
+                key_events.push(KeyEvent {
+                    step_index: idx,
+                    commit_sha: snap.commit_sha.clone(),
+                    kind: KeyEventKind::CycleIntroduced,
+                    message: format!(
+                        "{} circular dependenc{} introduced",
+                        snap.circular_dep_count,
+                        if snap.circular_dep_count == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
+                    ),
+                });
+            }
+
+            if prev_circular > 0 && snap.circular_dep_count == 0 {
+                key_events.push(KeyEvent {
+                    step_index: idx,
+                    commit_sha: snap.commit_sha.clone(),
+                    kind: KeyEventKind::CycleResolved,
+                    message: "All circular dependencies resolved".to_string(),
+                });
+            }
+
+            if snap.module_count > prev_modules {
+                key_events.push(KeyEvent {
+                    step_index: idx,
+                    commit_sha: snap.commit_sha.clone(),
+                    kind: KeyEventKind::NewModule,
+                    message: format!(
+                        "Module count grew from {prev_modules} to {}",
+                        snap.module_count
+                    ),
+                });
+            }
+
+            if snap.module_count < prev_modules {
+                key_events.push(KeyEvent {
+                    step_index: idx,
+                    commit_sha: snap.commit_sha.clone(),
+                    kind: KeyEventKind::ModuleRemoved,
+                    message: format!(
+                        "Module count shrank from {prev_modules} to {}",
+                        snap.module_count
+                    ),
+                });
+            }
+        }
+
+        // ── Health sparkline ───────────────────────────────────────────────────
+        if let Some(h) = snap.health_composite {
+            health_sparkline.push((snap.commit_date.clone(), h));
+        }
+
+        // ── Layout ────────────────────────────────────────────────────────────
+        let layout = layout_from_snapshot(&snap.files, config);
+
+        prev_files = cur_files;
+        prev_edge_count = snap.edge_count;
+        prev_circular = snap.circular_dep_count;
+        prev_modules = snap.module_count;
+
+        steps.push(TimeMachineStep {
+            snapshot: snap,
+            added_files,
+            removed_files,
+            added_edges,
+            removed_edges,
+            layout,
+        });
+    }
+
+    let current_index = steps.len().saturating_sub(1);
+
+    Ok(TimeMachineData {
+        steps,
+        current_index,
+        health_sparkline,
+        key_events,
+    })
+}
+
+// ── Time Machine renderer ─────────────────────────────────────────────────────
+
+/// Renders a self-contained Time Machine HTML page.
+///
+/// The page embeds:
+/// - `cxpak-data` — the last step's `ComputedLayout` (used by the base graph
+///   renderer for the initial view).
+/// - `cxpak-timeline` — the full `TimeMachineData` for the timeline-specific JS.
+/// - `cxpak-meta` — `RenderMetadata` (repo name, version, etc.).
+pub fn render_time_machine(
+    snapshots: Vec<TimelineSnapshot>,
+    metadata: &RenderMetadata,
+    config: &super::layout::LayoutConfig,
+) -> Result<String, super::layout::LayoutError> {
+    let data = build_time_machine_data(snapshots, config)?;
+    let timeline_json = serde_json::to_string(&data).unwrap();
+
+    // Use the last step's layout as the initial graph pane.
+    let initial_layout = &data.steps[data.current_index].layout;
+    let layout_json = serde_json::to_string(initial_layout).unwrap();
+
+    let title = visual_type_name(&super::VisualType::Timeline);
+
+    #[derive(serde::Serialize)]
+    struct MetaWithDisplay<'a> {
+        #[serde(flatten)]
+        inner: &'a RenderMetadata,
+        visual_type_display: &'static str,
+    }
+    let meta_with_display = MetaWithDisplay {
+        inner: metadata,
+        visual_type_display: title,
+    };
+    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let controller_js = view_controller_js(&super::VisualType::Timeline);
+
+    Ok(format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>cxpak — {title}</title>
+  <style>{css}</style>
+</head>
+<body>
+  <div id="cxpak-app"></div>
+  <script id="cxpak-data" type="application/json">{layout_json}</script>
+  <script id="cxpak-timeline" type="application/json">{timeline_json}</script>
+  <script id="cxpak-meta" type="application/json">{meta_json}</script>
+  <script>{d3}</script>
+  <script>{controller}</script>
+</body>
+</html>
+"#,
+        title = title,
+        css = VISUAL_CSS,
+        layout_json = layout_json,
+        timeline_json = timeline_json,
+        meta_json = meta_json,
+        d3 = D3_BUNDLE,
+        controller = controller_js,
+    ))
+}
+
 // ── Risk Heatmap renderer ─────────────────────────────────────────────────────
 
 /// Renders a self-contained Risk Heatmap HTML page.
@@ -1823,6 +2166,149 @@ mod tests {
         assert!(
             parsed.get("dividers").is_some(),
             "flow JSON must have 'dividers'"
+        );
+    }
+
+    // ── Time Machine tests ────────────────────────────────────────────────────
+
+    fn make_snapshot(idx: usize, file_count: usize) -> TimelineSnapshot {
+        use crate::visual::timeline::SnapshotFile;
+        TimelineSnapshot {
+            commit_sha: format!("sha{idx}"),
+            commit_date: format!("2026-01-0{}", idx + 1),
+            commit_message: format!("commit {idx}"),
+            files: (0..file_count)
+                .map(|i| SnapshotFile {
+                    path: format!("f{i}.rs"),
+                    imports: vec![],
+                })
+                .collect(),
+            edge_count: idx * 2,
+            module_count: 1,
+            health_composite: None,
+            circular_dep_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_build_time_machine_data_step_count() {
+        let snapshots = (0..5).map(|i| make_snapshot(i, 0)).collect();
+        let data =
+            build_time_machine_data(snapshots, &crate::visual::layout::LayoutConfig::default())
+                .unwrap();
+        assert_eq!(data.steps.len(), 5);
+    }
+
+    #[test]
+    fn test_time_machine_detects_large_churn() {
+        use crate::visual::timeline::SnapshotFile;
+
+        let snap1 = TimelineSnapshot {
+            commit_sha: "a".into(),
+            commit_date: "2026-01-01".into(),
+            commit_message: "first".into(),
+            files: (0..10)
+                .map(|i| SnapshotFile {
+                    path: format!("f{i}.rs"),
+                    imports: vec![],
+                })
+                .collect(),
+            edge_count: 0,
+            module_count: 1,
+            health_composite: None,
+            circular_dep_count: 0,
+        };
+        let snap2 = TimelineSnapshot {
+            commit_sha: "b".into(),
+            commit_date: "2026-01-02".into(),
+            commit_message: "big change".into(),
+            files: (0..3)
+                .map(|i| SnapshotFile {
+                    path: format!("new{i}.rs"),
+                    imports: vec![],
+                })
+                .collect(),
+            edge_count: 0,
+            module_count: 1,
+            health_composite: None,
+            circular_dep_count: 0,
+        };
+        let data = build_time_machine_data(
+            vec![snap1, snap2],
+            &crate::visual::layout::LayoutConfig::default(),
+        )
+        .unwrap();
+        assert!(data
+            .key_events
+            .iter()
+            .any(|e| matches!(e.kind, KeyEventKind::LargeChurn)));
+    }
+
+    #[test]
+    fn test_time_machine_current_index_is_last() {
+        let snapshots = (0..4).map(|i| make_snapshot(i, 2)).collect();
+        let data =
+            build_time_machine_data(snapshots, &crate::visual::layout::LayoutConfig::default())
+                .unwrap();
+        assert_eq!(data.current_index, 3);
+    }
+
+    #[test]
+    fn test_time_machine_empty_snapshots_returns_error() {
+        let result =
+            build_time_machine_data(vec![], &crate::visual::layout::LayoutConfig::default());
+        assert!(
+            result.is_err(),
+            "empty snapshots must return LayoutError::Empty"
+        );
+    }
+
+    #[test]
+    fn test_render_time_machine_contains_timeline_data() {
+        let snapshots = (0..3).map(|i| make_snapshot(i, 2)).collect();
+        let meta = make_test_metadata();
+        let config = crate::visual::layout::LayoutConfig::default();
+        let html = render_time_machine(snapshots, &meta, &config)
+            .expect("render_time_machine must succeed for 3 snapshots");
+
+        // Must be well-formed HTML.
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("</html>"));
+
+        // Must embed the timeline JSON in the expected script tag.
+        assert!(
+            html.contains(r#"id="cxpak-timeline""#),
+            "HTML must contain cxpak-timeline script tag"
+        );
+
+        // Script tag counts must balance.
+        let opens = html.matches("<script").count();
+        let closes = html.matches("</script>").count();
+        assert_eq!(opens, closes, "mismatched script tags");
+
+        // Timeline JSON must be parseable and contain expected keys.
+        let marker = r#"<script id="cxpak-timeline" type="application/json">"#;
+        let start = html.find(marker).expect("cxpak-timeline tag missing");
+        let content_start = start + marker.len();
+        let content_end = html[content_start..].find("</script>").unwrap() + content_start;
+        let json_str = &html[content_start..content_end];
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("timeline JSON must be valid");
+        assert!(
+            parsed.get("steps").is_some(),
+            "timeline JSON must have 'steps'"
+        );
+        assert!(
+            parsed.get("current_index").is_some(),
+            "timeline JSON must have 'current_index'"
+        );
+        assert!(
+            parsed.get("health_sparkline").is_some(),
+            "timeline JSON must have 'health_sparkline'"
+        );
+        assert!(
+            parsed.get("key_events").is_some(),
+            "timeline JSON must have 'key_events'"
         );
     }
 }

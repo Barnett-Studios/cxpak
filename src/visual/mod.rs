@@ -12,6 +12,8 @@ pub mod layout;
 pub mod onboard;
 #[cfg(feature = "visual")]
 pub mod render;
+#[cfg(feature = "visual")]
+pub mod timeline;
 
 /// Which visualization type to generate
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
