@@ -840,6 +840,363 @@ fn short_label(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
+// ── Flow Diagram types ────────────────────────────────────────────────────────
+
+/// Full data payload for the Flow Diagram view, embedded in the HTML page as
+/// `<script id="cxpak-flow" type="application/json">`.
+///
+/// Contains the computed graph layout plus flow-specific overlays: cross-language
+/// dividers, security checkpoints, and gaps where security controls are missing.
+#[derive(Debug, serde::Serialize)]
+pub struct FlowDiagramData {
+    /// Graph layout ready for D3 rendering.
+    pub layout: super::layout::ComputedLayout,
+    /// Vertical divider lines marking transitions between programming languages.
+    pub dividers: Vec<CrossLangDivider>,
+    /// Nodes identified as auth/validation/sanitisation checkpoints.
+    pub security_checkpoints: Vec<SecurityCheckpoint>,
+    /// Edges where a value crosses a security boundary without a checkpoint.
+    pub missing_security: Vec<MissingSecurityEdge>,
+    /// The symbol that was traced (source of the flow).
+    pub symbol: String,
+    /// Confidence of the overall trace: `"Exact"`, `"Approximate"`, or `"Speculative"`.
+    pub confidence: String,
+    /// `true` when at least one path was pruned by the depth limit.
+    pub truncated: bool,
+}
+
+/// A vertical divider rendered between two consecutive layout nodes that belong
+/// to different programming languages.  `x_position` is the midpoint between
+/// the two nodes (in layout-coordinate space) where the divider line is drawn.
+#[derive(Debug, serde::Serialize)]
+pub struct CrossLangDivider {
+    /// X coordinate (layout space) of the divider line.
+    pub x_position: f64,
+    /// Language of the node to the left of the divider.
+    pub left_language: String,
+    /// Language of the node to the right of the divider.
+    pub right_language: String,
+}
+
+/// A layout node that acts as a security checkpoint (auth guard, input
+/// validator, or sanitiser).
+#[derive(Debug, serde::Serialize)]
+pub struct SecurityCheckpoint {
+    /// The layout node id (matches a `LayoutNode::id` in `layout.nodes`).
+    pub node_id: String,
+    /// Category of the checkpoint: `"auth"`, `"validation"`, or `"sanitize"`.
+    pub checkpoint_type: String,
+}
+
+/// An edge between two layout nodes where a value crosses a security-sensitive
+/// file boundary without passing through a known checkpoint first.
+#[derive(Debug, serde::Serialize)]
+pub struct MissingSecurityEdge {
+    /// Source layout node id.
+    pub from_node_id: String,
+    /// Target layout node id.
+    pub to_node_id: String,
+    /// Human-readable description of the gap.
+    pub warning: String,
+}
+
+// ── Flow Diagram builder ──────────────────────────────────────────────────────
+
+/// Stable node id for a `FlowNode`: `"<file>::<symbol>"`.
+fn flow_node_id(node: &crate::intelligence::data_flow::FlowNode) -> String {
+    format!("{}::{}", node.file, node.symbol)
+}
+
+/// Collapse runs of more than 3 consecutive `Passthrough` nodes in a path into
+/// a single cluster node so the diagram stays readable.
+///
+/// The cluster node is inserted at the position of the first collapsed node and
+/// labelled `"… N more"`.  The surrounding Source and Sink nodes are left in
+/// place.  Any run of exactly 1–3 Passthrough nodes is kept verbatim.
+fn collapse_passthrough_chains(
+    nodes: &[crate::intelligence::data_flow::FlowNode],
+) -> Vec<crate::intelligence::data_flow::FlowNode> {
+    use crate::intelligence::data_flow::FlowNodeType;
+
+    if nodes.len() <= 5 {
+        // No collapsing needed for short paths.
+        return nodes.to_vec();
+    }
+
+    let mut result: Vec<crate::intelligence::data_flow::FlowNode> = Vec::new();
+    let mut i = 0;
+
+    while i < nodes.len() {
+        if nodes[i].node_type == FlowNodeType::Passthrough {
+            // Count the run length.
+            let run_start = i;
+            while i < nodes.len() && nodes[i].node_type == FlowNodeType::Passthrough {
+                i += 1;
+            }
+            let run_len = i - run_start;
+            if run_len > 3 {
+                // Emit first node of the run, then a cluster placeholder, then last.
+                result.push(nodes[run_start].clone());
+                // Build a synthetic cluster node using the middle position.
+                let mid_idx = run_start + run_len / 2;
+                let mut cluster = nodes[mid_idx].clone();
+                cluster.symbol = format!("… {} more", run_len - 2);
+                result.push(cluster);
+                result.push(nodes[i - 1].clone());
+            } else {
+                // Short run — keep verbatim.
+                for n in &nodes[run_start..i] {
+                    result.push(n.clone());
+                }
+            }
+        } else {
+            result.push(nodes[i].clone());
+            i += 1;
+        }
+    }
+
+    result
+}
+
+/// Determine the overall `confidence` string from the set of paths in a
+/// `DataFlowResult`.  The most pessimistic confidence wins.
+fn overall_confidence(flow: &crate::intelligence::data_flow::DataFlowResult) -> &'static str {
+    use crate::intelligence::data_flow::FlowConfidence;
+
+    let mut has_approximate = false;
+    for path in &flow.paths {
+        match path.confidence {
+            FlowConfidence::Speculative => return "Speculative",
+            FlowConfidence::Approximate => has_approximate = true,
+            FlowConfidence::Exact => {}
+        }
+    }
+    if has_approximate {
+        "Approximate"
+    } else {
+        "Exact"
+    }
+}
+
+/// Build a [`FlowDiagramData`] from a [`DataFlowResult`].
+///
+/// # Algorithm
+///
+/// 1. Flatten all paths into a deduplicated ordered list of [`FlowNode`]s.
+///    The first path visited defines the canonical order; later paths may add
+///    new nodes that appear after the last already-seen node in path order.
+/// 2. Apply passthrough-chain collapsing (>3 consecutive Passthrough nodes
+///    become a single `"… N more"` cluster node).
+/// 3. Build [`LayoutNode`]s and [`LayoutEdge`]s from consecutive node pairs
+///    in each path (after collapsing).
+/// 4. Call [`super::layout::compute_layout`] to obtain positions.
+/// 5. Detect cross-language boundaries by examining consecutive nodes in
+///    layout order and emit [`CrossLangDivider`]s.
+///
+/// # Errors
+///
+/// Propagates [`super::layout::LayoutError::Empty`] when the flow result has
+/// no paths or all paths are empty.
+pub fn build_flow_diagram_data(
+    flow: &crate::intelligence::data_flow::DataFlowResult,
+    _index: &CodebaseIndex,
+    config: &super::layout::LayoutConfig,
+) -> Result<FlowDiagramData, super::layout::LayoutError> {
+    use super::layout::{EdgeVisualType, LayoutEdge, LayoutNode, NodeMetadata, NodeType, Point};
+    use std::collections::{HashMap, HashSet};
+
+    // ── 1. Collect unique nodes in path-traversal order ───────────────────────
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut ordered_nodes: Vec<crate::intelligence::data_flow::FlowNode> = Vec::new();
+
+    // Always include the source node first.
+    let src_id = flow_node_id(&flow.source);
+    if seen_ids.insert(src_id.clone()) {
+        ordered_nodes.push(flow.source.clone());
+    }
+
+    for path in &flow.paths {
+        // Collapse passthrough chains for each path before processing.
+        let collapsed = collapse_passthrough_chains(&path.nodes);
+        for node in &collapsed {
+            let id = flow_node_id(node);
+            if seen_ids.insert(id) {
+                ordered_nodes.push(node.clone());
+            }
+        }
+    }
+
+    // ── 2. Build LayoutNodes ──────────────────────────────────────────────────
+    let layout_nodes: Vec<LayoutNode> = ordered_nodes
+        .iter()
+        .map(|n| {
+            let id = flow_node_id(n);
+            let label = n.symbol.clone();
+            LayoutNode {
+                id,
+                label,
+                layer: 0, // will be overwritten by compute_layout
+                position: Point { x: 0.0, y: 0.0 },
+                width: config.node_width,
+                height: config.node_height,
+                node_type: NodeType::Symbol,
+                metadata: NodeMetadata::default(),
+            }
+        })
+        .collect();
+
+    // ── 3. Build LayoutEdges from consecutive nodes in each path ──────────────
+    let mut edge_set: HashSet<(String, String)> = HashSet::new();
+    let mut layout_edges: Vec<LayoutEdge> = Vec::new();
+
+    for path in &flow.paths {
+        let collapsed = collapse_passthrough_chains(&path.nodes);
+        for pair in collapsed.windows(2) {
+            let src = flow_node_id(&pair[0]);
+            let tgt = flow_node_id(&pair[1]);
+            if edge_set.insert((src.clone(), tgt.clone())) {
+                let crosses_lang = pair[0].language != pair[1].language;
+                let edge_type = if crosses_lang {
+                    EdgeVisualType::CrossLanguage
+                } else {
+                    EdgeVisualType::DataFlow
+                };
+                layout_edges.push(LayoutEdge {
+                    source: src,
+                    target: tgt,
+                    edge_type,
+                    weight: 1.0,
+                    is_cycle: false,
+                    waypoints: vec![],
+                });
+            }
+        }
+    }
+
+    // Guard against empty graph.
+    if layout_nodes.is_empty() {
+        return Err(super::layout::LayoutError::Empty);
+    }
+
+    // ── 4. Compute layout ─────────────────────────────────────────────────────
+    let layout = super::layout::compute_layout(layout_nodes, layout_edges, config)?;
+
+    // ── 5. Detect cross-language dividers ─────────────────────────────────────
+    // Build a map from node id → language for fast lookup.
+    let lang_map: HashMap<String, String> = ordered_nodes
+        .iter()
+        .map(|n| (flow_node_id(n), n.language.clone()))
+        .collect();
+
+    // Sort layout nodes by x position to find left-right language transitions.
+    let mut sorted_by_x = layout.nodes.clone();
+    sorted_by_x.sort_by(|a, b| {
+        a.position
+            .x
+            .partial_cmp(&b.position.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut dividers: Vec<CrossLangDivider> = Vec::new();
+    for pair in sorted_by_x.windows(2) {
+        let left_lang = lang_map
+            .get(&pair[0].id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".into());
+        let right_lang = lang_map
+            .get(&pair[1].id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".into());
+        if left_lang != right_lang {
+            let x_position = pair[0].position.x
+                + pair[0].width
+                + (pair[1].position.x - pair[0].position.x - pair[0].width) / 2.0;
+            dividers.push(CrossLangDivider {
+                x_position,
+                left_language: left_lang,
+                right_language: right_lang,
+            });
+        }
+    }
+
+    let confidence = overall_confidence(flow).to_string();
+
+    Ok(FlowDiagramData {
+        layout,
+        dividers,
+        security_checkpoints: vec![],
+        missing_security: vec![],
+        symbol: flow.source.symbol.clone(),
+        confidence,
+        truncated: flow.truncated,
+    })
+}
+
+// ── Flow Diagram renderer ─────────────────────────────────────────────────────
+
+/// Renders a self-contained Flow Diagram HTML page.
+///
+/// The page embeds:
+/// - `cxpak-data` — the `ComputedLayout` (used by the base graph renderer for
+///   the initial graph pane).
+/// - `cxpak-flow` — the full `FlowDiagramData` (layout + dividers + security
+///   overlays) for the flow-specific JS renderer.
+/// - `cxpak-meta` — `RenderMetadata` (repo name, version, etc.).
+pub fn render_flow_diagram(
+    flow: &crate::intelligence::data_flow::DataFlowResult,
+    index: &CodebaseIndex,
+    metadata: &RenderMetadata,
+) -> Result<String, super::layout::LayoutError> {
+    let config = super::layout::LayoutConfig::default();
+    let flow_data = build_flow_diagram_data(flow, index, &config)?;
+    let flow_json = serde_json::to_string(&flow_data).unwrap();
+
+    // Embed the computed layout as the base graph pane data.
+    let layout_json = serde_json::to_string(&flow_data.layout).unwrap();
+
+    let title = visual_type_name(&super::VisualType::Flow);
+
+    #[derive(serde::Serialize)]
+    struct MetaWithDisplay<'a> {
+        #[serde(flatten)]
+        inner: &'a RenderMetadata,
+        visual_type_display: &'static str,
+    }
+    let meta_with_display = MetaWithDisplay {
+        inner: metadata,
+        visual_type_display: title,
+    };
+    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let controller_js = view_controller_js(&super::VisualType::Flow);
+
+    Ok(format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>cxpak — {title}</title>
+  <style>{css}</style>
+</head>
+<body>
+  <div id="cxpak-app"></div>
+  <script id="cxpak-data" type="application/json">{layout_json}</script>
+  <script id="cxpak-flow" type="application/json">{flow_json}</script>
+  <script id="cxpak-meta" type="application/json">{meta_json}</script>
+  <script>{d3}</script>
+  <script>{controller}</script>
+</body>
+</html>
+"#,
+        title = title,
+        css = VISUAL_CSS,
+        layout_json = layout_json,
+        flow_json = flow_json,
+        meta_json = meta_json,
+        d3 = D3_BUNDLE,
+        controller = controller_js,
+    ))
+}
+
 // ── Risk Heatmap renderer ─────────────────────────────────────────────────────
 
 /// Renders a self-contained Risk Heatmap HTML page.
@@ -1307,6 +1664,165 @@ mod tests {
         assert!(
             parsed.get("max_risk").is_some(),
             "heatmap JSON must have 'max_risk'"
+        );
+    }
+
+    // ── Flow Diagram tests ────────────────────────────────────────────────────
+
+    /// Build a minimal [`DataFlowResult`] with `n` nodes for testing.
+    ///
+    /// The source node lives at `"src/handler.rs"` and each subsequent node
+    /// lives at `"src/service_N.rs"`.  All nodes share the same language
+    /// ("rust") so no cross-language dividers are expected.
+    fn make_minimal_flow(
+        n: usize,
+        truncated: bool,
+    ) -> crate::intelligence::data_flow::DataFlowResult {
+        use crate::intelligence::data_flow::{
+            DataFlowResult, FlowConfidence, FlowNode, FlowNodeType, FlowPath,
+        };
+
+        let make_node = |file: &str, symbol: &str, node_type: FlowNodeType| FlowNode {
+            file: file.to_string(),
+            symbol: symbol.to_string(),
+            parameter: None,
+            language: "rust".to_string(),
+            node_type,
+        };
+
+        let source = make_node("src/handler.rs", "handle_request", FlowNodeType::Source);
+
+        let mut path_nodes = vec![source.clone()];
+        for i in 1..n {
+            let (file, sym, nt) = if i == n - 1 {
+                (
+                    "src/store.rs".to_string(),
+                    "save".to_string(),
+                    FlowNodeType::Sink,
+                )
+            } else {
+                (
+                    format!("src/service_{i}.rs"),
+                    format!("process_{i}"),
+                    FlowNodeType::Passthrough,
+                )
+            };
+            path_nodes.push(make_node(&file, &sym, nt));
+        }
+
+        let path = FlowPath {
+            nodes: path_nodes,
+            crosses_module_boundary: false,
+            crosses_language_boundary: false,
+            touches_security_boundary: false,
+            confidence: FlowConfidence::Exact,
+            length: n,
+        };
+
+        DataFlowResult {
+            source,
+            sink: None,
+            paths: vec![path],
+            truncated,
+            limitations: vec![],
+        }
+    }
+
+    #[test]
+    fn test_flow_diagram_data_from_simple_flow() {
+        let flow = make_minimal_flow(4, false);
+        let index = make_minimal_index();
+        let config = crate::visual::layout::LayoutConfig::default();
+
+        let data = build_flow_diagram_data(&flow, &index, &config)
+            .expect("build_flow_diagram_data must succeed for a 4-node flow");
+
+        // All 4 nodes from the single path must appear in the layout.
+        assert_eq!(
+            data.layout.nodes.len(),
+            4,
+            "expected 4 layout nodes, got {}",
+            data.layout.nodes.len()
+        );
+        // The source symbol must be recorded.
+        assert_eq!(data.symbol, "handle_request");
+        // All nodes share the same language — no cross-language dividers.
+        assert!(
+            data.dividers.is_empty(),
+            "expected no dividers for same-language flow"
+        );
+        // Confidence must be Exact (all hops Exact, none Speculative).
+        assert_eq!(data.confidence, "Exact");
+        // Not truncated.
+        assert!(!data.truncated);
+    }
+
+    #[test]
+    fn test_flow_diagram_truncated_flag() {
+        let flow = make_minimal_flow(3, true);
+        let index = make_minimal_index();
+        let config = crate::visual::layout::LayoutConfig::default();
+
+        let data = build_flow_diagram_data(&flow, &index, &config)
+            .expect("build_flow_diagram_data must succeed");
+
+        assert!(
+            data.truncated,
+            "truncated flag must be forwarded from DataFlowResult"
+        );
+    }
+
+    #[test]
+    fn test_render_flow_diagram_contains_flow_data() {
+        let flow = make_minimal_flow(3, false);
+        let index = make_minimal_index();
+        let meta = make_test_metadata();
+
+        let html = render_flow_diagram(&flow, &index, &meta)
+            .expect("render_flow_diagram must succeed for a 3-node flow");
+
+        // Must be well-formed HTML.
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("</html>"));
+
+        // Must embed the flow JSON in the expected script tag.
+        assert!(
+            html.contains(r#"id="cxpak-flow""#),
+            "HTML must contain cxpak-flow script tag"
+        );
+
+        // Script tag counts must balance.
+        let opens = html.matches("<script").count();
+        let closes = html.matches("</script>").count();
+        assert_eq!(opens, closes, "mismatched script tags");
+
+        // Flow JSON must be parseable and contain expected keys.
+        let marker = r#"<script id="cxpak-flow" type="application/json">"#;
+        let start = html.find(marker).expect("cxpak-flow tag missing");
+        let content_start = start + marker.len();
+        let content_end = html[content_start..].find("</script>").unwrap() + content_start;
+        let json_str = &html[content_start..content_end];
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("flow JSON must be valid");
+        assert!(
+            parsed.get("layout").is_some(),
+            "flow JSON must have 'layout'"
+        );
+        assert!(
+            parsed.get("symbol").is_some(),
+            "flow JSON must have 'symbol'"
+        );
+        assert!(
+            parsed.get("confidence").is_some(),
+            "flow JSON must have 'confidence'"
+        );
+        assert!(
+            parsed.get("truncated").is_some(),
+            "flow JSON must have 'truncated'"
+        );
+        assert!(
+            parsed.get("dividers").is_some(),
+            "flow JSON must have 'dividers'"
         );
     }
 }
