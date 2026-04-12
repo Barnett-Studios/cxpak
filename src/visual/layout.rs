@@ -571,6 +571,400 @@ pub fn compute_layout(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Task 5: Layout builders
+// ---------------------------------------------------------------------------
+
+use crate::index::CodebaseIndex;
+
+/// Derive a two-segment module prefix from a file path.
+///
+/// Delegates to `crate::intelligence::health::module_prefix` (depth 2).
+fn file_module_prefix(path: &str) -> String {
+    crate::intelligence::health::module_prefix(path, 2)
+}
+
+/// If a layer exceeds `max_per_layer`, group the tail nodes into a single
+/// `Cluster` node and update `layer_order` accordingly.
+///
+/// The first `max_per_layer - 1` nodes in any over-full layer are kept as-is.
+/// The remaining nodes are replaced by a single `Cluster` node whose
+/// `member_ids` lists the displaced node ids.
+///
+/// `nodes` is consumed and returned with the cluster node appended (excess
+/// nodes removed).
+fn enforce_cognitive_limit(
+    mut nodes: Vec<LayoutNode>,
+    layer_order: &mut [Vec<String>],
+    max_per_layer: usize,
+) -> Vec<LayoutNode> {
+    if max_per_layer == 0 {
+        return nodes;
+    }
+
+    // Build a quick lookup: node id → index in `nodes`
+    let mut id_to_idx: HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.clone(), i))
+        .collect();
+
+    let mut ids_to_remove: Vec<String> = Vec::new();
+
+    for layer in layer_order.iter_mut() {
+        if layer.len() <= max_per_layer {
+            continue;
+        }
+
+        // Keep the first (max_per_layer - 1) nodes; cluster the rest.
+        let keep = max_per_layer - 1;
+        let excess: Vec<String> = layer.drain(keep..).collect();
+
+        // Build a cluster node from the first excess node's properties (position etc
+        // will be overwritten by compute_layout anyway).
+        let cluster_id = format!("__cluster_{}", layer.len());
+        let cluster_node = LayoutNode {
+            id: cluster_id.clone(),
+            label: format!("{} more…", excess.len()),
+            layer: 0, // will be set by compute_layout
+            position: Point::default(),
+            width: 160.0,
+            height: 48.0,
+            node_type: NodeType::Cluster {
+                member_ids: excess.clone(),
+            },
+            metadata: NodeMetadata::default(),
+        };
+
+        // Mark excess nodes for removal.
+        ids_to_remove.extend(excess);
+
+        // Add cluster id to this layer.
+        layer.push(cluster_id.clone());
+
+        // Add cluster node.
+        nodes.push(cluster_node);
+        id_to_idx.insert(cluster_id, nodes.len() - 1);
+    }
+
+    // Remove excess nodes (keep cluster nodes that replaced them).
+    let remove_set: std::collections::HashSet<&str> =
+        ids_to_remove.iter().map(|s| s.as_str()).collect();
+    nodes.retain(|n| !remove_set.contains(n.id.as_str()));
+
+    nodes
+}
+
+/// Level 1 layout: one node per module, edges for cross-module imports.
+///
+/// Calls [`crate::intelligence::architecture::build_architecture_map`] with
+/// `module_depth = 2` to derive the set of modules.
+pub fn build_module_layout(
+    index: &CodebaseIndex,
+    config: &LayoutConfig,
+) -> Result<ComputedLayout, LayoutError> {
+    let arch = crate::intelligence::architecture::build_architecture_map(index, 2);
+
+    if arch.modules.is_empty() {
+        return Err(LayoutError::Empty);
+    }
+
+    // Collect which module prefixes participate in any circular dep.
+    let circular_modules: std::collections::HashSet<String> = arch
+        .circular_deps
+        .iter()
+        .flat_map(|cycle| cycle.iter().map(|path| file_module_prefix(path)))
+        .collect();
+
+    // Build one node per module.
+    let nodes: Vec<LayoutNode> = arch
+        .modules
+        .iter()
+        .map(|m| {
+            let pr = m.aggregate_pagerank;
+            let width = config.node_width * (1.0 + pr.min(1.0));
+            LayoutNode {
+                id: m.prefix.clone(),
+                label: m.prefix.clone(),
+                layer: 0,
+                position: Point::default(),
+                width,
+                height: config.node_height,
+                node_type: NodeType::Module,
+                metadata: NodeMetadata {
+                    pagerank: pr,
+                    is_circular: circular_modules.contains(&m.prefix),
+                    is_god_file: !m.god_files.is_empty(),
+                    ..NodeMetadata::default()
+                },
+            }
+        })
+        .collect();
+
+    // Build module id set for O(1) lookup.
+    let module_ids: std::collections::HashSet<String> =
+        nodes.iter().map(|n| n.id.clone()).collect();
+
+    // Build cross-module import edges (deduplicated).
+    let mut seen_edges: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut edges: Vec<LayoutEdge> = Vec::new();
+
+    for (source_file, deps) in &index.graph.edges {
+        let src_mod = file_module_prefix(source_file);
+        if !module_ids.contains(&src_mod) {
+            continue;
+        }
+        for dep in deps {
+            let dst_mod = file_module_prefix(&dep.target);
+            if dst_mod == src_mod || !module_ids.contains(&dst_mod) {
+                continue;
+            }
+            let key = (src_mod.clone(), dst_mod.clone());
+            if seen_edges.insert(key) {
+                edges.push(LayoutEdge {
+                    source: src_mod.clone(),
+                    target: dst_mod.clone(),
+                    edge_type: EdgeVisualType::Import,
+                    weight: 1.0,
+                    is_cycle: false,
+                    waypoints: vec![],
+                });
+            }
+        }
+    }
+
+    // Assign preliminary layer order for cognitive-limit enforcement.
+    let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let edge_pairs: Vec<(String, String)> = edges
+        .iter()
+        .map(|e| (e.source.clone(), e.target.clone()))
+        .collect();
+
+    // Layer-assign to get initial layer grouping (ignore errors — fall back to one layer).
+    let layer_map = layer_assign(&node_ids, &edge_pairs)
+        .unwrap_or_else(|_| node_ids.iter().map(|id| (id.clone(), 0)).collect());
+
+    let max_layer = layer_map.values().copied().max().unwrap_or(0);
+    let mut layer_order: Vec<Vec<String>> = vec![Vec::new(); max_layer + 1];
+    for id in &node_ids {
+        let l = layer_map.get(id).copied().unwrap_or(0);
+        layer_order[l].push(id.clone());
+    }
+
+    // Apply cognitive-limit clustering.
+    let nodes = enforce_cognitive_limit(nodes, &mut layer_order, config.max_nodes_per_layer);
+
+    compute_layout(nodes, edges, config)
+}
+
+/// Level 2 layout: files within a specific module prefix, edges for intra-module imports.
+pub fn build_file_layout(
+    index: &CodebaseIndex,
+    module_prefix: &str,
+    config: &LayoutConfig,
+) -> Result<ComputedLayout, LayoutError> {
+    // Filter files to this module.
+    let module_files: Vec<&crate::index::IndexedFile> = index
+        .files
+        .iter()
+        .filter(|f| file_module_prefix(&f.relative_path) == module_prefix)
+        .collect();
+
+    if module_files.is_empty() {
+        return Err(LayoutError::Empty);
+    }
+
+    // Build risk lookup (path → risk_score).
+    let risk_entries = crate::intelligence::risk::compute_risk_ranking(index);
+    let risk_map: HashMap<&str, f64> = risk_entries
+        .iter()
+        .map(|r| (r.path.as_str(), r.risk_score))
+        .collect();
+
+    // Build god-file set from architecture map.
+    let arch = crate::intelligence::architecture::build_architecture_map(index, 2);
+    let god_file_set: std::collections::HashSet<&str> = arch
+        .modules
+        .iter()
+        .filter(|m| m.prefix == module_prefix)
+        .flat_map(|m| m.god_files.iter().map(|s| s.as_str()))
+        .collect();
+
+    // Build one node per file.
+    let nodes: Vec<LayoutNode> = module_files
+        .iter()
+        .map(|f| {
+            let pr = index
+                .pagerank
+                .get(f.relative_path.as_str())
+                .copied()
+                .unwrap_or(0.0);
+            let risk = risk_map
+                .get(f.relative_path.as_str())
+                .copied()
+                .unwrap_or(0.0);
+            LayoutNode {
+                id: f.relative_path.clone(),
+                label: f.relative_path.clone(),
+                layer: 0,
+                position: Point::default(),
+                width: config.node_width,
+                height: config.node_height,
+                node_type: NodeType::File,
+                metadata: NodeMetadata {
+                    pagerank: pr,
+                    risk_score: risk,
+                    token_count: f.token_count,
+                    is_god_file: god_file_set.contains(f.relative_path.as_str()),
+                    has_dead_code: false,
+                    is_circular: false,
+                    health_score: None,
+                },
+            }
+        })
+        .collect();
+
+    // Build intra-module import edges.
+    let file_ids: std::collections::HashSet<&str> = module_files
+        .iter()
+        .map(|f| f.relative_path.as_str())
+        .collect();
+
+    let mut edges: Vec<LayoutEdge> = Vec::new();
+    for f in &module_files {
+        if let Some(deps) = index.graph.edges.get(f.relative_path.as_str()) {
+            for dep in deps {
+                if file_ids.contains(dep.target.as_str()) {
+                    edges.push(LayoutEdge {
+                        source: f.relative_path.clone(),
+                        target: dep.target.clone(),
+                        edge_type: EdgeVisualType::Import,
+                        weight: 1.0,
+                        is_cycle: false,
+                        waypoints: vec![],
+                    });
+                }
+            }
+        }
+    }
+
+    // Preliminary layer order for cognitive-limit enforcement.
+    let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let edge_pairs: Vec<(String, String)> = edges
+        .iter()
+        .map(|e| (e.source.clone(), e.target.clone()))
+        .collect();
+
+    let layer_map = layer_assign(&node_ids, &edge_pairs)
+        .unwrap_or_else(|_| node_ids.iter().map(|id| (id.clone(), 0)).collect());
+
+    let max_layer = layer_map.values().copied().max().unwrap_or(0);
+    let mut layer_order: Vec<Vec<String>> = vec![Vec::new(); max_layer + 1];
+    for id in &node_ids {
+        let l = layer_map.get(id).copied().unwrap_or(0);
+        layer_order[l].push(id.clone());
+    }
+
+    let nodes = enforce_cognitive_limit(nodes, &mut layer_order, config.max_nodes_per_layer);
+
+    compute_layout(nodes, edges, config)
+}
+
+/// Level 3 layout: symbols within a file, with call-graph edges.
+///
+/// Symbols are ordered by their appearance in the file (start_line).  When no
+/// call-graph edges exist between the symbols, a simple linear chain is added
+/// so the layout engine always produces a valid directed graph.
+pub fn build_symbol_layout(
+    index: &CodebaseIndex,
+    file_path: &str,
+    config: &LayoutConfig,
+) -> Result<ComputedLayout, LayoutError> {
+    let file = index
+        .files
+        .iter()
+        .find(|f| f.relative_path == file_path)
+        .ok_or(LayoutError::Empty)?;
+
+    let parse_result = file.parse_result.as_ref().ok_or(LayoutError::Empty)?;
+
+    if parse_result.symbols.is_empty() {
+        return Err(LayoutError::Empty);
+    }
+
+    // Sort symbols by start_line for stable ordering.
+    let mut symbols: Vec<&crate::parser::language::Symbol> = parse_result.symbols.iter().collect();
+    symbols.sort_by_key(|s| s.start_line);
+
+    let file_pr = index.pagerank.get(file_path).copied().unwrap_or(0.0);
+
+    let nodes: Vec<LayoutNode> = symbols
+        .iter()
+        .map(|s| {
+            let id = format!("{}::{}", file_path, s.name);
+            LayoutNode {
+                id: id.clone(),
+                label: s.name.clone(),
+                layer: 0,
+                position: Point::default(),
+                width: config.node_width,
+                height: config.node_height,
+                node_type: NodeType::Symbol,
+                metadata: NodeMetadata {
+                    pagerank: file_pr,
+                    ..NodeMetadata::default()
+                },
+            }
+        })
+        .collect();
+
+    // Build call-graph edges between symbols in this file.
+    let symbol_id_map: HashMap<&str, String> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), format!("{}::{}", file_path, s.name)))
+        .collect();
+
+    let mut edges: Vec<LayoutEdge> = Vec::new();
+    for call_edge in &index.call_graph.edges {
+        if call_edge.caller_file != file_path || call_edge.callee_file != file_path {
+            continue;
+        }
+        if let (Some(src_id), Some(dst_id)) = (
+            symbol_id_map.get(call_edge.caller_symbol.as_str()),
+            symbol_id_map.get(call_edge.callee_symbol.as_str()),
+        ) {
+            if src_id != dst_id {
+                edges.push(LayoutEdge {
+                    source: src_id.clone(),
+                    target: dst_id.clone(),
+                    edge_type: EdgeVisualType::Call,
+                    weight: 1.0,
+                    is_cycle: false,
+                    waypoints: vec![],
+                });
+            }
+        }
+    }
+
+    // If no call-graph edges found, create a linear chain by declaration order
+    // so the layout engine always has a valid directed graph to work with.
+    if edges.is_empty() && nodes.len() > 1 {
+        for i in 0..(nodes.len() - 1) {
+            edges.push(LayoutEdge {
+                source: nodes[i].id.clone(),
+                target: nodes[i + 1].id.clone(),
+                edge_type: EdgeVisualType::Call,
+                weight: 1.0,
+                is_cycle: false,
+                waypoints: vec![],
+            });
+        }
+    }
+
+    compute_layout(nodes, edges, config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +1150,256 @@ mod tests {
         let original = layer_order.clone();
         barycenter_sort(&mut layer_order, &adj, &rev_adj);
         assert_eq!(layer_order, original);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 5 tests
+    // ---------------------------------------------------------------------------
+
+    /// Helper: build a minimal CodebaseIndex from (relative_path, content) pairs.
+    fn make_minimal_index(paths: &[(&str, &str)]) -> crate::index::CodebaseIndex {
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let files: Vec<ScannedFile> = paths
+            .iter()
+            .map(|(rel, content)| {
+                let abs = dir.path().join(rel.replace('/', "_"));
+                std::fs::write(&abs, content).unwrap();
+                ScannedFile {
+                    relative_path: rel.to_string(),
+                    absolute_path: abs,
+                    language: Some("rust".into()),
+                    size_bytes: content.len() as u64,
+                }
+            })
+            .collect();
+        crate::index::CodebaseIndex::build(files, std::collections::HashMap::new(), &counter)
+    }
+
+    /// Helper: build a CodebaseIndex with symbols in one file.
+    fn make_index_with_symbols(
+        paths: &[(&str, &str)],
+        file_with_symbols: &str,
+        symbols: Vec<crate::parser::language::Symbol>,
+    ) -> crate::index::CodebaseIndex {
+        use crate::budget::counter::TokenCounter;
+        use crate::parser::language::ParseResult;
+        use crate::scanner::ScannedFile;
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut files = Vec::new();
+        let mut parse_results = std::collections::HashMap::new();
+        let mut content_map = std::collections::HashMap::new();
+        for (rel, content) in paths {
+            let abs = dir.path().join(rel.replace('/', "_"));
+            std::fs::write(&abs, content).unwrap();
+            files.push(ScannedFile {
+                relative_path: rel.to_string(),
+                absolute_path: abs,
+                language: Some("rust".into()),
+                size_bytes: content.len() as u64,
+            });
+            content_map.insert(rel.to_string(), content.to_string());
+        }
+        parse_results.insert(
+            file_with_symbols.to_string(),
+            ParseResult {
+                symbols,
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        crate::index::CodebaseIndex::build_with_content(files, parse_results, &counter, content_map)
+    }
+
+    fn make_sym(name: &str, start_line: usize) -> crate::parser::language::Symbol {
+        use crate::parser::language::{SymbolKind, Visibility};
+        crate::parser::language::Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: format!("pub fn {}()", name),
+            body: "{}".to_string(),
+            start_line,
+            end_line: start_line + 2,
+        }
+    }
+
+    #[test]
+    fn test_enforce_cognitive_limit_clusters_excess() {
+        let nodes: Vec<LayoutNode> = (0..12).map(|i| make_node(&i.to_string(), 0)).collect();
+        let mut layer_order = vec![(0..12).map(|i| i.to_string()).collect::<Vec<_>>()];
+        let result = enforce_cognitive_limit(nodes, &mut layer_order, 9);
+        // Layer should now have 9 entries: 8 original + 1 cluster
+        assert_eq!(layer_order[0].len(), 9);
+        // The last entry should be a cluster node
+        let cluster_id = &layer_order[0][8];
+        let cluster_node = result.iter().find(|n| n.id == *cluster_id).unwrap();
+        assert!(
+            matches!(cluster_node.node_type, NodeType::Cluster { .. }),
+            "expected Cluster node, got {:?}",
+            cluster_node.node_type
+        );
+        // Cluster should have 4 member ids (12 - 8 = 4)
+        if let NodeType::Cluster { member_ids } = &cluster_node.node_type {
+            assert_eq!(member_ids.len(), 4);
+        }
+        // Total nodes: 8 kept + 1 cluster (excess 4 removed)
+        assert_eq!(result.len(), 9);
+    }
+
+    #[test]
+    fn test_enforce_cognitive_limit_no_op_when_under_limit() {
+        let nodes: Vec<LayoutNode> = (0..5).map(|i| make_node(&i.to_string(), 0)).collect();
+        let mut layer_order = vec![(0..5).map(|i| i.to_string()).collect::<Vec<_>>()];
+        let result = enforce_cognitive_limit(nodes, &mut layer_order, 9);
+        assert_eq!(layer_order[0].len(), 5);
+        assert_eq!(result.len(), 5);
+        assert!(!result
+            .iter()
+            .any(|n| matches!(n.node_type, NodeType::Cluster { .. })));
+    }
+
+    #[test]
+    fn test_build_module_layout_creates_nodes() {
+        // Two files in different modules: src/a/mod.rs, src/b/mod.rs
+        let index = make_minimal_index(&[
+            ("src/a/mod.rs", "pub fn a() {}"),
+            ("src/b/mod.rs", "pub fn b() {}"),
+        ]);
+        let config = LayoutConfig::default();
+        let result = build_module_layout(&index, &config);
+        assert!(
+            result.is_ok(),
+            "build_module_layout failed: {:?}",
+            result.err()
+        );
+        let layout = result.unwrap();
+        // Must have at least 2 nodes (one per module)
+        assert!(
+            layout.nodes.len() >= 2,
+            "expected >= 2 nodes, got {}",
+            layout.nodes.len()
+        );
+        // All nodes must have Module type
+        for node in &layout.nodes {
+            assert!(
+                matches!(node.node_type, NodeType::Module | NodeType::Cluster { .. }),
+                "unexpected node type: {:?}",
+                node.node_type
+            );
+        }
+        // Positions must be non-negative
+        for node in &layout.nodes {
+            assert!(node.position.x >= 0.0, "negative x for {}", node.id);
+            assert!(node.position.y >= 0.0, "negative y for {}", node.id);
+        }
+    }
+
+    #[test]
+    fn test_build_file_layout_filters_by_module() {
+        // Two files in src/a, one in src/b
+        let index = make_minimal_index(&[
+            ("src/a/one.rs", "fn one() {}"),
+            ("src/a/two.rs", "fn two() {}"),
+            ("src/b/other.rs", "fn other() {}"),
+        ]);
+        let config = LayoutConfig::default();
+        let result = build_file_layout(&index, "src/a", &config);
+        assert!(
+            result.is_ok(),
+            "build_file_layout failed: {:?}",
+            result.err()
+        );
+        let layout = result.unwrap();
+        // Only src/a files should appear
+        for node in &layout.nodes {
+            if matches!(node.node_type, NodeType::Cluster { .. }) {
+                continue;
+            }
+            assert!(
+                node.id.starts_with("src/a/"),
+                "unexpected file in layout: {}",
+                node.id
+            );
+        }
+        // Must have exactly 2 file nodes (no clustering needed for 2 files)
+        assert_eq!(
+            layout.nodes.len(),
+            2,
+            "expected 2 nodes, got {}",
+            layout.nodes.len()
+        );
+    }
+
+    #[test]
+    fn test_build_file_layout_empty_module_returns_error() {
+        let index = make_minimal_index(&[("src/a/mod.rs", "fn a() {}")]);
+        let config = LayoutConfig::default();
+        let result = build_file_layout(&index, "src/nonexistent", &config);
+        assert!(matches!(result, Err(LayoutError::Empty)));
+    }
+
+    #[test]
+    fn test_build_symbol_layout_creates_symbol_nodes() {
+        let symbols = vec![
+            make_sym("alpha", 1),
+            make_sym("beta", 10),
+            make_sym("gamma", 20),
+        ];
+        let index = make_index_with_symbols(
+            &[(
+                "src/lib.rs",
+                "pub fn alpha() {} pub fn beta() {} pub fn gamma() {}",
+            )],
+            "src/lib.rs",
+            symbols,
+        );
+        let config = LayoutConfig::default();
+        let result = build_symbol_layout(&index, "src/lib.rs", &config);
+        assert!(
+            result.is_ok(),
+            "build_symbol_layout failed: {:?}",
+            result.err()
+        );
+        let layout = result.unwrap();
+        assert_eq!(
+            layout.nodes.len(),
+            3,
+            "expected 3 symbol nodes, got {}",
+            layout.nodes.len()
+        );
+        for node in &layout.nodes {
+            assert!(
+                matches!(node.node_type, NodeType::Symbol),
+                "unexpected node type: {:?}",
+                node.node_type
+            );
+            assert!(
+                node.id.starts_with("src/lib.rs::"),
+                "unexpected id: {}",
+                node.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_symbol_layout_missing_file_returns_error() {
+        let index = make_minimal_index(&[("src/lib.rs", "fn f() {}")]);
+        let config = LayoutConfig::default();
+        let result = build_symbol_layout(&index, "src/nonexistent.rs", &config);
+        assert!(matches!(result, Err(LayoutError::Empty)));
+    }
+
+    #[test]
+    fn test_build_symbol_layout_no_parse_result_returns_error() {
+        // File exists in the index but has no parse_result (no symbols)
+        let index = make_minimal_index(&[("src/lib.rs", "fn f() {}")]);
+        let config = LayoutConfig::default();
+        // The default build gives no parse results, so symbols will be empty
+        let result = build_symbol_layout(&index, "src/lib.rs", &config);
+        assert!(matches!(result, Err(LayoutError::Empty)));
     }
 }
