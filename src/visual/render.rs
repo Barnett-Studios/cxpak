@@ -66,6 +66,19 @@ CX.header = function() {
     (hs != null ? '<span class="cxpak-health ' + hc + '">' + hs.toFixed(1) + '/10</span>' : '') +
     '<span class="cxpak-timestamp">' + CX.esc(CX.meta.generated_at) + '</span>';
   CX.app.appendChild(h);
+  /* navigation links */
+  var typeMap = { 'Dashboard': 'dashboard', 'Architecture Explorer': 'architecture', 'Risk Heatmap': 'risk', 'Diff View': 'diff' };
+  var curType = typeMap[CX.meta.visual_type_display] || '';
+  var nav = document.createElement('nav');
+  nav.className = 'cxpak-nav';
+  ['dashboard','architecture','risk','diff'].forEach(function(v) {
+    var a = document.createElement('a');
+    a.href = 'cxpak-' + v + '.html';
+    a.className = 'cxpak-nav-link' + (curType === v ? ' active' : '');
+    a.textContent = v.charAt(0).toUpperCase() + v.slice(1);
+    nav.appendChild(a);
+  });
+  h.appendChild(nav);
 };
 
 CX.tooltip = (function() {
@@ -86,11 +99,15 @@ CX.tooltip = (function() {
 })();
 
 CX.svgCanvas = function(parent, w, h) {
+  var W = w || 1200, H = h || 800;
+  var contentH = H < 200 ? Math.max(H * 3, 400) : H;
+  var padY = (contentH - H) / 2;
   var svg = d3.select(parent || '#cxpak-app')
     .append('svg')
     .attr('width', '100%')
     .attr('height', '100%')
-    .attr('viewBox', '0 0 ' + (w || 1200) + ' ' + (h || 800));
+    .attr('preserveAspectRatio', 'xMidYMid meet')
+    .attr('viewBox', (-20) + ' ' + (-padY) + ' ' + (W + 40) + ' ' + contentH);
   var zg = svg.append('g');
   svg.call(d3.zoom().scaleExtent([0.1, 10]).on('zoom', function(ev) {
     zg.attr('transform', ev.transform);
@@ -235,14 +252,14 @@ var q2 = document.createElement('div'); q2.className = 'cxpak-quadrant';
 q2.innerHTML = '<div class="cxpak-quadrant-title">Top Risks</div>';
 var risks = dash.risks.top_risks || [];
 if (risks.length === 0) {
-  q2.innerHTML += '<div class="cxpak-empty">No risk data</div>';
+  q2.innerHTML += '<div class="cxpak-empty">No significant risks detected</div>';
 } else {
   var tbl = '<table class="cxpak-risk-table"><thead><tr><th>File</th><th>Risk</th><th>Churn</th><th>Blast</th><th>Tests</th></tr></thead><tbody>';
   risks.forEach(function(r) {
     tbl += '<tr><td><span class="cxpak-severity-dot ' + r.severity + '"></span>' + CX.esc(r.path) + '</td>' +
       '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
       '<td>' + r.churn_30d + '</td><td>' + r.blast_radius + '</td>' +
-      '<td>' + (r.has_tests ? 'Y' : 'N') + '</td></tr>';
+      '<td style="color:' + (r.has_tests ? '#06d6a0' : '#8888aa') + '">' + (r.has_tests ? '\u2713' : '\u2014') + '</td></tr>';
   });
   tbl += '</tbody></table>';
   q2.innerHTML += tbl;
@@ -332,6 +349,14 @@ function navigate(level, targetId) {
 }
 
 navigate(1, 'root');
+
+/* legend */
+var leg = document.createElement('div'); leg.className = 'cxpak-legend';
+leg.innerHTML =
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(239,71,111,0.25);border:1px solid #ef476f"></span>God file (many dependents)</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#2a2a50;border:1px solid #7b68ee;border-style:dashed"></span>Circular dependency</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#2a2a50;border:1px solid #ef476f;border-width:2px"></span>High risk (&gt;0.7)</div>';
+wrap.appendChild(leg);
 "#
 }
 
@@ -364,12 +389,13 @@ groups.append('rect').attr('class', 'treemap-cell')
   .attr('width', function(d) { return Math.max(0, d.x1 - d.x0); })
   .attr('height', function(d) { return Math.max(0, d.y1 - d.y0); })
   .attr('fill', function(d) { return d.children ? '#1a1a3e' : color(d.data.risk_score); })
+  .attr('fill-opacity', function(d) { if (d.children) return 1; var r = d.data.risk_score; return r < 0.1 ? 0.5 + r * 5 : 1; })
   .attr('stroke', '#0f0f23').attr('stroke-width', function(d) { return d.children ? 0 : 1; })
   .attr('rx', 2);
 
 groups.filter(function(d) { return !d.children; }).append('text').attr('class', 'treemap-label')
   .attr('x', 4).attr('y', 14)
-  .text(function(d) { var w = d.x1 - d.x0; return w > 40 ? d.data.label : ''; })
+  .text(function(d) { var w = d.x1 - d.x0; if (w > 25) return d.data.label; if (w > 15) { var ext = d.data.label.lastIndexOf('.'); return ext > 0 ? d.data.label.slice(ext) : d.data.label.slice(0, 3); } return ''; })
   .each(function(d) { var w = d.x1 - d.x0 - 8; if (this.getComputedTextLength() > w) { var t = d.data.label; while (t.length > 2 && this.getComputedTextLength() > w) { t = t.slice(0, -1); this.textContent = t + '..'; } } });
 
 groups.filter(function(d) { return d.children && d.depth === 1; }).append('text').attr('class', 'treemap-group-label')
@@ -397,6 +423,14 @@ window.addEventListener('resize', function() {
   groups.select('rect').attr('width', function(d) { return Math.max(0, d.x1 - d.x0); })
     .attr('height', function(d) { return Math.max(0, d.y1 - d.y0); });
 });
+
+/* legend */
+var leg = document.createElement('div'); leg.className = 'cxpak-legend';
+leg.innerHTML =
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#06d6a0"></span>Low risk (&lt;0.4)</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ffd166"></span>Medium (0.4\u20130.7)</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ef476f"></span>High risk (&gt;0.7)</div>';
+wrap.appendChild(leg);
 "#
 }
 
@@ -595,6 +629,13 @@ if (df.new_risks && df.new_risks.length > 0) {
   rl.innerHTML += tbl;
   dw.appendChild(rl);
 }
+
+/* legend */
+var dleg = document.createElement('div'); dleg.className = 'cxpak-legend';
+dleg.innerHTML =
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(255,209,102,0.2);border:2px solid #ffd166"></span>Changed file</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(255,159,67,0.15);border:1.5px solid #ff9f43"></span>Blast radius</div>';
+panels.parentNode.appendChild(dleg);
 "#
 }
 
@@ -771,6 +812,7 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
     let risk_entries = crate::intelligence::risk::compute_risk_ranking(index);
     let top_risks: Vec<RiskDisplayEntry> = risk_entries
         .into_iter()
+        .filter(|e| e.risk_score >= 0.05)
         .take(5)
         .map(|e| {
             let has_tests = index.test_map.contains_key(e.path.as_str());
@@ -857,6 +899,22 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
             severity: AlertSeverity::Medium,
             link_view: super::VisualType::Architecture,
         });
+    }
+
+    // Low health dimension alerts (score < 3.0 out of 10).
+    for (name, score) in &health.dimensions {
+        if *score < 3.0 {
+            alerts.push(Alert {
+                kind: AlertKind::HighRiskFile,
+                message: format!(
+                    "{} score is critically low: {:.1}/10",
+                    name.replace('_', " "),
+                    score
+                ),
+                severity: AlertSeverity::High,
+                link_view: super::VisualType::Dashboard,
+            });
+        }
     }
 
     DashboardData {

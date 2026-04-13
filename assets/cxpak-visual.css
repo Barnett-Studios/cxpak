@@ -372,6 +372,56 @@ html, body {
   text-align: center;
 }
 
+/* ── Navigation links ───────────────────────────────────────────── */
+
+.cxpak-nav {
+  display: flex;
+  gap: 4px;
+  margin-left: 16px;
+}
+
+.cxpak-nav-link {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: all 0.15s;
+}
+
+.cxpak-nav-link:hover { color: var(--text-primary); background: var(--bg-card); }
+.cxpak-nav-link.active { color: var(--accent-blue); background: rgba(76, 201, 240, 0.1); }
+
+/* ── Legend overlay ─────────────────────────────────────────────── */
+
+.cxpak-legend {
+  position: absolute;
+  bottom: 16px;
+  right: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  font-size: 11px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cxpak-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cxpak-legend-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
 /* Architecture mini-map (inside dashboard quadrant) */
 .cxpak-minimap {
   flex: 1;
