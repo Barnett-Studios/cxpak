@@ -30,6 +30,13 @@ fn render_onboarding(map: &OnboardingMap, format: &OutputFormat) -> String {
     }
 }
 
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn render_onboarding_xml(map: &OnboardingMap) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<onboarding>\n");
     out.push_str(&format!(
@@ -38,18 +45,25 @@ fn render_onboarding_xml(map: &OnboardingMap) -> String {
     ));
     out.push_str(&format!(
         "  <estimated_reading_time>{}</estimated_reading_time>\n",
-        map.estimated_reading_time
+        xml_escape(&map.estimated_reading_time)
     ));
     for (i, phase) in map.phases.iter().enumerate() {
         out.push_str(&format!(
             "  <phase index=\"{}\" name=\"{}\" module=\"{}\">\n",
-            i, phase.name, phase.module
+            i,
+            xml_escape(&phase.name),
+            xml_escape(&phase.module)
         ));
-        out.push_str(&format!("    <rationale>{}</rationale>\n", phase.rationale));
+        out.push_str(&format!(
+            "    <rationale>{}</rationale>\n",
+            xml_escape(&phase.rationale)
+        ));
         for file in &phase.files {
             out.push_str(&format!(
                 "    <file path=\"{}\" pagerank=\"{:.3}\" tokens=\"{}\"/>\n",
-                file.path, file.pagerank, file.estimated_tokens
+                xml_escape(&file.path),
+                file.pagerank,
+                file.estimated_tokens
             ));
         }
         out.push_str("  </phase>\n");

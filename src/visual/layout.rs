@@ -247,8 +247,13 @@ pub(crate) fn insert_dummy_nodes(
             }
         };
 
-        let span = dst_layer.saturating_sub(src_layer);
+        // Back-edges (dst < src) and same-layer / adjacent-layer edges need no dummies.
+        if dst_layer <= src_layer + 1 {
+            aug_edges.push(edge.clone());
+            continue;
+        }
 
+        let span = dst_layer - src_layer;
         if span <= 1 {
             aug_edges.push(edge.clone());
             continue;
@@ -613,7 +618,7 @@ fn enforce_cognitive_limit(
 
     let mut ids_to_remove: Vec<String> = Vec::new();
 
-    for layer in layer_order.iter_mut() {
+    for (layer_idx, layer) in layer_order.iter_mut().enumerate() {
         if layer.len() <= max_per_layer {
             continue;
         }
@@ -622,9 +627,9 @@ fn enforce_cognitive_limit(
         let keep = max_per_layer - 1;
         let excess: Vec<String> = layer.drain(keep..).collect();
 
-        // Build a cluster node from the first excess node's properties (position etc
-        // will be overwritten by compute_layout anyway).
-        let cluster_id = format!("__cluster_{}", layer.len());
+        // Build a cluster node. Include layer_idx in the ID to avoid
+        // collisions when multiple layers exceed the limit.
+        let cluster_id = format!("__cluster_{}", layer_idx);
         let cluster_node = LayoutNode {
             id: cluster_id.clone(),
             label: format!("{} more…", excess.len()),

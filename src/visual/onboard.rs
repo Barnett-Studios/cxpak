@@ -54,12 +54,13 @@ pub fn compute_onboarding_map(
     };
     use std::collections::HashMap;
 
-    // Build exclusion set: test files (from test_map keys) and
+    // Build exclusion set: test files (from test_map values, not keys —
+    // keys are source files, values are the test file refs) and
     // generated/vendored paths (noise filter blocklist).
     let excluded: std::collections::HashSet<&str> = index
         .test_map
-        .keys()
-        .map(|k| k.as_str())
+        .values()
+        .flat_map(|refs| refs.iter().map(|r| r.path.as_str()))
         .chain(
             index
                 .files

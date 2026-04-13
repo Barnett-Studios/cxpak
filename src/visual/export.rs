@@ -28,7 +28,7 @@ fn mermaid_id(id: &str) -> String {
         })
         .collect();
     if escaped.len() > 32 {
-        escaped[..32].to_string()
+        escaped.chars().take(32).collect()
     } else {
         escaped
     }
@@ -254,7 +254,8 @@ pub fn to_c4(layout: &ComputedLayout, metadata: &RenderMetadata) -> String {
 
 /// Serializes a `ComputedLayout` to pretty-printed JSON.
 pub fn to_json(layout: &ComputedLayout) -> String {
-    serde_json::to_string_pretty(layout).unwrap()
+    serde_json::to_string_pretty(layout)
+        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e))
 }
 
 #[cfg(test)]
