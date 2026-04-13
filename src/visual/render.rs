@@ -364,7 +364,7 @@ groups.append('rect').attr('class', 'treemap-cell')
   .attr('width', function(d) { return Math.max(0, d.x1 - d.x0); })
   .attr('height', function(d) { return Math.max(0, d.y1 - d.y0); })
   .attr('fill', function(d) { return d.children ? '#1a1a3e' : color(d.data.risk_score); })
-  .attr('stroke', '#0f0f23').attr('stroke-width', d.children ? 0 : 1)
+  .attr('stroke', '#0f0f23').attr('stroke-width', function(d) { return d.children ? 0 : 1; })
   .attr('rx', 2);
 
 groups.filter(function(d) { return !d.children; }).append('text').attr('class', 'treemap-label')
