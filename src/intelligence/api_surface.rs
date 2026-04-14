@@ -169,6 +169,127 @@ pub fn extract_public_symbols(
     )
 }
 
+/// Infer language tag from file extension. Returns `""` for unknown extensions.
+fn language_from_path(path: &str) -> &'static str {
+    let ext = match path.rsplit_once('.') {
+        Some((_, e)) => e.to_lowercase(),
+        None => return "",
+    };
+    match ext.as_str() {
+        "rs" => "rust",
+        "py" | "pyi" => "python",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "go" => "go",
+        "rb" => "ruby",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "ex" | "exs" => "elixir",
+        "cs" => "csharp",
+        "scala" => "scala",
+        "php" => "php",
+        _ => "",
+    }
+}
+
+/// Returns true when the file content contains an import/use of a web framework
+/// that matches the inferred language of the file.
+///
+/// This guard prevents route-detection regexes from firing on test fixtures,
+/// docstrings, or any source file that merely mentions route-like strings
+/// without actually being a web-framework handler file.
+fn has_framework_import(content: &str, language: Option<&str>) -> bool {
+    let lang = language.unwrap_or("");
+    match lang {
+        "rust" => {
+            content.contains("use axum")
+                || content.contains("use actix_web")
+                || content.contains("use rocket")
+                || content.contains("use warp")
+                || content.contains("use tide")
+                || content.contains("use poem")
+                || content.contains("use salvo")
+        }
+        "python" => {
+            content.contains("from flask")
+                || content.contains("import flask")
+                || content.contains("from fastapi")
+                || content.contains("import fastapi")
+                || content.contains("from django")
+                || content.contains("from aiohttp")
+                || content.contains("from starlette")
+                || content.contains("from sanic")
+                || content.contains("import bottle")
+                || content.contains("from bottle")
+        }
+        "javascript" | "typescript" => {
+            content.contains("require('express')")
+                || content.contains("require(\"express\")")
+                || content.contains("from 'express'")
+                || content.contains("from \"express\"")
+                || content.contains("from 'koa'")
+                || content.contains("from \"koa\"")
+                || content.contains("from 'fastify'")
+                || content.contains("from \"fastify\"")
+                || content.contains("from '@nestjs/")
+                || content.contains("from \"@nestjs/")
+                || content.contains("from 'hono'")
+                || content.contains("from \"hono\"")
+                || content.contains("Router()")
+                || content.contains("new Koa()")
+                || content.contains("fastify(")
+        }
+        "go" => {
+            content.contains("\"github.com/gin-gonic/gin\"")
+                || content.contains("\"github.com/labstack/echo")
+                || content.contains("\"github.com/gofiber/fiber")
+                || content.contains("\"net/http\"")
+        }
+        "ruby" => {
+            content.contains("Rails.application.routes")
+                || content.contains("require 'sinatra'")
+                || content.contains("require \"sinatra\"")
+                || content.contains("ActionController")
+        }
+        "java" | "kotlin" => {
+            content.contains("@RestController")
+                || content.contains("@Controller")
+                || content.contains("@RequestMapping")
+                || content.contains("@GetMapping")
+                || content.contains("@PostMapping")
+                || content.contains("@PutMapping")
+                || content.contains("@DeleteMapping")
+                || content.contains("@PatchMapping")
+                || content.contains("import org.springframework")
+        }
+        "elixir" => content.contains("use Phoenix.Router") || content.contains("use Plug.Router"),
+        "csharp" => {
+            content.contains("using Microsoft.AspNetCore")
+                || content.contains("using Microsoft.AspNet")
+                || content.contains("[ApiController]")
+                || content.contains("[Controller]")
+                || content.contains("[Route(")
+                || content.contains("[HttpGet(")
+                || content.contains("[HttpPost(")
+                || content.contains("[HttpPut(")
+                || content.contains("[HttpDelete(")
+                || content.contains("[HttpPatch(")
+        }
+        "scala" => {
+            content.contains("import play.api")
+                || content.contains("import akka.http")
+                || content.contains("import org.http4s")
+        }
+        "php" => {
+            content.contains("use Illuminate\\")
+                || content.contains("use Symfony\\")
+                || content.contains("Route::")
+                || content.contains("$router->")
+        }
+        _ => false,
+    }
+}
+
 /// Returns true when the file extension indicates source code that may contain route
 /// registrations. Non-source files (markdown, YAML, JSON, plain text, etc.) return false
 /// to avoid false-positive route matches from documentation code examples.
@@ -211,9 +332,29 @@ fn is_source_code_file(path: &str) -> bool {
 
 /// Detect HTTP route endpoints from file content using 12 framework patterns.
 pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
-    // Gate: skip non-source files (markdown, YAML, JSON, HTML, plain text, etc.)
+    // Gate 1: skip non-source files (markdown, YAML, JSON, HTML, plain text, etc.)
     // to avoid false positives from documentation code examples.
     if !is_source_code_file(file_path) {
+        return vec![];
+    }
+
+    // Gate 2: skip source files that don't import a web framework.
+    // This prevents test fixtures, docstrings, and files that merely contain
+    // route-looking strings (e.g., api_surface.rs itself) from generating
+    // spurious route matches. Files without a framework import cannot contain
+    // real HTTP handlers.
+    //
+    // Exemption: Rails and Phoenix routes files are identified by file-path
+    // convention ("routes" / "router" in the path) rather than import — those
+    // framework-specific gates still apply inside the route-detection logic.
+    let lang = language_from_path(file_path);
+    // Some frameworks are identified purely by file-path convention rather than imports:
+    // - Django: `urls.py` files contain route registrations (no explicit import check needed)
+    // - Rails: `config/routes.rb` and similar (file path contains "routes")
+    // - Phoenix: `router.ex` and similar (file path contains "router")
+    let is_path_gated =
+        file_path.contains("routes") || file_path.contains("router") || file_path.contains("urls");
+    if !is_path_gated && !has_framework_import(content, Some(lang)) {
         return vec![];
     }
 
@@ -1036,7 +1177,7 @@ mod tests {
 
     #[test]
     fn test_detect_routes_express() {
-        let content = r#"app.get('/users', listUsers); router.post("/items", createItem);"#;
+        let content = "const express = require('express');\napp.get('/users', listUsers); router.post(\"/items\", createItem);";
         let routes = detect_routes(content, "routes/index.js");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
@@ -1049,7 +1190,7 @@ mod tests {
 
     #[test]
     fn test_detect_routes_flask() {
-        let content = "@app.route('/home')\ndef home_view():\n    pass\n@blueprint.get('/api/data')\ndef get_data():\n    pass";
+        let content = "from flask import Flask, Blueprint\n@app.route('/home')\ndef home_view():\n    pass\n@blueprint.get('/api/data')\ndef get_data():\n    pass";
         let routes = detect_routes(content, "app.py");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
@@ -1075,7 +1216,7 @@ mod tests {
 
     #[test]
     fn test_detect_routes_fastapi() {
-        let content = "@app.get(\"/users\")\nasync def list_users():\n    pass\n@router.post(\"/items\")\ndef create_item():\n    pass";
+        let content = "from fastapi import FastAPI\n@app.get(\"/users\")\nasync def list_users():\n    pass\n@router.post(\"/items\")\ndef create_item():\n    pass";
         let routes = detect_routes(content, "main.py");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
@@ -1088,7 +1229,7 @@ mod tests {
 
     #[test]
     fn test_detect_routes_spring() {
-        let content = "@GetMapping(\"/users\")\npublic List<User> getUsers() {}\n@PostMapping(\"/users\")\npublic User createUser() {}\n@RequestMapping(\"/api\")\npublic String apiRoot() {}";
+        let content = "import org.springframework.web.bind.annotation.*;\n@GetMapping(\"/users\")\npublic List<User> getUsers() {}\n@PostMapping(\"/users\")\npublic User createUser() {}\n@RequestMapping(\"/api\")\npublic String apiRoot() {}";
         let routes = detect_routes(content, "UserController.java");
         assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].method, "GET");
@@ -1104,7 +1245,7 @@ mod tests {
 
     #[test]
     fn test_detect_routes_actix() {
-        let content = "#[get(\"/health\")]\nasync fn health_check() -> impl Responder { HttpResponse::Ok() }\n#[post(\"/login\")]\nasync fn do_login() -> impl Responder { HttpResponse::Ok() }";
+        let content = "use actix_web::{get, post, HttpResponse, Responder};\n#[get(\"/health\")]\nasync fn health_check() -> impl Responder { HttpResponse::Ok() }\n#[post(\"/login\")]\nasync fn do_login() -> impl Responder { HttpResponse::Ok() }";
         let routes = detect_routes(content, "src/main.rs");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
@@ -1117,7 +1258,7 @@ mod tests {
 
     #[test]
     fn test_detect_routes_axum() {
-        let content = r#"Router::new().route("/users", get(list_users)).route("/users/:id", post(create_user))"#;
+        let content = "use axum::Router;\nuse axum::routing::{get, post};\nRouter::new().route(\"/users\", get(list_users)).route(\"/users/:id\", post(create_user))";
         let routes = detect_routes(content, "src/server.rs");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].path, "/users");
@@ -1128,8 +1269,7 @@ mod tests {
 
     #[test]
     fn test_detect_routes_gin() {
-        let content = r#"r.GET("/ping", pingHandler)
-router.POST("/users", createUser)"#;
+        let content = "import \"github.com/gin-gonic/gin\"\nr.GET(\"/ping\", pingHandler)\nrouter.POST(\"/users\", createUser)";
         let routes = detect_routes(content, "main.go");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].method, "GET");
@@ -1142,9 +1282,7 @@ router.POST("/users", createUser)"#;
 
     #[test]
     fn test_detect_routes_echo() {
-        let content = r#"e.GET("/users", getUsers)
-g.POST("/items", createItem)
-echo.DELETE("/users/:id", deleteUser)"#;
+        let content = "import \"github.com/labstack/echo/v4\"\ne.GET(\"/users\", getUsers)\ng.POST(\"/items\", createItem)\necho.DELETE(\"/users/:id\", deleteUser)";
         let routes = detect_routes(content, "server.go");
         assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].method, "GET");
@@ -1209,7 +1347,7 @@ post "/items", ItemController, :create"#;
 
     #[test]
     fn test_detect_routes_express_anonymous_handler() {
-        let content = r#"app.get('/x', function(req, res) { res.send('ok'); });"#;
+        let content = "const express = require('express');\napp.get('/x', function(req, res) { res.send('ok'); });";
         let routes = detect_routes(content, "app.js");
         assert!(!routes.is_empty());
         assert_eq!(routes[0].handler, "<anonymous>");
@@ -1850,7 +1988,7 @@ type User {
     fn test_detect_routes_flask_fallback() {
         // Flask decorator with no `def` on the following line — triggers the
         // fallback branch which emits `<anonymous>` as the handler.
-        let content = "@app.route('/fallback')\n# no def follows";
+        let content = "from flask import Flask\n@app.route('/fallback')\n# no def follows";
         let routes = detect_routes(content, "app.py");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].method, "GET");
@@ -1861,7 +1999,7 @@ type User {
     #[test]
     fn test_detect_routes_fastapi_fallback() {
         // FastAPI decorator with no `def` on the following line.
-        let content = "@router.delete('/fallback-fast')\n# dangling decorator";
+        let content = "from fastapi import FastAPI, APIRouter\n@router.delete('/fallback-fast')\n# dangling decorator";
         let routes = detect_routes(content, "main.py");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].method, "DELETE");
@@ -1872,7 +2010,7 @@ type User {
     #[test]
     fn test_detect_routes_spring_fallback() {
         // Spring annotation with no method signature following it.
-        let content = "@PostMapping(\"/fallback-spring\")\n// end of file";
+        let content = "import org.springframework.web.bind.annotation.PostMapping;\n@PostMapping(\"/fallback-spring\")\n// end of file";
         let routes = detect_routes(content, "Controller.java");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].method, "POST");
@@ -1883,7 +2021,7 @@ type User {
     #[test]
     fn test_detect_routes_actix_fallback() {
         // actix attribute with no `fn` on the following line.
-        let content = "#[put(\"/fallback-actix\")]\n// trailing comment";
+        let content = "use actix_web::{put};\n#[put(\"/fallback-actix\")]\n// trailing comment";
         let routes = detect_routes(content, "src/lib.rs");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].method, "PUT");
@@ -1895,7 +2033,7 @@ type User {
     fn test_detect_routes_axum_fallback() {
         // .route("/path") without an explicit handler signature matched
         // by the strict regex (no verb wrapper).
-        let content = r#".route("/fallback-axum")"#;
+        let content = "use axum::Router;\n.route(\"/fallback-axum\")";
         let routes = detect_routes(content, "src/server.rs");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].method, "GET");
@@ -2179,7 +2317,7 @@ type User {
 
     #[test]
     fn test_detect_routes_scans_javascript() {
-        let content = "app.get('/users', getUsers);";
+        let content = "const express = require('express');\napp.get('/users', getUsers);";
         let routes = detect_routes(content, "src/app.js");
         assert_eq!(routes.len(), 1, "JavaScript route must be detected");
         assert_eq!(routes[0].method, "GET");
@@ -2194,5 +2332,137 @@ type User {
             detect_routes(content, "notes.txt").is_empty(),
             ".txt files must not produce routes"
         );
+    }
+
+    // ---- framework-import gate tests (Bug 6) ----
+
+    #[test]
+    fn test_detect_routes_requires_framework_import_rust() {
+        // Rust file with route-looking string literal but no axum/actix import.
+        let content = r#"let s = "app.get(\"/users\", getUsers)";"#;
+        assert!(
+            detect_routes(content, "src/foo.rs").is_empty(),
+            "Rust file without framework import must produce no routes"
+        );
+    }
+
+    #[test]
+    fn test_detect_routes_requires_framework_import_js() {
+        // JS file with route call but no express/koa import.
+        let content = "app.get('/users', getUsers);";
+        assert!(
+            detect_routes(content, "src/app.js").is_empty(),
+            "JS file without framework import must produce no routes"
+        );
+    }
+
+    #[test]
+    fn test_detect_routes_with_axum_import_no_panic() {
+        // Axum import present — detect_routes runs without panicking.
+        let content = "use axum::Router;\nuse axum::routing::get;\n\npub fn router() -> Router {\n    Router::new().route(\"/health\", get(health_handler))\n}\n";
+        let _ = detect_routes(content, "src/app.rs");
+    }
+
+    #[test]
+    fn test_detect_routes_express_with_import() {
+        let content = "const express = require('express');\nconst app = express();\napp.get('/users', getUsers);\n";
+        let routes = detect_routes(content, "src/app.js");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/users");
+    }
+
+    #[test]
+    fn test_detect_routes_express_without_import_skipped() {
+        // No framework import — must be skipped even if route pattern matches.
+        let content = "app.get('/users', getUsers);";
+        assert!(
+            detect_routes(content, "src/app.js").is_empty(),
+            "JS file without express import must not produce routes"
+        );
+    }
+
+    #[test]
+    fn test_has_framework_import_rust_axum() {
+        assert!(has_framework_import("use axum::Router;", Some("rust")));
+        assert!(!has_framework_import("fn main() {}", Some("rust")));
+    }
+
+    #[test]
+    fn test_has_framework_import_rust_actix() {
+        assert!(has_framework_import(
+            "use actix_web::{get, post};",
+            Some("rust")
+        ));
+    }
+
+    #[test]
+    fn test_has_framework_import_python_flask() {
+        assert!(has_framework_import(
+            "from flask import Flask",
+            Some("python")
+        ));
+        assert!(!has_framework_import("import os", Some("python")));
+    }
+
+    #[test]
+    fn test_has_framework_import_python_fastapi() {
+        assert!(has_framework_import(
+            "from fastapi import FastAPI",
+            Some("python")
+        ));
+    }
+
+    #[test]
+    fn test_has_framework_import_js_express_require() {
+        assert!(has_framework_import(
+            "const express = require('express');",
+            Some("javascript")
+        ));
+    }
+
+    #[test]
+    fn test_has_framework_import_ts_express_esm() {
+        assert!(has_framework_import(
+            "import express from 'express';",
+            Some("typescript")
+        ));
+    }
+
+    #[test]
+    fn test_has_framework_import_go_gin() {
+        assert!(has_framework_import(
+            "import \"github.com/gin-gonic/gin\"",
+            Some("go")
+        ));
+        assert!(!has_framework_import("import \"fmt\"", Some("go")));
+    }
+
+    #[test]
+    fn test_has_framework_import_unknown_lang_returns_false() {
+        assert!(!has_framework_import(
+            "app.get('/x', h);",
+            Some("brainfuck")
+        ));
+        assert!(!has_framework_import("app.get('/x', h);", None));
+    }
+
+    #[test]
+    fn test_language_from_path_known_extensions() {
+        assert_eq!(language_from_path("src/main.rs"), "rust");
+        assert_eq!(language_from_path("app.py"), "python");
+        assert_eq!(language_from_path("index.js"), "javascript");
+        assert_eq!(language_from_path("app.ts"), "typescript");
+        assert_eq!(language_from_path("main.go"), "go");
+        assert_eq!(language_from_path("app.rb"), "ruby");
+        assert_eq!(language_from_path("Foo.java"), "java");
+        assert_eq!(language_from_path("Foo.kt"), "kotlin");
+        assert_eq!(language_from_path("router.ex"), "elixir");
+        assert_eq!(language_from_path("Foo.cs"), "csharp");
+    }
+
+    #[test]
+    fn test_language_from_path_unknown_extension() {
+        assert_eq!(language_from_path("file.xyz"), "");
+        assert_eq!(language_from_path("no_extension"), "");
     }
 }

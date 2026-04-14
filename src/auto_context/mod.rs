@@ -383,7 +383,7 @@ mod tests {
             (
                 "backend/users.py",
                 "python",
-                "@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
+                "from fastapi import FastAPI\n@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
             ),
         ]);
         assert!(

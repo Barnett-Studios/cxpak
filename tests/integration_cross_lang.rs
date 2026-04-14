@@ -35,14 +35,14 @@ export async function createPost(data) { return fetch("/api/posts", { method: "P
     std::fs::create_dir_all(users_py.parent().unwrap()).unwrap();
     std::fs::write(
         &users_py,
-        "@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
+        "from fastapi import FastAPI\n@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
     )
     .unwrap();
 
     let posts_py = dir.path().join("backend/posts.py");
     std::fs::write(
         &posts_py,
-        "@app.post(\"/api/posts\")\ndef create_post():\n    return {}\n",
+        "from fastapi import FastAPI\n@app.post(\"/api/posts\")\ndef create_post():\n    return {}\n",
     )
     .unwrap();
 

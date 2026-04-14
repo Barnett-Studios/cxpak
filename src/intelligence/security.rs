@@ -913,8 +913,9 @@ pub fn process_input(data: String) {
     #[test]
     fn test_build_security_surface_detects_unprotected_endpoints() {
         let mut index = crate::index::CodebaseIndex::empty();
-        // Express-style route that detect_routes can find
-        let content = "app.get('/api/users', listUsers);";
+        // Express-style route that detect_routes can find — must include an express import
+        // so the framework-import gate allows route detection.
+        let content = "const express = require('express');\napp.get('/api/users', listUsers);";
         index
             .files
             .push(make_indexed_file("src/routes.js", content, vec![]));

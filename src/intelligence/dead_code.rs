@@ -112,6 +112,26 @@ fn has_string_references(
     false
 }
 
+/// Returns true when the symbol name is referenced inside `content` (the file that
+/// defines it) beyond its own definition. Uses word-boundary matching to avoid
+/// prefix false-positives (e.g., `"foo"` must not match `"foobar"`).
+///
+/// Short names (<3 chars) are assumed alive to avoid false positives from ubiquitous
+/// identifiers like `id`, `ok`, etc.
+fn same_file_string_reference(name: &str, content: &str) -> bool {
+    if name.len() < 3 {
+        return true; // too short — assume alive
+    }
+    // Use word-boundary regex for precision. If regex compilation fails (should
+    // not happen for valid identifiers), fall back to simple contains-count.
+    if let Ok(re) = regex::Regex::new(&format!(r"\b{}\b", regex::escape(name))) {
+        // More than 1 occurrence means the name appears outside its definition.
+        re.find_iter(content).count() > 1
+    } else {
+        content.matches(name).count() > 1
+    }
+}
+
 fn is_test_file(path: &str) -> bool {
     path.contains("/tests/")
         || path.contains("/test/")
@@ -194,16 +214,24 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
                     true
                 } else {
                     let is_public = symbol.visibility == Visibility::Public;
-                    is_entry_point(
+                    let is_ep = is_entry_point(
                         &file.relative_path,
                         &symbol.name,
                         &symbol.signature,
                         is_public,
                         &route_cache,
-                    ) || {
+                    );
+                    let is_test_ref = {
                         let key = (file.relative_path.clone(), symbol.name.clone());
                         test_referenced.contains(&key)
-                    }
+                    };
+                    // Fallback: the call graph tracks cross-file edges but may miss
+                    // intra-file calls (private helpers called from within the same
+                    // file). Check whether the name appears more than once in the
+                    // file's content using word-boundary matching. If so, the symbol
+                    // is referenced locally and is alive.
+                    let is_same_file_ref = same_file_string_reference(&symbol.name, &file.content);
+                    is_ep || is_test_ref || is_same_file_ref
                 }
             } else {
                 // For types (and constants): use string-reference scan across all files.
@@ -546,6 +574,150 @@ mod tests {
         assert!(
             dead.iter().any(|d| d.symbol == "unused"),
             "private fn with no callers must be flagged dead"
+        );
+    }
+
+    // ---- same-file string reference fallback tests (Bug 7) ----
+
+    #[test]
+    fn test_same_file_string_reference_finds_call() {
+        let content = "fn helper() {} fn public_fn() { helper(); }";
+        assert!(
+            same_file_string_reference("helper", content),
+            "helper appears twice: once in definition, once in call"
+        );
+    }
+
+    #[test]
+    fn test_same_file_string_reference_single_occurrence_not_referenced() {
+        let content = "fn unused() { println!(\"hi\"); }";
+        assert!(
+            !same_file_string_reference("unused", content),
+            "unused appears only once (the definition) — not alive"
+        );
+    }
+
+    #[test]
+    fn test_same_file_string_reference_word_boundary() {
+        // "foo" must NOT match "foobar"
+        let content = "fn foobar() { println!(\"unrelated\"); }";
+        assert!(
+            !same_file_string_reference("foo", content),
+            "word-boundary: 'foo' must not match 'foobar'"
+        );
+    }
+
+    #[test]
+    fn test_same_file_string_reference_short_name_returns_true() {
+        // Very short names (<3 chars) are assumed alive to avoid false positives.
+        assert!(
+            same_file_string_reference("id", "fn id() {}"),
+            "names shorter than 3 chars must be assumed alive"
+        );
+    }
+
+    #[test]
+    fn test_dead_code_skips_privately_called_helper() {
+        // File content: helper is defined AND called — not dead.
+        let counter = crate::budget::counter::TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let content = "fn helper() {}\nfn public_fn() { helper(); }";
+        let fp = dir.path().join("util.rs");
+        std::fs::write(&fp, content).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "util.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: content.len() as u64,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "util.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "helper".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn helper()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "public_fn".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "fn public_fn()".into(),
+                        body: "{ helper(); }".into(),
+                        start_line: 2,
+                        end_line: 2,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("util.rs".to_string(), content.to_string());
+        let index = crate::index::CodebaseIndex::build_with_content(
+            files,
+            parse_results,
+            &counter,
+            content_map,
+        );
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            !dead.iter().any(|d| d.symbol == "helper"),
+            "helper is called within util.rs and must NOT be flagged as dead"
+        );
+    }
+
+    #[test]
+    fn test_dead_code_flags_unused_helper_even_with_short_name_false() {
+        // A private function with a 5+ char name that genuinely has no references.
+        let counter = crate::budget::counter::TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let content = "fn orphan() {}";
+        let fp = dir.path().join("isolate.rs");
+        std::fs::write(&fp, content).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "isolate.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: content.len() as u64,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "isolate.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "orphan".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "fn orphan()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("isolate.rs".to_string(), content.to_string());
+        let index = crate::index::CodebaseIndex::build_with_content(
+            files,
+            parse_results,
+            &counter,
+            content_map,
+        );
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            dead.iter().any(|d| d.symbol == "orphan"),
+            "orphan with no callers or references must be flagged as dead"
         );
     }
 

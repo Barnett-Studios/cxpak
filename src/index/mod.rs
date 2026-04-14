@@ -685,7 +685,7 @@ mod tests {
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         std::fs::write(
             &py,
-            "@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
+            "from fastapi import FastAPI\n@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
         )
         .unwrap();
 

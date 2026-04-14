@@ -680,7 +680,8 @@ mod tests {
             (
                 "backend/users.py",
                 "python",
-                r#"@app.get("/api/users")
+                r#"from fastapi import FastAPI
+@app.get("/api/users")
 def get_users():
     return []
 "#,
@@ -1077,13 +1078,13 @@ subprocess.run(["my-binary", "--arg"])
             (
                 "backend/users.py",
                 "python",
-                "@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
+                "from fastapi import FastAPI\n@app.get(\"/api/users\")\ndef get_users():\n    return []\n",
             ),
             ("admin/panel.ts", "typescript", r#"fetch("/api/admin");"#),
             (
                 "backend/admin.py",
                 "python",
-                "@app.get(\"/api/admin\")\ndef get_admin():\n    return []\n",
+                "from fastapi import FastAPI\n@app.get(\"/api/admin\")\ndef get_admin():\n    return []\n",
             ),
         ]);
         let edges = detect_http_bridges(&index);
