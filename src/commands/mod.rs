@@ -5,6 +5,8 @@ pub mod diff;
 #[cfg(feature = "visual")]
 pub mod onboard;
 pub mod overview;
+#[cfg(feature = "plugins")]
+pub mod plugin;
 #[cfg(feature = "daemon")]
 pub mod serve;
 pub mod trace;

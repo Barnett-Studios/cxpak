@@ -65,6 +65,23 @@ fn main() {
                 commands::conventions::run_diff(path)
             }
         },
+        #[cfg(feature = "plugins")]
+        Commands::Plugin { subcommand } => match subcommand {
+            cxpak::cli::PluginSubcommand::List { path } => commands::plugin::run_list(path),
+            cxpak::cli::PluginSubcommand::Add {
+                wasm_path,
+                name,
+                patterns,
+                needs_content,
+                path,
+            } => commands::plugin::run_add(
+                path,
+                wasm_path,
+                name.as_deref(),
+                patterns,
+                *needs_content,
+            ),
+        },
         Commands::Diff {
             tokens,
             out,

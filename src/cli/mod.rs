@@ -150,6 +150,12 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: ConventionsSubcommand,
     },
+    /// Manage WASM plugins registered in .cxpak/plugins.json
+    #[cfg(feature = "plugins")]
+    Plugin {
+        #[command(subcommand)]
+        subcommand: PluginSubcommand,
+    },
     /// Trace from error/function, pack relevant code paths
     Trace {
         #[arg(long, default_value = "50k")]
@@ -187,6 +193,32 @@ pub enum ConventionsSubcommand {
     },
     /// Compare current conventions against .cxpak/conventions.json
     Diff {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+}
+
+#[cfg(feature = "plugins")]
+#[derive(Subcommand)]
+pub enum PluginSubcommand {
+    /// List all registered plugins
+    List {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Register a new WASM plugin
+    Add {
+        /// Path to the .wasm file
+        wasm_path: PathBuf,
+        /// Optional name; defaults to the wasm filename stem
+        #[arg(long)]
+        name: Option<String>,
+        /// Comma-separated glob patterns controlling which files the plugin sees
+        #[arg(long, value_delimiter = ',')]
+        patterns: Vec<String>,
+        /// Grant the plugin access to raw file contents
+        #[arg(long)]
+        needs_content: bool,
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -630,6 +662,60 @@ mod tests {
                 assert!(matches!(format, OutputFormat::Markdown));
             }
             _ => panic!("expected Onboard"),
+        }
+    }
+
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn cli_plugin_list_parses() {
+        let cli = Cli::try_parse_from(["cxpak", "plugin", "list", "."])
+            .expect("should parse plugin list");
+        match cli.command {
+            Commands::Plugin { subcommand } => match subcommand {
+                PluginSubcommand::List { path } => {
+                    assert_eq!(path, std::path::PathBuf::from("."));
+                }
+                _ => panic!("expected List"),
+            },
+            _ => panic!("expected Plugin"),
+        }
+    }
+
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn cli_plugin_add_parses() {
+        let cli = Cli::try_parse_from([
+            "cxpak",
+            "plugin",
+            "add",
+            "foo.wasm",
+            "--name",
+            "foo",
+            "--patterns",
+            "**/*.py,**/*.pyi",
+            "--needs-content",
+        ])
+        .expect("should parse plugin add");
+        match cli.command {
+            Commands::Plugin { subcommand } => match subcommand {
+                PluginSubcommand::Add {
+                    wasm_path,
+                    name,
+                    patterns,
+                    needs_content,
+                    ..
+                } => {
+                    assert_eq!(wasm_path, std::path::PathBuf::from("foo.wasm"));
+                    assert_eq!(name, Some("foo".to_string()));
+                    assert_eq!(
+                        patterns,
+                        vec!["**/*.py".to_string(), "**/*.pyi".to_string()]
+                    );
+                    assert!(needs_content);
+                }
+                _ => panic!("expected Add"),
+            },
+            _ => panic!("expected Plugin"),
         }
     }
 }
