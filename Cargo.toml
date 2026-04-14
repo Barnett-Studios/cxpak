@@ -84,6 +84,8 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+headless_chrome = "1"
+tiny_http = "0.12"
 
 [features]
 default = [
@@ -150,4 +152,5 @@ embeddings = [
     "dep:tokenizers", "dep:reqwest", "dep:bincode",
 ]
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
+e2e-browser = []
 plugins = ["dep:wasmtime"]
