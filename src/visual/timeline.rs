@@ -338,4 +338,90 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(load_cached_snapshots(dir.path()).is_none());
     }
+
+    // ── Additional timeline tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_compute_timeline_snapshots_on_real_repo_not_empty() {
+        // The current working directory IS a git repo.
+        let path = std::path::Path::new(".");
+        let snapshots = compute_timeline_snapshots(path, 5).unwrap();
+        assert!(
+            !snapshots.is_empty(),
+            "compute_timeline_snapshots on a real git repo should return at least one snapshot"
+        );
+    }
+
+    #[test]
+    fn test_compute_timeline_snapshots_respects_max_limit() {
+        let path = std::path::Path::new(".");
+        let max = 3;
+        let snapshots = compute_timeline_snapshots(path, max).unwrap();
+        assert!(
+            snapshots.len() <= max,
+            "snapshot count {} should not exceed max_snapshots {}",
+            snapshots.len(),
+            max
+        );
+    }
+
+    #[test]
+    fn test_save_and_load_snapshots_preserves_all_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let original = vec![
+            TimelineSnapshot {
+                commit_sha: "deadbeef".into(),
+                commit_date: "2026-04-01T12:00:00Z".into(),
+                commit_message: "add feature X".into(),
+                files: vec![
+                    SnapshotFile {
+                        path: "src/main.rs".into(),
+                        imports: vec!["src/lib.rs".into()],
+                    },
+                    SnapshotFile {
+                        path: "src/lib.rs".into(),
+                        imports: vec![],
+                    },
+                ],
+                edge_count: 7,
+                module_count: 2,
+                health_composite: Some(0.73),
+                circular_dep_count: 1,
+            },
+            TimelineSnapshot {
+                commit_sha: "cafebabe".into(),
+                commit_date: "2026-04-02T08:00:00Z".into(),
+                commit_message: "fix bug Y".into(),
+                files: vec![SnapshotFile {
+                    path: "src/main.rs".into(),
+                    imports: vec![],
+                }],
+                edge_count: 3,
+                module_count: 1,
+                health_composite: None,
+                circular_dep_count: 0,
+            },
+        ];
+
+        save_snapshots(dir.path(), &original).unwrap();
+        let loaded = load_cached_snapshots(dir.path()).expect("should load cached snapshots");
+
+        assert_eq!(
+            loaded.len(),
+            2,
+            "loaded snapshot count must equal saved count"
+        );
+        assert_eq!(loaded[0].commit_sha, "deadbeef");
+        assert_eq!(loaded[0].commit_date, "2026-04-01T12:00:00Z");
+        assert_eq!(loaded[0].commit_message, "add feature X");
+        assert_eq!(loaded[0].files.len(), 2);
+        assert_eq!(loaded[0].files[0].imports, vec!["src/lib.rs".to_string()]);
+        assert_eq!(loaded[0].edge_count, 7);
+        assert_eq!(loaded[0].module_count, 2);
+        assert_eq!(loaded[0].health_composite, Some(0.73));
+        assert_eq!(loaded[0].circular_dep_count, 1);
+        assert_eq!(loaded[1].commit_sha, "cafebabe");
+        assert_eq!(loaded[1].health_composite, None);
+        assert_eq!(loaded[1].circular_dep_count, 0);
+    }
 }

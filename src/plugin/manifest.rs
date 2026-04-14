@@ -93,32 +93,27 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 fn glob_match_inner(pattern: &[u8], path: &[u8]) -> bool {
+    // Double-star: skip any number of path segments (must be checked before single-star)
+    if pattern.starts_with(b"**") {
+        let rest_pat = if pattern.len() > 2 && pattern[2] == b'/' {
+            &pattern[3..]
+        } else {
+            &pattern[2..]
+        };
+        // Try matching rest_pat at each position in path (including empty remainder)
+        for start in 0..=path.len() {
+            if glob_match_inner(rest_pat, &path[start..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     match (pattern.first(), path.first()) {
         // Both exhausted — match
         (None, None) => true,
-        // Pattern exhausted but path remains — only match if trailing slashes
+        // Pattern exhausted but path remains
         (None, _) => false,
-        // Double-star: skip any number of path segments
-        (Some(b'*'), Some(b'*')) if pattern.get(1) == Some(&b'*') => {
-            let rest_pat = if pattern.len() > 2 && pattern[2] == b'/' {
-                &pattern[3..]
-            } else {
-                &pattern[2..]
-            };
-            // Try matching at each position in path
-            for start in 0..=path.len() {
-                if glob_match_inner(rest_pat, &path[start..]) {
-                    return true;
-                }
-                // Advance past the next path byte (including separator)
-                if start < path.len() {
-                    // continue
-                } else {
-                    break;
-                }
-            }
-            false
-        }
         // Single star: matches anything up to the next separator
         (Some(b'*'), _) => {
             let rest_pat = &pattern[1..];
@@ -257,5 +252,304 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("checksum mismatch"), "got: {msg}");
+    }
+
+    // ── Additional manifest tests ─────────────────────────────────────────────
+
+    #[test]
+    fn load_manifest_with_malformed_json_returns_error() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let cxpak_dir = dir.path().join(".cxpak");
+        std::fs::create_dir_all(&cxpak_dir).unwrap();
+        std::fs::write(cxpak_dir.join("plugins.json"), b"{ not valid json !!").unwrap();
+
+        let result = load_manifest(dir.path());
+        assert!(result.is_err(), "malformed JSON must return Err, not panic");
+    }
+
+    #[test]
+    fn build_index_snapshot_needs_content_false_all_contents_are_none() {
+        use crate::index::CodebaseIndex;
+        use std::collections::HashMap;
+
+        let index = CodebaseIndex {
+            files: vec![crate::index::IndexedFile {
+                relative_path: "src/main.py".to_string(),
+                language: Some("Python".to_string()),
+                size_bytes: 100,
+                token_count: 10,
+                parse_result: None,
+                content: "print('hello')".to_string(),
+                mtime_secs: None,
+            }],
+            language_stats: HashMap::new(),
+            total_files: 1,
+            total_bytes: 100,
+            total_tokens: 10,
+            term_frequencies: HashMap::new(),
+            domains: std::collections::HashSet::new(),
+            schema: None,
+            graph: crate::index::graph::DependencyGraph::default(),
+            pagerank: HashMap::new(),
+            test_map: HashMap::new(),
+            conventions: crate::conventions::ConventionProfile::default(),
+            call_graph: crate::intelligence::call_graph::CallGraph::default(),
+            co_changes: vec![],
+            cross_lang_edges: vec![],
+            #[cfg(feature = "embeddings")]
+            embedding_index: None,
+        };
+
+        let entry = PluginEntry {
+            name: "p".to_string(),
+            path: "p.wasm".to_string(),
+            checksum: "x".to_string(),
+            file_patterns: vec!["**/*.py".to_string()],
+            needs_content: false,
+        };
+        let snapshot = build_index_snapshot(&index, &entry);
+        assert_eq!(snapshot.files.len(), 1);
+        assert!(
+            snapshot.files[0].content.is_none(),
+            "content must be None when needs_content=false"
+        );
+    }
+
+    #[test]
+    fn build_index_snapshot_needs_content_true_all_contents_are_some() {
+        use crate::index::CodebaseIndex;
+        use std::collections::HashMap;
+
+        let index = CodebaseIndex {
+            files: vec![crate::index::IndexedFile {
+                relative_path: "src/main.py".to_string(),
+                language: Some("Python".to_string()),
+                size_bytes: 100,
+                token_count: 10,
+                parse_result: None,
+                content: "print('hello')".to_string(),
+                mtime_secs: None,
+            }],
+            language_stats: HashMap::new(),
+            total_files: 1,
+            total_bytes: 100,
+            total_tokens: 10,
+            term_frequencies: HashMap::new(),
+            domains: std::collections::HashSet::new(),
+            schema: None,
+            graph: crate::index::graph::DependencyGraph::default(),
+            pagerank: HashMap::new(),
+            test_map: HashMap::new(),
+            conventions: crate::conventions::ConventionProfile::default(),
+            call_graph: crate::intelligence::call_graph::CallGraph::default(),
+            co_changes: vec![],
+            cross_lang_edges: vec![],
+            #[cfg(feature = "embeddings")]
+            embedding_index: None,
+        };
+
+        let entry = PluginEntry {
+            name: "p".to_string(),
+            path: "p.wasm".to_string(),
+            checksum: "x".to_string(),
+            file_patterns: vec!["**/*.py".to_string()],
+            needs_content: true,
+        };
+        let snapshot = build_index_snapshot(&index, &entry);
+        assert_eq!(snapshot.files.len(), 1);
+        assert!(
+            snapshot.files[0].content.is_some(),
+            "content must be Some when needs_content=true"
+        );
+        assert_eq!(
+            snapshot.files[0].content.as_deref(),
+            Some("print('hello')"),
+            "content must equal the file's raw content"
+        );
+    }
+
+    #[test]
+    fn build_index_snapshot_excludes_non_matching_extensions() {
+        use crate::index::CodebaseIndex;
+        use std::collections::HashMap;
+
+        let index = CodebaseIndex {
+            files: vec![
+                crate::index::IndexedFile {
+                    relative_path: "src/main.py".to_string(),
+                    language: Some("Python".to_string()),
+                    size_bytes: 50,
+                    token_count: 5,
+                    parse_result: None,
+                    content: "x=1".to_string(),
+                    mtime_secs: None,
+                },
+                crate::index::IndexedFile {
+                    relative_path: "src/lib.ts".to_string(),
+                    language: Some("TypeScript".to_string()),
+                    size_bytes: 50,
+                    token_count: 5,
+                    parse_result: None,
+                    content: "export {}".to_string(),
+                    mtime_secs: None,
+                },
+                crate::index::IndexedFile {
+                    relative_path: "src/main.rs".to_string(),
+                    language: Some("Rust".to_string()),
+                    size_bytes: 50,
+                    token_count: 5,
+                    parse_result: None,
+                    content: "fn main() {}".to_string(),
+                    mtime_secs: None,
+                },
+            ],
+            language_stats: HashMap::new(),
+            total_files: 3,
+            total_bytes: 150,
+            total_tokens: 15,
+            term_frequencies: HashMap::new(),
+            domains: std::collections::HashSet::new(),
+            schema: None,
+            graph: crate::index::graph::DependencyGraph::default(),
+            pagerank: HashMap::new(),
+            test_map: HashMap::new(),
+            conventions: crate::conventions::ConventionProfile::default(),
+            call_graph: crate::intelligence::call_graph::CallGraph::default(),
+            co_changes: vec![],
+            cross_lang_edges: vec![],
+            #[cfg(feature = "embeddings")]
+            embedding_index: None,
+        };
+
+        let entry = PluginEntry {
+            name: "py".to_string(),
+            path: "py.wasm".to_string(),
+            checksum: "x".to_string(),
+            file_patterns: vec!["**/*.py".to_string()],
+            needs_content: false,
+        };
+        let snapshot = build_index_snapshot(&index, &entry);
+        // Only the .py file should match
+        assert_eq!(
+            snapshot.files.len(),
+            1,
+            "only *.py should match, got {:?}",
+            snapshot.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert_eq!(snapshot.files[0].path, "src/main.py");
+    }
+
+    #[test]
+    fn build_index_snapshot_empty_patterns_matches_all() {
+        use crate::index::CodebaseIndex;
+        use std::collections::HashMap;
+
+        let index = CodebaseIndex {
+            files: vec![
+                crate::index::IndexedFile {
+                    relative_path: "src/a.rs".to_string(),
+                    language: Some("Rust".to_string()),
+                    size_bytes: 10,
+                    token_count: 1,
+                    parse_result: None,
+                    content: "fn a() {}".to_string(),
+                    mtime_secs: None,
+                },
+                crate::index::IndexedFile {
+                    relative_path: "src/b.py".to_string(),
+                    language: Some("Python".to_string()),
+                    size_bytes: 10,
+                    token_count: 1,
+                    parse_result: None,
+                    content: "x=1".to_string(),
+                    mtime_secs: None,
+                },
+            ],
+            language_stats: HashMap::new(),
+            total_files: 2,
+            total_bytes: 20,
+            total_tokens: 2,
+            term_frequencies: HashMap::new(),
+            domains: std::collections::HashSet::new(),
+            schema: None,
+            graph: crate::index::graph::DependencyGraph::default(),
+            pagerank: HashMap::new(),
+            test_map: HashMap::new(),
+            conventions: crate::conventions::ConventionProfile::default(),
+            call_graph: crate::intelligence::call_graph::CallGraph::default(),
+            co_changes: vec![],
+            cross_lang_edges: vec![],
+            #[cfg(feature = "embeddings")]
+            embedding_index: None,
+        };
+
+        let entry = PluginEntry {
+            name: "all".to_string(),
+            path: "all.wasm".to_string(),
+            checksum: "x".to_string(),
+            file_patterns: vec![], // empty → match everything
+            needs_content: false,
+        };
+        let snapshot = build_index_snapshot(&index, &entry);
+        assert_eq!(
+            snapshot.files.len(),
+            2,
+            "empty patterns should match all files"
+        );
+    }
+
+    #[test]
+    fn verify_checksum_error_message_contains_both_hashes() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(b"some content").expect("write");
+        tmp.flush().expect("flush");
+
+        let result = verify_checksum(
+            tmp.path(),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        // Message must mention the expected hash
+        assert!(
+            msg.contains("0000000000000000000000000000000000000000000000000000000000000000"),
+            "error must include the expected hash, got: {msg}"
+        );
+        // And also the actual hash (different from all-zeros)
+        assert!(
+            msg.contains("got"),
+            "error must show the actual hash via 'got', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn glob_match_double_star_matches_nested_path() {
+        assert!(
+            glob_match("**/*.py", "deep/nested/x.py"),
+            "**/*.py should match deep/nested/x.py"
+        );
+    }
+
+    #[test]
+    fn glob_match_single_star_does_not_cross_directories() {
+        assert!(
+            !glob_match("*.py", "nested/x.py"),
+            "*.py should NOT match nested/x.py"
+        );
+        assert!(
+            glob_match("*.py", "x.py"),
+            "*.py should match top-level x.py"
+        );
+    }
+
+    #[test]
+    fn glob_match_double_star_alone_matches_everything() {
+        assert!(
+            glob_match("**", "any/path/file.rs"),
+            "** should match any path"
+        );
+        assert!(glob_match("**", "single.rs"), "** should match single file");
+        assert!(glob_match("**", ""), "** should match empty path");
     }
 }

@@ -107,4 +107,38 @@ mod tests {
             "error should mention 'plugin too large', got: {msg}"
         );
     }
+
+    /// PluginLoader::new() must succeed — the wasmtime engine initialises without error.
+    #[test]
+    fn plugin_loader_new_succeeds() {
+        let result = PluginLoader::new();
+        assert!(result.is_ok(), "PluginLoader::new() must return Ok");
+    }
+
+    /// Loading a valid (but trivial) WASM module from disk should fail with an error
+    /// that mentions "guest function binding", confirming that module compilation
+    /// succeeds but the v2.0.0 stub rejects the call.
+    #[test]
+    fn load_valid_wasm_returns_err_containing_guest_function_binding() {
+        // Minimal valid WASM module: magic header + version (8 bytes).
+        let minimal_wasm: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, // magic: \0asm
+            0x01, 0x00, 0x00, 0x00, // version: 1
+        ];
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(minimal_wasm).expect("write wasm");
+        tmp.flush().expect("flush");
+
+        let loader = PluginLoader::new().expect("engine init");
+        let result = loader.load(tmp.path());
+        assert!(
+            result.is_err(),
+            "loading a wasm plugin must return Err (stub not implemented)"
+        );
+        let msg = result.err().expect("is err").to_string();
+        assert!(
+            msg.contains("guest function binding"),
+            "error should mention 'guest function binding', got: {msg}"
+        );
+    }
 }

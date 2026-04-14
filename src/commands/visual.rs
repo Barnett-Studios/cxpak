@@ -254,4 +254,66 @@ mod tests {
         let _timeline = crate::visual::VisualType::Timeline;
         let _diff = crate::visual::VisualType::Diff;
     }
+
+    /// ext_for_format covers all 6 VisualFormatArg variants with correct extensions.
+    /// This protects against adding new variants without updating the match arm.
+    #[test]
+    fn test_ext_for_format_returns_correct_extensions() {
+        assert_eq!(ext_for_format(&VisualFormatArg::Html), "html");
+        assert_eq!(ext_for_format(&VisualFormatArg::Mermaid), "mmd");
+        assert_eq!(ext_for_format(&VisualFormatArg::Svg), "svg");
+        assert_eq!(ext_for_format(&VisualFormatArg::Png), "png");
+        assert_eq!(ext_for_format(&VisualFormatArg::C4), "dsl");
+        assert_eq!(ext_for_format(&VisualFormatArg::Json), "json");
+    }
+
+    /// The default output filename uses `cxpak-{type}.{ext}` format.
+    #[test]
+    fn test_default_filename_format() {
+        let type_arg = VisualTypeArg::Risk;
+        let format_arg = VisualFormatArg::Svg;
+        let slug = type_slug(&type_arg);
+        let ext = ext_for_format(&format_arg);
+        let default_name = format!("cxpak-{slug}.{ext}");
+        assert_eq!(default_name, "cxpak-risk.svg");
+    }
+
+    /// type_slug + ext_for_format for every combination of type and format produces
+    /// the expected "cxpak-{type}.{ext}" pattern (non-empty, no spaces).
+    #[test]
+    fn test_default_filename_all_types_and_formats_are_non_empty() {
+        let types = [
+            VisualTypeArg::Dashboard,
+            VisualTypeArg::Architecture,
+            VisualTypeArg::Risk,
+            VisualTypeArg::Flow,
+            VisualTypeArg::Timeline,
+            VisualTypeArg::Diff,
+        ];
+        let formats = [
+            VisualFormatArg::Html,
+            VisualFormatArg::Mermaid,
+            VisualFormatArg::Svg,
+            VisualFormatArg::Png,
+            VisualFormatArg::C4,
+            VisualFormatArg::Json,
+        ];
+        for t in &types {
+            for f in &formats {
+                let name = format!("cxpak-{}.{}", type_slug(t), ext_for_format(f));
+                assert!(
+                    !name.is_empty(),
+                    "filename for {t:?}/{f:?} should not be empty"
+                );
+                assert!(
+                    !name.contains(' '),
+                    "filename for {t:?}/{f:?} should not contain spaces, got: {name}"
+                );
+                assert!(
+                    name.starts_with("cxpak-"),
+                    "filename for {t:?}/{f:?} should start with 'cxpak-', got: {name}"
+                );
+            }
+        }
+    }
 }

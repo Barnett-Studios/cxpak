@@ -400,4 +400,153 @@ mod tests {
         assert!(!is_entry_point("src/commands/serve.rs"));
         assert!(!is_entry_point("tests/integration.rs"));
     }
+
+    // ── Additional onboard tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_compute_onboarding_map_excludes_test_files() {
+        // Index with a source file and a test file mapped to it.
+        // compute_onboarding_map should include src/a.rs but exclude tests/a_test.rs.
+        use crate::intelligence::test_map::{TestConfidence, TestFileRef};
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let src_file = dir.path().join("a.rs");
+        std::fs::write(&src_file, "pub fn run() {}").unwrap();
+        let test_file = dir.path().join("a_test.rs");
+        std::fs::write(&test_file, "#[test] fn t() {}").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/a.rs".to_string(),
+                absolute_path: src_file,
+                language: Some("rust".to_string()),
+                size_bytes: 15,
+            },
+            ScannedFile {
+                relative_path: "tests/a_test.rs".to_string(),
+                absolute_path: test_file,
+                language: Some("rust".to_string()),
+                size_bytes: 25,
+            },
+        ];
+        let mut content_map = HashMap::new();
+        content_map.insert("src/a.rs".to_string(), "pub fn run() {}".to_string());
+        content_map.insert(
+            "tests/a_test.rs".to_string(),
+            "#[test] fn t() {}".to_string(),
+        );
+
+        let mut idx =
+            CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
+        // Inject a test map entry mapping src/a.rs → tests/a_test.rs
+        idx.test_map.insert(
+            "src/a.rs".to_string(),
+            vec![TestFileRef {
+                path: "tests/a_test.rs".to_string(),
+                confidence: TestConfidence::NameMatch,
+            }],
+        );
+
+        let map = compute_onboarding_map(&idx, None);
+        let all_paths: Vec<&str> = map
+            .phases
+            .iter()
+            .flat_map(|p| p.files.iter())
+            .map(|f| f.path.as_str())
+            .collect();
+
+        assert!(
+            !all_paths.contains(&"tests/a_test.rs"),
+            "test file should be excluded from onboarding map, got paths: {all_paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_compute_onboarding_map_excludes_generated_files() {
+        // A generated/vendored file (dist/bundle.min.js) should be excluded.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let src_file = dir.path().join("a.rs");
+        std::fs::write(&src_file, "pub fn run() {}").unwrap();
+        let gen_file = dir.path().join("bundle.min.js");
+        std::fs::write(&gen_file, "var x=1;").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/a.rs".to_string(),
+                absolute_path: src_file,
+                language: Some("rust".to_string()),
+                size_bytes: 15,
+            },
+            ScannedFile {
+                relative_path: "dist/bundle.min.js".to_string(),
+                absolute_path: gen_file,
+                language: Some("javascript".to_string()),
+                size_bytes: 8,
+            },
+        ];
+        let mut content_map = HashMap::new();
+        content_map.insert("src/a.rs".to_string(), "pub fn run() {}".to_string());
+        content_map.insert("dist/bundle.min.js".to_string(), "var x=1;".to_string());
+
+        let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
+        let map = compute_onboarding_map(&idx, None);
+        let all_paths: Vec<&str> = map
+            .phases
+            .iter()
+            .flat_map(|p| p.files.iter())
+            .map(|f| f.path.as_str())
+            .collect();
+
+        assert!(
+            !all_paths.contains(&"dist/bundle.min.js"),
+            "generated file should be excluded from onboarding map, got paths: {all_paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_onboarding_markdown_contains_phase_name_rationale_and_files() {
+        let index = make_test_index();
+        let map = compute_onboarding_map(&index, None);
+        let md = render_onboarding_markdown(&map);
+
+        for phase in &map.phases {
+            assert!(
+                md.contains(&phase.name),
+                "markdown must contain phase name '{}', got:\n{md}",
+                phase.name
+            );
+            // Rationale is in an italic block (_text_)
+            assert!(
+                md.contains(&phase.rationale) || !phase.rationale.is_empty(),
+                "phase rationale must be non-empty"
+            );
+            for file in &phase.files {
+                assert!(
+                    md.contains(&file.path),
+                    "markdown must list file '{}' from phase '{}'",
+                    file.path,
+                    phase.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_render_onboarding_json_roundtrips() {
+        let index = make_test_index();
+        let original = compute_onboarding_map(&index, None);
+        let json = render_onboarding_json(&original);
+        let deserialized: OnboardingMap =
+            serde_json::from_str(&json).expect("render_onboarding_json output must be valid JSON");
+        assert_eq!(deserialized.total_files, original.total_files);
+        assert_eq!(deserialized.phases.len(), original.phases.len());
+        assert_eq!(
+            deserialized.estimated_reading_time,
+            original.estimated_reading_time
+        );
+    }
 }

@@ -211,4 +211,88 @@ mod tests {
         let result = run_add(dir.path(), &wasm_path, None, &[], false);
         assert!(result.is_err());
     }
+
+    /// A wasm file inside the repo must be stored with a relative path (not absolute).
+    #[test]
+    fn test_add_stores_relative_path_for_file_inside_repo() {
+        let dir = TempDir::new().unwrap();
+        let wasm_path = dir.path().join("plugins").join("my.wasm");
+        std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        std::fs::write(&wasm_path, b"fake wasm").unwrap();
+
+        run_add(
+            dir.path(),
+            &wasm_path,
+            None,
+            &["**/*.rs".to_string()],
+            false,
+        )
+        .unwrap();
+
+        let manifest = load_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.plugins.len(), 1);
+        let stored_path = &manifest.plugins[0].path;
+        assert!(
+            !stored_path.starts_with('/'),
+            "stored path should be relative, got: {stored_path}"
+        );
+        assert!(
+            stored_path.contains("my.wasm"),
+            "stored path should contain filename, got: {stored_path}"
+        );
+    }
+
+    /// A wasm file outside the repo root must produce an Err.
+    #[test]
+    fn test_add_rejects_path_outside_repo() {
+        let repo_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let wasm_path = outside_dir.path().join("external.wasm");
+        std::fs::write(&wasm_path, b"fake").unwrap();
+
+        let result = run_add(
+            repo_dir.path(),
+            &wasm_path,
+            None,
+            &["**/*.py".to_string()],
+            false,
+        );
+        assert!(result.is_err(), "wasm outside repo root must return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("inside the repo root"),
+            "error should mention 'inside the repo root', got: {msg}"
+        );
+    }
+
+    /// The SHA-256 checksum stored in the manifest must be exactly 64 hex characters.
+    #[test]
+    fn test_add_checksum_is_64_hex_chars() {
+        let dir = TempDir::new().unwrap();
+        let wasm_path = dir.path().join("chk.wasm");
+        std::fs::write(&wasm_path, b"some wasm content").unwrap();
+
+        run_add(
+            dir.path(),
+            &wasm_path,
+            None,
+            &["**/*.ts".to_string()],
+            false,
+        )
+        .unwrap();
+
+        let manifest = load_manifest(dir.path()).unwrap();
+        let checksum = &manifest.plugins[0].checksum;
+        assert_eq!(
+            checksum.len(),
+            64,
+            "SHA-256 hex checksum must be exactly 64 characters, got {}: {}",
+            checksum.len(),
+            checksum
+        );
+        assert!(
+            checksum.chars().all(|c| c.is_ascii_hexdigit()),
+            "checksum must contain only hex digits, got: {checksum}"
+        );
+    }
 }

@@ -606,4 +606,93 @@ mod tests {
         // 100 / 200 = 0.5 → ceil = 1 minute
         assert_eq!(format_reading_time(100), "~1m");
     }
+
+    // ── Additional onboarding tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_topological_sort_deterministic_same_input() {
+        // Running topological_sort_files twice with the same input must produce identical output.
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs", EdgeType::Import);
+        graph.add_edge("b.rs", "c.rs", EdgeType::Import);
+        graph.add_edge("a.rs", "c.rs", EdgeType::Import);
+
+        let files = ["a.rs", "b.rs", "c.rs"];
+        let first = topological_sort_files(&files, &graph);
+        let second = topological_sort_files(&files, &graph);
+        assert_eq!(
+            first, second,
+            "topological_sort_files must be deterministic"
+        );
+    }
+
+    #[test]
+    fn test_topological_sort_large_input_completes_quickly() {
+        // 100 disconnected nodes — verifies the algorithm completes in reasonable time.
+        let files: Vec<String> = (0..100).map(|i| format!("src/f{i:03}.rs")).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let graph = DependencyGraph::new();
+        let start = std::time::Instant::now();
+        let result = topological_sort_files(&file_refs, &graph);
+        let elapsed = start.elapsed();
+        assert_eq!(result.len(), 100);
+        assert!(
+            elapsed.as_millis() < 100,
+            "topological_sort_files on 100 nodes took {}ms, expected <100ms",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn test_group_into_phases_first_phase_rationale_mentions_core() {
+        let files: Vec<String> = (0..3).map(|i| format!("src/core/f{i}.rs")).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let graph = DependencyGraph::new();
+        let sorted = topological_sort_files(&file_refs, &graph);
+        let pagerank: HashMap<String, f64> = files.iter().map(|f| (f.clone(), 1.0)).collect();
+        let tokens: HashMap<String, usize> = files.iter().map(|f| (f.clone(), 100)).collect();
+        let symbols: HashMap<String, Vec<String>> = HashMap::new();
+
+        let phases = group_into_phases(&sorted, &pagerank, &graph, &tokens, &symbols);
+        assert!(!phases.is_empty(), "must produce at least one phase");
+        // Phase 0 rationale should mention "Core" (derived from build_rationale).
+        let rationale = &phases[0].rationale;
+        assert!(
+            rationale.to_lowercase().contains("core") || rationale.contains("depended"),
+            "phase 0 rationale should mention core dependency context, got: {rationale}"
+        );
+    }
+
+    #[test]
+    fn test_group_into_phases_no_phase_exceeds_9_files() {
+        let files: Vec<String> = (0..50).map(|i| format!("src/big/f{i:02}.rs")).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let graph = DependencyGraph::new();
+        let sorted = topological_sort_files(&file_refs, &graph);
+        let pagerank: HashMap<String, f64> = files.iter().map(|f| (f.clone(), 0.5)).collect();
+        let tokens: HashMap<String, usize> = files.iter().map(|f| (f.clone(), 50)).collect();
+        let symbols: HashMap<String, Vec<String>> = HashMap::new();
+
+        let phases = group_into_phases(&sorted, &pagerank, &graph, &tokens, &symbols);
+        for phase in &phases {
+            assert!(
+                phase.files.len() <= 9,
+                "phase '{}' has {} files, exceeds limit of 9",
+                phase.name,
+                phase.files.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_reading_time_boundary_200_tokens_is_1m() {
+        // Exactly 200 tokens = 200/200 = 1.0 → ceil = 1 minute
+        assert_eq!(format_reading_time(200), "~1m");
+    }
+
+    #[test]
+    fn test_format_reading_time_boundary_12000_tokens_is_1h_0m() {
+        // Exactly 12000 tokens = 60.0 minutes → "~1h 0m"
+        assert_eq!(format_reading_time(12_000), "~1h 0m");
+    }
 }

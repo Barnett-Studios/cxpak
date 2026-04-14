@@ -1078,4 +1078,69 @@ mod tests {
         assert!(deps.iter().any(|e| e.target == "b.rs"
             && e.edge_type == EdgeType::CrossLanguage(BridgeType::FfiBinding)));
     }
+
+    /// A 3-file Rust project where `a.rs` imports `b.rs` and `c.rs` via `crate::`
+    /// must produce exactly 2 Import edges from `a.rs`.
+    #[test]
+    fn test_build_dependency_graph_3_file_rust_produces_2_edges() {
+        let files = vec![
+            make_indexed_file("src/a.rs", "rust", vec!["crate::b", "crate::c"]),
+            make_indexed_file("src/b.rs", "rust", vec![]),
+            make_indexed_file("src/c.rs", "rust", vec![]),
+        ];
+        let graph = build_dependency_graph(&files, None);
+        let deps = graph
+            .edges
+            .get("src/a.rs")
+            .expect("src/a.rs should have outgoing edges");
+        assert_eq!(
+            deps.len(),
+            2,
+            "expected exactly 2 edges from src/a.rs, got {}",
+            deps.len()
+        );
+        assert!(
+            deps.iter().any(|e| e.target == "src/b.rs"),
+            "edge to src/b.rs expected"
+        );
+        assert!(
+            deps.iter().any(|e| e.target == "src/c.rs"),
+            "edge to src/c.rs expected"
+        );
+    }
+
+    /// A project with both Rust and Python files where each language uses its own
+    /// import syntax must produce correctly resolved edges for both languages.
+    #[test]
+    fn test_build_dependency_graph_mixed_rust_and_python_imports_both_resolve() {
+        let files = vec![
+            // Rust file that imports another Rust file via crate::
+            make_indexed_file("src/main.rs", "rust", vec!["crate::lib"]),
+            make_indexed_file("src/lib.rs", "rust", vec![]),
+            // Python file that imports another Python file via relative import
+            make_indexed_file("app/views.py", "python", vec![".models"]),
+            make_indexed_file("app/models.py", "python", vec![]),
+        ];
+        let graph = build_dependency_graph(&files, None);
+
+        // Rust edge: src/main.rs → src/lib.rs
+        let rust_deps = graph
+            .edges
+            .get("src/main.rs")
+            .expect("src/main.rs should have edges");
+        assert!(
+            rust_deps.iter().any(|e| e.target == "src/lib.rs"),
+            "src/main.rs should import src/lib.rs"
+        );
+
+        // Python edge: app/views.py → app/models.py
+        let py_deps = graph
+            .edges
+            .get("app/views.py")
+            .expect("app/views.py should have edges");
+        assert!(
+            py_deps.iter().any(|e| e.target == "app/models.py"),
+            "app/views.py should import app/models.py"
+        );
+    }
 }

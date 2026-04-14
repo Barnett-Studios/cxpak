@@ -1497,4 +1497,217 @@ mod tests {
         let result = build_symbol_layout(&index, "src/lib.rs", &config);
         assert!(matches!(result, Err(LayoutError::Empty)));
     }
+
+    // ── Additional Task-5 tests: grid reflow, dummy nodes, cognitive limit ─────
+
+    #[test]
+    fn test_compute_layout_grid_reflow_4_nodes_single_layer() {
+        // 4 nodes with no edges → single layer → triggers grid reflow.
+        let nodes: Vec<LayoutNode> = (0..4).map(|i| make_node(&format!("n{i}"), 0)).collect();
+        let layout = compute_layout(nodes, vec![], &LayoutConfig::default()).unwrap();
+        // Grid reflow produces >1 layer row when there are ≥4 nodes in one layer.
+        let nonempty = layout.layers.iter().filter(|l| !l.is_empty()).count();
+        assert!(
+            nonempty > 1,
+            "expected grid to produce multiple rows, got {nonempty}"
+        );
+        // All nodes should be present
+        assert_eq!(layout.nodes.len(), 4);
+    }
+
+    #[test]
+    fn test_compute_layout_3_nodes_no_grid_reflow() {
+        // 3 nodes with no edges → single layer → NOT enough to trigger grid reflow.
+        let nodes: Vec<LayoutNode> = (0..3).map(|i| make_node(&format!("n{i}"), 0)).collect();
+        // Chain edges so layer assign doesn't collapse into one layer.
+        let edges = vec![make_edge("n0", "n1"), make_edge("n1", "n2")];
+        let layout = compute_layout(nodes, edges, &LayoutConfig::default()).unwrap();
+        assert_eq!(layout.nodes.len(), 3);
+        // With a chain each node goes in its own layer — that's the Sugiyama output.
+        let nonempty_layers: Vec<_> = layout.layers.iter().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            nonempty_layers.len(),
+            3,
+            "expected 3 layers for chain, got {}",
+            nonempty_layers.len()
+        );
+    }
+
+    #[test]
+    fn test_build_module_layout_returns_empty_error_for_empty_index() {
+        let index = make_minimal_index(&[]);
+        let config = LayoutConfig::default();
+        let result = build_module_layout(&index, &config);
+        assert!(matches!(result, Err(LayoutError::Empty)));
+    }
+
+    #[test]
+    fn test_build_module_layout_normalizes_pagerank_non_trivial_width() {
+        // Two modules with very different sizes → widths should differ.
+        let index = make_minimal_index(&[
+            ("src/a/big.rs", &"fn f() {}".repeat(50)),
+            ("src/b/small.rs", "fn g() {}"),
+        ]);
+        let config = LayoutConfig::default();
+        let result = build_module_layout(&index, &config);
+        assert!(result.is_ok(), "build_module_layout must succeed");
+        let layout = result.unwrap();
+        // All node widths must be between 0.7× and 1.4× the base width.
+        for node in &layout.nodes {
+            if matches!(node.node_type, NodeType::Cluster { .. }) {
+                continue;
+            }
+            assert!(
+                node.width >= config.node_width * 0.69,
+                "width too small: {} for {}",
+                node.width,
+                node.id
+            );
+            assert!(
+                node.width <= config.node_width * 1.41,
+                "width too large: {} for {}",
+                node.width,
+                node.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_file_layout_returns_empty_for_nonexistent_prefix() {
+        let index = make_minimal_index(&[("src/a/mod.rs", "fn a() {}")]);
+        let config = LayoutConfig::default();
+        let result = build_file_layout(&index, "src/z", &config);
+        assert!(matches!(result, Err(LayoutError::Empty)));
+    }
+
+    #[test]
+    fn test_build_file_layout_token_based_sizing() {
+        // Large file should get a wider node than tiny file in the same module.
+        let big_content = "fn f() {}\n".repeat(200);
+        let index = make_minimal_index(&[
+            ("src/a/big.rs", &big_content),
+            ("src/a/small.rs", "fn g() {}"),
+        ]);
+        let config = LayoutConfig::default();
+        let result = build_file_layout(&index, "src/a", &config);
+        assert!(
+            result.is_ok(),
+            "build_file_layout must succeed: {:?}",
+            result.err()
+        );
+        let layout = result.unwrap();
+        let big_node = layout.nodes.iter().find(|n| n.id.contains("big"));
+        let small_node = layout.nodes.iter().find(|n| n.id.contains("small"));
+        if let (Some(big), Some(small)) = (big_node, small_node) {
+            assert!(
+                big.width >= small.width,
+                "big file width {} should be >= small file width {}",
+                big.width,
+                small.width
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_symbol_layout_returns_empty_for_nonexistent_file() {
+        let index = make_minimal_index(&[("src/lib.rs", "fn f() {}")]);
+        let config = LayoutConfig::default();
+        let result = build_symbol_layout(&index, "src/does_not_exist.rs", &config);
+        assert!(matches!(result, Err(LayoutError::Empty)));
+    }
+
+    #[test]
+    fn test_build_symbol_layout_node_ids_use_file_separator() {
+        let symbols = vec![make_sym("alpha", 1), make_sym("beta", 5)];
+        let index = make_index_with_symbols(
+            &[("src/lib.rs", "pub fn alpha() {} pub fn beta() {}")],
+            "src/lib.rs",
+            symbols,
+        );
+        let config = LayoutConfig::default();
+        let layout = build_symbol_layout(&index, "src/lib.rs", &config).unwrap();
+        for node in &layout.nodes {
+            assert_eq!(
+                node.id.matches("::").count(),
+                1,
+                "node id '{}' should contain exactly one '::'",
+                node.id
+            );
+            assert!(
+                node.id.starts_with("src/lib.rs::"),
+                "node id '{}' should start with 'src/lib.rs::'",
+                node.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_enforce_cognitive_limit_unique_cluster_ids_across_layers() {
+        // Two layers each exceeding the limit → each gets its own cluster id.
+        let nodes: Vec<LayoutNode> = (0..24).map(|i| make_node(&i.to_string(), i / 12)).collect();
+        let mut layer_order: Vec<Vec<String>> = vec![
+            (0..12).map(|i: usize| i.to_string()).collect(),
+            (12..24).map(|i: usize| i.to_string()).collect(),
+        ];
+        let result = enforce_cognitive_limit(nodes, &mut layer_order, 9);
+        // Find all cluster node ids.
+        let cluster_ids: Vec<&str> = result
+            .iter()
+            .filter(|n| matches!(n.node_type, NodeType::Cluster { .. }))
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(
+            cluster_ids.len(),
+            2,
+            "expected one cluster per over-full layer"
+        );
+        // Cluster ids must be distinct.
+        assert_ne!(
+            cluster_ids[0], cluster_ids[1],
+            "cluster ids must be unique across layers"
+        );
+    }
+
+    #[test]
+    fn test_insert_dummy_nodes_3_layer_span_produces_2_dummies() {
+        // Edge from layer 0 to layer 3 → dummies at layers 1 and 2.
+        let nodes = vec![make_node("a", 0), make_node("d", 3)];
+        let edges = vec![make_edge("a", "d")];
+        let mut layers = HashMap::new();
+        layers.insert("a".to_string(), 0usize);
+        layers.insert("d".to_string(), 3usize);
+        let (aug_nodes, aug_edges, dummy_ids) = insert_dummy_nodes(&nodes, &edges, &layers);
+        assert_eq!(
+            dummy_ids.len(),
+            2,
+            "expected 2 dummy nodes for span-3 edge, got {}",
+            dummy_ids.len()
+        );
+        assert_eq!(
+            aug_nodes.len(),
+            4,
+            "expected 4 total nodes, got {}",
+            aug_nodes.len()
+        );
+        assert_eq!(
+            aug_edges.len(),
+            3,
+            "expected 3 edges in chain, got {}",
+            aug_edges.len()
+        );
+    }
+
+    #[test]
+    fn test_insert_dummy_nodes_back_edge_no_dummies() {
+        // Back edge (layer 3 → layer 0): no dummies should be inserted.
+        let nodes = vec![make_node("a", 3), make_node("b", 0)];
+        let edges = vec![make_edge("a", "b")];
+        let mut layers = HashMap::new();
+        layers.insert("a".to_string(), 3usize);
+        layers.insert("b".to_string(), 0usize);
+        let (aug_nodes, aug_edges, dummy_ids) = insert_dummy_nodes(&nodes, &edges, &layers);
+        assert_eq!(dummy_ids.len(), 0, "back edge should produce no dummies");
+        assert_eq!(aug_nodes.len(), 2);
+        assert_eq!(aug_edges.len(), 1);
+    }
 }

@@ -210,4 +210,50 @@ mod tests {
         assert_eq!(map.total_files, 0);
         assert!(map.phases.is_empty());
     }
+
+    /// xml_escape must convert `<`, `&`, and `>` to their XML entities.
+    #[test]
+    fn test_xml_escape_converts_all_special_chars() {
+        let input = "<a&b>";
+        let escaped = xml_escape(input);
+        assert_eq!(escaped, "&lt;a&amp;b&gt;");
+    }
+
+    /// The XML output from render_onboarding_xml must not contain raw `<` or `&`
+    /// characters inside attribute values or text content supplied by the OnboardingMap.
+    /// We build a map containing characters that require escaping and verify the output.
+    #[test]
+    fn test_render_onboarding_xml_escapes_special_chars_in_content() {
+        let counter = TokenCounter::new();
+        // Build a minimal index so compute_onboarding_map returns at least one phase.
+        let files = vec![ScannedFile {
+            relative_path: "src/a<b>&c.rs".to_string(),
+            absolute_path: PathBuf::from("/tmp/src/a<b>&c.rs"),
+            language: Some("rust".to_string()),
+            size_bytes: 100,
+        }];
+        let mut content_map = HashMap::new();
+        content_map.insert("src/a<b>&c.rs".to_string(), "fn foo() {}".to_string());
+        let index = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
+        let map = compute_onboarding_map(&index, None);
+
+        let xml = render_onboarding_xml(&map);
+
+        // The XML skeleton tags themselves use < legitimately — so we check that
+        // the raw unescaped sequences "&>" and "<a" from our crafted filename
+        // do NOT appear verbatim in the XML attributes/text (they must be escaped).
+        // We look at the file path attributes specifically.
+        for line in xml.lines() {
+            if line.contains("path=") {
+                assert!(
+                    !line.contains("a<b>"),
+                    "unescaped '<' must not appear in path attribute: {line}"
+                );
+                assert!(
+                    !line.contains("b>&"),
+                    "unescaped '&' must not appear in path attribute: {line}"
+                );
+            }
+        }
+    }
 }

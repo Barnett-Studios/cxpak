@@ -152,4 +152,99 @@ mod tests {
         };
         assert!(warn_if_needs_content(&entry).is_none());
     }
+
+    // ── Exact-boundary tests ───────────────────────────────────────────────────
+
+    /// A serialized payload that is exactly 1 MB must be accepted (limit is strictly
+    /// greater-than, so `== MAX_RETURN_BYTES` is still Ok).
+    #[test]
+    fn enforce_return_limit_exactly_1mb_is_ok() {
+        // Build a single Finding whose JSON serialization lands at exactly MAX_RETURN_BYTES.
+        // We start with a 1-element vec and pad the message until the serialized length
+        // reaches 1_048_576.
+        let target = super::MAX_RETURN_BYTES;
+
+        // Measure baseline overhead for an empty-message finding.
+        let baseline = Finding {
+            kind: "t".to_string(),
+            message: "".to_string(),
+            path: None,
+            severity: "info".to_string(),
+            metadata: HashMap::new(),
+        };
+        let base_len = serde_json::to_vec(&vec![&baseline]).unwrap().len();
+        assert!(
+            base_len < target,
+            "baseline serialisation ({base_len}) exceeds target {target} — test precondition failed"
+        );
+
+        let pad_len = target - base_len;
+        let padded = Finding {
+            kind: "t".to_string(),
+            message: "a".repeat(pad_len),
+            path: None,
+            severity: "info".to_string(),
+            metadata: HashMap::new(),
+        };
+        // Verify our padding arithmetic actually hits the target.
+        let actual_len = serde_json::to_vec(&vec![&padded]).unwrap().len();
+        assert_eq!(
+            actual_len, target,
+            "padded serialisation should equal exactly {target}, got {actual_len}"
+        );
+
+        let result = enforce_return_limit(vec![padded]);
+        assert!(
+            result.is_ok(),
+            "exactly {target} bytes should be Ok (limit is strictly greater-than)"
+        );
+    }
+
+    /// A payload of exactly 1 MB + 1 byte must be rejected.
+    #[test]
+    fn enforce_return_limit_1mb_plus_1_byte_is_err() {
+        let target = super::MAX_RETURN_BYTES + 1;
+
+        let baseline = Finding {
+            kind: "t".to_string(),
+            message: "".to_string(),
+            path: None,
+            severity: "info".to_string(),
+            metadata: HashMap::new(),
+        };
+        let base_len = serde_json::to_vec(&vec![&baseline]).unwrap().len();
+        let pad_len = target - base_len;
+
+        let padded = Finding {
+            kind: "t".to_string(),
+            message: "a".repeat(pad_len),
+            path: None,
+            severity: "info".to_string(),
+            metadata: HashMap::new(),
+        };
+        let actual_len = serde_json::to_vec(&vec![&padded]).unwrap().len();
+        assert_eq!(
+            actual_len, target,
+            "padded serialisation should equal exactly {target}, got {actual_len}"
+        );
+
+        let result = enforce_return_limit(vec![padded]);
+        assert!(result.is_err(), "1 MB + 1 byte should be Err");
+    }
+
+    /// The error message for an oversized payload must include the actual byte count.
+    #[test]
+    fn enforce_return_limit_error_message_contains_actual_size() {
+        // Use the large_findings() helper which exceeds 1 MB.
+        let findings = large_findings();
+        // Pre-compute what the serialized length will be so we know what to assert.
+        let expected_size = serde_json::to_vec(&findings).unwrap().len();
+        let result = enforce_return_limit(findings);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains(&expected_size.to_string()),
+            "error message should contain actual size {expected_size}, got: {msg}"
+        );
+    }
 }

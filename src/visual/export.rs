@@ -394,4 +394,202 @@ mod tests {
         let result = mermaid_id(&long_id);
         assert!(result.len() <= 32);
     }
+
+    // ── Additional export tests ───────────────────────────────────────────────
+
+    fn make_cycle_layout() -> ComputedLayout {
+        let nodes = vec![
+            LayoutNode {
+                id: "src/a".into(),
+                label: "a".into(),
+                layer: 0,
+                position: Point { x: 0.0, y: 0.0 },
+                width: 160.0,
+                height: 48.0,
+                node_type: NodeType::Module,
+                metadata: NodeMetadata::default(),
+            },
+            LayoutNode {
+                id: "src/b".into(),
+                label: "b".into(),
+                layer: 1,
+                position: Point { x: 0.0, y: 120.0 },
+                width: 160.0,
+                height: 48.0,
+                node_type: NodeType::Module,
+                metadata: NodeMetadata::default(),
+            },
+        ];
+        let edges = vec![LayoutEdge {
+            source: "src/a".into(),
+            target: "src/b".into(),
+            edge_type: EdgeVisualType::Import,
+            weight: 1.0,
+            is_cycle: true,
+            waypoints: vec![],
+        }];
+        ComputedLayout {
+            nodes,
+            edges,
+            width: 200.0,
+            height: 200.0,
+            layers: vec![vec!["src/a".into()], vec!["src/b".into()]],
+        }
+    }
+
+    fn make_waypoint_layout() -> ComputedLayout {
+        let nodes = vec![
+            LayoutNode {
+                id: "src/a".into(),
+                label: "a".into(),
+                layer: 0,
+                position: Point { x: 0.0, y: 0.0 },
+                width: 160.0,
+                height: 48.0,
+                node_type: NodeType::Module,
+                metadata: NodeMetadata::default(),
+            },
+            LayoutNode {
+                id: "src/b".into(),
+                label: "b".into(),
+                layer: 2,
+                position: Point { x: 0.0, y: 240.0 },
+                width: 160.0,
+                height: 48.0,
+                node_type: NodeType::Module,
+                metadata: NodeMetadata::default(),
+            },
+        ];
+        let edges = vec![LayoutEdge {
+            source: "src/a".into(),
+            target: "src/b".into(),
+            edge_type: EdgeVisualType::Import,
+            weight: 1.0,
+            is_cycle: false,
+            waypoints: vec![Point { x: 80.0, y: 120.0 }],
+        }];
+        ComputedLayout {
+            nodes,
+            edges,
+            width: 200.0,
+            height: 288.0,
+            layers: vec![vec!["src/a".into()], vec!["src/b".into()]],
+        }
+    }
+
+    fn make_empty_layout() -> ComputedLayout {
+        ComputedLayout {
+            nodes: vec![],
+            edges: vec![],
+            width: 0.0,
+            height: 0.0,
+            layers: vec![],
+        }
+    }
+
+    #[test]
+    fn test_to_mermaid_with_cycle_edge_has_style_directive() {
+        let layout = make_cycle_layout();
+        let mermaid = to_mermaid(&layout);
+        assert!(
+            mermaid.contains("style"),
+            "cycle edge should emit 'style' directive, got:\n{mermaid}"
+        );
+    }
+
+    #[test]
+    fn test_to_mermaid_empty_layout_starts_with_graph_td() {
+        let layout = make_empty_layout();
+        let mermaid = to_mermaid(&layout);
+        assert!(mermaid.starts_with("graph TD"), "got: {mermaid}");
+    }
+
+    #[test]
+    fn test_to_svg_cycle_edge_uses_distinct_stroke_color() {
+        let layout = make_cycle_layout();
+        let meta = make_test_meta();
+        let svg = to_svg(&layout, &meta);
+        // Cycle stroke is "#ff4444"; normal is "#5a7a9a"
+        assert!(
+            svg.contains("#ff4444"),
+            "cycle edge should use red stroke '#ff4444', got:\n{svg}"
+        );
+    }
+
+    #[test]
+    fn test_to_svg_with_waypoints_renders_polyline() {
+        let layout = make_waypoint_layout();
+        let meta = make_test_meta();
+        let svg = to_svg(&layout, &meta);
+        assert!(
+            svg.contains("<polyline"),
+            "edge with waypoints should render as polyline, got:\n{svg}"
+        );
+    }
+
+    #[test]
+    fn test_to_c4_uses_container_keyword() {
+        let layout = make_3_module_layout();
+        let meta = make_test_meta();
+        let c4 = to_c4(&layout, &meta);
+        // Structurizr DSL uses "container" for each module
+        assert!(
+            c4.contains("container"),
+            "C4 output must use 'container' keyword, got:\n{c4}"
+        );
+    }
+
+    #[test]
+    fn test_to_json_does_not_panic_on_normal_layout() {
+        let layout = make_3_module_layout();
+        let json = to_json(&layout);
+        // Must start with '{' — not an error placeholder
+        assert!(
+            json.trim_start().starts_with('{'),
+            "expected JSON object, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_to_json_roundtrip_node_count() {
+        let layout = make_3_module_layout();
+        let json = to_json(&layout);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["nodes"].as_array().unwrap().len(),
+            3,
+            "roundtrip must preserve 3 nodes"
+        );
+    }
+
+    #[test]
+    fn test_mermaid_id_multibyte_unicode_no_panic() {
+        // Multi-byte Unicode characters should not panic.
+        let id = "src/αβγ/δεζ.rs";
+        let result = mermaid_id(id);
+        assert!(
+            !result.is_empty(),
+            "mermaid_id should return non-empty string"
+        );
+        assert!(result.len() <= 32, "result should be at most 32 chars");
+    }
+
+    #[test]
+    #[cfg(feature = "visual")]
+    fn test_to_png_magic_bytes_and_minimum_size() {
+        let layout = make_3_module_layout();
+        let meta = make_test_meta();
+        let bytes = to_png(&layout, &meta, 800, 600).unwrap();
+        // PNG magic bytes: 0x89 50 4E 47
+        assert_eq!(
+            &bytes[..4],
+            &[137, 80, 78, 71],
+            "must start with PNG magic bytes"
+        );
+        assert!(
+            bytes.len() > 1024,
+            "PNG output must be > 1KB, got {} bytes",
+            bytes.len()
+        );
+    }
 }
