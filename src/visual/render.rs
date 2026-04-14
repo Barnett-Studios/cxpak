@@ -181,10 +181,10 @@ CX.renderGraph = function(root, data, opts) {
     var m = d.metadata || {};
     var html = '<div class="tt-title">' + CX.esc(d.id) + '</div>' +
       '<div class="tt-row"><span class="tt-label">Type</span><span class="tt-value">' + CX.esc(d.node_type) + '</span></div>' +
-      '<div class="tt-row"><span class="tt-label">PageRank</span><span class="tt-value">' + (m.pagerank || 0).toFixed(3) + '</span></div>' +
+      '<div class="tt-row"><span class="tt-label">PageRank</span><span class="tt-value">' + CX.fmtNum(m.pagerank) + '</span></div>' +
       '<div class="tt-row"><span class="tt-label">Risk</span><span class="tt-value tt-' +
         (m.risk_score >= 0.7 ? 'high' : m.risk_score >= 0.4 ? 'medium' : 'low') + '">' +
-        (m.risk_score || 0).toFixed(2) + '</span></div>' +
+        CX.fmtNum(m.risk_score) + '</span></div>' +
       '<div class="tt-row"><span class="tt-label">Tokens</span><span class="tt-value">' + (m.token_count || 0) + '</span></div>';
     CX.tooltip.show(html, ev);
   }).on('mouseout', function() { CX.tooltip.hide(); });
@@ -194,6 +194,14 @@ CX.renderGraph = function(root, data, opts) {
 
 CX.dimColor = function(score) {
   return score >= 7 ? '#06d6a0' : score >= 4 ? '#ffd166' : '#ef476f';
+};
+
+CX.fmtNum = function(v) {
+  if (v == null || v === 0) return '0';
+  var abs = Math.abs(v);
+  if (abs >= 0.01) return v.toFixed(3);
+  if (abs >= 0.0001) return v.toFixed(5);
+  return v.toExponential(2);
 };
 "#
 }
@@ -3994,5 +4002,40 @@ mod tests {
             );
         }
         // Err(_) branch: minimal index may not produce module layout — that is acceptable.
+    }
+
+    // ---- fmtNum helper presence ----
+
+    #[test]
+    fn test_common_js_contains_fmtnum_helper() {
+        // The fmtNum helper must be embedded in the shared JS returned by common_js().
+        let js = common_js();
+        assert!(
+            js.contains("CX.fmtNum"),
+            "fmtNum helper must be present in common JS"
+        );
+        assert!(
+            js.contains("toExponential"),
+            "fmtNum must fall back to scientific notation for very small values"
+        );
+        assert!(
+            js.contains("toFixed(5)"),
+            "fmtNum must use toFixed(5) for values in [0.0001, 0.01)"
+        );
+    }
+
+    #[test]
+    fn test_render_dashboard_contains_fmtnum() {
+        let index = make_minimal_index();
+        let meta = make_test_metadata();
+        let html = render_dashboard(&index, &meta);
+        assert!(
+            html.contains("CX.fmtNum"),
+            "rendered dashboard HTML must embed the fmtNum helper"
+        );
+        assert!(
+            html.contains("toExponential"),
+            "rendered dashboard HTML must include toExponential fallback"
+        );
     }
 }

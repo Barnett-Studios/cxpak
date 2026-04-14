@@ -71,6 +71,8 @@ pub fn run(
     // 3. Index
     let index_start = std::time::Instant::now();
     let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+    index.conventions = crate::conventions::build_convention_profile(&index, path);
+    index.co_changes = index.conventions.git_health.co_changes.clone();
 
     // 3b. Rank files by importance and sort so high-value files get budget first
     let git_ctx = git::extract_git_context(path, 20).ok();

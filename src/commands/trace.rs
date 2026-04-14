@@ -58,6 +58,8 @@ pub fn run(
     // 3. Index
     let index_start = Instant::now();
     let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+    index.conventions = crate::conventions::build_convention_profile(&index, path);
+    index.co_changes = index.conventions.git_health.co_changes.clone();
 
     if verbose {
         eprintln!(

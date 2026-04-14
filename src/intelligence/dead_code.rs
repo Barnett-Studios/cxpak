@@ -1,4 +1,4 @@
-use crate::index::CodebaseIndex;
+use crate::index::{CodebaseIndex, IndexedFile};
 use crate::intelligence::api_surface::detect_routes;
 use crate::parser::language::{SymbolKind, Visibility};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,47 @@ fn is_entry_point(
     false
 }
 
+/// Returns true when the symbol kind represents a callable (function/method).
+/// These are checked against the call graph for callers.
+fn is_callable_kind(kind: &SymbolKind) -> bool {
+    matches!(kind, SymbolKind::Function | SymbolKind::Method)
+}
+
+/// Returns true when the symbol kind represents a type definition.
+/// Types don't appear in call graphs; we use string-reference scanning instead.
+fn is_type_kind(kind: &SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Interface
+            | SymbolKind::Class
+            | SymbolKind::TypeAlias
+    )
+}
+
+/// Returns true when the symbol name appears as a substring in any file other than
+/// `defining_file`. Short names (<3 chars) are assumed alive to avoid false positives.
+fn has_string_references(
+    symbol_name: &str,
+    defining_file: &str,
+    all_files: &[IndexedFile],
+) -> bool {
+    if symbol_name.len() < 3 {
+        return true; // too short to search reliably — assume alive
+    }
+    for file in all_files {
+        if file.relative_path == defining_file {
+            continue;
+        }
+        if file.content.contains(symbol_name) {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_test_file(path: &str) -> bool {
     path.contains("/tests/")
         || path.contains("/test/")
@@ -135,26 +176,41 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
         };
 
         for symbol in &pr.symbols {
-            let has_callers = index
-                .call_graph
-                .has_callers(&file.relative_path, &symbol.name);
-            if has_callers {
+            // Structural-only kinds (Heading, Selector, Key, etc.) are not semantic
+            // entities and must be skipped entirely from dead code detection.
+            if !is_callable_kind(&symbol.kind)
+                && !is_type_kind(&symbol.kind)
+                && symbol.kind != SymbolKind::Constant
+            {
                 continue;
             }
 
-            let is_public = symbol.visibility == Visibility::Public;
-            if is_entry_point(
-                &file.relative_path,
-                &symbol.name,
-                &symbol.signature,
-                is_public,
-                &route_cache,
-            ) {
-                continue;
-            }
+            let is_alive = if is_callable_kind(&symbol.kind) {
+                // For functions/methods: check the call graph.
+                let has_callers = index
+                    .call_graph
+                    .has_callers(&file.relative_path, &symbol.name);
+                if has_callers {
+                    true
+                } else {
+                    let is_public = symbol.visibility == Visibility::Public;
+                    is_entry_point(
+                        &file.relative_path,
+                        &symbol.name,
+                        &symbol.signature,
+                        is_public,
+                        &route_cache,
+                    ) || {
+                        let key = (file.relative_path.clone(), symbol.name.clone());
+                        test_referenced.contains(&key)
+                    }
+                }
+            } else {
+                // For types (and constants): use string-reference scan across all files.
+                has_string_references(&symbol.name, &file.relative_path, &index.files)
+            };
 
-            let key = (file.relative_path.clone(), symbol.name.clone());
-            if test_referenced.contains(&key) {
+            if is_alive {
                 continue;
             }
 
@@ -369,5 +425,172 @@ mod tests {
         };
         let json = serde_json::to_string(&ds).unwrap();
         assert!(json.contains("\"orphan\""));
+    }
+
+    // ---- type-kind dead code fixes ----
+
+    fn make_struct_index(
+        symbol_name: &str,
+        def_content: &str,
+        ref_content: Option<&str>,
+    ) -> crate::index::CodebaseIndex {
+        let counter = crate::budget::counter::TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let def_path = dir.path().join("a.rs");
+        std::fs::write(&def_path, def_content).unwrap();
+        let mut files = vec![ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: def_path,
+            language: Some("rust".into()),
+            size_bytes: def_content.len() as u64,
+        }];
+        let mut content_map = HashMap::new();
+        content_map.insert("a.rs".to_string(), def_content.to_string());
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "a.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: symbol_name.into(),
+                    kind: SymbolKind::Struct,
+                    visibility: Visibility::Public,
+                    signature: format!("pub struct {symbol_name}"),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        if let Some(ref_src) = ref_content {
+            let ref_path = dir.path().join("b.rs");
+            std::fs::write(&ref_path, ref_src).unwrap();
+            files.push(ScannedFile {
+                relative_path: "b.rs".into(),
+                absolute_path: ref_path,
+                language: Some("rust".into()),
+                size_bytes: ref_src.len() as u64,
+            });
+            content_map.insert("b.rs".to_string(), ref_src.to_string());
+        }
+        crate::index::CodebaseIndex::build_with_content(files, parse_results, &counter, content_map)
+    }
+
+    #[test]
+    fn test_dead_code_skips_used_struct() {
+        // a.rs defines struct Foo; b.rs references "Foo" by name.
+        let index = make_struct_index(
+            "Foo",
+            "pub struct Foo {}",
+            Some("fn bar() -> Foo { todo!() }"),
+        );
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            !dead.iter().any(|d| d.symbol == "Foo"),
+            "Foo is referenced in b.rs and must NOT be dead: {:?}",
+            dead.iter().map(|d| &d.symbol).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_dead_code_flags_unused_private_struct() {
+        // Single file with a struct that has no references in any other file.
+        let index = make_struct_index("Orphan", "pub struct Orphan {}", None);
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            dead.iter().any(|d| d.symbol == "Orphan"),
+            "Orphan struct with no external references must be dead: {:?}",
+            dead.iter().map(|d| &d.symbol).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_dead_code_flags_unused_private_function() {
+        let counter = crate::budget::counter::TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("util.rs");
+        std::fs::write(&fp, "fn unused() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "util.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 14,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "util.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "unused".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "fn unused()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("util.rs".to_string(), "fn unused() {}".to_string());
+        let index = crate::index::CodebaseIndex::build_with_content(
+            files,
+            parse_results,
+            &counter,
+            content_map,
+        );
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            dead.iter().any(|d| d.symbol == "unused"),
+            "private fn with no callers must be flagged dead"
+        );
+    }
+
+    #[test]
+    fn test_dead_code_skips_short_names() {
+        // A struct named "T" (< 3 chars) must be treated as alive to avoid false positives.
+        let counter = crate::budget::counter::TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("short.rs");
+        std::fs::write(&fp, "pub struct T {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "short.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 14,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "short.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "T".into(),
+                    kind: SymbolKind::Struct,
+                    visibility: Visibility::Public,
+                    signature: "pub struct T".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("short.rs".to_string(), "pub struct T {}".to_string());
+        let index = crate::index::CodebaseIndex::build_with_content(
+            files,
+            parse_results,
+            &counter,
+            content_map,
+        );
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            !dead.iter().any(|d| d.symbol == "T"),
+            "single-char struct name must be assumed alive (too short to search reliably)"
+        );
     }
 }

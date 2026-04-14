@@ -99,9 +99,53 @@ fn score_conventions(index: &CodebaseIndex) -> f64 {
     scores.iter().sum::<f64>() / scores.len() as f64
 }
 
-/// Test coverage dimension: ratio of source files with >= 1 mapped test file, scaled to [0, 10].
+/// Returns true when a source file contains inline tests based on language-specific markers.
+///
+/// Detects:
+/// - Rust: `#[cfg(test)]` or `#[test]`
+/// - Python: `def test_` (function-level) or `class Test`
+/// - TypeScript/JavaScript: `describe(`, ` it(`, or `\ntest(`  (non-word prefix)
+/// - Go: `func Test`
+pub(crate) fn has_inline_tests(file: &crate::index::IndexedFile) -> bool {
+    let lang = file.language.as_deref().unwrap_or("");
+    let content = &file.content;
+    match lang {
+        "rust" => content.contains("#[cfg(test)]") || content.contains("#[test]"),
+        "python" => content.contains("def test_") || content.contains("class Test"),
+        "typescript" | "javascript" | "tsx" | "jsx" => {
+            content.contains("describe(")
+                || content.contains(" it(")
+                // require `test(` to be preceded by a non-word char to avoid false
+                // matches like `latest(` or `formattest(`.
+                || {
+                    let bytes = content.as_bytes();
+                    let needle = b"test(";
+                    let mut pos = 0;
+                    let mut found = false;
+                    while pos + needle.len() <= bytes.len() {
+                        if bytes[pos..].starts_with(needle) {
+                            let preceded_by_non_word = pos == 0
+                                || !bytes[pos - 1].is_ascii_alphanumeric()
+                                    && bytes[pos - 1] != b'_';
+                            if preceded_by_non_word {
+                                found = true;
+                                break;
+                            }
+                        }
+                        pos += 1;
+                    }
+                    found
+                }
+        }
+        "go" => content.contains("func Test"),
+        _ => false,
+    }
+}
+
+/// Test coverage dimension: ratio of source files with >= 1 mapped test file or inline
+/// tests, scaled to [0, 10].
 fn score_test_coverage(index: &CodebaseIndex) -> f64 {
-    let source_files: Vec<&str> = index
+    let source_files: Vec<&crate::index::IndexedFile> = index
         .files
         .iter()
         .filter(|f| {
@@ -115,7 +159,6 @@ fn score_test_coverage(index: &CodebaseIndex) -> f64 {
                 && !p.contains("_spec.")
                 && !p.contains(".spec.")
         })
-        .map(|f| f.relative_path.as_str())
         .collect();
 
     if source_files.is_empty() {
@@ -124,7 +167,7 @@ fn score_test_coverage(index: &CodebaseIndex) -> f64 {
 
     let covered = source_files
         .iter()
-        .filter(|path| index.test_map.contains_key(*path as &str))
+        .filter(|f| index.test_map.contains_key(f.relative_path.as_str()) || has_inline_tests(f))
         .count();
 
     (covered as f64 / source_files.len() as f64) * 10.0
@@ -587,6 +630,107 @@ mod tests {
         assert!(
             health.dead_code.is_some(),
             "dead_code should be Some in v1.3.0"
+        );
+    }
+
+    // ---- has_inline_tests ----
+
+    fn mk_file(path: &str, lang: &str, content: &str) -> crate::index::IndexedFile {
+        crate::index::IndexedFile {
+            relative_path: path.to_string(),
+            language: Some(lang.to_string()),
+            size_bytes: content.len() as u64,
+            token_count: 0,
+            parse_result: None,
+            content: content.to_string(),
+            mtime_secs: None,
+        }
+    }
+
+    #[test]
+    fn test_has_inline_tests_rust_cfg_test() {
+        let content = "pub fn foo() {}\n\n#[cfg(test)]\nmod tests {\n    #[test] fn bar() {}\n}";
+        let f = mk_file("src/foo.rs", "rust", content);
+        assert!(has_inline_tests(&f), "Rust #[cfg(test)] must be detected");
+    }
+
+    #[test]
+    fn test_has_inline_tests_rust_no_tests() {
+        let f = mk_file("src/foo.rs", "rust", "pub fn foo() {}");
+        assert!(
+            !has_inline_tests(&f),
+            "Rust file without tests must return false"
+        );
+    }
+
+    #[test]
+    fn test_has_inline_tests_python() {
+        let content = "class TestFoo:\n    def test_one(self):\n        pass";
+        let f = mk_file("foo_test.py", "python", content);
+        assert!(has_inline_tests(&f), "Python class Test must be detected");
+    }
+
+    #[test]
+    fn test_has_inline_tests_typescript() {
+        let content = "describe('foo', () => {\n  it('works', () => {});\n});";
+        let f = mk_file("foo.spec.ts", "typescript", content);
+        assert!(has_inline_tests(&f), "TypeScript describe must be detected");
+    }
+
+    #[test]
+    fn test_has_inline_tests_typescript_no_tests() {
+        let content = "export function latest(x: number) { return x; }";
+        let f = mk_file("util.ts", "typescript", content);
+        assert!(
+            !has_inline_tests(&f),
+            "'latest(' must not be detected as a test"
+        );
+    }
+
+    #[test]
+    fn test_score_test_coverage_counts_inline_tests() {
+        use crate::budget::counter::TokenCounter;
+        use crate::parser::language::ParseResult;
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = TokenCounter::new();
+        // Two Rust source files: one with inline tests, one without.
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/with_tests.rs".into(),
+                absolute_path: std::path::PathBuf::from("/tmp/with_tests.rs"),
+                language: Some("rust".into()),
+                size_bytes: 60,
+            },
+            ScannedFile {
+                relative_path: "src/no_tests.rs".into(),
+                absolute_path: std::path::PathBuf::from("/tmp/no_tests.rs"),
+                language: Some("rust".into()),
+                size_bytes: 20,
+            },
+        ];
+        let parse_results: HashMap<String, ParseResult> = HashMap::new();
+        let mut content_map = HashMap::new();
+        content_map.insert(
+            "src/with_tests.rs".to_string(),
+            "pub fn foo() {}\n\n#[cfg(test)]\nmod tests { #[test] fn t() {} }".to_string(),
+        );
+        content_map.insert("src/no_tests.rs".to_string(), "pub fn bar() {}".to_string());
+
+        let index = crate::index::CodebaseIndex::build_with_content(
+            files,
+            parse_results,
+            &counter,
+            content_map,
+        );
+        // test_map is empty (no external _test.rs); 1 of 2 files has inline tests.
+        assert!(index.test_map.is_empty(), "test_map should be empty");
+        let score = score_test_coverage(&index);
+        // 1 of 2 covered → 0.5 × 10 = 5.0
+        assert!(
+            (score - 5.0).abs() < 1e-9,
+            "expected coverage score 5.0, got {score}"
         );
     }
 }

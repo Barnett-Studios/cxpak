@@ -169,8 +169,54 @@ pub fn extract_public_symbols(
     )
 }
 
+/// Returns true when the file extension indicates source code that may contain route
+/// registrations. Non-source files (markdown, YAML, JSON, plain text, etc.) return false
+/// to avoid false-positive route matches from documentation code examples.
+fn is_source_code_file(path: &str) -> bool {
+    let ext = match path.rsplit_once('.') {
+        Some((_, e)) => e.to_lowercase(),
+        None => return false,
+    };
+    matches!(
+        ext.as_str(),
+        "rs" | "py"
+            | "pyi"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "ts"
+            | "tsx"
+            | "go"
+            | "java"
+            | "kt"
+            | "kts"
+            | "rb"
+            | "ex"
+            | "exs"
+            | "elm"
+            | "scala"
+            | "cs"
+            | "swift"
+            | "php"
+            | "c"
+            | "cpp"
+            | "cc"
+            | "cxx"
+            | "h"
+            | "hpp"
+            | "hxx"
+    )
+}
+
 /// Detect HTTP route endpoints from file content using 12 framework patterns.
 pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
+    // Gate: skip non-source files (markdown, YAML, JSON, HTML, plain text, etc.)
+    // to avoid false positives from documentation code examples.
+    if !is_source_code_file(file_path) {
+        return vec![];
+    }
+
     let mut routes = vec![];
 
     // Helper to compute 1-based line number from a byte offset.
@@ -2117,5 +2163,36 @@ type User {
         // Token budget sanity: token_count is non-zero and under the budget.
         assert!(surface.token_count > 0);
         assert!(surface.token_count <= 100_000);
+    }
+
+    // ---- source-code gate tests ----
+
+    #[test]
+    fn test_detect_routes_skips_markdown() {
+        let content = "# Example\n\n```javascript\napp.get('/users', getUsers);\n```\n";
+        let routes = detect_routes(content, "docs/api.md");
+        assert!(
+            routes.is_empty(),
+            "markdown files must not produce routes, got: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_routes_scans_javascript() {
+        let content = "app.get('/users', getUsers);";
+        let routes = detect_routes(content, "src/app.js");
+        assert_eq!(routes.len(), 1, "JavaScript route must be detected");
+        assert_eq!(routes[0].method, "GET");
+        assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].handler, "getUsers");
+    }
+
+    #[test]
+    fn test_detect_routes_skips_txt() {
+        let content = "app.get('/x', h);";
+        assert!(
+            detect_routes(content, "notes.txt").is_empty(),
+            ".txt files must not produce routes"
+        );
     }
 }

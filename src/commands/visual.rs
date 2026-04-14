@@ -62,7 +62,9 @@ fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::error::Error>>
     }
     let (parse_results, content_map) =
         cache::parse::parse_with_cache(&files, path, &counter, false);
-    let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+    let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+    index.conventions = crate::conventions::build_convention_profile(&index, path);
+    index.co_changes = index.conventions.git_health.co_changes.clone();
     Ok(index)
 }
 
