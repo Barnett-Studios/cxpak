@@ -227,12 +227,26 @@ fn dashboard_js() -> &'static str {
 CX.header();
 var dash = JSON.parse(document.getElementById('cxpak-dashboard').textContent);
 
+/* navTo() preserves the filename prefix used by the header nav so in-page
+   links work regardless of the hosting filename convention (cxpak-dashboard.html,
+   dashboard.html, etc.). */
+function navTo(view) {
+  var curPath = window.location.pathname.split('/').pop() || '';
+  var m = curPath.match(/^(.+?)(dashboard|architecture|risk|diff|flow|timeline)(\.html?)$/i);
+  var prefix = m ? m[1] : 'cxpak-';
+  var ext = m ? m[3] : '.html';
+  window.location.href = prefix + view + ext;
+}
+
 var grid = document.createElement('div');
 grid.className = 'cxpak-dashboard';
 CX.app.appendChild(grid);
 
 /* Q1: Health gauge */
-var q1 = document.createElement('div'); q1.className = 'cxpak-quadrant';
+var q1 = document.createElement('div');
+q1.className = 'cxpak-quadrant cxpak-clickable';
+q1.title = 'View architecture explorer';
+q1.onclick = function() { navTo('architecture'); };
 q1.innerHTML = '<div class="cxpak-quadrant-title">Health Score</div>';
 var gw = document.createElement('div'); gw.className = 'cxpak-gauge-wrap';
 var sc = dash.health.composite;
@@ -255,10 +269,13 @@ gSvg.append('path').datum({ endAngle: 0 })
 var bars = document.createElement('div'); bars.className = 'cxpak-dim-bars';
 (dash.health.dimensions || []).forEach(function(dim) {
   var name = dim[0], val = dim[1];
-  bars.innerHTML += '<div class="cxpak-dim-row">' +
+  var row = document.createElement('div');
+  row.className = 'cxpak-dim-row';
+  row.innerHTML =
     '<span class="cxpak-dim-label">' + CX.esc(name.replace(/_/g, ' ')) + '</span>' +
     '<div class="cxpak-dim-bar"><div class="cxpak-dim-fill" style="width:' + (val*10) + '%;background:' + CX.dimColor(val) + '"></div></div>' +
-    '<span class="cxpak-dim-val" style="color:' + CX.dimColor(val) + '">' + val.toFixed(1) + '</span></div>';
+    '<span class="cxpak-dim-val" style="color:' + CX.dimColor(val) + '">' + val.toFixed(1) + '</span>';
+  bars.appendChild(row);
 });
 gw.appendChild(bars);
 q1.appendChild(gw);
@@ -271,20 +288,32 @@ var risks = dash.risks.top_risks || [];
 if (risks.length === 0) {
   q2.innerHTML += '<div class="cxpak-empty">No significant risks detected</div>';
 } else {
-  var tbl = '<table class="cxpak-risk-table"><thead><tr><th>File</th><th>Risk</th><th>Churn</th><th>Blast</th><th>Tests</th></tr></thead><tbody>';
+  var tbl = document.createElement('table');
+  tbl.className = 'cxpak-risk-table';
+  tbl.innerHTML = '<thead><tr><th>File</th><th>Risk</th><th>Churn</th><th>Blast</th><th>Tests</th></tr></thead>';
+  var tb = document.createElement('tbody');
   risks.forEach(function(r) {
-    tbl += '<tr><td><span class="cxpak-severity-dot ' + r.severity + '"></span>' + CX.esc(r.path) + '</td>' +
+    var tr = document.createElement('tr');
+    tr.className = 'cxpak-clickable';
+    tr.title = 'View risk heatmap';
+    tr.onclick = function() { navTo('risk'); };
+    tr.innerHTML =
+      '<td><span class="cxpak-severity-dot ' + r.severity + '"></span>' + CX.esc(r.path) + '</td>' +
       '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
       '<td>' + r.churn_30d + '</td><td>' + r.blast_radius + '</td>' +
-      '<td style="color:' + (r.has_tests ? '#06d6a0' : '#8888aa') + '">' + (r.has_tests ? '\u2713' : '\u2014') + '</td></tr>';
+      '<td style="color:' + (r.has_tests ? '#06d6a0' : '#8888aa') + '">' + (r.has_tests ? '\u2713' : '\u2014') + '</td>';
+    tb.appendChild(tr);
   });
-  tbl += '</tbody></table>';
-  q2.innerHTML += tbl;
+  tbl.appendChild(tb);
+  q2.appendChild(tbl);
 }
 grid.appendChild(q2);
 
 /* Q3: Architecture mini-map */
-var q3 = document.createElement('div'); q3.className = 'cxpak-quadrant';
+var q3 = document.createElement('div');
+q3.className = 'cxpak-quadrant cxpak-clickable';
+q3.title = 'Open architecture explorer';
+q3.onclick = function() { navTo('architecture'); };
 q3.innerHTML = '<div class="cxpak-quadrant-title">Architecture (' +
   (dash.architecture_preview.module_count || 0) + ' modules, ' +
   (dash.architecture_preview.circular_dep_count || 0) + ' cycles)</div>';
@@ -312,9 +341,17 @@ if (alerts.length === 0) {
   alerts.forEach(function(a) {
     var sev = a.severity || 'Low';
     var icon = sev === 'High' ? '!!' : sev === 'Medium' ? '!' : 'i';
-    al.innerHTML += '<div class="cxpak-alert-item sev-' + sev + '">' +
+    var link = (a.link_view || 'Dashboard');
+    var item = document.createElement('div');
+    item.className = 'cxpak-alert-item sev-' + sev + ' cxpak-clickable';
+    item.title = 'View details in ' + link + ' view';
+    item.onclick = (function(target) {
+      return function() { navTo(target.toLowerCase()); };
+    })(link);
+    item.innerHTML =
       '<span class="cxpak-alert-icon">' + icon + '</span>' +
-      '<span class="cxpak-alert-msg">' + CX.esc(a.message) + '</span></div>';
+      '<span class="cxpak-alert-msg">' + CX.esc(a.message) + '</span>';
+    al.appendChild(item);
   });
 }
 q4.appendChild(al);
@@ -1293,6 +1330,57 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
                 link_view: super::VisualType::Dashboard,
             });
         }
+    }
+
+    // Dead-symbol alert — defined but never called from anywhere indexed.
+    let dead_symbols = crate::intelligence::dead_code::detect_dead_code(index, None);
+    if !dead_symbols.is_empty() {
+        let count = dead_symbols.len();
+        alerts.push(Alert {
+            kind: AlertKind::DeadSymbols,
+            message: format!(
+                "{} dead symbol{} detected (defined but never called)",
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            severity: if count > 20 {
+                AlertSeverity::High
+            } else if count > 5 {
+                AlertSeverity::Medium
+            } else {
+                AlertSeverity::Low
+            },
+            link_view: super::VisualType::Architecture,
+        });
+    }
+
+    // Unprotected-endpoint alert — HTTP routes with no auth guard. Uses a
+    // standard middleware vocabulary that matches common frameworks.
+    let auth_patterns = [
+        "require_auth",
+        "authenticate",
+        "authorize",
+        "auth_middleware",
+        "check_auth",
+    ];
+    let security =
+        crate::intelligence::security::build_security_surface(index, &auth_patterns, None);
+    if !security.unprotected_endpoints.is_empty() {
+        let count = security.unprotected_endpoints.len();
+        alerts.push(Alert {
+            kind: AlertKind::UnprotectedEndpoints,
+            message: format!(
+                "{} unprotected endpoint{} detected (no auth guard)",
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            severity: if count > 10 {
+                AlertSeverity::High
+            } else {
+                AlertSeverity::Medium
+            },
+            link_view: super::VisualType::Architecture,
+        });
     }
 
     DashboardData {

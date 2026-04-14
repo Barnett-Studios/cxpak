@@ -372,6 +372,36 @@ html, body {
   text-align: center;
 }
 
+/* ── Clickable affordance ───────────────────────────────────────── */
+.cxpak-clickable {
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  position: relative;
+}
+.cxpak-clickable:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--accent-blue);
+}
+.cxpak-risk-table tr.cxpak-clickable:hover td { background: var(--bg-card); }
+.cxpak-alert-item.cxpak-clickable:hover { background: var(--bg-card-hover); }
+
+/* Arrow indicator — only on quadrant-sized containers. Table rows and
+   alert items get the hover background affordance instead, to avoid
+   cluttering dense layouts. */
+.cxpak-quadrant.cxpak-clickable::after {
+  content: '→';
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  opacity: 0;
+  transition: opacity 0.15s;
+  color: var(--accent-blue);
+  font-size: 14px;
+  pointer-events: none;
+}
+.cxpak-quadrant.cxpak-clickable:hover::after { opacity: 1; }
+
 /* ── Navigation links ───────────────────────────────────────────── */
 
 .cxpak-nav {
