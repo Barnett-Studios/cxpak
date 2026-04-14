@@ -567,44 +567,310 @@ CX.header();
 var tl = JSON.parse(document.getElementById('cxpak-timeline').textContent);
 var steps = tl.steps || [];
 var curIdx = tl.current_index || 0;
+if (curIdx >= steps.length) curIdx = Math.max(0, steps.length - 1);
 
 var wrap = document.createElement('div'); wrap.className = 'cxpak-timeline-wrap';
+wrap.style.position = 'relative';
 CX.app.appendChild(wrap);
 
-/* sparkline area */
+/* ── Sparkline area ───────────────────────────────────────── */
 var spark = document.createElement('div'); spark.className = 'cxpak-sparkline-area';
 wrap.appendChild(spark);
 var sp = tl.health_sparkline || [];
-if (sp.length > 1) {
+var sparkMarker = null;
+var sparkScaleX = null;
+var sparkScaleY = null;
+if (sp.length >= 1) {
   var sw = spark.clientWidth || (window.innerWidth - 48), sh = 64;
   var sSvg = d3.select(spark).append('svg').attr('width', sw).attr('height', sh);
-  var xS = d3.scaleLinear().domain([0, sp.length - 1]).range([0, sw]);
-  var yS = d3.scaleLinear().domain([0, 10]).range([sh, 0]);
-  var ln = d3.line().x(function(d, i) { return xS(i); }).y(function(d) { return yS(d[1]); }).curve(d3.curveMonotoneX);
-  var area = d3.area().x(function(d, i) { return xS(i); }).y0(sh).y1(function(d) { return yS(d[1]); }).curve(d3.curveMonotoneX);
-  sSvg.append('path').datum(sp).attr('class','cxpak-sparkline-fill').attr('d', area);
-  sSvg.append('path').datum(sp).attr('class','cxpak-sparkline-path').attr('d', ln);
+  sparkScaleX = d3.scaleLinear().domain([0, Math.max(1, sp.length - 1)]).range([0, sw]);
+  sparkScaleY = d3.scaleLinear().domain([0, 10]).range([sh, 0]);
+  if (sp.length > 1) {
+    var ln = d3.line().x(function(d, i) { return sparkScaleX(i); }).y(function(d) { return sparkScaleY(d[1]); }).curve(d3.curveMonotoneX);
+    var area = d3.area().x(function(d, i) { return sparkScaleX(i); }).y0(sh).y1(function(d) { return sparkScaleY(d[1]); }).curve(d3.curveMonotoneX);
+    sSvg.append('path').datum(sp).attr('class','cxpak-sparkline-fill').attr('d', area);
+    sSvg.append('path').datum(sp).attr('class','cxpak-sparkline-path').attr('d', ln);
+  }
+  /* current-step marker (vertical cursor + dot) */
+  sparkMarker = sSvg.append('g').attr('class', 'cxpak-sparkline-marker');
+  sparkMarker.append('line')
+    .attr('class', 'cxpak-sparkline-cursor')
+    .attr('y1', 0).attr('y2', sh)
+    .attr('x1', 0).attr('x2', 0);
+  sparkMarker.append('circle')
+    .attr('class', 'cxpak-sparkline-dot')
+    .attr('r', 4).attr('cx', 0).attr('cy', sh / 2);
 }
 
-/* graph area */
+function updateSparklineMarker(idx) {
+  if (!sparkMarker || !sparkScaleX || !sparkScaleY) return;
+  if (idx < 0 || idx >= sp.length) return;
+  var x = sparkScaleX(idx);
+  var y = sparkScaleY(sp[idx] ? sp[idx][1] : 5);
+  sparkMarker.select('line')
+    .transition().duration(400)
+    .attr('x1', x).attr('x2', x);
+  sparkMarker.select('circle')
+    .transition().duration(400)
+    .attr('cx', x).attr('cy', y);
+}
+
+/* ── Playback control bar ────────────────────────────────── */
+var controls = document.createElement('div'); controls.className = 'cxpak-timeline-controls';
+wrap.appendChild(controls);
+
+function mkBtn(label, title, onClick) {
+  var b = document.createElement('button');
+  b.className = 'cxpak-tm-btn';
+  b.setAttribute('type', 'button');
+  b.setAttribute('title', title);
+  b.textContent = label;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+var btnFirst = mkBtn('\u23EE', 'Jump to first (Home)', function() { renderStep(0); });
+var btnPrev  = mkBtn('\u25C0', 'Step back (\u2190)', function() { renderStep(curIdx - 1); });
+var btnPlay  = mkBtn('\u25B6', 'Play/Pause (Space)', function() { togglePlay(); });
+var btnNext  = mkBtn('\u25B6', 'Step forward (\u2192)', function() { renderStep(curIdx + 1); });
+var btnLast  = mkBtn('\u23ED', 'Jump to last (End)', function() { renderStep(steps.length - 1); });
+btnNext.textContent = '\u25B6'; /* single right-triangle for step forward */
+btnPrev.textContent = '\u25C0';
+/* Distinguish play vs step-forward visually by giving step-forward a trailing line */
+btnNext.innerHTML = '\u25B6\u2502';
+btnPrev.innerHTML = '\u2502\u25C0';
+
+controls.appendChild(btnFirst);
+controls.appendChild(btnPrev);
+controls.appendChild(btnPlay);
+controls.appendChild(btnNext);
+controls.appendChild(btnLast);
+
+var speedLabel = document.createElement('span');
+speedLabel.className = 'cxpak-tm-speed-label';
+speedLabel.textContent = 'Speed';
+controls.appendChild(speedLabel);
+
+var speedBtns = {};
+[0.5, 1, 2, 4].forEach(function(spd) {
+  var b = document.createElement('button');
+  b.className = 'cxpak-tm-btn';
+  b.setAttribute('type', 'button');
+  b.textContent = spd + 'x';
+  b.addEventListener('click', function() { setSpeed(spd); });
+  speedBtns[spd] = b;
+  controls.appendChild(b);
+});
+
+var stepIndicator = document.createElement('span');
+stepIndicator.className = 'cxpak-tm-step-indicator';
+controls.appendChild(stepIndicator);
+
+/* ── Graph area (persistent SVG for D3 transitions) ──────── */
 var graphArea = document.createElement('div'); graphArea.className = 'cxpak-timeline-graph';
 wrap.appendChild(graphArea);
 
-/* timeline bar */
+/* ── Timeline bar ────────────────────────────────────────── */
 var bar = document.createElement('div'); bar.className = 'cxpak-timeline-bar';
 wrap.appendChild(bar);
 
+/* ── Empty-history fallback ──────────────────────────────── */
+if (steps.length === 0) {
+  /* Disable all controls */
+  [btnFirst, btnPrev, btnPlay, btnNext, btnLast].forEach(function(b) { b.disabled = true; });
+  Object.keys(speedBtns).forEach(function(k) { speedBtns[k].disabled = true; });
+  stepIndicator.textContent = 'Insufficient git history for timeline';
+
+  var emptyMsg = document.createElement('div');
+  emptyMsg.className = 'cxpak-empty';
+  emptyMsg.style.margin = 'auto';
+  emptyMsg.style.padding = '32px';
+  emptyMsg.style.textAlign = 'center';
+  emptyMsg.innerHTML = '<strong>No timeline snapshots available</strong><br>' +
+    'Insufficient git history for timeline. Run cxpak in a repository with more commits, ' +
+    'or generate snapshots with <code>cxpak visual --visual-type timeline</code> after committing changes.';
+  graphArea.appendChild(emptyMsg);
+  return;
+}
+
+/* ── Persistent SVG + state ──────────────────────────────── */
+var initialLayout = steps[curIdx].layout || CX.layout;
+var canvasW = initialLayout.width || 1200;
+var canvasH = initialLayout.height || 800;
+var canvas = CX.svgCanvas(graphArea, canvasW, canvasH);
+var timelineG = canvas.g;
+timelineG.append('g').attr('class', 'cxpak-edges');
+timelineG.append('g').attr('class', 'cxpak-nodes');
+
+function renderSnapshot(data) {
+  var nodes = data.nodes || [];
+  var edges = data.edges || [];
+  var nmap = {};
+  nodes.forEach(function(n) { nmap[n.id] = n; });
+  function nx(id) { var n = nmap[id]; return n ? n.position.x + n.width / 2 : 0; }
+  function ny(id) { var n = nmap[id]; return n ? n.position.y + n.height / 2 : 0; }
+
+  /* ── Edges: enter / update / exit ─────────────────────── */
+  function edgeKey(d) { return d.source + '->' + d.target; }
+  var edgeLayer = timelineG.select('.cxpak-edges');
+  var edgeSel = edgeLayer.selectAll('line').data(edges, edgeKey);
+
+  edgeSel.exit()
+    .transition().duration(500)
+    .style('opacity', 0)
+    .remove();
+
+  var edgeEnter = edgeSel.enter().append('line')
+    .attr('class', function(d) { return 'cxpak-edge' + (d.is_cycle ? ' cycle' : ''); })
+    .attr('stroke-width', function(d) { return Math.max(1, Math.min(3, d.weight || 1)); })
+    .attr('x1', function(d) { return nx(d.source); })
+    .attr('y1', function(d) { return ny(d.source); })
+    .attr('x2', function(d) { return nx(d.target); })
+    .attr('y2', function(d) { return ny(d.target); })
+    .style('opacity', 0);
+
+  edgeEnter.merge(edgeSel)
+    .transition().duration(500)
+    .style('opacity', 1)
+    .attr('x1', function(d) { return nx(d.source); })
+    .attr('y1', function(d) { return ny(d.source); })
+    .attr('x2', function(d) { return nx(d.target); })
+    .attr('y2', function(d) { return ny(d.target); });
+
+  /* ── Nodes: enter / update / exit ─────────────────────── */
+  var nodeLayer = timelineG.select('.cxpak-nodes');
+  var nodeSel = nodeLayer.selectAll('g.cxpak-node').data(nodes, function(d) { return d.id; });
+
+  nodeSel.exit()
+    .transition().duration(500)
+    .style('opacity', 0)
+    .attr('transform', function(d) {
+      return 'translate(' + d.position.x + ',' + d.position.y + ') scale(0.3)';
+    })
+    .remove();
+
+  var nodeEnter = nodeSel.enter().append('g')
+    .attr('class', CX.nodeClass)
+    .attr('transform', function(d) {
+      return 'translate(' + d.position.x + ',' + d.position.y + ') scale(0.3)';
+    })
+    .style('opacity', 0);
+
+  nodeEnter.append('rect')
+    .attr('width', function(d) { return d.width; })
+    .attr('height', function(d) { return d.height; })
+    .attr('rx', 6).attr('ry', 6);
+
+  nodeEnter.append('text')
+    .attr('x', function(d) { return d.width / 2; })
+    .attr('y', function(d) { return d.height / 2; })
+    .attr('text-anchor', 'middle')
+    .attr('dominant-baseline', 'middle')
+    .text(function(d) { return d.label; });
+
+  nodeEnter
+    .transition().duration(500)
+    .style('opacity', 1)
+    .attr('transform', function(d) {
+      return 'translate(' + d.position.x + ',' + d.position.y + ') scale(1)';
+    });
+
+  nodeSel
+    .transition().duration(500)
+    .attr('transform', function(d) {
+      return 'translate(' + d.position.x + ',' + d.position.y + ') scale(1)';
+    });
+}
+
+/* ── Playback state ──────────────────────────────────────── */
+var isPlaying = false;
+var playSpeed = 1.0;
+var STEP_MS = 1200;
+var playTimer = null;
+
+function updatePlayButton() {
+  btnPlay.innerHTML = isPlaying ? '\u23F8' : '\u25B6';
+  btnPlay.classList.toggle('active', isPlaying);
+}
+
+function play() {
+  if (isPlaying || steps.length === 0) return;
+  if (curIdx >= steps.length - 1) {
+    /* At the end — don't auto-rewind */
+    return;
+  }
+  isPlaying = true;
+  updatePlayButton();
+  scheduleNext();
+}
+
+function pause() {
+  isPlaying = false;
+  if (playTimer) { clearTimeout(playTimer); playTimer = null; }
+  updatePlayButton();
+}
+
+function togglePlay() { if (isPlaying) pause(); else play(); }
+
+function scheduleNext() {
+  if (!isPlaying) return;
+  playTimer = setTimeout(function() {
+    if (!isPlaying) return;
+    if (curIdx >= steps.length - 1) { pause(); return; }
+    renderStep(curIdx + 1);
+    scheduleNext();
+  }, STEP_MS / playSpeed);
+}
+
+function setSpeed(spd) {
+  playSpeed = spd;
+  Object.keys(speedBtns).forEach(function(k) {
+    speedBtns[k].classList.toggle('active', parseFloat(k) === spd);
+  });
+}
+setSpeed(1);
+
+/* ── Key-event flash ─────────────────────────────────────── */
+function flashKeyEvent(idx) {
+  var evts = (tl.key_events || []).filter(function(e) { return e.step_index === idx; });
+  if (evts.length === 0) return;
+  var e = evts[0];
+  var flash = document.createElement('div');
+  flash.className = 'cxpak-event-flash';
+  flash.innerHTML = '<strong>' + CX.esc(e.kind) + '</strong><br>' + CX.esc(e.message);
+  wrap.appendChild(flash);
+  d3.select(flash)
+    .transition().duration(1500)
+    .style('opacity', 0)
+    .on('end', function() {
+      if (flash.parentNode) flash.parentNode.removeChild(flash);
+    });
+}
+
+/* ── Step renderer ───────────────────────────────────────── */
 function renderStep(idx) {
   if (idx < 0 || idx >= steps.length) return;
   curIdx = idx;
-  graphArea.innerHTML = '';
-  var step = steps[idx];
-  var data = step.layout || CX.layout;
-  var cv = CX.svgCanvas(graphArea, data.width || 1200, data.height || 800);
-  CX.renderGraph(cv.g, data);
+  var data = steps[idx].layout || CX.layout;
+  renderSnapshot(data);
   renderBar();
+  updateSparklineMarker(idx);
+  updateStepIndicator();
+  flashKeyEvent(idx);
 }
 
+function updateStepIndicator() {
+  var s = steps[curIdx] && steps[curIdx].snapshot;
+  var sha = s ? s.commit_sha.slice(0, 7) : '—';
+  stepIndicator.textContent = 'Step ' + (curIdx + 1) + ' of ' + steps.length + ' — commit ' + sha;
+  /* Disable edge buttons at boundaries */
+  btnFirst.disabled = curIdx === 0;
+  btnPrev.disabled = curIdx === 0;
+  btnLast.disabled = curIdx === steps.length - 1;
+  btnNext.disabled = curIdx === steps.length - 1;
+}
+
+/* ── Timeline bar (commit dots + event flags) ────────────── */
 function renderBar() {
   bar.innerHTML = '';
   if (steps.length === 0) return;
@@ -630,7 +896,6 @@ function renderBar() {
     })
     .on('mouseout', function() { CX.tooltip.hide(); });
 
-  /* key events */
   var evts = tl.key_events || [];
   var evtColors = { CycleIntroduced: '#ef476f', CycleResolved: '#06d6a0', LargeChurn: '#ffd166', HealthDropped: '#ef476f', NewModule: '#4cc9f0', ModuleRemoved: '#ff9f43' };
   bSvg.selectAll('.cxpak-event-flag').data(evts).join('g').attr('class', 'cxpak-event-flag')
@@ -641,7 +906,43 @@ function renderBar() {
     .on('mouseout', function() { CX.tooltip.hide(); });
 }
 
+/* ── Keyboard shortcuts ──────────────────────────────────── */
+document.addEventListener('keydown', function(ev) {
+  /* Don't hijack when typing in form elements */
+  var t = ev.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  switch (ev.key) {
+    case ' ':
+    case 'Spacebar':
+      ev.preventDefault();
+      togglePlay();
+      break;
+    case 'ArrowLeft':
+      ev.preventDefault();
+      if (isPlaying) pause();
+      renderStep(curIdx - 1);
+      break;
+    case 'ArrowRight':
+      ev.preventDefault();
+      if (isPlaying) pause();
+      renderStep(curIdx + 1);
+      break;
+    case 'Home':
+      ev.preventDefault();
+      if (isPlaying) pause();
+      renderStep(0);
+      break;
+    case 'End':
+      ev.preventDefault();
+      if (isPlaying) pause();
+      renderStep(steps.length - 1);
+      break;
+  }
+});
+
+/* Initial render */
 renderStep(curIdx);
+updatePlayButton();
 "#
 }
 
@@ -2065,12 +2366,32 @@ pub fn render_time_machine(
     metadata: &RenderMetadata,
     config: &super::layout::LayoutConfig,
 ) -> Result<String, super::layout::LayoutError> {
-    let data = build_time_machine_data(snapshots, config)?;
-    let timeline_json = serde_json::to_string(&data).unwrap();
-
-    // Use the last step's layout as the initial graph pane.
-    let initial_layout = &data.steps[data.current_index].layout;
-    let layout_json = serde_json::to_string(initial_layout).unwrap();
+    // When snapshots is empty we still render a page — the timeline JS has a
+    // fallback path that shows disabled controls with an "insufficient git
+    // history" message.
+    let (timeline_json, layout_json) = if snapshots.is_empty() {
+        let empty = TimeMachineData {
+            steps: Vec::new(),
+            current_index: 0,
+            health_sparkline: Vec::new(),
+            key_events: Vec::new(),
+        };
+        let layout = super::layout::ComputedLayout {
+            nodes: vec![],
+            edges: vec![],
+            width: 0.0,
+            height: 0.0,
+            layers: vec![],
+        };
+        (
+            serde_json::to_string(&empty).unwrap(),
+            serde_json::to_string(&layout).unwrap(),
+        )
+    } else {
+        let data = build_time_machine_data(snapshots, config)?;
+        let layout_json = serde_json::to_string(&data.steps[data.current_index].layout).unwrap();
+        (serde_json::to_string(&data).unwrap(), layout_json)
+    };
 
     let title = visual_type_name(&super::VisualType::Timeline);
 

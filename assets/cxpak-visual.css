@@ -606,6 +606,96 @@ html, body {
   color: var(--text-dim);
 }
 
+/* Timeline playback controls */
+.cxpak-timeline-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.cxpak-tm-btn {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  color: var(--text-primary);
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  transition: all 0.15s;
+  min-width: 32px;
+  font-family: inherit;
+}
+
+.cxpak-tm-btn:hover:not(:disabled) {
+  background: var(--bg-card-hover);
+  border-color: var(--accent-blue);
+}
+
+.cxpak-tm-btn.active {
+  background: var(--accent-purple);
+  color: #fff;
+  border-color: var(--accent-purple);
+}
+
+.cxpak-tm-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.cxpak-tm-speed-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-left: 12px;
+  margin-right: 4px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.cxpak-tm-step-indicator {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Sparkline current-step marker */
+.cxpak-sparkline-cursor {
+  stroke: var(--accent-purple);
+  stroke-width: 1.5;
+  opacity: 0.6;
+  stroke-dasharray: 3 3;
+}
+
+.cxpak-sparkline-dot {
+  fill: var(--accent-purple);
+  stroke: var(--bg-primary);
+  stroke-width: 2;
+}
+
+/* Key event flash overlay */
+.cxpak-event-flash {
+  position: absolute;
+  top: 20%;
+  left: 50%;
+  transform: translate(-50%, 0);
+  background: rgba(239, 71, 111, 0.95);
+  color: #fff;
+  padding: 16px 24px;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  text-align: center;
+  box-shadow: 0 8px 32px rgba(239, 71, 111, 0.4);
+  z-index: 100;
+  pointer-events: none;
+}
+
 /* ── Diff View ───────────────────────────────────────────────────── */
 
 .cxpak-diff-wrap {
