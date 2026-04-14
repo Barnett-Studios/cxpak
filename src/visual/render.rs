@@ -69,11 +69,16 @@ CX.header = function() {
   /* navigation links */
   var typeMap = { 'Dashboard': 'dashboard', 'Architecture Explorer': 'architecture', 'Risk Heatmap': 'risk', 'Diff View': 'diff' };
   var curType = typeMap[CX.meta.visual_type_display] || '';
+  // Derive filename prefix from the current page so nav works regardless of naming convention.
+  var curPath = window.location.pathname.split('/').pop() || '';
+  var m = curPath.match(/^(.+?)(dashboard|architecture|risk|diff)(\.html?)$/i);
+  var prefix = m ? m[1] : 'cxpak-';
+  var ext = m ? m[3] : '.html';
   var nav = document.createElement('nav');
   nav.className = 'cxpak-nav';
   ['dashboard','architecture','risk','diff'].forEach(function(v) {
     var a = document.createElement('a');
-    a.href = 'cxpak-' + v + '.html';
+    a.href = prefix + v + ext;
     a.className = 'cxpak-nav-link' + (curType === v ? ' active' : '');
     a.textContent = v.charAt(0).toUpperCase() + v.slice(1);
     nav.appendChild(a);
@@ -126,6 +131,16 @@ CX.nodeClass = function(d) {
   return c;
 };
 
+CX.textColorFor = function(fill) {
+  /* Rough luminance check — return dark text on light fills, light text on dark fills. */
+  if (!fill) return null;
+  var c = d3.color(fill);
+  if (!c) return null;
+  var rgb = c.rgb();
+  var lum = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+  return lum > 140 ? '#0f0f23' : '#e8e8f0';
+};
+
 CX.renderGraph = function(root, data, opts) {
   opts = opts || {};
   var nodes = data.nodes || [];
@@ -150,12 +165,14 @@ CX.renderGraph = function(root, data, opts) {
   ng.append('rect')
     .attr('width', function(d) { return d.width; })
     .attr('height', function(d) { return d.height; })
-    .attr('rx', 6).attr('ry', 6);
+    .attr('rx', 6).attr('ry', 6)
+    .attr('fill', function(d) { return opts.fillFn ? opts.fillFn(d) : null; });
 
   ng.append('text')
     .attr('x', function(d) { return d.width/2; })
     .attr('y', function(d) { return d.height/2; })
     .attr('text-anchor','middle').attr('dominant-baseline','middle')
+    .attr('fill', function(d) { return opts.fillFn ? CX.textColorFor(opts.fillFn(d)) : null; })
     .text(function(d) { return d.label; });
 
   if (opts.onNodeClick) ng.on('click', function(ev, d) { opts.onNodeClick(d, ev); });
@@ -276,7 +293,13 @@ q3.appendChild(mm);
 grid.appendChild(q3);
 var pl = dash.architecture_preview.layout || CX.layout;
 var cv = CX.svgCanvas(mm, pl.width || 600, pl.height || 400);
-CX.renderGraph(cv.g, pl);
+var mmHealth = d3.scaleLinear().domain([0, 5, 10]).range(['#ef476f', '#ffd166', '#06d6a0']).clamp(true);
+CX.renderGraph(cv.g, pl, {
+  fillFn: function(d) {
+    var h = d.metadata && d.metadata.health_score;
+    return h != null ? mmHealth(h) : '#2a2a50';
+  }
+});
 
 /* Q4: Alerts */
 var q4 = document.createElement('div'); q4.className = 'cxpak-quadrant';
@@ -325,6 +348,38 @@ function renderBreadcrumbs() {
   });
 }
 
+/* color scales for the three levels */
+var healthScale = d3.scaleLinear()
+  .domain([0, 5, 10])
+  .range(['#ef476f', '#ffd166', '#06d6a0'])
+  .clamp(true);
+var riskScale = d3.scaleLinear()
+  .domain([0, 0.4, 0.7, 1.0])
+  .range(['#06d6a0', '#ffd166', '#ff9f43', '#ef476f'])
+  .clamp(true);
+/* symbol-level PageRank gradient: build from max pagerank in the sub-layout. */
+function prScaleFor(data) {
+  var maxPr = 0;
+  (data.nodes || []).forEach(function(n) { var p = n.metadata && n.metadata.pagerank; if (p && p > maxPr) maxPr = p; });
+  return d3.scaleLinear().domain([0, Math.max(maxPr, 1e-6)]).range(['#2a2a50', '#4cc9f0']).clamp(true);
+}
+
+function fillFnForLevel(level, data) {
+  if (level === 1) return function(d) {
+    var h = d.metadata && d.metadata.health_score;
+    return h != null ? healthScale(h) : '#2a2a50';
+  };
+  if (level === 2) return function(d) {
+    var r = d.metadata && d.metadata.risk_score;
+    return r != null ? riskScale(r) : '#2a2a50';
+  };
+  var prS = prScaleFor(data);
+  return function(d) {
+    var p = d.metadata && d.metadata.pagerank;
+    return p != null ? prS(p) : '#2a2a50';
+  };
+}
+
 function navigate(level, targetId) {
   curLevel = level; curTarget = targetId;
   wrap.innerHTML = '';
@@ -335,6 +390,7 @@ function navigate(level, targetId) {
   if (!data || !data.nodes || data.nodes.length === 0) { wrap.innerHTML = '<div class="cxpak-empty">No data at this level</div>'; renderBreadcrumbs(); return; }
   var cv = CX.svgCanvas(wrap, data.width || 1200, data.height || 800);
   CX.renderGraph(cv.g, data, {
+    fillFn: fillFnForLevel(level, data),
     onNodeClick: function(d) {
       if (level === 1 && exp.level2[d.id]) {
         bc.push({ label: d.label, level: 2, target_id: d.id });
@@ -353,9 +409,11 @@ navigate(1, 'root');
 /* legend */
 var leg = document.createElement('div'); leg.className = 'cxpak-legend';
 leg.innerHTML =
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(239,71,111,0.25);border:1px solid #ef476f"></span>God file (many dependents)</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#2a2a50;border:1px solid #7b68ee;border-style:dashed"></span>Circular dependency</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#2a2a50;border:1px solid #ef476f;border-width:2px"></span>High risk (&gt;0.7)</div>';
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#06d6a0"></span>Healthy module (Level 1) / Low risk (Level 2)</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ffd166"></span>Mid range</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ef476f"></span>Unhealthy module / High risk</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(239,71,111,0.25);border:1px solid #ef476f"></span>God file (stroke overlay)</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#2a2a50;border:1px solid #7b68ee;border-style:dashed"></span>Circular dependency</div>';
 wrap.appendChild(leg);
 "#
 }
@@ -468,18 +526,37 @@ dividers.forEach(function(div) {
     .text(div.right_language);
 });
 
-/* render the graph with flow-specific node coloring */
+/* render the graph with flow-specific node coloring driven by FlowNodeType */
+var flowColors = {
+  'source': '#4cc9f0',
+  'transform': '#ffd166',
+  'sink': '#ef476f',
+  'passthrough': '#8888aa'
+};
 CX.renderGraph(cv.g, data, {
   nodeClass: function(d) {
     var c = 'cxpak-node';
     if (d.label && d.label.indexOf('...') === 0) return c;
-    var idx = (data.nodes || []).indexOf(d);
-    if (idx === 0) c += ' cxpak-flow-source';
-    else if (idx === (data.nodes || []).length - 1) c += ' cxpak-flow-sink';
-    else c += ' cxpak-flow-transform';
+    var k = d.metadata && d.metadata.flow_node_kind;
+    if (k === 'source') c += ' cxpak-flow-source';
+    else if (k === 'sink') c += ' cxpak-flow-sink';
+    else if (k === 'transform') c += ' cxpak-flow-transform';
     return c;
+  },
+  fillFn: function(d) {
+    var k = d.metadata && d.metadata.flow_node_kind;
+    return flowColors[k] || '#2a2a50';
   }
 });
+
+/* flow legend (bottom-right) */
+var flowLeg = document.createElement('div'); flowLeg.className = 'cxpak-legend';
+flowLeg.innerHTML =
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#4cc9f0"></span>Source</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ffd166"></span>Transform</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ef476f"></span>Sink</div>' +
+  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#8888aa"></span>Passthrough</div>';
+wrap.appendChild(flowLeg);
 "#
 }
 
@@ -1521,6 +1598,12 @@ pub fn build_flow_diagram_data(
         .map(|n| {
             let id = flow_node_id(n);
             let label = n.symbol.clone();
+            let kind = match n.node_type {
+                crate::intelligence::data_flow::FlowNodeType::Source => "source",
+                crate::intelligence::data_flow::FlowNodeType::Transform => "transform",
+                crate::intelligence::data_flow::FlowNodeType::Sink => "sink",
+                crate::intelligence::data_flow::FlowNodeType::Passthrough => "passthrough",
+            };
             LayoutNode {
                 id,
                 label,
@@ -1529,7 +1612,10 @@ pub fn build_flow_diagram_data(
                 width: config.node_width,
                 height: config.node_height,
                 node_type: NodeType::Symbol,
-                metadata: NodeMetadata::default(),
+                metadata: NodeMetadata {
+                    flow_node_kind: Some(kind.to_string()),
+                    ..NodeMetadata::default()
+                },
             }
         })
         .collect();

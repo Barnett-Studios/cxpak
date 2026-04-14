@@ -44,6 +44,10 @@ pub struct NodeMetadata {
     pub is_god_file: bool,
     pub has_dead_code: bool,
     pub is_circular: bool,
+    /// Flow node kind for Flow Diagram view: "source", "transform", "sink",
+    /// or "passthrough". `None` for non-flow contexts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_node_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
@@ -540,6 +544,51 @@ pub fn compute_layout(
     // Sort final nodes by id for deterministic output regardless of input order.
     final_nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
+    let mut final_layer_order: Vec<Vec<String>> = layer_order
+        .into_iter()
+        .map(|layer| {
+            layer
+                .into_iter()
+                .filter(|id| !dummy_set.contains(id.as_str()))
+                .collect()
+        })
+        .collect();
+
+    // 10a. Grid reflow: when the Sugiyama pipeline places every node in a
+    // single layer (common for sparse module graphs with no cross-module
+    // edges), reposition them as a grid so the rendered SVG doesn't degrade
+    // into a thin horizontal strip. Only applies when there are enough
+    // nodes to make a grid meaningful (>= 4).
+    let num_nonempty_layers = final_layer_order.iter().filter(|l| !l.is_empty()).count();
+    if num_nonempty_layers == 1 && final_nodes.len() >= 4 {
+        let n = final_nodes.len() as f64;
+        // Target aspect ratio ~16:10 (typical viewport).
+        let aspect = 16.0 / 10.0;
+        let cols = ((n * aspect).sqrt().ceil() as usize).max(1);
+        let rows = final_nodes.len().div_ceil(cols);
+
+        // Nodes are already sorted alphabetically above — stable grid layout.
+        let step_x = config.node_width + config.node_sep;
+        let step_y = config.node_height + config.node_sep;
+
+        for (i, node) in final_nodes.iter_mut().enumerate() {
+            let col = i % cols;
+            let row = i / cols;
+            node.position = Point {
+                x: col as f64 * step_x,
+                y: row as f64 * step_y,
+            };
+            node.layer = row;
+        }
+
+        // Rebuild layer order so downstream consumers see the grid rows.
+        let mut new_layer_order: Vec<Vec<String>> = vec![Vec::new(); rows];
+        for node in &final_nodes {
+            new_layer_order[node.layer].push(node.id.clone());
+        }
+        final_layer_order = new_layer_order;
+    }
+
     // 11. Compute overall width and height from node positions.
     let width = final_nodes
         .iter()
@@ -558,16 +607,6 @@ pub fn compute_layout(
             .iter()
             .map(|n| n.position.y - n.height / 2.0)
             .fold(f64::INFINITY, f64::min);
-
-    let final_layer_order: Vec<Vec<String>> = layer_order
-        .into_iter()
-        .map(|layer| {
-            layer
-                .into_iter()
-                .filter(|id| !dummy_set.contains(id.as_str()))
-                .collect()
-        })
-        .collect();
 
     Ok(ComputedLayout {
         nodes: final_nodes,
@@ -683,23 +722,57 @@ pub fn build_module_layout(
         .flat_map(|cycle| cycle.iter().map(|path| file_module_prefix(path)))
         .collect();
 
+    // Normalize PageRank across all modules so the node-size multiplier is
+    // perceivable (real PageRank values often sit in [0.001, 0.05], so the
+    // naive `1 + pr.min(1.0)` gives a visual range of ~1.001..1.05).
+    let max_pr = arch
+        .modules
+        .iter()
+        .map(|m| m.aggregate_pagerank)
+        .fold(0.0_f64, f64::max);
+    let min_pr = arch
+        .modules
+        .iter()
+        .map(|m| m.aggregate_pagerank)
+        .fold(f64::INFINITY, f64::min);
+    let pr_range = (max_pr - min_pr).max(1e-6);
+
     // Build one node per module.
     let nodes: Vec<LayoutNode> = arch
         .modules
         .iter()
         .map(|m| {
             let pr = m.aggregate_pagerank;
-            let width = config.node_width * (1.0 + pr.min(1.0));
+            let normalized = ((pr - min_pr) / pr_range).clamp(0.0, 1.0);
+            // Visible range: smallest module = 0.7x base, largest = 1.4x base.
+            let width_scale = 0.7 + 0.7 * normalized;
+            let height_scale = 0.9 + 0.3 * normalized;
+
+            // Per-module health proxy in [0, 10]:
+            //   base    = 10 * cohesion * (1 - clamp(coupling, 0, 1))
+            //   penalty = 2 * number of god files (cap so health >= 0)
+            // Modules with unknown cohesion (single-file) fall back to 5.0
+            // (neutral) so the gradient still shows something.
+            let coupling_clamped = m.coupling.clamp(0.0, 1.0);
+            let base = if m.file_count > 1 {
+                10.0 * m.cohesion * (1.0 - coupling_clamped)
+            } else {
+                5.0
+            };
+            let god_penalty = 2.0 * m.god_files.len() as f64;
+            let health = (base - god_penalty).clamp(0.0, 10.0);
+
             LayoutNode {
                 id: m.prefix.clone(),
                 label: m.prefix.clone(),
                 layer: 0,
                 position: Point::default(),
-                width,
-                height: config.node_height,
+                width: config.node_width * width_scale,
+                height: config.node_height * height_scale,
                 node_type: NodeType::Module,
                 metadata: NodeMetadata {
                     pagerank: pr,
+                    health_score: Some(health),
                     is_circular: circular_modules.contains(&m.prefix),
                     is_god_file: !m.god_files.is_empty(),
                     ..NodeMetadata::default()
@@ -798,6 +871,15 @@ pub fn build_file_layout(
         .flat_map(|m| m.god_files.iter().map(|s| s.as_str()))
         .collect();
 
+    // Normalize token counts on a log scale so very large files don't
+    // visually dominate and modest files still show perceivable size
+    // differences.
+    let log_max = module_files
+        .iter()
+        .map(|f| ((f.token_count as f64) + 1.0).ln())
+        .fold(0.0_f64, f64::max)
+        .max(1e-6);
+
     // Build one node per file.
     let nodes: Vec<LayoutNode> = module_files
         .iter()
@@ -811,13 +893,18 @@ pub fn build_file_layout(
                 .get(f.relative_path.as_str())
                 .copied()
                 .unwrap_or(0.0);
+            // Log-normalized token scale → visible [0.7x, 1.4x] width range.
+            let log_tokens = ((f.token_count as f64) + 1.0).ln();
+            let normalized = (log_tokens / log_max).clamp(0.0, 1.0);
+            let width_scale = 0.7 + 0.7 * normalized;
+            let height_scale = 0.9 + 0.3 * normalized;
             LayoutNode {
                 id: f.relative_path.clone(),
                 label: f.relative_path.clone(),
                 layer: 0,
                 position: Point::default(),
-                width: config.node_width,
-                height: config.node_height,
+                width: config.node_width * width_scale,
+                height: config.node_height * height_scale,
                 node_type: NodeType::File,
                 metadata: NodeMetadata {
                     pagerank: pr,
@@ -827,6 +914,7 @@ pub fn build_file_layout(
                     has_dead_code: false,
                     is_circular: false,
                     health_score: None,
+                    flow_node_kind: None,
                 },
             }
         })
