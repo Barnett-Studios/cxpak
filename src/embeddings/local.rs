@@ -171,12 +171,20 @@ fn ensure_model_files(dir: &Path) -> Result<(), String> {
             continue;
         }
         let url = format!("{HF_BASE}/{name}");
-        download_file(&url, &dest)?;
+        download_file_atomic(&url, &dest)?;
     }
     Ok(())
 }
 
-fn download_file(url: &str, dest: &Path) -> Result<(), String> {
+/// Download `url` to `dest` atomically via a temporary file + rename.
+///
+/// The file is written to `<dest>.tmp.<pid>` and then renamed to `dest`.
+/// On Unix, `rename(2)` is atomic: if two processes race, one wins and the
+/// other's rename simply fails with EEXIST (or silently overwrites on Linux),
+/// so both see a complete, consistent file. If the rename fails because
+/// another process already placed the final file, we remove the temp file and
+/// accept the already-existing copy.
+fn download_file_atomic(url: &str, dest: &Path) -> Result<(), String> {
     let response =
         reqwest::blocking::get(url).map_err(|e| format!("download error for {url}: {e}"))?;
 
@@ -188,7 +196,18 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
         .bytes()
         .map_err(|e| format!("read bytes error: {e}"))?;
 
-    std::fs::write(dest, &bytes).map_err(|e| format!("write error: {e}"))
+    let tmp_path = dest.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp_path, &bytes).map_err(|e| format!("write error: {e}"))?;
+
+    if let Err(e) = std::fs::rename(&tmp_path, dest) {
+        // Another process already created the destination — clean up the temp
+        // file and verify the existing file is readable.
+        let _ = std::fs::remove_file(&tmp_path);
+        if !dest.exists() {
+            return Err(format!("rename failed and destination missing: {e}"));
+        }
+    }
+    Ok(())
 }
 
 fn l2_normalize(v: &[f32]) -> Vec<f32> {

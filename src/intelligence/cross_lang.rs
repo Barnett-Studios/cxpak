@@ -607,6 +607,14 @@ fn guess_containing_symbol(file: &crate::index::IndexedFile, offset: usize) -> S
         return "<module>".into();
     };
     // Parser stores start_line / end_line — convert our offset to a line number.
+    //
+    // Safety: iterating over `.bytes()` and counting `\n` (0x0A) is safe for
+    // multi-byte UTF-8 content because `\n` is a single-byte character and
+    // can never appear as a continuation byte in a multi-byte sequence.  The
+    // slice bound `offset.min(file.content.len())` ensures we never index past
+    // the end of the string.  The offsets passed in here originate from
+    // `str::find` / `Regex::find` on the same UTF-8 string, so they are always
+    // valid char boundaries — no mid-codepoint slicing occurs.
     let line = file.content[..offset.min(file.content.len())]
         .bytes()
         .filter(|&b| b == b'\n')

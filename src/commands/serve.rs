@@ -22,9 +22,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 type SharedIndex = Arc<RwLock<CodebaseIndex>>;
 type SharedSnapshot = Arc<RwLock<Option<crate::auto_context::diff::ContextSnapshot>>>;
+
+/// Maximum allowed regex pattern length in the search endpoint.
+/// Patterns beyond this limit risk catastrophic backtracking (ReDoS).
+const MAX_PATTERN_LEN: usize = 1000;
 
 fn matches_focus(path: &str, focus: Option<&str>) -> bool {
     match focus {
@@ -166,31 +171,94 @@ pub fn validate_workspace_path(
     workspace: &std::path::Path,
     requested: &str,
 ) -> Result<std::path::PathBuf, String> {
-    if requested.contains("..") {
-        return Err(format!("path traversal rejected: {requested}"));
-    }
     let p = std::path::Path::new(requested);
     if p.is_absolute() {
         return Err(format!("absolute paths rejected: {requested}"));
     }
-    let candidate = workspace.join(p);
+
+    // Canonicalize the workspace base (must exist).
     let ws_canon = workspace
         .canonicalize()
         .map_err(|e| format!("workspace canonicalize failed: {e}"))?;
-    if !candidate.starts_with(&ws_canon) && !candidate.starts_with(workspace) {
+    let ws_depth = ws_canon.components().count();
+
+    // Build a lexically-normalized candidate by tracking a component stack.
+    // This resolves `..` components without touching the filesystem, which
+    // prevents traversal even when intermediate directories do not exist.
+    let mut stack: Vec<std::ffi::OsString> = ws_canon
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let mut traversal_attempt = false;
+
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if stack.len() > ws_depth {
+                    stack.pop();
+                } else {
+                    // The `..` would go above the workspace root — flag this
+                    // as a traversal attempt regardless of where the path ends.
+                    traversal_attempt = true;
+                }
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(seg) => {
+                stack.push(seg.to_os_string());
+            }
+            // RootDir / Prefix cannot appear in a relative path; already
+            // rejected absolute paths above.
+            _ => {}
+        }
+    }
+
+    if traversal_attempt {
+        return Err(format!("path traversal rejected: {requested}"));
+    }
+
+    let resolved: std::path::PathBuf = stack.iter().collect();
+
+    // If the resolved path exists on disk, canonicalize it to catch any
+    // symlink-based escapes. For non-existent paths the lexical check is
+    // sufficient.
+    let final_path = if resolved.exists() {
+        resolved
+            .canonicalize()
+            .map_err(|e| format!("path canonicalize failed: {e}"))?
+    } else {
+        resolved
+    };
+
+    if !final_path.starts_with(&ws_canon) {
         return Err(format!("path escapes workspace: {requested}"));
     }
-    Ok(candidate)
+    Ok(final_path)
 }
 
 pub fn extract_bearer_token(header: &str) -> Option<&str> {
     header.strip_prefix("Bearer ")
 }
 
+/// Compare the provided Bearer token against the expected token in constant time.
+///
+/// Uses `subtle::ConstantTimeEq` to prevent timing side-channel attacks.
+/// Tokens of different byte lengths are rejected immediately before the
+/// constant-time comparison so that the length itself leaks no additional
+/// information beyond what is already visible (the comparison fails).
 pub fn check_auth(expected: Option<&str>, provided: Option<&str>) -> bool {
     match expected {
         None => true,
-        Some(tok) => provided == Some(tok),
+        Some(tok) => match provided {
+            None => false,
+            Some(prov) => {
+                // Reject length mismatch first; both branches are falsy so no
+                // useful timing information is revealed.
+                if tok.len() != prov.len() {
+                    return false;
+                }
+                bool::from(tok.as_bytes().ct_eq(prov.as_bytes()))
+            }
+        },
     }
 }
 
@@ -514,19 +582,26 @@ struct TraceParams {
 async fn trace_handler(
     State(index): State<SharedIndex>,
     Query(params): Query<TraceParams>,
-) -> Result<Json<Value>, StatusCode> {
+) -> (StatusCode, Json<Value>) {
     let target = match params.target {
         Some(t) if !t.is_empty() => t,
         _ => {
-            return Ok(Json(json!({
-                "error": "missing required query parameter: target"
-            })));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing required query parameter: target"})),
+            );
         }
     };
 
-    let idx = index
-        .read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let idx = match index.read() {
+        Ok(g) => g,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "index lock poisoned"})),
+            );
+        }
+    };
     let token_budget = params
         .tokens
         .as_deref()
@@ -536,13 +611,16 @@ async fn trace_handler(
     let found =
         !idx.find_symbol(&target).is_empty() || !idx.find_content_matches(&target).is_empty();
 
-    Ok(Json(json!({
-        "target": target,
-        "token_budget": token_budget,
-        "found": found,
-        "total_files": idx.total_files,
-        "total_tokens": idx.total_tokens,
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "target": target,
+            "token_budget": token_budget,
+            "found": found,
+            "total_files": idx.total_files,
+            "total_tokens": idx.total_tokens,
+        })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -593,20 +671,45 @@ struct SearchParams {
 async fn search_handler(
     State(index): State<SharedIndex>,
     Json(params): Json<SearchParams>,
-) -> Result<Json<Value>, StatusCode> {
-    let idx = index
-        .read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
+) -> (StatusCode, Json<Value>) {
     if params.pattern.is_empty() {
-        return Ok(Json(
-            json!({"error": "pattern is required and must not be empty"}),
-        ));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "pattern is required and must not be empty"})),
+        );
+    }
+
+    if params.pattern.len() > MAX_PATTERN_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "pattern length {} exceeds maximum allowed length {}",
+                    params.pattern.len(),
+                    MAX_PATTERN_LEN
+                )
+            })),
+        );
     }
 
     let re = match regex::Regex::new(&params.pattern) {
         Ok(r) => r,
-        Err(e) => return Ok(Json(json!({"error": format!("invalid regex: {e}")}))),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid regex: {e}")})),
+            )
+        }
+    };
+
+    let idx = match index.read() {
+        Ok(g) => g,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "index lock poisoned"})),
+            );
+        }
     };
 
     let limit = params.limit.unwrap_or(20);
@@ -647,13 +750,16 @@ async fn search_handler(
         }
     }
 
-    Ok(Json(json!({
-        "pattern": params.pattern,
-        "matches": matches_vec,
-        "total_matches": total_matches,
-        "files_searched": files_searched,
-        "truncated": total_matches > limit,
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "pattern": params.pattern,
+            "matches": matches_vec,
+            "total_matches": total_matches,
+            "files_searched": files_searched,
+            "truncated": total_matches > limit,
+        })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -667,15 +773,13 @@ async fn blast_radius_handler(
     State(index): State<SharedIndex>,
     Json(params): Json<BlastRadiusParams>,
 ) -> Result<Json<Value>, StatusCode> {
+    if params.files.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let idx = index
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if params.files.is_empty() {
-        return Ok(Json(
-            json!({"error": "files is required and must not be empty"}),
-        ));
-    }
 
     let files: Vec<&str> = params.files.iter().map(|s| s.as_str()).collect();
     let depth = params.depth.unwrap_or(3);
@@ -742,9 +846,7 @@ async fn auto_context_handler(
     Json(params): Json<AutoContextParams>,
 ) -> Result<Json<Value>, StatusCode> {
     if params.task.is_empty() {
-        return Ok(Json(
-            json!({"error": "task is required and must not be empty"}),
-        ));
+        return Err(StatusCode::BAD_REQUEST);
     }
     let idx = index
         .read()
@@ -962,9 +1064,7 @@ async fn predict_handler(
     let files = match params.files {
         Some(f) if !f.is_empty() => f,
         _ => {
-            return Ok(Json(
-                json!({"error": "missing required field: files (non-empty list of paths)"}),
-            ));
+            return Err(StatusCode::BAD_REQUEST);
         }
     };
 
@@ -1048,9 +1148,7 @@ async fn data_flow_handler(
     Json(params): Json<DataFlowParams>,
 ) -> Result<Json<Value>, StatusCode> {
     let Some(symbol) = params.symbol.filter(|s| !s.is_empty()) else {
-        return Ok(Json(json!({
-            "error": "missing required field: symbol"
-        })));
+        return Err(StatusCode::BAD_REQUEST);
     };
     let idx = index
         .read()
@@ -3061,13 +3159,9 @@ mod tests {
             target: None,
             tokens: None,
         };
-        let result = rt
-            .block_on(trace_handler(State(shared), Query(params)))
-            .unwrap();
-        assert_eq!(
-            result.0["error"],
-            "missing required query parameter: target"
-        );
+        let (status, body) = rt.block_on(trace_handler(State(shared), Query(params)));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.get("error").is_some());
     }
 
     #[test]
@@ -3078,13 +3172,9 @@ mod tests {
             target: Some("".to_string()),
             tokens: None,
         };
-        let result = rt
-            .block_on(trace_handler(State(shared), Query(params)))
-            .unwrap();
-        assert_eq!(
-            result.0["error"],
-            "missing required query parameter: target"
-        );
+        let (status, body) = rt.block_on(trace_handler(State(shared), Query(params)));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.get("error").is_some());
     }
 
     #[test]
@@ -3095,12 +3185,11 @@ mod tests {
             target: Some("main".to_string()),
             tokens: None,
         };
-        let result = rt
-            .block_on(trace_handler(State(shared), Query(params)))
-            .unwrap();
-        assert_eq!(result.0["target"], "main");
-        assert_eq!(result.0["found"], true);
-        assert_eq!(result.0["token_budget"], 50_000);
+        let (status, body) = rt.block_on(trace_handler(State(shared), Query(params)));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["target"], "main");
+        assert_eq!(body["found"], true);
+        assert_eq!(body["token_budget"], 50_000);
     }
 
     #[test]
@@ -3111,11 +3200,10 @@ mod tests {
             target: Some("hello".to_string()),
             tokens: None,
         };
-        let result = rt
-            .block_on(trace_handler(State(shared), Query(params)))
-            .unwrap();
-        assert_eq!(result.0["target"], "hello");
-        assert_eq!(result.0["found"], true);
+        let (status, body) = rt.block_on(trace_handler(State(shared), Query(params)));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["target"], "hello");
+        assert_eq!(body["found"], true);
     }
 
     #[test]
@@ -3126,11 +3214,10 @@ mod tests {
             target: Some("nonexistent_xyz".to_string()),
             tokens: None,
         };
-        let result = rt
-            .block_on(trace_handler(State(shared), Query(params)))
-            .unwrap();
-        assert_eq!(result.0["target"], "nonexistent_xyz");
-        assert_eq!(result.0["found"], false);
+        let (status, body) = rt.block_on(trace_handler(State(shared), Query(params)));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["target"], "nonexistent_xyz");
+        assert_eq!(body["found"], false);
     }
 
     #[test]
@@ -3141,10 +3228,9 @@ mod tests {
             target: Some("main".to_string()),
             tokens: Some("10k".to_string()),
         };
-        let result = rt
-            .block_on(trace_handler(State(shared), Query(params)))
-            .unwrap();
-        assert_eq!(result.0["token_budget"], 10_000);
+        let (status, body) = rt.block_on(trace_handler(State(shared), Query(params)));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["token_budget"], 10_000);
     }
 
     // --- v1.5.0: HTTP handlers for data_flow and cross_lang ---
@@ -3182,10 +3268,9 @@ mod tests {
             depth: None,
             focus: None,
         };
-        let result = rt
-            .block_on(data_flow_handler(State(shared), Json(params)))
-            .unwrap();
-        assert!(result.0["error"].as_str().unwrap_or("").contains("symbol"));
+        let result = rt.block_on(data_flow_handler(State(shared), Json(params)));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -3757,12 +3842,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .unwrap();
-            let json: Value = serde_json::from_slice(&bytes).unwrap();
-            assert!(json["error"].as_str().is_some());
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         });
     }
 
@@ -4198,8 +4278,8 @@ mod tests {
             target: Some("main".to_string()),
             tokens: None,
         };
-        let result = rt.block_on(trace_handler(State(shared), Query(params)));
-        assert!(result.is_err());
+        let (status, _body) = rt.block_on(trace_handler(State(shared), Query(params)));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -5920,6 +6000,102 @@ mod tests {
     #[test]
     fn check_auth_accepts_matching_token() {
         assert!(check_auth(Some("secret"), Some("secret")));
+    }
+
+    // --- Timing-safe auth tests ---
+
+    #[test]
+    fn check_auth_rejects_different_length_tokens() {
+        // A shorter provided token must be rejected even if it's a prefix of the expected.
+        assert!(!check_auth(Some("secretlong"), Some("secret")));
+        assert!(!check_auth(Some("secret"), Some("secretlong")));
+    }
+
+    #[test]
+    fn check_auth_uses_constant_time_comparison() {
+        // This test verifies the function works correctly for same-length wrong tokens,
+        // ensuring ConstantTimeEq is actually exercised on the byte slices.
+        assert!(!check_auth(Some("aaaaaaaa"), Some("aaaaaaab")));
+        assert!(!check_auth(Some("aaaaaaab"), Some("aaaaaaaa")));
+        assert!(check_auth(Some("aaaaaaaa"), Some("aaaaaaaa")));
+    }
+
+    // --- Path canonicalization tests ---
+
+    #[test]
+    fn path_validation_rejects_dotdot_traversal_via_existing_parent() {
+        // foo/../../etc/passwd: the second `..` would pop above the workspace
+        // root, which is a traversal attempt and must be rejected.
+        let ws = std::path::Path::new("/tmp");
+        let result = validate_workspace_path(ws, "foo/../../etc/passwd");
+        assert!(
+            result.is_err(),
+            "should reject path that attempts traversal above workspace"
+        );
+    }
+
+    // --- MAX_PATTERN_LEN tests ---
+
+    #[test]
+    fn max_pattern_len_constant_is_1000() {
+        assert_eq!(MAX_PATTERN_LEN, 1000);
+    }
+
+    #[test]
+    fn search_returns_400_for_oversized_pattern() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let repo_path = Arc::new(std::path::PathBuf::from("/tmp"));
+            let app = build_router_for_test(shared, repo_path);
+
+            let long_pattern = "a".repeat(MAX_PATTERN_LEN + 1);
+            let body = serde_json::to_vec(&serde_json::json!({"pattern": long_pattern})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/search")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "pattern exceeding MAX_PATTERN_LEN must return 400"
+            );
+        });
+    }
+
+    #[test]
+    fn search_returns_400_for_empty_pattern() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let repo_path = Arc::new(std::path::PathBuf::from("/tmp"));
+            let app = build_router_for_test(shared, repo_path);
+
+            let body = serde_json::to_vec(&serde_json::json!({"pattern": ""})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/search")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "empty pattern must return 400"
+            );
+        });
     }
 
     // --- v1 router tests ---

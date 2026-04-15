@@ -136,9 +136,13 @@ fn glob_match_inner(pattern: &[u8], path: &[u8]) -> bool {
 
 pub fn verify_checksum(path: &Path, expected: &str) -> Result<(), Box<dyn std::error::Error>> {
     use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+
     let bytes = std::fs::read(path)?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
-    if hash != expected {
+
+    // Length mismatch means definite failure; check before constant-time compare.
+    if hash.len() != expected.len() || !bool::from(hash.as_bytes().ct_eq(expected.as_bytes())) {
         return Err(format!(
             "checksum mismatch for {}: expected {expected}, got {hash}",
             path.display()

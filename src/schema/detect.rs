@@ -8,6 +8,65 @@ use crate::schema::{
 };
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+// ---------------------------------------------------------------------------
+// Compile-once regex statics — avoids recompiling the same patterns on every
+// call and eliminates all runtime `.unwrap()` on pattern compilation.
+// ---------------------------------------------------------------------------
+
+static RE_DJANGO_TABLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"db_table\s*=\s*["']([^"']+)["']"#).expect("RE_DJANGO_TABLE"));
+
+static RE_DJANGO_FIELD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\w+)\s*=\s*models\.(\w+)\(([^)]*)\)").expect("RE_DJANGO_FIELD"));
+
+static RE_SQLALCHEMY_TABLE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"__tablename__\s*=\s*["']([^"']+)["']"#).expect("RE_SQLALCHEMY_TABLE")
+});
+
+static RE_SQLALCHEMY_COL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\w+)\s*=\s*Column\(([^)]*)\)").expect("RE_SQLALCHEMY_COL"));
+
+static RE_SQLALCHEMY_FK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"ForeignKey\(["']([^"'.]+)\."#).expect("RE_SQLALCHEMY_FK"));
+
+static RE_TYPEORM_ENTITY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"@Entity\(["']([^"']+)["']\)"#).expect("RE_TYPEORM_ENTITY"));
+
+static RE_TYPEORM_FIELD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@(\w+)\([^)]*\)\s+(\w+)\s*:\s*(\w+)").expect("RE_TYPEORM_FIELD"));
+
+static RE_PRISMA_MAP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"@@map\(["']([^"']+)["']\)"#).expect("RE_PRISMA_MAP"));
+
+static RE_RAILS_TS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d{14})_(.+)\.rb$").expect("RE_RAILS_TS"));
+
+static RE_ALEMBIC_REVISION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"revision\s*=\s*["']([^"']+)["']"#).expect("RE_ALEMBIC_REVISION")
+});
+
+static RE_ALEMBIC_FNAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([a-f0-9_]+)\.py$").expect("RE_ALEMBIC_FNAME"));
+
+static RE_FLYWAY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^V(\d+(?:\.\d+)?)__(.+)\.sql$").expect("RE_FLYWAY"));
+
+static RE_DJANGO_MIGRATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d{4})_(.+)\.py$").expect("RE_DJANGO_MIGRATION"));
+
+static RE_KNEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d{14})_(.+)\.(js|ts)$").expect("RE_KNEX"));
+
+static RE_PRISMA_DIR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.+/prisma/migrations)/(\d{14})_(.+)$").expect("RE_PRISMA_DIR"));
+
+static RE_DRIZZLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d{4})_(.+)\.sql$").expect("RE_DRIZZLE"));
+
+static RE_GENERIC_MIGRATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+)_(.+)\.sql$").expect("RE_GENERIC_MIGRATION"));
 
 // ---------------------------------------------------------------------------
 // Task 8: ORM pattern matchers
@@ -75,19 +134,16 @@ fn try_detect_django(
 
 fn extract_django_table_name(body: &str, class_name: &str) -> String {
     // Look for db_table = "X" or db_table = 'X'
-    let re = Regex::new(r#"db_table\s*=\s*["']([^"']+)["']"#).unwrap();
-    if let Some(cap) = re.captures(body) {
+    if let Some(cap) = RE_DJANGO_TABLE.captures(body) {
         return cap[1].to_string();
     }
-    class_name.to_lowercase()
+    camel_to_snake(class_name)
 }
 
 fn extract_django_fields(body: &str) -> Vec<OrmFieldSchema> {
     let mut fields = Vec::new();
     // Match: name = models.FieldType(...)
-    let field_re = Regex::new(r"(\w+)\s*=\s*models\.(\w+)\(([^)]*)\)").unwrap();
-
-    for cap in field_re.captures_iter(body) {
+    for cap in RE_DJANGO_FIELD.captures_iter(body) {
         let name = cap[1].to_string();
         let field_type = cap[2].to_string();
         let args = cap[3].to_string();
@@ -161,8 +217,7 @@ fn try_detect_sqlalchemy(
 
 fn extract_sqlalchemy_table_name(body: &str, class_name: &str) -> String {
     // Look for __tablename__ = "X" or __tablename__ = 'X'
-    let re = Regex::new(r#"__tablename__\s*=\s*["']([^"']+)["']"#).unwrap();
-    if let Some(cap) = re.captures(body) {
+    if let Some(cap) = RE_SQLALCHEMY_TABLE.captures(body) {
         return cap[1].to_string();
     }
     class_name.to_lowercase()
@@ -171,10 +226,7 @@ fn extract_sqlalchemy_table_name(body: &str, class_name: &str) -> String {
 fn extract_sqlalchemy_fields(body: &str) -> Vec<OrmFieldSchema> {
     let mut fields = Vec::new();
     // Match: name = Column(Type, ...)
-    let col_re = Regex::new(r"(\w+)\s*=\s*Column\(([^)]*)\)").unwrap();
-    let fk_re = Regex::new(r#"ForeignKey\(["']([^"'.]+)\."#).unwrap();
-
-    for cap in col_re.captures_iter(body) {
+    for cap in RE_SQLALCHEMY_COL.captures_iter(body) {
         let name = cap[1].to_string();
         let args = cap[2].to_string();
 
@@ -189,7 +241,7 @@ fn extract_sqlalchemy_fields(body: &str) -> Vec<OrmFieldSchema> {
         let is_relation = args.contains("ForeignKey(");
         let related_model = if is_relation {
             // Extract table from ForeignKey("table.col")
-            fk_re.captures(&args).map(|c| c[1].to_string())
+            RE_SQLALCHEMY_FK.captures(&args).map(|c| c[1].to_string())
         } else {
             None
         };
@@ -249,8 +301,7 @@ fn try_detect_typeorm(
 
 fn extract_typeorm_table_name(file_content: &str, class_name: &str) -> String {
     // Scan file content for @Entity("X") or @Entity('X')
-    let re = Regex::new(r#"@Entity\(["']([^"']+)["']\)"#).unwrap();
-    if let Some(cap) = re.captures(file_content) {
+    if let Some(cap) = RE_TYPEORM_ENTITY.captures(file_content) {
         return cap[1].to_string();
     }
     class_name.to_lowercase()
@@ -265,9 +316,7 @@ fn extract_typeorm_fields(body: &str) -> Vec<OrmFieldSchema> {
     // Match decorator + field declaration pattern
     // e.g.: @Column() name: string
     //        @ManyToOne(() => User, ...) user: User
-    let field_re = Regex::new(r"@(\w+)\([^)]*\)\s+(\w+)\s*:\s*(\w+)").unwrap();
-
-    for cap in field_re.captures_iter(body) {
+    for cap in RE_TYPEORM_FIELD.captures_iter(body) {
         let decorator = format!("@{}", &cap[1]);
         let name = cap[2].to_string();
         let is_relation = relation_decorators.contains(&decorator.as_str());
@@ -308,6 +357,26 @@ fn try_detect_active_record(
         file_path: file_path.to_string(),
         fields,
     })
+}
+
+/// Convert a CamelCase (or PascalCase) class name to snake_case.
+///
+/// Inserts an underscore before each uppercase letter that follows a lowercase
+/// letter, then lowercases the whole string.  This matches Django's real
+/// default table-naming behaviour (without app_label prefix).
+///
+/// Examples:
+/// - `UserProfile` → `user_profile`
+/// - `HTTPServer`  → `h_t_t_p_server`
+pub fn camel_to_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if c.is_uppercase() && !out.is_empty() {
+            out.push('_');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
 }
 
 fn pluralize(name: &str) -> String {
@@ -360,8 +429,7 @@ fn try_detect_prisma(
 
 fn extract_prisma_table_name(body: &str, model_name: &str) -> String {
     // Look for @@map("X")
-    let re = Regex::new(r#"@@map\(["']([^"']+)["']\)"#).unwrap();
-    if let Some(cap) = re.captures(body) {
+    if let Some(cap) = RE_PRISMA_MAP.captures(body) {
         return cap[1].to_string();
     }
     model_name.to_lowercase()
@@ -484,12 +552,11 @@ fn try_rails_migrations(dir: &str, files: &[&crate::index::IndexedFile]) -> Opti
     }
 
     // Rails migration files end in .rb and have a timestamp prefix
-    let ts_re = Regex::new(r"^(\d{14})_(.+)\.rb$").unwrap();
     let mut entries: Vec<MigrationEntry> = files
         .iter()
         .filter_map(|f| {
             let fname = filename(&f.relative_path);
-            let cap = ts_re.captures(fname)?;
+            let cap = RE_RAILS_TS.captures(fname)?;
             Some(MigrationEntry {
                 file_path: f.relative_path.clone(),
                 sequence: cap[1].to_string(),
@@ -520,9 +587,6 @@ fn try_alembic_migrations(
         return None;
     }
 
-    let revision_re = Regex::new(r#"revision\s*=\s*["']([^"']+)["']"#).unwrap();
-    let fname_re = Regex::new(r"^([a-f0-9_]+)\.py$").unwrap();
-
     let mut entries: Vec<MigrationEntry> = files
         .iter()
         .filter_map(|f| {
@@ -531,9 +595,9 @@ fn try_alembic_migrations(
                 return None;
             }
             // Try to read revision from content
-            let sequence = if let Some(cap) = revision_re.captures(&f.content) {
+            let sequence = if let Some(cap) = RE_ALEMBIC_REVISION.captures(&f.content) {
                 cap[1].to_string()
-            } else if let Some(cap) = fname_re.captures(fname) {
+            } else if let Some(cap) = RE_ALEMBIC_FNAME.captures(fname) {
                 cap[1].to_string()
             } else {
                 return None;
@@ -571,13 +635,11 @@ fn try_flyway_migrations(
     dir: &str,
     files: &[&crate::index::IndexedFile],
 ) -> Option<MigrationChain> {
-    let flyway_re = Regex::new(r"^V(\d+(?:\.\d+)?)__(.+)\.sql$").unwrap();
-
     let mut entries: Vec<MigrationEntry> = files
         .iter()
         .filter_map(|f| {
             let fname = filename(&f.relative_path);
-            let cap = flyway_re.captures(fname)?;
+            let cap = RE_FLYWAY.captures(fname)?;
             Some(MigrationEntry {
                 file_path: f.relative_path.clone(),
                 sequence: cap[1].to_string(),
@@ -614,13 +676,11 @@ fn try_django_migrations(
         return None;
     }
 
-    let django_re = Regex::new(r"^(\d{4})_(.+)\.py$").unwrap();
-
     let mut entries: Vec<MigrationEntry> = files
         .iter()
         .filter_map(|f| {
             let fname = filename(&f.relative_path);
-            let cap = django_re.captures(fname)?;
+            let cap = RE_DJANGO_MIGRATION.captures(fname)?;
             Some(MigrationEntry {
                 file_path: f.relative_path.clone(),
                 sequence: cap[1].to_string(),
@@ -648,13 +708,11 @@ fn try_knex_migrations(dir: &str, files: &[&crate::index::IndexedFile]) -> Optio
         return None;
     }
 
-    let knex_re = Regex::new(r"^(\d{14})_(.+)\.(js|ts)$").unwrap();
-
     let mut entries: Vec<MigrationEntry> = files
         .iter()
         .filter_map(|f| {
             let fname = filename(&f.relative_path);
-            let cap = knex_re.captures(fname)?;
+            let cap = RE_KNEX.captures(fname)?;
             Some(MigrationEntry {
                 file_path: f.relative_path.clone(),
                 sequence: cap[1].to_string(),
@@ -688,8 +746,7 @@ fn try_prisma_migrations(
 ) -> Option<MigrationChain> {
     // This function is called with dir = "prisma/migrations/TIMESTAMP_name"
     // We check: does this dir match prisma/migrations/{timestamp}_{name}?
-    let prisma_dir_re = Regex::new(r"^(.+/prisma/migrations)/(\d{14})_(.+)$").unwrap();
-    let cap = prisma_dir_re.captures(dir)?;
+    let cap = RE_PRISMA_DIR.captures(dir)?;
 
     let base_migrations_dir = cap[1].to_string();
     let timestamp = cap[2].to_string();
@@ -717,7 +774,7 @@ fn try_prisma_migrations(
     let mut all_entries: Vec<MigrationEntry> = Vec::new();
 
     for (other_dir, other_files) in all_dirs {
-        if let Some(other_cap) = prisma_dir_re.captures(other_dir) {
+        if let Some(other_cap) = RE_PRISMA_DIR.captures(other_dir) {
             if other_cap[1] == base_migrations_dir {
                 let other_ts = other_cap[2].to_string();
                 let other_name = other_cap[3].to_string();
@@ -740,7 +797,7 @@ fn try_prisma_migrations(
     let min_dir = all_dirs
         .keys()
         .filter(|k| {
-            prisma_dir_re
+            RE_PRISMA_DIR
                 .captures(k)
                 .map(|c| c[1] == *base_migrations_dir)
                 .unwrap_or(false)
@@ -779,13 +836,11 @@ fn try_drizzle_migrations(
         return None;
     }
 
-    let drizzle_re = Regex::new(r"^(\d{4})_(.+)\.sql$").unwrap();
-
     let mut entries: Vec<MigrationEntry> = files
         .iter()
         .filter_map(|f| {
             let fname = filename(&f.relative_path);
-            let cap = drizzle_re.captures(fname)?;
+            let cap = RE_DRIZZLE.captures(fname)?;
             Some(MigrationEntry {
                 file_path: f.relative_path.clone(),
                 sequence: cap[1].to_string(),
@@ -813,13 +868,11 @@ fn try_generic_migrations(
     files: &[&crate::index::IndexedFile],
 ) -> Option<MigrationChain> {
     // Match numeric prefix + underscore + name + .sql
-    let generic_re = Regex::new(r"^(\d+)_(.+)\.sql$").unwrap();
-
     let mut entries: Vec<MigrationEntry> = files
         .iter()
         .filter_map(|f| {
             let fname = filename(&f.relative_path);
-            let cap = generic_re.captures(fname)?;
+            let cap = RE_GENERIC_MIGRATION.captures(fname)?;
             Some(MigrationEntry {
                 file_path: f.relative_path.clone(),
                 sequence: cap[1].to_string(),
@@ -2011,5 +2064,81 @@ mod tests {
         let index = make_index(vec![file]);
         let schema = build_schema_index(&index).expect("schema should be built");
         assert!(schema.orm_models.contains_key("Post"));
+    }
+
+    // -------------------------------------------------------------------------
+    // camel_to_snake tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn camel_to_snake_user_profile() {
+        assert_eq!(camel_to_snake("UserProfile"), "user_profile");
+    }
+
+    #[test]
+    fn camel_to_snake_single_word() {
+        assert_eq!(camel_to_snake("User"), "user");
+        assert_eq!(camel_to_snake("user"), "user");
+    }
+
+    #[test]
+    fn camel_to_snake_http_server() {
+        // Consecutive uppercase letters each get a separator (simple impl).
+        assert_eq!(camel_to_snake("HTTPServer"), "h_t_t_p_server");
+    }
+
+    #[test]
+    fn camel_to_snake_order_item() {
+        assert_eq!(camel_to_snake("OrderItem"), "order_item");
+    }
+
+    #[test]
+    fn camel_to_snake_already_snake() {
+        assert_eq!(camel_to_snake("order_item"), "order_item");
+    }
+
+    // -------------------------------------------------------------------------
+    // LazyLock regex statics — verify they compile without panicking
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn regex_statics_instantiate_without_panic() {
+        // Force initialisation of every LazyLock static defined in this module.
+        let _ = &*RE_DJANGO_TABLE;
+        let _ = &*RE_DJANGO_FIELD;
+        let _ = &*RE_SQLALCHEMY_TABLE;
+        let _ = &*RE_SQLALCHEMY_COL;
+        let _ = &*RE_SQLALCHEMY_FK;
+        let _ = &*RE_TYPEORM_ENTITY;
+        let _ = &*RE_TYPEORM_FIELD;
+        let _ = &*RE_PRISMA_MAP;
+        let _ = &*RE_RAILS_TS;
+        let _ = &*RE_ALEMBIC_REVISION;
+        let _ = &*RE_ALEMBIC_FNAME;
+        let _ = &*RE_FLYWAY;
+        let _ = &*RE_DJANGO_MIGRATION;
+        let _ = &*RE_KNEX;
+        let _ = &*RE_PRISMA_DIR;
+        let _ = &*RE_DRIZZLE;
+        let _ = &*RE_GENERIC_MIGRATION;
+    }
+
+    // Django table name uses camel_to_snake (not to_lowercase) when no db_table override.
+    #[test]
+    fn test_django_default_table_name_is_snake_case() {
+        let sym = make_symbol(
+            "UserProfile",
+            SymbolKind::Class,
+            "class UserProfile(models.Model)",
+            "    name = models.CharField(max_length=100)\n",
+        );
+        let file = make_file("app/models.py", Some("python"), "", vec![sym], vec![]);
+        let index = make_index(vec![file]);
+        let models = detect_orm_models(&index);
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].table_name, "user_profile",
+            "Django default table name should be camel_to_snake, not to_lowercase"
+        );
     }
 }

@@ -21,8 +21,16 @@ impl CxpakLspBackend {
         }
     }
 
+    fn lock_err(e: impl std::fmt::Display) -> tower_lsp::jsonrpc::Error {
+        tower_lsp::jsonrpc::Error {
+            code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+            message: format!("lock poisoned: {e}").into(),
+            data: None,
+        }
+    }
+
     pub async fn custom_health(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let idx = self.index.read().unwrap();
+        let idx = self.index.read().map_err(Self::lock_err)?;
         match super::methods::handle_custom_method("cxpak/health", serde_json::Value::Null, &idx) {
             Ok(Some(v)) => Ok(v),
             Ok(None) => Ok(serde_json::Value::Null),
@@ -35,7 +43,7 @@ impl CxpakLspBackend {
     }
 
     pub async fn custom_conventions(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let idx = self.index.read().unwrap();
+        let idx = self.index.read().map_err(Self::lock_err)?;
         match super::methods::handle_custom_method(
             "cxpak/conventions",
             serde_json::Value::Null,
@@ -52,7 +60,7 @@ impl CxpakLspBackend {
     }
 
     pub async fn custom_blast_radius(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let idx = self.index.read().unwrap();
+        let idx = self.index.read().map_err(Self::lock_err)?;
         match super::methods::handle_custom_method(
             "cxpak/blastRadius",
             serde_json::Value::Null,
@@ -147,7 +155,7 @@ impl LanguageServer for CxpakLspBackend {
 
     async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
         let uri = params.text_document.uri.to_string();
-        let idx = self.index.read().unwrap();
+        let idx = self.index.read().map_err(Self::lock_err)?;
         let lenses = super::methods::code_lens_for_file(&uri, &idx);
         Ok(if lenses.is_empty() {
             None
@@ -174,7 +182,7 @@ impl LanguageServer for CxpakLspBackend {
         params: DocumentDiagnosticParams,
     ) -> LspResult<DocumentDiagnosticReportResult> {
         let uri = params.text_document.uri.to_string();
-        let idx = self.index.read().unwrap();
+        let idx = self.index.read().map_err(Self::lock_err)?;
         let diags = super::methods::diagnostics_for_file(&uri, &idx);
         Ok(DocumentDiagnosticReportResult::Report(
             DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
@@ -192,7 +200,7 @@ impl LanguageServer for CxpakLspBackend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
-        let idx = self.index.read().unwrap();
+        let idx = self.index.read().map_err(Self::lock_err)?;
         let symbols = super::methods::workspace_symbols(&params.query, &idx);
         Ok(if symbols.is_empty() {
             None

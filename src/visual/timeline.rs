@@ -89,8 +89,11 @@ pub fn compute_timeline_snapshots(
         let commit_sha = format!("{}", commit.id());
         let commit_date = {
             let t = commit.time();
-            // git2 gives seconds since Unix epoch + offset in minutes.
-            // We build an ISO 8601 UTC string without pulling in chrono.
+            // git2::Time carries both seconds (UTC epoch) and offset_minutes
+            // (local UTC offset). We intentionally ignore offset_minutes and
+            // render all timestamps as UTC. This keeps the output deterministic
+            // regardless of the author's timezone and avoids pulling in chrono
+            // or a timezone database.
             let secs = t.seconds();
             let s = secs.unsigned_abs();
             let y_rem = s % (365 * 24 * 3600); // very rough — good enough for display

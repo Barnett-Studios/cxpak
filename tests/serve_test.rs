@@ -278,7 +278,7 @@ mod serve_tests {
         assert!(wait_for_server(port), "server should start within 5s");
 
         let (status, body) = http_get(port, "/trace");
-        assert_eq!(status, 200);
+        assert_eq!(status, 400);
         let json: Value = serde_json::from_str(&body).unwrap();
         assert!(json["error"].as_str().unwrap().contains("missing"));
 
