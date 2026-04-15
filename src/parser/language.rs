@@ -42,6 +42,7 @@ pub enum SymbolKind {
     Mutation,
     Type,
     Instruction,
+    Macro,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -133,9 +133,35 @@ impl LanguageSupport for JavaScriptLanguage {
                 }
 
                 "export_statement" => {
+                    // Handle `export * from './m'` — wildcard re-export.
+                    // The tree-sitter JS grammar uses a child with kind `"*"`
+                    // for the asterisk token (same pattern as TypeScript).
+                    let mut has_star = false;
                     let mut cursor = node.walk();
                     for child in node.children(&mut cursor) {
-                        stack.push(child);
+                        if child.kind() == "*" || child.kind() == "export_star" {
+                            has_star = true;
+                        }
+                    }
+                    if has_star {
+                        let stmt_text = Self::node_text(&node, source_bytes);
+                        let source_path = if let Some(from_idx) = stmt_text.rfind(" from ") {
+                            stmt_text[from_idx + 6..]
+                                .trim()
+                                .trim_matches(|c| c == '\'' || c == '"' || c == ';')
+                                .to_string()
+                        } else {
+                            String::new()
+                        };
+                        imports.push(Import {
+                            source: source_path,
+                            names: vec!["*".to_string()],
+                        });
+                    } else {
+                        let mut cursor2 = node.walk();
+                        for child in node.children(&mut cursor2) {
+                            stack.push(child);
+                        }
                     }
                 }
 
@@ -251,11 +277,18 @@ impl LanguageSupport for JavaScriptLanguage {
                 }
 
                 // Re-exports: export { A, B } from 'module'
+                // Renamed: export { Foo as Bar } from 'module'
                 "export_clause" => {
                     let mut ec_cursor = node.walk();
                     for child in node.children(&mut ec_cursor) {
                         if child.kind() == "export_specifier" {
-                            let name = Self::extract_name(&child, source_bytes);
+                            // Prefer the alias field ("as Bar") over the base name.
+                            let name = if let Some(alias_node) = child.child_by_field_name("alias")
+                            {
+                                Self::node_text(&alias_node, source_bytes).to_string()
+                            } else {
+                                Self::extract_name(&child, source_bytes)
+                            };
                             if !name.is_empty() {
                                 exports.push(Export {
                                     name: name.clone(),

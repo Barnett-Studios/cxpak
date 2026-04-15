@@ -46,7 +46,9 @@ impl FileCache {
     pub fn save(&self, cache_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(cache_dir)?;
         let json = serde_json::to_string(self)?;
-        std::fs::write(cache_dir.join("cache.json"), json)
+        let tmp = cache_dir.join("cache.json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(tmp, cache_dir.join("cache.json"))
     }
 
     pub fn as_map(&self) -> HashMap<&str, &CacheEntry> {
@@ -181,6 +183,24 @@ mod tests {
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].relative_path, "src/lib.rs");
         assert_eq!(loaded.entries[0].token_count, 42);
+    }
+
+    #[test]
+    fn test_atomic_save_no_tmp_file_after_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cache = FileCache::new();
+        cache.entries.push(make_entry("src/lib.rs"));
+        cache.save(dir.path()).expect("save");
+
+        // After a successful save, the .tmp file must not remain.
+        let tmp_path = dir.path().join("cache.json.tmp");
+        assert!(
+            !tmp_path.exists(),
+            "cache.json.tmp must not exist after successful save"
+        );
+        // The real file must exist and be loadable.
+        let loaded = FileCache::load(dir.path());
+        assert_eq!(loaded.entries.len(), 1);
     }
 
     #[test]

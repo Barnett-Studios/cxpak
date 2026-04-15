@@ -408,8 +408,36 @@ impl LanguageSupport for RustLanguage {
                 }
 
                 "use_declaration" => {
+                    let is_pub = Self::is_public(&node, source_bytes);
                     if let Some(import) = Self::extract_use_import(&node, source_bytes) {
+                        if is_pub {
+                            for name in &import.names {
+                                exports.push(Export {
+                                    name: name.clone(),
+                                    kind: SymbolKind::TypeAlias,
+                                });
+                            }
+                        }
                         imports.push(import);
+                    }
+                }
+
+                "macro_definition" => {
+                    let name = Self::extract_name(&node, source_bytes);
+                    if !name.is_empty() {
+                        symbols.push(Symbol {
+                            name: name.clone(),
+                            kind: SymbolKind::Macro,
+                            visibility: Visibility::Public,
+                            signature: Self::first_line(&node, source_bytes),
+                            body: String::new(),
+                            start_line: node.start_position().row + 1,
+                            end_line: node.end_position().row + 1,
+                        });
+                        exports.push(Export {
+                            name,
+                            kind: SymbolKind::Macro,
+                        });
                     }
                 }
 
@@ -930,6 +958,51 @@ trait InternalHelper {
             .expect("COUNTER");
         assert_eq!(counter.visibility, Visibility::Private);
         assert!(!result.exports.iter().any(|e| e.name == "COUNTER"));
+    }
+
+    #[test]
+    fn test_pub_use_produces_export() {
+        let source = "pub use std::collections::HashMap;\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = RustLanguage;
+        let result = lang.extract(source, &tree);
+
+        assert_eq!(result.imports.len(), 1, "import should be recorded");
+        assert!(
+            result.exports.iter().any(|e| e.name == "HashMap"),
+            "pub use should produce an Export for HashMap, got: {:?}",
+            result.exports
+        );
+    }
+
+    #[test]
+    fn test_macro_rules_produces_symbol() {
+        let source = "macro_rules! foo { () => {} }\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = RustLanguage;
+        let result = lang.extract(source, &tree);
+
+        let macros: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Macro)
+            .collect();
+        assert_eq!(
+            macros.len(),
+            1,
+            "expected one macro symbol, got: {:?}",
+            macros
+        );
+        assert_eq!(macros[0].name, "foo");
+        assert!(
+            result
+                .exports
+                .iter()
+                .any(|e| e.name == "foo" && e.kind == SymbolKind::Macro),
+            "macro should be in exports"
+        );
     }
 
     #[test]

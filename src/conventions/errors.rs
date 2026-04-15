@@ -67,8 +67,15 @@ pub fn extract_errors(index: &CodebaseIndex) -> ErrorConventions {
                         }
 
                         // Check for .unwrap() usage — only count in src
+                        // Strip line comments before matching to avoid false positives.
                         if !is_test {
-                            let unwrap_occurrences = symbol.body.matches(".unwrap()").count();
+                            let stripped: String = symbol
+                                .body
+                                .lines()
+                                .map(|l| l.find("//").map(|i| &l[..i]).unwrap_or(l))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let unwrap_occurrences = stripped.matches(".unwrap()").count();
                             if unwrap_occurrences > 0 {
                                 unwrap_src += unwrap_occurrences;
                                 *contribution.counts.entry("unwrap_src".into()).or_insert(0) +=
@@ -76,7 +83,7 @@ pub fn extract_errors(index: &CodebaseIndex) -> ErrorConventions {
                             }
 
                             // Check for .expect() usage
-                            let expect_occurrences = symbol.body.matches(".expect(").count();
+                            let expect_occurrences = stripped.matches(".expect(").count();
                             if expect_occurrences > 0 {
                                 expect_src += expect_occurrences;
                                 *contribution.counts.entry("expect_src".into()).or_insert(0) +=
@@ -88,11 +95,11 @@ pub fn extract_errors(index: &CodebaseIndex) -> ErrorConventions {
                         if is_rust && !is_test {
                             let q_count = question_re.find_iter(&symbol.body).count();
                             if q_count > 0 {
-                                question_count += q_count;
+                                question_count += 1; // count functions using ?, not total ? tokens
                                 *contribution
                                     .counts
                                     .entry("question_mark".into())
-                                    .or_insert(0) += q_count;
+                                    .or_insert(0) += 1;
                             }
                             question_total += 1;
                         }
@@ -443,6 +450,99 @@ mod tests {
     // from the total, which produced an incorrect denominator when test functions were
     // plentiful.  After the fix, each file is classified up-front as test/src and only
     // src-file function symbols contribute to the denominator.
+    #[test]
+    fn test_question_mark_percentage_at_most_100() {
+        // A function with multiple ? operators should count as 1 function,
+        // not as multiple occurrences, so percentage stays ≤ 100%.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "heavy_user".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn heavy_user() -> Result<(), E>".into(),
+                    // 10 question-mark uses in one function body
+                    body: "{ a()?; b()?; c()?; d()?; e()?; f()?; g()?; h()?; i()?; j()?; Ok(()) }"
+                        .into(),
+                    start_line: 1,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let errors = extract_errors(&index);
+
+        if let Some(obs) = errors.question_mark_propagation {
+            assert!(
+                obs.percentage <= 100.0,
+                "question-mark percentage must not exceed 100, got {}",
+                obs.percentage
+            );
+        }
+    }
+
+    #[test]
+    fn test_comment_unwrap_not_counted() {
+        // An `.unwrap()` that appears only in a line comment must not be counted.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "x").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "clean_fn".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn clean_fn() -> Result<(), E>".into(),
+                    // The only .unwrap() is inside a comment — should not be detected.
+                    body: "{ // .unwrap() is bad practice\n    Ok(()) }".into(),
+                    start_line: 1,
+                    end_line: 3,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let errors = extract_errors(&index);
+
+        // With only one src function and no real unwrap, should show 100% clean.
+        let obs = errors.unwrap_usage.expect("unwrap_usage should be Some");
+        assert_eq!(
+            obs.percentage, 100.0,
+            "commented-out .unwrap() must not count as an unwrap usage"
+        );
+    }
+
     #[test]
     fn test_extract_errors_test_file_fns_excluded_from_src_denominator() {
         let counter = TokenCounter::new();

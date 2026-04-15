@@ -14,7 +14,34 @@ pub fn render(sections: &OutputSections) -> String {
 }
 
 pub fn render_single_section(title: &str, content: &str) -> String {
-    let tag = title.to_lowercase().replace([' ', '/'], "-");
+    let raw: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let raw = raw.trim_matches('-').to_string();
+    let raw = if raw.is_empty() {
+        "section".to_string()
+    } else {
+        raw
+    };
+    // XML NCName: first char must be letter or '_'; prefix '_' if it's a digit.
+    let tag = if raw
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        format!("_{raw}")
+    } else {
+        raw
+    };
     let mut out = String::from("<cxpak>\n");
     emit_section(&mut out, &tag, content);
     out.push_str("</cxpak>\n");
@@ -42,7 +69,12 @@ fn emit_section(out: &mut String, tag: &str, content: &str) {
 }
 
 fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
+    let cleaned: String = s
+        .chars()
+        .filter(|&c| !matches!(c as u32, 0x0..=0x8 | 0xB..=0xC | 0xE..=0x1F))
+        .collect();
+    cleaned
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
@@ -92,6 +124,30 @@ mod tests {
     #[test]
     fn test_escape_xml_handles_apostrophe() {
         assert_eq!(escape_xml("it's"), "it&apos;s");
+    }
+
+    #[test]
+    fn test_render_single_section_safe_tag_from_injection() {
+        let output = render_single_section("<inject>", "content");
+        // The injected angle brackets should be mapped to dashes, not kept as-is.
+        assert!(
+            !output.contains("<<inject>>"),
+            "raw injection chars must not appear: {output}"
+        );
+        assert!(
+            output.contains("<cxpak>"),
+            "wrapper must still be present: {output}"
+        );
+    }
+
+    #[test]
+    fn test_escape_xml_strips_forbidden_control_chars() {
+        let input = "\x00\x01\x08<>";
+        let result = escape_xml(input);
+        assert!(!result.contains('\x00'), "null must be stripped: {result}");
+        assert!(!result.contains('\x01'), "SOH must be stripped: {result}");
+        assert!(result.contains("&lt;"), "< must be escaped: {result}");
+        assert!(result.contains("&gt;"), "> must be escaped: {result}");
     }
 
     #[test]

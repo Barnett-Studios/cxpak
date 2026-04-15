@@ -153,10 +153,38 @@ impl LanguageSupport for TypeScriptLanguage {
                 }
 
                 "export_statement" => {
-                    // Push children so we handle the exported declaration
+                    // Handle `export * from './m'` — wildcard re-export.
+                    // The tree-sitter TS grammar represents this as a child
+                    // with kind `"*"` (the literal asterisk token) rather than
+                    // a named `export_star` node.
+                    let mut has_star = false;
                     let mut cursor = node.walk();
                     for child in node.children(&mut cursor) {
-                        stack.push(child);
+                        if child.kind() == "*" || child.kind() == "export_star" {
+                            has_star = true;
+                        }
+                    }
+                    if has_star {
+                        // Extract the string literal source from the export_statement text.
+                        let stmt_text = Self::node_text(&node, source_bytes);
+                        let source_path = if let Some(from_idx) = stmt_text.rfind(" from ") {
+                            stmt_text[from_idx + 6..]
+                                .trim()
+                                .trim_matches(|c| c == '\'' || c == '"' || c == ';')
+                                .to_string()
+                        } else {
+                            String::new()
+                        };
+                        imports.push(Import {
+                            source: source_path,
+                            names: vec!["*".to_string()],
+                        });
+                    } else {
+                        // Push children so we handle the exported declaration
+                        let mut cursor2 = node.walk();
+                        for child in node.children(&mut cursor2) {
+                            stack.push(child);
+                        }
                     }
                 }
 
@@ -362,12 +390,19 @@ impl LanguageSupport for TypeScriptLanguage {
                 }
 
                 // Re-exports: export { A, B } from 'module'
+                // Renamed: export { Foo as Bar } from 'module'
                 "export_clause" => {
                     // export_clause is a child of export_statement; collect named re-exports
                     let mut ec_cursor = node.walk();
                     for child in node.children(&mut ec_cursor) {
                         if child.kind() == "export_specifier" {
-                            let name = Self::extract_name(&child, source_bytes);
+                            // Prefer the alias field ("as Bar") over the base name.
+                            let name = if let Some(alias_node) = child.child_by_field_name("alias")
+                            {
+                                Self::node_text(&alias_node, source_bytes).to_string()
+                            } else {
+                                Self::extract_name(&child, source_bytes)
+                            };
                             if !name.is_empty() {
                                 exports.push(Export {
                                     name: name.clone(),
@@ -784,6 +819,50 @@ mod tests {
         assert!(
             export_names.contains(&"Bar"),
             "expected Bar in exports: {:?}",
+            export_names
+        );
+    }
+
+    #[test]
+    fn test_export_star_produces_wildcard_import() {
+        let source = "export * from './m';\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = TypeScriptLanguage;
+        let result = lang.extract(source, &tree);
+
+        assert!(
+            result
+                .imports
+                .iter()
+                .any(|i| i.names.contains(&"*".to_string())),
+            "export * should produce a wildcard Import, got imports: {:?}",
+            result.imports
+        );
+        // Must NOT produce an Export entry (no local name)
+        assert!(
+            result.exports.is_empty(),
+            "export * should not produce local Exports"
+        );
+    }
+
+    #[test]
+    fn test_export_renamed_specifier_uses_alias() {
+        let source = "export { Foo as Bar } from './module';\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = TypeScriptLanguage;
+        let result = lang.extract(source, &tree);
+
+        let export_names: Vec<&str> = result.exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            export_names.contains(&"Bar"),
+            "renamed export should record alias 'Bar', got: {:?}",
+            export_names
+        );
+        assert!(
+            !export_names.contains(&"Foo"),
+            "original name 'Foo' should not appear when alias is used: {:?}",
             export_names
         );
     }

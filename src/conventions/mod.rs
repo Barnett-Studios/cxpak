@@ -135,6 +135,14 @@ pub fn update_conventions_incremental(
     // Recompute testing from full test_map (cheap)
     profile.testing = testing::extract_testing(index);
 
+    // Rebuild the five observation-based profiles so stale aggregates are
+    // replaced. These are O(total symbols) — fast even for large codebases.
+    profile.naming = naming::extract_naming(index);
+    profile.imports = imports::extract_imports(index);
+    profile.errors = errors::extract_errors(index);
+    profile.visibility = visibility::extract_visibility(index);
+    profile.functions = functions::extract_functions(index);
+
     // Git health: NOT updated here — uses TTL cache
 }
 
@@ -281,6 +289,99 @@ mod tests {
     }
 
     #[test]
+    fn test_incremental_update_naming_matches_full_rebuild() {
+        use crate::budget::counter::TokenCounter;
+        use crate::parser::language::SymbolKind;
+        use crate::parser::language::{ParseResult, Symbol, Visibility};
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let fp_a = dir.path().join("a.rs");
+        let fp_b = dir.path().join("b.rs");
+        std::fs::write(&fp_a, "fn snake_one() {}").unwrap();
+        std::fs::write(&fp_b, "fn snake_two() {}").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/a.rs".into(),
+                absolute_path: fp_a.clone(),
+                language: Some("rust".into()),
+                size_bytes: 1,
+            },
+            ScannedFile {
+                relative_path: "src/b.rs".into(),
+                absolute_path: fp_b,
+                language: Some("rust".into()),
+                size_bytes: 1,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/a.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "snake_one".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn snake_one()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "src/b.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "snake_two".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn snake_two()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = crate::index::CodebaseIndex::build(files, parse_results, &counter);
+        let full_profile = build_convention_profile(&index, dir.path());
+
+        let mut incremental_profile = build_convention_profile(&index, dir.path());
+        // Trigger an incremental update without changing anything meaningful.
+        update_conventions_incremental(
+            &mut incremental_profile,
+            &["src/b.rs".to_string()],
+            &[],
+            &index,
+        );
+
+        // Both profiles should agree on function_style dominant.
+        assert_eq!(
+            full_profile
+                .naming
+                .function_style
+                .as_ref()
+                .map(|o| o.dominant.as_str()),
+            incremental_profile
+                .naming
+                .function_style
+                .as_ref()
+                .map(|o| o.dominant.as_str()),
+            "incremental update must produce same function_style as full rebuild"
+        );
+    }
+
+    #[test]
     fn test_update_conventions_incremental_remove_then_add() {
         use crate::budget::counter::TokenCounter;
         use crate::parser::language::SymbolKind;
@@ -354,17 +455,45 @@ mod tests {
         assert!(profile.naming.file_contributions.contains_key("src/a.rs"));
         assert!(profile.naming.file_contributions.contains_key("src/b.rs"));
 
-        // Remove "src/a.rs", update "src/b.rs"
+        // Build a post-removal index that no longer contains src/a.rs.
+        let fp_b2 = dir.path().join("b.rs");
+        let files_after: Vec<crate::scanner::ScannedFile> = vec![ScannedFile {
+            relative_path: "src/b.rs".into(),
+            absolute_path: fp_b2,
+            language: Some("rust".into()),
+            size_bytes: 1,
+        }];
+        let mut pr_after = HashMap::new();
+        pr_after.insert(
+            "src/b.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "fn_in_b".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn fn_in_b()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let index_after = crate::index::CodebaseIndex::build(files_after, pr_after, &counter);
+
+        // Remove "src/a.rs", update "src/b.rs" — pass the post-removal index.
         update_conventions_incremental(
             &mut profile,
             &["src/b.rs".to_string()],
             &["src/a.rs".to_string()],
-            &index,
+            &index_after,
         );
 
-        // "src/a.rs" must be gone from naming contributions
+        // After rebuild from index_after, "src/a.rs" is gone because it is not
+        // in the new index.
         assert!(!profile.naming.file_contributions.contains_key("src/a.rs"));
-        // "src/b.rs" still present (update is a noop but the key is preserved)
+        // "src/b.rs" still present.
         assert!(profile.naming.file_contributions.contains_key("src/b.rs"));
     }
 }

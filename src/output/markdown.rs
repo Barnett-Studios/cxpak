@@ -1,5 +1,17 @@
 use super::OutputSections;
 
+/// Returns a code fence string (backtick run) that is guaranteed to be longer
+/// than the longest backtick run that appears at the start of any line in
+/// `content`.  This prevents backtick injection from user-controlled content.
+fn code_fence_for(content: &str) -> String {
+    let max_run = content
+        .lines()
+        .map(|l| l.chars().take_while(|&c| c == '`').count())
+        .max()
+        .unwrap_or(0);
+    "`".repeat(max_run.max(2) + 1)
+}
+
 pub fn render(sections: &OutputSections) -> String {
     let mut out = String::new();
     if !sections.metadata.is_empty() {
@@ -8,9 +20,14 @@ pub fn render(sections: &OutputSections) -> String {
         out.push_str("\n\n");
     }
     if !sections.directory_tree.is_empty() {
-        out.push_str("## Directory Tree\n\n```\n");
+        let fence = code_fence_for(&sections.directory_tree);
+        out.push_str("## Directory Tree\n\n");
+        out.push_str(&fence);
+        out.push('\n');
         out.push_str(&sections.directory_tree);
-        out.push_str("\n```\n\n");
+        out.push('\n');
+        out.push_str(&fence);
+        out.push_str("\n\n");
     }
     if !sections.module_map.is_empty() {
         out.push_str("## Module / Component Map\n\n");
@@ -75,6 +92,22 @@ mod tests {
         assert!(output.contains("## Key Files"));
         assert!(output.contains("## Function / Type Signatures"));
         assert!(output.contains("## Git Context"));
+    }
+
+    #[test]
+    fn test_code_fence_escapes_triple_backtick_in_content() {
+        // Content that contains a triple-backtick run.
+        let content = "```\nsome code\n```";
+        let fence = code_fence_for(content);
+        // Fence must be longer than 3 backticks.
+        assert!(
+            fence.len() > 3,
+            "fence should be longer than longest backtick run in content, got: {fence}"
+        );
+        assert!(
+            fence.chars().all(|c| c == '`'),
+            "fence must consist only of backticks"
+        );
     }
 
     #[test]

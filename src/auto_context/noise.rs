@@ -133,7 +133,10 @@ pub fn dedup_similar_files(
             if sim > 0.80 {
                 let pr_i = *pagerank.get(&entries[i].path).unwrap_or(&0.0);
                 let pr_j = *pagerank.get(&entries[j].path).unwrap_or(&0.0);
-                if pr_i >= pr_j {
+                // Prefer higher relevance score; break ties by PageRank.
+                let keep_i = entries[i].score > entries[j].score
+                    || (entries[i].score == entries[j].score && pr_i >= pr_j);
+                if keep_i {
                     filter_reasons.push((entries[j].path.clone(), entries[i].path.clone()));
                     removed[j] = true;
                 } else {
@@ -436,6 +439,43 @@ mod tests {
         assert!(
             sim.abs() < f64::EPSILON,
             "no overlap should give 0.0, got {sim}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_keeps_higher_relevance_score_over_pagerank() {
+        // high_score has lower pagerank but higher relevance — must be kept.
+        let entries = vec![
+            ScoredFileEntry {
+                path: "src/high_score.rs".to_string(),
+                score: 0.9,
+                token_count: 100,
+            },
+            ScoredFileEntry {
+                path: "src/high_rank.rs".to_string(),
+                score: 0.3,
+                token_count: 100,
+            },
+        ];
+
+        let mut symbols_by_path: HashMap<String, HashSet<String>> = HashMap::new();
+        let shared: HashSet<String> = ["foo", "bar", "baz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        symbols_by_path.insert("src/high_score.rs".to_string(), shared.clone());
+        symbols_by_path.insert("src/high_rank.rs".to_string(), shared);
+
+        let mut pagerank: HashMap<String, f64> = HashMap::new();
+        pagerank.insert("src/high_score.rs".to_string(), 0.1); // low pagerank
+        pagerank.insert("src/high_rank.rs".to_string(), 0.9); // high pagerank
+
+        let (kept, _) = dedup_similar_files(entries, &symbols_by_path, &pagerank);
+
+        assert_eq!(kept.len(), 1, "one file should survive");
+        assert_eq!(
+            kept[0].path, "src/high_score.rs",
+            "higher relevance score file should be kept regardless of pagerank"
         );
     }
 

@@ -32,6 +32,8 @@ pub struct PackedSections {
     /// tokens worth of edges are included; the rest are dropped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cross_language_edges: Option<serde_json::Value>,
+    /// Token count consumed by the cross-language edges section.
+    pub cross_language_tokens: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,9 +132,9 @@ pub fn allocate_and_pack_with_cross_lang(
         } else if remaining > 0 {
             // Truncate to whatever budget is left (line-level granularity).
             let truncated = truncate_to_budget(&content, remaining, &counter);
-            let truncated_tokens = counter.count(&truncated);
+            let truncated_tokens = counter.count(&truncated).min(remaining);
             target_tokens += truncated_tokens;
-            remaining = remaining.saturating_sub(truncated_tokens);
+            remaining -= truncated_tokens;
             packed_targets.push(PackedFile {
                 path,
                 score,
@@ -165,9 +167,9 @@ pub fn allocate_and_pack_with_cross_lang(
             });
         } else if remaining > 0 {
             let truncated = truncate_to_budget(&content, remaining, &counter);
-            let truncated_tokens = counter.count(&truncated);
+            let truncated_tokens = counter.count(&truncated).min(remaining);
             test_tokens += truncated_tokens;
-            remaining = remaining.saturating_sub(truncated_tokens);
+            remaining -= truncated_tokens;
             packed_tests.push(PackedFile {
                 path,
                 score: 0.0,
@@ -204,9 +206,9 @@ pub fn allocate_and_pack_with_cross_lang(
                 });
             } else {
                 let truncated = truncate_to_budget(&schema_str, remaining, &counter);
-                let truncated_tokens = counter.count(&truncated);
+                let truncated_tokens = counter.count(&truncated).min(remaining);
                 schema_tokens = truncated_tokens;
-                remaining = remaining.saturating_sub(truncated_tokens);
+                remaining -= truncated_tokens;
                 packed_schema_files.push(PackedFile {
                     path: "<schema>".to_string(),
                     score: 0.0,
@@ -259,6 +261,7 @@ pub fn allocate_and_pack_with_cross_lang(
     // Dedicated section; capped at min(remaining, 500) tokens so it never
     // starves the primary budget allocations above. Structured JSON is kept
     // intact (no truncation) because LLMs rely on the structure for routing.
+    let mut cross_lang_tokens = 0usize;
     let resolved_cross_lang = if let Some(cross_val) = cross_lang_json {
         let cap = remaining.min(500);
         if cap > 0 {
@@ -266,6 +269,7 @@ pub fn allocate_and_pack_with_cross_lang(
             let cross_tok = counter.count(&cross_str);
             if cross_tok <= cap {
                 remaining = remaining.saturating_sub(cross_tok);
+                cross_lang_tokens = cross_tok;
                 Some(cross_val)
             } else {
                 None
@@ -305,6 +309,7 @@ pub fn allocate_and_pack_with_cross_lang(
             api_surface: resolved_api,
             blast_radius: resolved_blast,
             cross_language_edges: resolved_cross_lang,
+            cross_language_tokens: cross_lang_tokens,
         },
     }
 }
@@ -913,6 +918,33 @@ mod tests {
     // -----------------------------------------------------------------------
     // test_zero_budget
     // -----------------------------------------------------------------------
+    #[test]
+    fn test_used_plus_remaining_equals_total_after_truncation() {
+        // Budget tight enough to truncate a multi-line file.
+        let content = (1..=30)
+            .map(|i| format!("fn line_{}() {{ /* body {} */ }}", i, i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let full_tokens = tok(&content);
+        let budget = (full_tokens * 2) / 3;
+
+        let result = allocate_and_pack(
+            vec![make_target("src/big.rs", 0.9, &content)],
+            vec![],
+            None,
+            None,
+            None,
+            budget,
+            false,
+        );
+
+        assert_eq!(
+            result.budget.used + result.budget.remaining,
+            result.budget.total,
+            "used + remaining must equal total after truncation"
+        );
+    }
+
     #[test]
     fn test_zero_budget() {
         let result = allocate_and_pack(

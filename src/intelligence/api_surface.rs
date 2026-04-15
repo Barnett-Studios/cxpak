@@ -91,6 +91,7 @@ fn symbol_kind_str(kind: &SymbolKind) -> &'static str {
         SymbolKind::Mutation => "mutation",
         SymbolKind::Type => "type",
         SymbolKind::Instruction => "instruction",
+        SymbolKind::Macro => "macro",
     }
 }
 
