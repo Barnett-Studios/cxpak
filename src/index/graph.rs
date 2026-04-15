@@ -185,7 +185,11 @@ fn is_module_root_file(path: &str) -> bool {
 /// Resolve a Rust `use` path to an actual file path present in `all_paths`.
 ///
 /// Handled prefixes:
-/// - `crate::X` → `src/X.rs`, `src/X/mod.rs`
+/// - `crate::X` → `src/X.rs`, `src/X/mod.rs`; when the full path doesn't
+///   match any file, segments are stripped from the right end until a match is
+///   found.  This handles re-exported types: `use crate::intelligence::CallGraph`
+///   resolves to `src/intelligence/mod.rs` because `CallGraph` is defined there
+///   but there is no `src/intelligence/CallGraph.rs`.
 /// - `self::X`  → refers to items inline in the current file or re-exported
 ///   names; there is no cross-file resolution that makes sense here, so we
 ///   return `None`.
@@ -195,6 +199,8 @@ fn is_module_root_file(path: &str) -> bool {
 ///   * From a **regular file** (`src/foo/bar.rs`) the first `super::` keeps
 ///     us in the *same* directory (the parent module is `src/foo/mod.rs`,
 ///     not `src/`).  Each additional `super::` walks up one more level.
+///   * Progressive prefix shortening is applied to the remaining path after
+///     the `super::` segments are resolved, same as for `crate::`.
 /// - anything else is treated as an external crate (returns `None`)
 fn resolve_rust_import(
     source_path: &str,
@@ -203,13 +209,21 @@ fn resolve_rust_import(
 ) -> Option<String> {
     let source_dir = parent_dir(source_path);
 
-    // `crate::X::Y` → `src/X/Y.rs` or `src/X/Y/mod.rs`
+    // `crate::X::Y::Z` — try longest path first, strip segments on failure.
+    // This allows `crate::intelligence::CallGraph` to fall back to
+    // `src/intelligence/mod.rs` when `CallGraph` is a re-exported type.
     if let Some(rest) = import_source.strip_prefix("crate::") {
-        let base = rest.replace("::", "/");
-        return try_candidates(
-            &[format!("src/{base}.rs"), format!("src/{base}/mod.rs")],
-            all_paths,
-        );
+        let parts: Vec<&str> = rest.split("::").collect();
+        for take in (1..=parts.len()).rev() {
+            let base = parts[..take].join("/");
+            if let Some(p) = try_candidates(
+                &[format!("src/{base}.rs"), format!("src/{base}/mod.rs")],
+                all_paths,
+            ) {
+                return Some(p);
+            }
+        }
+        return None;
     }
 
     // `self::X` — refers to items defined inline in the current module (same
@@ -242,16 +256,34 @@ fn resolve_rust_import(
         } else {
             parent_n(source_dir, dir_ups)
         };
-        let base = trimmed.replace("::", "/");
-        let (a, b) = if target_dir.is_empty() {
-            (format!("{base}.rs"), format!("{base}/mod.rs"))
-        } else {
-            (
-                format!("{target_dir}/{base}.rs"),
-                format!("{target_dir}/{base}/mod.rs"),
-            )
-        };
-        return try_candidates(&[a, b], all_paths);
+        // Apply progressive prefix shortening for the remaining path so that
+        // re-exported types resolve to the module root file.
+        let parts: Vec<&str> = trimmed.split("::").collect();
+        for take in (1..=parts.len()).rev() {
+            let base = parts[..take].join("/");
+            let (a, b) = if target_dir.is_empty() {
+                (format!("{base}.rs"), format!("{base}/mod.rs"))
+            } else {
+                (
+                    format!("{target_dir}/{base}.rs"),
+                    format!("{target_dir}/{base}/mod.rs"),
+                )
+            };
+            if let Some(p) = try_candidates(&[a, b], all_paths) {
+                return Some(p);
+            }
+        }
+        // Zero-segment fallback: the type is re-exported from the target directory's
+        // own module root (e.g. `super::CallGraph` where CallGraph is in mod.rs).
+        if !target_dir.is_empty() {
+            if let Some(p) = try_candidates(
+                &[format!("{target_dir}/mod.rs"), format!("{target_dir}.rs")],
+                all_paths,
+            ) {
+                return Some(p);
+            }
+        }
+        return None;
     }
 
     // Not a known Rust path prefix — fall back to the legacy heuristic.
@@ -286,13 +318,23 @@ fn resolve_python_import(
             ];
             return try_candidates(&candidates, all_paths);
         }
-        return try_candidates(
-            &[
-                format!("{source_dir}/{rest_path}.py"),
-                format!("{source_dir}/{rest_path}/__init__.py"),
-            ],
-            all_paths,
-        );
+        // Progressive prefix shortening: try longest path first so that
+        // `from .models import MyClass` falls back to `<dir>/models/__init__.py`
+        // when `MyClass` is re-exported there rather than living in its own file.
+        let parts: Vec<&str> = rest.split('.').collect();
+        for take in (1..=parts.len()).rev() {
+            let base = parts[..take].join("/");
+            if let Some(p) = try_candidates(
+                &[
+                    format!("{source_dir}/{base}.py"),
+                    format!("{source_dir}/{base}/__init__.py"),
+                ],
+                all_paths,
+            ) {
+                return Some(p);
+            }
+        }
+        return None;
     } else if dots > 1 {
         // `from ..X import Y` — walk up (dots-1) directories from source_dir
         let target_dir = parent_n(source_dir, dots - 1);
@@ -307,28 +349,44 @@ fn resolve_python_import(
             };
             return try_candidates(&candidates, all_paths);
         }
-        let (a, b) = if target_dir.is_empty() {
-            (
-                format!("{rest_path}.py"),
-                format!("{rest_path}/__init__.py"),
-            )
-        } else {
-            (
-                format!("{target_dir}/{rest_path}.py"),
-                format!("{target_dir}/{rest_path}/__init__.py"),
-            )
-        };
-        return try_candidates(&[a, b], all_paths);
+        // Progressive prefix shortening for relative multi-dot imports.
+        let parts: Vec<&str> = rest.split('.').collect();
+        for take in (1..=parts.len()).rev() {
+            let base = parts[..take].join("/");
+            let (a, b) = if target_dir.is_empty() {
+                (format!("{base}.py"), format!("{base}/__init__.py"))
+            } else {
+                (
+                    format!("{target_dir}/{base}.py"),
+                    format!("{target_dir}/{base}/__init__.py"),
+                )
+            };
+            if let Some(p) = try_candidates(&[a, b], all_paths) {
+                return Some(p);
+            }
+        }
+        return None;
     }
 
-    // Absolute import: try several roots
-    let candidates = vec![
-        format!("{rest_path}.py"),
-        format!("{rest_path}/__init__.py"),
-        format!("src/{rest_path}.py"),
-        format!("src/{rest_path}/__init__.py"),
-    ];
-    try_candidates(&candidates, all_paths)
+    // Absolute import: try multiple roots with progressive prefix shortening.
+    // `from myapp.models import MyClass` will fall back to `myapp/__init__.py`
+    // when `MyClass` is re-exported there rather than in `myapp/models/MyClass.py`.
+    let parts: Vec<&str> = rest.split('.').collect();
+    for take in (1..=parts.len()).rev() {
+        let base = parts[..take].join("/");
+        if let Some(p) = try_candidates(
+            &[
+                format!("{base}.py"),
+                format!("{base}/__init__.py"),
+                format!("src/{base}.py"),
+                format!("src/{base}/__init__.py"),
+            ],
+            all_paths,
+        ) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Resolve a TypeScript / JavaScript import specifier to an actual file path.
@@ -1235,6 +1293,85 @@ mod tests {
         assert!(
             py_deps.iter().any(|e| e.target == "app/models.py"),
             "app/views.py should import app/models.py"
+        );
+    }
+
+    // ─── Re-export / progressive prefix shortening ───────────────────────────
+
+    #[test]
+    fn test_resolve_rust_type_reexport_from_mod() {
+        let all: HashSet<&str> = ["src/intelligence/mod.rs", "src/intelligence/call_graph.rs"]
+            .iter()
+            .copied()
+            .collect();
+        // `crate::intelligence::CallGraph` — CallGraph is a type re-exported
+        // from mod.rs; there is no src/intelligence/CallGraph.rs.
+        assert_eq!(
+            resolve_rust_import("src/other.rs", "crate::intelligence::CallGraph", &all),
+            Some("src/intelligence/mod.rs".to_string()),
+            "should fall back to mod.rs when the type has no own file"
+        );
+    }
+
+    #[test]
+    fn test_resolve_rust_prefers_deepest_match() {
+        let all: HashSet<&str> = ["src/intelligence/mod.rs", "src/intelligence/call_graph.rs"]
+            .iter()
+            .copied()
+            .collect();
+        // When call_graph.rs exists, prefer it over mod.rs for
+        // crate::intelligence::call_graph (exact module path).
+        assert_eq!(
+            resolve_rust_import("src/other.rs", "crate::intelligence::call_graph", &all),
+            Some("src/intelligence/call_graph.rs".to_string()),
+            "exact module path should resolve to the dedicated file"
+        );
+    }
+
+    #[test]
+    fn test_resolve_rust_three_segment_type() {
+        let all: HashSet<&str> = ["src/visual/layout.rs"].iter().copied().collect();
+        // `crate::visual::layout::LayoutNode` — strip the type name segment,
+        // resolve to src/visual/layout.rs.
+        assert_eq!(
+            resolve_rust_import("src/main.rs", "crate::visual::layout::LayoutNode", &all),
+            Some("src/visual/layout.rs".to_string()),
+            "three-segment path should resolve to the containing module file"
+        );
+    }
+
+    #[test]
+    fn test_resolve_rust_super_type_reexport() {
+        let all: HashSet<&str> = ["src/intelligence/mod.rs"].iter().copied().collect();
+        // From src/intelligence/blast_radius.rs, `super::CallGraph` should fall
+        // back to src/intelligence/mod.rs via progressive shortening.
+        assert_eq!(
+            resolve_rust_import("src/intelligence/blast_radius.rs", "super::CallGraph", &all),
+            Some("src/intelligence/mod.rs".to_string()),
+            "super:: type re-export should fall back to mod.rs"
+        );
+    }
+
+    #[test]
+    fn test_resolve_python_type_reexport() {
+        let all: HashSet<&str> = ["myapp/__init__.py"].iter().copied().collect();
+        // `from myapp import MyClass` — MyClass is re-exported from __init__.py;
+        // there is no myapp/MyClass.py.
+        assert_eq!(
+            resolve_python_import("tests/test_x.py", "myapp.MyClass", &all),
+            Some("myapp/__init__.py".to_string()),
+            "absolute Python import should fall back to __init__.py on type re-export"
+        );
+    }
+
+    #[test]
+    fn test_resolve_python_relative_type_reexport() {
+        let all: HashSet<&str> = ["app/models/__init__.py"].iter().copied().collect();
+        // `from .models import User` — User is re-exported from models/__init__.py.
+        assert_eq!(
+            resolve_python_import("app/views.py", ".models.User", &all),
+            Some("app/models/__init__.py".to_string()),
+            "relative Python import should fall back to __init__.py on type re-export"
         );
     }
 }

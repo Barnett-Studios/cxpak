@@ -697,6 +697,19 @@ pub fn build_call_graph(index: &crate::index::CodebaseIndex) -> CallGraph {
         m
     };
 
+    // Build per-file local symbol set: file_path -> HashSet<symbol_name>.
+    // This enables intra-file call resolution for private helpers that are
+    // never added to `symbol_exports`.
+    let mut local_symbols: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for file in &index.files {
+        if let Some(pr) = &file.parse_result {
+            let set: std::collections::HashSet<String> =
+                pr.symbols.iter().map(|s| s.name.clone()).collect();
+            local_symbols.insert(file.relative_path.clone(), set);
+        }
+    }
+
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut unresolved: Vec<UnresolvedCall> = Vec::new();
 
@@ -715,9 +728,22 @@ pub fn build_call_graph(index: &crate::index::CodebaseIndex) -> CallGraph {
                     continue;
                 }
 
-                // Check if callee is in the same file — skip intra-file calls
-                let same_file = pr.symbols.iter().any(|s| s.name == callee_name);
-                if same_file {
+                // Intra-file call: callee is defined in the same file.
+                // Add an Exact intra-file edge and continue so we don't also
+                // emit an Approximate cross-file edge if the name happens to
+                // be exported elsewhere too.
+                let is_local = local_symbols
+                    .get(&file.relative_path)
+                    .map(|s| s.contains(&callee_name))
+                    .unwrap_or(false);
+                if is_local {
+                    edges.push(CallEdge {
+                        caller_file: file.relative_path.clone(),
+                        caller_symbol: symbol.name.clone(),
+                        callee_file: file.relative_path.clone(),
+                        callee_symbol: callee_name,
+                        confidence: CallConfidence::Exact,
+                    });
                     continue;
                 }
 
@@ -1065,5 +1091,122 @@ fn helper(_y: i32) -> i32 { 0 }
         let source = "fn real_fn() { helper(); }";
         let calls = extract_call_sites_from_source(source, "rust", "nonexistent");
         assert!(calls.is_empty());
+    }
+
+    // ─── Intra-file call graph tests ─────────────────────────────────────────
+
+    /// Build a minimal `CodebaseIndex` containing a single Rust file whose
+    /// parse result has two symbols — `caller` and `helper` — and whose
+    /// content text allows the tree-sitter extractor to find the call.
+    fn make_intra_file_index() -> crate::index::CodebaseIndex {
+        use crate::index::CodebaseIndex;
+        use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = crate::budget::counter::TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = "fn helper() -> i32 { 42 }\nfn caller() -> i32 { helper() }";
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, src).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: src.len() as u64,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "lib.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "helper".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn helper() -> i32".into(),
+                        body: "{ 42 }".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "caller".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn caller() -> i32".into(),
+                        body: "{ helper() }".into(),
+                        start_line: 2,
+                        end_line: 2,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let mut content_map = HashMap::new();
+        content_map.insert("lib.rs".to_string(), src.to_string());
+
+        CodebaseIndex::build_with_content(files, parse_results, &counter, content_map)
+    }
+
+    #[test]
+    fn test_call_graph_tracks_intra_file_calls() {
+        // Verify that the call from `caller` to `helper` within lib.rs produces
+        // an intra-file CallEdge (same file for both caller and callee).
+        let index = make_intra_file_index();
+        let cg = build_call_graph(&index);
+
+        let has_intra_edge = cg.edges.iter().any(|e| {
+            e.caller_file == "lib.rs"
+                && e.callee_file == "lib.rs"
+                && e.caller_symbol == "caller"
+                && e.callee_symbol == "helper"
+        });
+        assert!(
+            has_intra_edge,
+            "expected intra-file edge caller→helper in lib.rs; edges: {:?}",
+            cg.edges
+        );
+    }
+
+    #[test]
+    fn test_call_graph_intra_file_edge_is_exact() {
+        // Intra-file edges must be Exact, not Approximate.
+        let index = make_intra_file_index();
+        let cg = build_call_graph(&index);
+
+        let edge = cg.edges.iter().find(|e| {
+            e.caller_file == "lib.rs"
+                && e.callee_file == "lib.rs"
+                && e.caller_symbol == "caller"
+                && e.callee_symbol == "helper"
+        });
+        let edge = edge.expect("intra-file edge should exist");
+        assert_eq!(
+            edge.confidence,
+            CallConfidence::Exact,
+            "intra-file edges must have Exact confidence"
+        );
+    }
+
+    #[test]
+    fn test_call_graph_intra_file_not_in_unresolved() {
+        // `helper()` called inside `caller` should NOT appear in unresolved
+        // once intra-file resolution is applied.
+        let index = make_intra_file_index();
+        let cg = build_call_graph(&index);
+
+        let in_unresolved = cg
+            .unresolved
+            .iter()
+            .any(|u| u.caller_file == "lib.rs" && u.callee_name == "helper");
+        assert!(
+            !in_unresolved,
+            "helper should be resolved intra-file, not unresolved: {:?}",
+            cg.unresolved
+        );
     }
 }
