@@ -3,6 +3,13 @@ use super::{Detection, Finding};
 
 const MAX_RETURN_BYTES: usize = 1_048_576; // 1 MB
 
+/// Enforces the 1 MB return payload limit.
+///
+/// Note: This function runs on the host AFTER the `Vec<Finding>` has been
+/// deserialized from WASM linear memory.  A future enhancement should enforce
+/// the limit on the raw byte slice read from WASM memory, before
+/// `serde_json::from_slice`, to prevent the host from allocating memory for
+/// a payload that will be rejected.
 pub fn enforce_return_limit(
     findings: Vec<Finding>,
 ) -> Result<Vec<Finding>, Box<dyn std::error::Error>> {

@@ -41,13 +41,10 @@ pub struct GitContext {
 
 /// Format a Unix timestamp (seconds since epoch) as "YYYY-MM-DD" without chrono.
 fn format_date(unix_secs: i64) -> String {
-    // Days since Unix epoch
-    let days = unix_secs / 86_400;
-
-    // Offset negative timestamps to epoch if somehow negative
-    if days < 0 {
-        return "1970-01-01".to_string();
-    }
+    // Use div_euclid so that negative timestamps floor correctly (e.g. -1 → day -1,
+    // not day 0 as plain `/` would give).  We then clamp to 0 so that any timestamp
+    // before the Unix epoch renders as "1970-01-01" rather than a pre-1970 date.
+    let days = unix_secs.div_euclid(86_400).max(0);
 
     // Compute year/month/day using the proleptic Gregorian calendar algorithm
     // Reference: https://en.wikipedia.org/wiki/Julian_day#Julian_day_number_calculation
@@ -79,7 +76,23 @@ pub fn extract_git_context(
     let repo = git2::Repository::open(repo_path)?;
 
     let mut revwalk = repo.revwalk()?;
-    revwalk.push_head()?;
+    match revwalk.push_head() {
+        Ok(_) => {}
+        Err(push_head_err) => {
+            // Detached HEAD — push the commit HEAD points to directly.
+            // If HEAD cannot be resolved (unborn branch / empty repo), propagate the
+            // original error so callers get a meaningful failure.
+            let fallback_ok = repo
+                .head()
+                .ok()
+                .and_then(|h| h.peel_to_commit().ok())
+                .map(|c| revwalk.push(c.id()))
+                .is_some();
+            if !fallback_ok {
+                return Err(push_head_err);
+            }
+        }
+    }
     revwalk.set_sorting(git2::Sort::TIME)?;
 
     let mut commits: Vec<CommitInfo> = Vec::new();
@@ -312,6 +325,27 @@ mod tests {
     }
 
     #[test]
+    fn test_format_date_negative_timestamps_floor_to_epoch() {
+        // All negative timestamps should render as 1970-01-01, not a wrong date
+        // caused by rounding toward zero with plain `/`.
+        assert_eq!(
+            format_date(-86_399),
+            "1970-01-01",
+            "-86399s should floor to epoch"
+        );
+        assert_eq!(
+            format_date(-86_400),
+            "1970-01-01",
+            "-86400s should floor to epoch"
+        );
+        assert_eq!(
+            format_date(-1_000_000),
+            "1970-01-01",
+            "large negative should floor to epoch"
+        );
+    }
+
+    #[test]
     fn test_multiple_contributors() {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
@@ -349,5 +383,20 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let result = extract_git_context(dir.path(), 100);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_detached_head_succeeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "t@t.com").unwrap();
+        let c1 = make_commit(&repo, &sig, "initial", &[("a.txt", "1")], None);
+
+        // Detach HEAD by pointing it directly at the commit object.
+        repo.set_head_detached(c1).unwrap();
+
+        let ctx = extract_git_context(dir.path(), 100).unwrap();
+        assert_eq!(ctx.commits.len(), 1);
+        assert_eq!(ctx.commits[0].message, "initial");
     }
 }

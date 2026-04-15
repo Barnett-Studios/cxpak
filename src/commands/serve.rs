@@ -1296,7 +1296,8 @@ fn mcp_stdio_loop_with_io(
                                     "tokens": { "type": "string", "description": "Token budget (default '50k')", "default": "50k" },
                                     "focus": { "type": "string", "description": "Path prefix to scope" },
                                     "include_tests": { "type": "boolean", "description": "Include mapped test files (default true)", "default": true },
-                                    "include_blast_radius": { "type": "boolean", "description": "Include blast radius analysis (default true)", "default": true }
+                                    "include_blast_radius": { "type": "boolean", "description": "Include blast radius analysis (default true)", "default": true },
+                                    "mode": { "type": "string", "description": "Context mode: 'full' (default) or 'briefing'", "enum": ["full", "briefing"] }
                                 },
                                 "required": ["task"]
                             }
@@ -2776,13 +2777,18 @@ fn handle_tool_call(
 
             // Validate parameter requirements before rendering.
             if visual_type == "flow" && symbol.is_none() {
-                return mcp_tool_result(
+                return mcp_error_response(
                     id,
-                    "Error: 'symbol' argument is required when type='flow'",
+                    -32602,
+                    "Invalid params: symbol is required when type=flow",
                 );
             }
             if visual_type == "diff" && files_arg.is_none() {
-                return mcp_tool_result(id, "Error: 'files' argument is required when type='diff'");
+                return mcp_error_response(
+                    id,
+                    -32602,
+                    "Invalid params: files is required when type=diff",
+                );
             }
 
             #[cfg(feature = "visual")]
@@ -6453,10 +6459,16 @@ mod tests {
             &snap,
         );
         assert_eq!(resp["jsonrpc"], "2.0");
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        // Now returns an error response (-32602 InvalidParams), not a tool result.
+        let code = resp["error"]["code"].as_i64().unwrap();
+        assert_eq!(
+            code, -32602,
+            "flow without symbol must return -32602 InvalidParams"
+        );
+        let msg = resp["error"]["message"].as_str().unwrap();
         assert!(
-            text.contains("Error") && text.contains("symbol"),
-            "flow without symbol must return error mentioning 'symbol', got: {text}"
+            msg.contains("symbol"),
+            "error message must mention 'symbol', got: {msg}"
         );
     }
 
@@ -6473,10 +6485,16 @@ mod tests {
             &snap,
         );
         assert_eq!(resp["jsonrpc"], "2.0");
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        // Now returns an error response (-32602 InvalidParams), not a tool result.
+        let code = resp["error"]["code"].as_i64().unwrap();
+        assert_eq!(
+            code, -32602,
+            "diff without files must return -32602 InvalidParams"
+        );
+        let msg = resp["error"]["message"].as_str().unwrap();
         assert!(
-            text.contains("Error") && text.contains("files"),
-            "diff without files must return error mentioning 'files', got: {text}"
+            msg.contains("files"),
+            "error message must mention 'files', got: {msg}"
         );
     }
 

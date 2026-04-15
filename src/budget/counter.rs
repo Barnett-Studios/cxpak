@@ -17,9 +17,13 @@ impl TokenCounter {
         }
     }
 
-    /// Count tokens in a string
+    /// Count tokens in a string.
+    ///
+    /// Uses `encode_ordinary` so that special tokens such as `<|endoftext|>` are
+    /// treated as literal text rather than single synthetic tokens, giving accurate
+    /// counts for user-supplied content.
     pub fn count(&self, text: &str) -> usize {
-        self.bpe.encode_with_special_tokens(text).len()
+        self.bpe.encode_ordinary(text).len()
     }
 
     /// Count tokens in a string, returning 0 for empty input
@@ -76,5 +80,17 @@ mod tests {
         let counter = TokenCounter::new();
         let count = counter.count_or_zero("hello world");
         assert!(count > 0);
+    }
+
+    #[test]
+    fn test_count_special_token_treated_as_literal() {
+        let counter = TokenCounter::new();
+        // With encode_ordinary, <|endoftext|> is treated as multiple literal tokens,
+        // not a single special token.  The count must be > 1.
+        let count = counter.count("<|endoftext|>");
+        assert!(
+            count > 1,
+            "special token must be counted as literal text (>1 token), got {count}"
+        );
     }
 }

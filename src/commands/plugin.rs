@@ -122,7 +122,10 @@ pub fn run_add(
     std::fs::create_dir_all(&manifest_dir)?;
     let manifest_path = manifest_dir.join("plugins.json");
     let json = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(&manifest_path, json)?;
+    // Atomic write: write to .tmp then rename so the file is never partially written.
+    let tmp_path = manifest_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json)?;
+    std::fs::rename(&tmp_path, &manifest_path)?;
 
     println!("Added plugin '{name}'");
     println!("  path:     {relative}");
@@ -262,6 +265,30 @@ mod tests {
         assert!(
             msg.contains("inside the repo root"),
             "error should mention 'inside the repo root', got: {msg}"
+        );
+    }
+
+    /// After run_add succeeds, no leftover .tmp file must remain.
+    #[test]
+    fn test_add_leaves_no_tmp_file() {
+        let dir = TempDir::new().unwrap();
+        let wasm_path = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm_path, b"fake wasm").unwrap();
+
+        run_add(
+            dir.path(),
+            &wasm_path,
+            None,
+            &["**/*.rs".to_string()],
+            false,
+        )
+        .unwrap();
+
+        let tmp = dir.path().join(".cxpak").join("plugins.json.tmp");
+        assert!(
+            !tmp.exists(),
+            "atomic write must not leave a .tmp file, but found: {}",
+            tmp.display()
         );
     }
 

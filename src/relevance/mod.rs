@@ -118,17 +118,42 @@ impl MultiSignalScorer {
     }
 
     /// Score all files in the index against the query.
+    ///
+    /// The query embedding is computed once here and reused for every file,
+    /// avoiding per-file provider creation and embed calls.
     pub fn score_all(&self, query: &str, index: &CodebaseIndex) -> Vec<ScoredFile> {
+        // Compute the query embedding a single time before the per-file loop.
+        #[cfg(feature = "embeddings")]
+        let query_embedding: Option<Vec<f32>> = {
+            use crate::embeddings::{create_provider, EmbeddingConfig};
+            create_provider(EmbeddingConfig::local_default())
+                .ok()
+                .and_then(|p| p.embed(query).ok())
+        };
+        #[cfg(not(feature = "embeddings"))]
+        let query_embedding: Option<Vec<f32>> = None;
+
         index
             .files
             .iter()
-            .map(|f| self.score(query, &f.relative_path, index))
+            .map(|f| {
+                self.score_with_embedding(
+                    query,
+                    &f.relative_path,
+                    index,
+                    query_embedding.as_deref(),
+                )
+            })
             .collect()
     }
-}
 
-impl RelevanceScorer for MultiSignalScorer {
-    fn score(&self, query: &str, file_path: &str, index: &CodebaseIndex) -> ScoredFile {
+    fn score_with_embedding(
+        &self,
+        query: &str,
+        file_path: &str,
+        index: &CodebaseIndex,
+        query_embedding: Option<&[f32]>,
+    ) -> ScoredFile {
         let w = &self.weights;
         let expanded = self.expanded_tokens.as_ref();
 
@@ -141,12 +166,15 @@ impl RelevanceScorer for MultiSignalScorer {
 
         // Signal 7: embedding similarity (feature-gated, value 0.0 when inactive).
         #[cfg(feature = "embeddings")]
-        let emb_sig = signals::embedding_similarity_signal(query, file_path, index);
+        let emb_sig = signals::embedding_similarity_signal(query_embedding, file_path, index);
         #[cfg(not(feature = "embeddings"))]
-        let emb_sig = SignalResult {
-            name: "embedding_similarity",
-            score: 0.0,
-            detail: "embeddings feature not enabled".to_string(),
+        let emb_sig = {
+            let _ = query_embedding;
+            SignalResult {
+                name: "embedding_similarity",
+                score: 0.0,
+                detail: "embeddings feature not enabled".to_string(),
+            }
         };
 
         let combined = w.path_similarity * path_sig.score
@@ -181,6 +209,14 @@ impl RelevanceScorer for MultiSignalScorer {
             ],
             token_count,
         }
+    }
+}
+
+impl RelevanceScorer for MultiSignalScorer {
+    fn score(&self, query: &str, file_path: &str, index: &CodebaseIndex) -> ScoredFile {
+        // Single-file scoring path: no cached embedding available.
+        // Use score_all for bulk scoring to share the query embedding across files.
+        self.score_with_embedding(query, file_path, index, None)
     }
 }
 

@@ -40,6 +40,8 @@ pub fn run_diff(path: &Path) -> Result<(), Box<dyn Error>> {
     let index = build_index(path)?;
     let repo = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let current = build_export(&repo.to_string_lossy(), index.conventions);
+    // diff_exports(current, baseline) — reports changes SINCE baseline.
+    // Argument order verified: current is freshly computed, baseline is stored.
     let diff = diff_exports(&current, &baseline);
     println!("{}", serde_json::to_string_pretty(&diff)?);
     Ok(())

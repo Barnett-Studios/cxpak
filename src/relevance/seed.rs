@@ -125,13 +125,10 @@ pub fn select_seeds_with_graph(
         }
     }
 
-    // Step 6: Sort by score descending
+    // Step 6: Sort by score descending using total_cmp for a strict total order
+    // (handles NaN deterministically rather than treating it as Equal).
     let mut results: Vec<ScoredFile> = result_map.into_values().collect();
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     // Step 7: Truncate to limit
     results.truncate(limit);

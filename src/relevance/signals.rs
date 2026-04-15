@@ -146,7 +146,7 @@ pub fn symbol_match(
 }
 
 /// ImportProximity: Boost if file imports or is imported by other files.
-/// Returns 0.5 (neutral) if no connections, scales up with more connections (capped at 10).
+/// Returns 0.0 when no connections exist, scales to 1.0 at 10+ connections.
 pub fn import_proximity(file_path: &str, index: &CodebaseIndex) -> SignalResult {
     let file = match index.files.iter().find(|f| f.relative_path == file_path) {
         Some(f) => f,
@@ -198,16 +198,11 @@ pub fn import_proximity(file_path: &str, index: &CodebaseIndex) -> SignalResult 
         .count();
 
     let connections = outgoing + incoming;
-    if connections == 0 {
-        return SignalResult {
-            name: "import_proximity",
-            score: 0.5, // neutral
-            detail: "no imports".to_string(),
-        };
-    }
 
-    // Scale: 0.5 (neutral) up to 1.0, capped at 10 connections
-    let score = 0.5 + 0.5 * (connections.min(10) as f64 / 10.0);
+    // Scale: 0.0 (no connections) to 1.0 (10+ connections), capped at 10.
+    // Floor is 0.0 so disconnected files score lower than weakly-connected ones
+    // — preserving full signal discrimination across the range.
+    let score = connections.min(10) as f64 / 10.0;
 
     SignalResult {
         name: "import_proximity",
@@ -306,10 +301,10 @@ pub fn recency_boost_signal(file_path: &str, index: &CodebaseIndex) -> SignalRes
     let score = crate::intelligence::recent_changes::recency_score_for_file(file_path, index);
     let detail = if score > 0.6 {
         "in 30d churn bucket".to_string()
-    } else if score == 0.0 {
-        "in 180d bucket only".to_string()
-    } else {
+    } else if score > 0.0 {
         "no git history".to_string()
+    } else {
+        "in 180d bucket only".to_string()
     };
     SignalResult {
         name: "recency_boost",
@@ -331,18 +326,18 @@ pub fn pagerank_signal(file_path: &str, pagerank: &HashMap<String, f64>) -> Sign
     }
 }
 
-/// EmbeddingSimilarity: cosine similarity of the query embedding to the file's stored embedding.
+/// EmbeddingSimilarity: cosine similarity of a pre-computed query embedding to the file's
+/// stored embedding.
 ///
 /// Requires the `embeddings` feature and an `embedding_index` in the index.
-/// Returns a neutral score of 0.5 if no embedding is available for `file_path`.
+/// `query_embedding` must be computed once by the caller before the per-file loop to avoid
+/// embedding the same query string on every invocation.  Pass `None` to get a neutral 0.5.
 #[cfg(feature = "embeddings")]
 pub fn embedding_similarity_signal(
-    query: &str,
+    query_embedding: Option<&[f32]>,
     file_path: &str,
     index: &CodebaseIndex,
 ) -> crate::relevance::SignalResult {
-    use crate::embeddings::{create_provider, EmbeddingConfig};
-
     let emb_index = match &index.embedding_index {
         Some(ei) => ei,
         None => {
@@ -354,31 +349,18 @@ pub fn embedding_similarity_signal(
         }
     };
 
-    // Embed the query on-the-fly using the local provider.
-    let config = EmbeddingConfig::local_default();
-    let provider = match create_provider(config) {
-        Ok(p) => p,
-        Err(e) => {
+    let query_vec = match query_embedding {
+        Some(v) => v,
+        None => {
             return crate::relevance::SignalResult {
                 name: "embedding_similarity",
                 score: 0.5,
-                detail: format!("provider error: {e}"),
+                detail: "no query embedding".to_string(),
             }
         }
     };
 
-    let query_vec = match provider.embed(query) {
-        Ok(v) => v,
-        Err(e) => {
-            return crate::relevance::SignalResult {
-                name: "embedding_similarity",
-                score: 0.5,
-                detail: format!("embed error: {e}"),
-            }
-        }
-    };
-
-    match emb_index.cosine_similarity(file_path, &query_vec) {
+    match emb_index.cosine_similarity(file_path, query_vec) {
         Some(sim) => {
             // Cosine similarity is in [-1, 1]; map to [0, 1].
             let score = ((sim + 1.0) / 2.0).clamp(0.0, 1.0);
@@ -573,7 +555,12 @@ mod tests {
         );
         let index = CodebaseIndex::build(files, pr, &counter);
         let result = import_proximity("a.rs", &index);
-        assert!(result.score >= 0.5);
+        // a.rs has 1 outgoing import → score = 1/10 = 0.1, which is > 0.0 (no-connection floor).
+        assert!(
+            result.score > 0.0,
+            "file with imports must score above 0.0: {}",
+            result.score
+        );
     }
 
     #[test]
@@ -591,8 +578,8 @@ mod tests {
         let index = CodebaseIndex::build(files, HashMap::new(), &counter);
         let result = import_proximity("standalone.rs", &index);
         assert!(
-            (result.score - 0.5).abs() < 0.01,
-            "no imports should be neutral (0.5): {}",
+            result.score < 0.01,
+            "no imports should score 0.0 (floor): {}",
             result.score
         );
     }
@@ -776,18 +763,18 @@ mod tests {
         );
         let index = CodebaseIndex::build(files, pr, &counter);
 
-        // middleware.rs should match (segment "middleware" == path stem "middleware")
+        // middleware.rs should match (segment "middleware" == path stem "middleware") → score > 0.0
         let result_mw = import_proximity("middleware.rs", &index);
         assert!(
-            result_mw.score > 0.5,
+            result_mw.score > 0.0,
             "middleware.rs should match via segment: {}",
             result_mw.score
         );
 
-        // ware.rs should NOT match (no segment equals "ware")
+        // ware.rs should NOT match (no segment equals "ware") → score == 0.0
         let result_ware = import_proximity("ware.rs", &index);
         assert!(
-            result_ware.score <= 0.5,
+            result_ware.score < 0.01,
             "ware.rs should not match 'middleware' by substring: {}",
             result_ware.score
         );
@@ -954,11 +941,11 @@ mod tests {
             },
         );
         let index = CodebaseIndex::build(files, pr, &counter);
-        // a.rs has no outgoing imports and stem "a" is too short → no incoming match
+        // a.rs has no outgoing imports and stem "a" is too short → no incoming match → 0.0
         let result = import_proximity("a.rs", &index);
         assert!(
-            (result.score - 0.5).abs() < 0.01,
-            "short stem should be neutral: {}",
+            result.score < 0.01,
+            "short stem with no connections should score 0.0: {}",
             result.score
         );
     }

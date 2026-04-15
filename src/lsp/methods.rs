@@ -1,6 +1,15 @@
 use std::path::Path;
 use tower_lsp::lsp_types::{CodeLens, Command, Position, Range, Url};
 
+/// Error type returned by [`handle_custom_method`].
+#[derive(Debug)]
+pub enum LspMethodError {
+    /// The requested method name is not registered (maps to JSON-RPC MethodNotFound -32601).
+    NotFound(String),
+    /// An internal error occurred while handling the method (maps to InternalError -32603).
+    Internal(String),
+}
+
 /// Convert a `file://` URI to a path relative to `repo_root`.
 ///
 /// Example: `file:///Users/me/repo/src/main.rs` + `/Users/me/repo` → `src/main.rs`
@@ -192,7 +201,7 @@ pub fn handle_custom_method(
     method: &str,
     _params: serde_json::Value,
     index: &crate::index::CodebaseIndex,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<serde_json::Value>, LspMethodError> {
     match method {
         "cxpak/health" => Ok(Some(serde_json::json!({
             "total_files": index.total_files,
@@ -200,7 +209,7 @@ pub fn handle_custom_method(
         }))),
         "cxpak/conventions" => serde_json::to_value(&index.conventions)
             .map(Some)
-            .map_err(|e| format!("serialization failed: {e}")),
+            .map_err(|e| LspMethodError::Internal(format!("serialization failed: {e}"))),
         "cxpak/blastRadius" => Ok(Some(serde_json::json!({
             "note": "use cxpak/health for file counts; blast radius requires file param"
         }))),
@@ -218,7 +227,7 @@ pub fn handle_custom_method(
             "status": "available",
             "method": method,
         }))),
-        _ => Err(format!("unknown method: {method}")),
+        _ => Err(LspMethodError::NotFound(method.to_string())),
     }
 }
 
@@ -401,10 +410,13 @@ mod tests {
     }
 
     #[test]
-    fn custom_method_unknown_returns_error() {
+    fn custom_method_unknown_returns_not_found() {
         let index = make_test_index();
         let result = handle_custom_method("cxpak/nonexistent", serde_json::Value::Null, &index);
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(LspMethodError::NotFound(_))),
+            "unknown method must return LspMethodError::NotFound"
+        );
     }
 
     #[test]

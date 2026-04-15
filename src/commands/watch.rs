@@ -14,8 +14,8 @@ const MAX_DEBOUNCE_ITERS: usize = 40; // 40 × 50 ms = 2 s
 
 pub fn run(
     path: &Path,
-    _token_budget: usize,
-    _format: &OutputFormat,
+    token_budget: usize,
+    format: &OutputFormat,
     _verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Canonicalize the base path so that absolute paths delivered by `notify`
@@ -27,10 +27,12 @@ pub fn run(
     let mut index = build_index(&canon_path)?;
 
     eprintln!(
-        "cxpak: watching {} ({} files indexed, {} tokens)",
+        "cxpak: watching {} ({} files indexed, {} tokens, budget={}, format={:?})",
         canon_path.display(),
         index.total_files,
-        index.total_tokens
+        index.total_tokens,
+        token_budget,
+        format
     );
 
     let watcher = FileWatcher::new(&canon_path)?;
@@ -77,12 +79,15 @@ pub(crate) fn classify_changes(
         match change {
             FileChange::Created(p) | FileChange::Modified(p) => {
                 if let Ok(rel) = p.strip_prefix(base_path) {
-                    modified_paths.insert(rel.to_string_lossy().to_string());
+                    // Use a lowercase key so that case-insensitive filesystems
+                    // (macOS HFS+, Windows NTFS) don't produce duplicate entries
+                    // for the same file with different capitalisation.
+                    modified_paths.insert(rel.to_string_lossy().to_ascii_lowercase());
                 }
             }
             FileChange::Removed(p) => {
                 if let Ok(rel) = p.strip_prefix(base_path) {
-                    removed_paths.insert(rel.to_string_lossy().to_string());
+                    removed_paths.insert(rel.to_string_lossy().to_ascii_lowercase());
                 }
             }
         }
@@ -275,6 +280,23 @@ mod tests {
         let count = apply_incremental_update(&mut index, dir.path(), &modified, &removed);
         // File doesn't exist, read_to_string fails, so no update
         assert_eq!(count, 0);
+    }
+
+    /// Case-insensitive FS dedup: two events for the same file with different case must
+    /// produce a single entry in the modified set.
+    #[test]
+    fn test_classify_changes_deduplicates_case_variants() {
+        let base = PathBuf::from("/repo");
+        let changes = vec![
+            FileChange::Modified(PathBuf::from("/repo/Src/Main.rs")),
+            FileChange::Modified(PathBuf::from("/repo/src/main.rs")),
+        ];
+        let (modified, _removed) = classify_changes(&changes, &base);
+        assert_eq!(
+            modified.len(),
+            1,
+            "case variants of the same path must dedup to one entry, got: {modified:?}"
+        );
     }
 
     /// classify_changes with a canonical absolute base path returns a non-empty result.

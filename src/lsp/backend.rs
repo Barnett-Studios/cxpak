@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
@@ -5,11 +6,13 @@ use tower_lsp::{async_trait, Client, LanguageServer};
 
 type SharedIndex = Arc<RwLock<crate::index::CodebaseIndex>>;
 type SharedPath = Arc<std::path::PathBuf>;
+type SharedDocuments = Arc<RwLock<HashMap<Url, String>>>;
 
 pub struct CxpakLspBackend {
     pub client: Client,
     pub index: SharedIndex,
     pub path: SharedPath,
+    pub documents: SharedDocuments,
 }
 
 impl CxpakLspBackend {
@@ -18,6 +21,7 @@ impl CxpakLspBackend {
             client,
             index,
             path,
+            documents: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -29,16 +33,28 @@ impl CxpakLspBackend {
         }
     }
 
+    fn method_err(e: super::methods::LspMethodError) -> tower_lsp::jsonrpc::Error {
+        use super::methods::LspMethodError;
+        match e {
+            LspMethodError::NotFound(m) => tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::MethodNotFound,
+                message: m.into(),
+                data: None,
+            },
+            LspMethodError::Internal(m) => tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+                message: m.into(),
+                data: None,
+            },
+        }
+    }
+
     pub async fn custom_health(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
         let idx = self.index.read().map_err(Self::lock_err)?;
         match super::methods::handle_custom_method("cxpak/health", serde_json::Value::Null, &idx) {
             Ok(Some(v)) => Ok(v),
             Ok(None) => Ok(serde_json::Value::Null),
-            Err(e) => Err(tower_lsp::jsonrpc::Error {
-                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
-                message: e.into(),
-                data: None,
-            }),
+            Err(e) => Err(Self::method_err(e)),
         }
     }
 
@@ -51,11 +67,7 @@ impl CxpakLspBackend {
         ) {
             Ok(Some(v)) => Ok(v),
             Ok(None) => Ok(serde_json::Value::Null),
-            Err(e) => Err(tower_lsp::jsonrpc::Error {
-                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
-                message: e.into(),
-                data: None,
-            }),
+            Err(e) => Err(Self::method_err(e)),
         }
     }
 
@@ -68,11 +80,7 @@ impl CxpakLspBackend {
         ) {
             Ok(Some(v)) => Ok(v),
             Ok(None) => Ok(serde_json::Value::Null),
-            Err(e) => Err(tower_lsp::jsonrpc::Error {
-                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
-                message: e.into(),
-                data: None,
-            }),
+            Err(e) => Err(Self::method_err(e)),
         }
     }
 
@@ -93,6 +101,9 @@ impl LanguageServer for CxpakLspBackend {
     async fn initialize(&self, _params: InitializeParams) -> LspResult<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
+                )),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(false),
                 }),
@@ -109,6 +120,28 @@ impl LanguageServer for CxpakLspBackend {
             },
             ..Default::default()
         })
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        if let Ok(mut docs) = self.documents.write() {
+            docs.insert(params.text_document.uri, params.text_document.text);
+        }
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        if let (Ok(mut docs), Some(change)) = (
+            self.documents.write(),
+            params.content_changes.into_iter().last(),
+        ) {
+            // Full-document sync: last change carries the complete new content.
+            docs.insert(params.text_document.uri, change.text);
+        }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        if let Ok(mut docs) = self.documents.write() {
+            docs.remove(&params.text_document.uri);
+        }
     }
 
     async fn initialized(&self, _params: InitializedParams) {
@@ -182,15 +215,27 @@ impl LanguageServer for CxpakLspBackend {
             })
         };
 
-        let content: String = match file {
-            Some(f) => f.content.clone(),
-            None => {
-                // Fall back to reading from disk when the file isn't indexed yet.
-                let path_opt =
-                    super::methods::uri_to_rel_path(uri, &self.path).map(|rel| self.path.join(rel));
-                match path_opt.and_then(|p| std::fs::read_to_string(p).ok()) {
-                    Some(c) => c,
-                    None => return Ok(None),
+        // Prefer the in-memory document (most recent editor state) over the indexed
+        // content, falling back to disk when the URI is not open in the editor.
+        let in_memory = self
+            .documents
+            .read()
+            .ok()
+            .and_then(|docs| docs.get(uri).cloned());
+
+        let content: String = if let Some(text) = in_memory {
+            text
+        } else {
+            match file {
+                Some(f) => f.content.clone(),
+                None => {
+                    // Fall back to reading from disk when the file isn't indexed yet.
+                    let path_opt = super::methods::uri_to_rel_path(uri, &self.path)
+                        .map(|rel| self.path.join(rel));
+                    match path_opt.and_then(|p| std::fs::read_to_string(p).ok()) {
+                        Some(c) => c,
+                        None => return Ok(None),
+                    }
                 }
             }
         };
