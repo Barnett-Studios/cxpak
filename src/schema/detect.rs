@@ -28,8 +28,14 @@ static RE_SQLALCHEMY_TABLE: LazyLock<Regex> = LazyLock::new(|| {
 static RE_SQLALCHEMY_COL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\w+)\s*=\s*Column\(([^)]*)\)").expect("RE_SQLALCHEMY_COL"));
 
-static RE_SQLALCHEMY_FK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"ForeignKey\(["']([^"'.]+)\."#).expect("RE_SQLALCHEMY_FK"));
+// Captures schema-qualified foreign key references: ForeignKey("table.col"),
+// ForeignKey("schema.table.col"), ForeignKey("db.schema.table.col"), etc.
+// Group 1 captures everything before the final dot segment (may include dots
+// for multi-part qualifications); group 2 captures the table name (penultimate
+// segment). The caller splits group 1 on '.' and takes the last component.
+static RE_SQLALCHEMY_FK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"ForeignKey\(["']([^"']+)\.([^"'.]+)["']"#).expect("RE_SQLALCHEMY_FK")
+});
 
 static RE_TYPEORM_ENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"@Entity\(["']([^"']+)["']\)"#).expect("RE_TYPEORM_ENTITY"));
@@ -240,8 +246,12 @@ fn extract_sqlalchemy_fields(body: &str) -> Vec<OrmFieldSchema> {
         // Check for ForeignKey
         let is_relation = args.contains("ForeignKey(");
         let related_model = if is_relation {
-            // Extract table from ForeignKey("table.col")
-            RE_SQLALCHEMY_FK.captures(&args).map(|c| c[1].to_string())
+            // Extract table from ForeignKey("table.col") or ForeignKey("schema.table.col").
+            // Capture group 1 holds everything before the final dot; group 2 holds
+            // the column name. The table is the last segment of group 1.
+            RE_SQLALCHEMY_FK
+                .captures(&args)
+                .map(|c| c[1].split('.').next_back().unwrap_or(&c[1]).to_string())
         } else {
             None
         };
@@ -2139,6 +2149,48 @@ mod tests {
         let _ = &*RE_PRISMA_DIR;
         let _ = &*RE_DRIZZLE;
         let _ = &*RE_GENERIC_MIGRATION;
+    }
+
+    #[test]
+    fn test_sqlalchemy_fk_schema_qualified_two_part() {
+        // ForeignKey("users.id") → table "users"
+        let caps = RE_SQLALCHEMY_FK
+            .captures(r#"ForeignKey("users.id")"#)
+            .unwrap();
+        let table = caps[1]
+            .split('.')
+            .next_back()
+            .unwrap_or(&caps[1])
+            .to_string();
+        assert_eq!(table, "users");
+    }
+
+    #[test]
+    fn test_sqlalchemy_fk_schema_qualified_three_part() {
+        // ForeignKey("public.users.id") → table "users"
+        let caps = RE_SQLALCHEMY_FK
+            .captures(r#"ForeignKey("public.users.id")"#)
+            .unwrap();
+        let table = caps[1]
+            .split('.')
+            .next_back()
+            .unwrap_or(&caps[1])
+            .to_string();
+        assert_eq!(table, "users");
+    }
+
+    #[test]
+    fn test_sqlalchemy_fk_schema_qualified_four_part() {
+        // ForeignKey("db.public.users.id") → table "users"
+        let caps = RE_SQLALCHEMY_FK
+            .captures(r#"ForeignKey("db.public.users.id")"#)
+            .unwrap();
+        let table = caps[1]
+            .split('.')
+            .next_back()
+            .unwrap_or(&caps[1])
+            .to_string();
+        assert_eq!(table, "users");
     }
 
     // Django table name uses camel_to_snake (not to_lowercase) when no db_table override.

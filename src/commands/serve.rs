@@ -6611,6 +6611,7 @@ mod tests {
                     callee_file: "src/lib.rs".to_string(),
                     callee_symbol: "helper".to_string(),
                     confidence: crate::intelligence::call_graph::CallConfidence::Exact,
+                    resolution_note: None,
                 },
                 CallEdge {
                     caller_file: "src/lib.rs".to_string(),
@@ -6618,6 +6619,7 @@ mod tests {
                     callee_file: "src/util.rs".to_string(),
                     callee_symbol: "util_fn".to_string(),
                     confidence: crate::intelligence::call_graph::CallConfidence::Exact,
+                    resolution_note: None,
                 },
             ],
             unresolved: vec![],
@@ -6678,6 +6680,7 @@ mod tests {
                     callee_file: "src/lib.rs".to_string(),
                     callee_symbol: "helper".to_string(),
                     confidence: crate::intelligence::call_graph::CallConfidence::Exact,
+                    resolution_note: None,
                 },
                 // Only caller in src/
                 CallEdge {
@@ -6686,6 +6689,7 @@ mod tests {
                     callee_file: "vendor/ext.rs".to_string(),
                     callee_symbol: "ext_fn".to_string(),
                     confidence: crate::intelligence::call_graph::CallConfidence::Exact,
+                    resolution_note: None,
                 },
             ],
             unresolved: vec![],

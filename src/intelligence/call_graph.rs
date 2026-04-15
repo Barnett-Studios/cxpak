@@ -17,6 +17,13 @@ pub struct CallEdge {
     pub callee_file: String,
     pub callee_symbol: String,
     pub confidence: CallConfidence,
+    /// Present when this edge was resolved ambiguously. For example, when
+    /// multiple files export the same symbol the Approximate picker selects
+    /// the first exporter lexicographically — deterministic but arbitrary.
+    /// Consumers that require exact provenance should treat this edge as
+    /// low-confidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_note: Option<String>,
 }
 
 /// A call that could not be resolved to a specific file.
@@ -743,6 +750,7 @@ pub fn build_call_graph(index: &crate::index::CodebaseIndex) -> CallGraph {
                         callee_file: file.relative_path.clone(),
                         callee_symbol: callee_name,
                         confidence: CallConfidence::Exact,
+                        resolution_note: None,
                     });
                     continue;
                 }
@@ -765,21 +773,33 @@ pub fn build_call_graph(index: &crate::index::CodebaseIndex) -> CallGraph {
                             callee_file,
                             callee_symbol: callee_name,
                             confidence: CallConfidence::Exact,
+                            resolution_note: None,
                         });
                     }
                 } else if let Some(exporters) = symbol_exports.get(&callee_name) {
-                    // Approximate: symbol exists elsewhere but we can't confirm import
+                    // Approximate: symbol exists elsewhere but we can't confirm import.
                     let other: Vec<&String> = exporters
                         .iter()
                         .filter(|e| *e != &file.relative_path)
                         .collect();
                     if !other.is_empty() {
+                        // When multiple files export the same symbol, we emit an
+                        // edge only to the first exporter lexicographically. This
+                        // is deterministic (exporters are pre-sorted) but
+                        // arbitrary — a call to `serialize` that ambiguously
+                        // resolves to 5 crates picks one.
+                        let resolution_note = if other.len() > 1 {
+                            Some(format!("ambiguous: {} exporters", other.len()))
+                        } else {
+                            None
+                        };
                         edges.push(CallEdge {
                             caller_file: file.relative_path.clone(),
                             caller_symbol: symbol.name.clone(),
                             callee_file: other[0].clone(),
                             callee_symbol: callee_name,
                             confidence: CallConfidence::Approximate,
+                            resolution_note,
                         });
                     }
                 } else {
@@ -839,6 +859,7 @@ mod tests {
                     callee_file: "b.rs".into(),
                     callee_symbol: "bar".into(),
                     confidence: CallConfidence::Exact,
+                    resolution_note: None,
                 },
                 CallEdge {
                     caller_file: "c.rs".into(),
@@ -846,6 +867,7 @@ mod tests {
                     callee_file: "b.rs".into(),
                     callee_symbol: "bar".into(),
                     confidence: CallConfidence::Approximate,
+                    resolution_note: None,
                 },
             ],
             unresolved: vec![],
@@ -869,6 +891,7 @@ mod tests {
                 callee_file: "b.rs".into(),
                 callee_symbol: "init".into(),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             }],
             unresolved: vec![],
         };
@@ -893,6 +916,7 @@ mod tests {
                 callee_file: "b.rs".into(),
                 callee_symbol: "bar".into(),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             }],
             unresolved: vec![UnresolvedCall {
                 caller_file: "a.rs".into(),

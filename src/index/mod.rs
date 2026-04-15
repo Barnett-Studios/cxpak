@@ -383,6 +383,16 @@ impl CodebaseIndex {
     pub fn rebuild_graph(&mut self) {
         self.graph = crate::index::graph::build_dependency_graph(&self.files, self.schema.as_ref());
         self.call_graph = crate::intelligence::call_graph::build_call_graph(self);
+        // Re-inject cross-language edges so incremental rebuilds don't lose
+        // the HttpCall / FfiBinding / GrpcCall / etc. edges that were detected
+        // during the original full build.
+        for e in &self.cross_lang_edges {
+            self.graph.add_edge(
+                &e.source_file,
+                &e.target_file,
+                crate::index::graph::EdgeType::CrossLanguage(e.bridge_type.clone()),
+            );
+        }
     }
 
     /// Rebuild the index incrementally: re-parse only files whose mtime/size differs.
@@ -524,6 +534,10 @@ impl CodebaseIndex {
     /// Remove a file from the index by relative path.
     ///
     /// Adjusts language stats and totals. No-op if the file is not present.
+    ///
+    /// Uses [`Vec::swap_remove`] — this is O(1) but reorders the vector.
+    /// Callers holding saved `usize` indices into `self.files` must re-derive
+    /// them after this call.
     pub fn remove_file(&mut self, relative_path: &str) {
         if let Some(pos) = self
             .files

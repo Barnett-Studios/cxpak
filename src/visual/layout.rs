@@ -391,23 +391,31 @@ pub(crate) fn barycenter_sort(
 /// Returns x,y for each node id. y is determined by layer × layer_sep.
 /// Layers are centered horizontally relative to each other; the global x minimum is
 /// shifted to 0 so all positions are non-negative.
+///
+/// `node_widths` maps node id → actual width, allowing variable-width nodes
+/// (e.g. cluster nodes, god-file nodes) to be placed without overlap.
+/// Falls back to `config.node_width` for any node not in the map.
 pub(crate) fn assign_coordinates(
     layer_order: &[Vec<String>],
+    node_widths: &HashMap<String, f64>,
     config: &LayoutConfig,
 ) -> HashMap<String, Point> {
     let mut coords: HashMap<String, Point> = HashMap::new();
 
     for (layer_idx, layer) in layer_order.iter().enumerate() {
-        let y = layer_idx as f64 * config.layer_sep;
-        let n = layer.len() as f64;
-        // Total width of the layer: n nodes each of width node_width, separated by node_sep.
-        let total_width = n * config.node_width + (n - 1.0).max(0.0) * config.node_sep;
-        // Center horizontally: start at half the total width offset from 0.
-        let x_start = -total_width / 2.0 + config.node_width / 2.0;
+        let widths: Vec<f64> = layer
+            .iter()
+            .map(|id| node_widths.get(id).copied().unwrap_or(config.node_width))
+            .collect();
+        let total_width: f64 =
+            widths.iter().sum::<f64>() + (layer.len().saturating_sub(1)) as f64 * config.node_sep;
+        let mut x = -total_width / 2.0;
+        let y = layer_idx as f64 * (config.node_height + config.layer_sep);
 
-        for (pos, id) in layer.iter().enumerate() {
-            let x = x_start + pos as f64 * (config.node_width + config.node_sep);
+        for (id, w) in layer.iter().zip(widths.iter()) {
+            x += w / 2.0;
             coords.insert(id.clone(), Point { x, y });
+            x += w / 2.0 + config.node_sep;
         }
     }
 
@@ -483,7 +491,10 @@ pub fn compute_layout(
     barycenter_sort(&mut layer_order, &adjacency, &reverse_adjacency);
 
     // 7. Coordinate assignment.
-    let coords = assign_coordinates(&layer_order, config);
+    // Build per-node width lookup from augmented nodes (includes cluster nodes).
+    let node_widths: HashMap<String, f64> =
+        aug_nodes.iter().map(|n| (n.id.clone(), n.width)).collect();
+    let coords = assign_coordinates(&layer_order, &node_widths, config);
 
     // 8. Build the dummy id set for fast lookup.
     let dummy_set: std::collections::HashSet<&str> = dummy_ids.iter().map(|s| s.as_str()).collect();
@@ -672,7 +683,10 @@ fn enforce_cognitive_limit(
         let cluster_node = LayoutNode {
             id: cluster_id.clone(),
             label: format!("{} more…", excess.len()),
-            layer: 0, // will be set by compute_layout
+            // Set the layer explicitly so layer_assign places the cluster in
+            // the correct row. Without this, all_layers in compute_layout
+            // initialises the cluster to layer 0 via `or_insert(node.layer)`.
+            layer: layer_idx,
             position: Point::default(),
             width: 160.0,
             height: 48.0,
@@ -1208,7 +1222,8 @@ mod tests {
             vec!["d".to_string(), "e".to_string()],
         ];
         let config = LayoutConfig::default();
-        let coords = assign_coordinates(&layer_order, &config);
+        let node_widths: HashMap<String, f64> = HashMap::new();
+        let coords = assign_coordinates(&layer_order, &node_widths, &config);
         let x_a = coords["a"].x;
         let x_b = coords["b"].x;
         let x_c = coords["c"].x;

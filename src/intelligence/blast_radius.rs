@@ -107,6 +107,11 @@ pub(crate) fn is_test_path(path: &str) -> bool {
     }
     // Also catch filename-level markers like foo_test.rs, test_foo.py, etc.
     if let Some(filename) = parts.last() {
+        // A path whose final component is a bare directory name like "tests"
+        // or "spec" (e.g. when the index contains directory entries).
+        if matches!(*filename, "tests" | "test" | "spec" | "__tests__") {
+            return true;
+        }
         if filename.contains("_test.")
             || filename.contains("_spec.")
             || filename.starts_with("test_")

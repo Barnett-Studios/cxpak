@@ -2279,10 +2279,15 @@ fn layout_from_snapshot(
         dir_to_files.entry(dir).or_default().push(f.path.clone());
     }
 
+    const MAX_HEURISTIC_EDGES_PER_DIR: usize = 20;
     let mut edges: Vec<LayoutEdge> = Vec::new();
     for dir_files in dir_to_files.values() {
-        for i in 0..dir_files.len() {
+        let mut edge_count = 0usize;
+        'outer: for i in 0..dir_files.len() {
             for j in (i + 1)..dir_files.len() {
+                if edge_count >= MAX_HEURISTIC_EDGES_PER_DIR {
+                    break 'outer;
+                }
                 edges.push(LayoutEdge {
                     source: dir_files[i].clone(),
                     target: dir_files[j].clone(),
@@ -2291,6 +2296,7 @@ fn layout_from_snapshot(
                     is_cycle: false,
                     waypoints: vec![],
                 });
+                edge_count += 1;
             }
         }
     }

@@ -22,9 +22,11 @@ pub fn co_change_weight(days_ago: i64) -> f64 {
 
 /// Build co-change edges from a list of (commit_files, days_ago) pairs.
 ///
-/// A pair (file_a, file_b) becomes an edge when it co-appears in >= 3 commits
-/// within the 180-day window. `recency_weight` is the weight of the most recent
-/// co-commit (not the average), per the design spec.
+/// Emits an edge for every pair that co-appears at least once. Threshold
+/// filtering is the responsibility of the caller (see
+/// [`build_co_change_edges_with_dates`] and [`build_co_change_edges`]).
+/// `recency_weight` is the weight of the most recent co-commit (not the
+/// average), per the design spec.
 ///
 /// `commits` is `Vec<(Vec<String>, i64)>` where the i64 is days_ago at index time.
 pub fn build_co_changes(commits: &[(Vec<String>, i64)]) -> Vec<CoChangeEdge> {
@@ -55,7 +57,6 @@ pub fn build_co_changes(commits: &[(Vec<String>, i64)]) -> Vec<CoChangeEdge> {
 
     pair_data
         .into_iter()
-        .filter(|(_, (count, _))| *count >= 3)
         .map(
             |((file_a, file_b), (count, most_recent_days))| CoChangeEdge {
                 file_a,
@@ -120,6 +121,7 @@ pub fn mine_co_changes_from_git(
     }
 
     let mut results = Vec::new();
+    let mut consecutive_old = 0usize;
 
     for oid_result in revwalk {
         let oid = match oid_result {
@@ -133,8 +135,17 @@ pub fn mine_co_changes_from_git(
 
         let commit_time = commit.time().seconds();
         if commit_time < cutoff {
-            break; // revwalk is time-ordered descending
+            // Revwalks on repos with branches, rebases, or grafts are not
+            // strictly time-ordered descending. A single old commit does not
+            // mean all following commits are old — tolerate up to 50
+            // consecutive out-of-window commits before giving up.
+            consecutive_old += 1;
+            if consecutive_old >= 50 {
+                break;
+            }
+            continue;
         }
+        consecutive_old = 0;
 
         let days_ago = (now - commit_time) / 86400;
 
@@ -198,17 +209,20 @@ mod tests {
     }
 
     #[test]
-    fn test_build_co_changes_threshold_3() {
-        // Two files co-appear in exactly 2 commits -> filtered out (< 3)
+    fn test_build_co_changes_emits_all_pairs() {
+        // build_co_changes has no internal threshold — it emits every pair.
+        // Two files co-appearing in 2 commits should produce 1 edge.
         let commits = vec![
             (vec!["a.rs".to_string(), "b.rs".to_string()], 10i64),
             (vec!["a.rs".to_string(), "b.rs".to_string()], 20i64),
         ];
         let edges = build_co_changes(&commits);
-        assert!(
-            edges.is_empty(),
-            "pairs with < 3 co-commits must be excluded"
+        assert_eq!(
+            edges.len(),
+            1,
+            "build_co_changes must emit all pairs regardless of count"
         );
+        assert_eq!(edges[0].count, 2);
     }
 
     #[test]
@@ -320,26 +334,30 @@ mod tests {
 
     #[test]
     fn test_build_co_changes_multiple_pairs() {
-        // Three files co-appearing: a+b (4x), a+c (3x), b+c (2x - excluded)
+        // Three files co-appearing: a+b (4x), a+c (3x), b+c (2x).
+        // build_co_changes emits all three pairs — no internal threshold.
         let commits: Vec<(Vec<String>, i64)> = (0..4)
             .map(|i| (vec!["a.rs".to_string(), "b.rs".to_string()], i as i64 * 10))
             .chain((0..3).map(|i| (vec!["a.rs".to_string(), "c.rs".to_string()], i as i64 * 10)))
             .chain((0..2).map(|i| (vec!["b.rs".to_string(), "c.rs".to_string()], i as i64 * 10)))
             .collect();
         let edges = build_co_changes(&commits);
-        assert_eq!(
-            edges.len(),
-            2,
-            "a+b and a+c should qualify; b+c (count=2) should not"
-        );
+        assert_eq!(edges.len(), 3, "all three pairs must be emitted");
         let has_ab = edges.iter().any(|e| {
             (e.file_a == "a.rs" && e.file_b == "b.rs") || (e.file_a == "b.rs" && e.file_b == "a.rs")
         });
         let has_ac = edges.iter().any(|e| {
             (e.file_a == "a.rs" && e.file_b == "c.rs") || (e.file_a == "c.rs" && e.file_b == "a.rs")
         });
+        let has_bc = edges.iter().any(|e| {
+            (e.file_a == "b.rs" && e.file_b == "c.rs") || (e.file_a == "c.rs" && e.file_b == "b.rs")
+        });
         assert!(has_ab);
         assert!(has_ac);
+        assert!(
+            has_bc,
+            "b+c (count=2) must now be emitted by build_co_changes"
+        );
     }
 
     #[test]
@@ -412,19 +430,18 @@ mod tests {
 
     #[test]
     fn test_build_co_change_edges_with_dates_custom_threshold() {
-        // 2 commits within window, threshold=2 -> should produce edge
+        // 2 commits within window, threshold=2 -> should produce an edge.
+        // build_co_changes no longer has an internal threshold; the caller
+        // threshold is the sole gate.
         let commits = vec![
             (vec!["a.rs".to_string(), "b.rs".to_string()], 5i64),
             (vec!["a.rs".to_string(), "b.rs".to_string()], 15i64),
         ];
-        // build_co_changes requires >= 3, but build_co_change_edges_with_dates
-        // first delegates to build_co_changes then applies its own threshold.
-        // Since build_co_changes hard-codes >= 3 and count=2 < 3,
-        // this should still be empty.
         let edges = build_co_change_edges_with_dates(&commits, 2, 180);
-        assert!(
-            edges.is_empty(),
-            "build_co_changes internal threshold of 3 still applies"
+        assert_eq!(
+            edges.len(),
+            1,
+            "count=2 meets threshold=2 and must produce an edge"
         );
     }
 

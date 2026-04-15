@@ -634,6 +634,7 @@ mod tests {
                     callee_file: "src/b.rs".into(),
                     callee_symbol: "my_fn".into(),
                     confidence: CallConfidence::Exact,
+                    resolution_note: None,
                 },
                 CallEdge {
                     caller_file: "src/other.rs".into(),
@@ -641,6 +642,7 @@ mod tests {
                     callee_file: "src/b.rs".into(),
                     callee_symbol: "my_fn".into(),
                     confidence: CallConfidence::Approximate,
+                    resolution_note: None,
                 },
             ],
             unresolved: Vec::new(),
@@ -683,6 +685,7 @@ mod tests {
                 callee_file: "src/b.rs".into(),
                 callee_symbol: "helper".into(),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             }],
             unresolved: Vec::new(),
         };
@@ -706,6 +709,7 @@ mod tests {
                 callee_file: "src/b.rs".into(),
                 callee_symbol: "my_fn".into(),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             }],
             unresolved: Vec::new(),
         };

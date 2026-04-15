@@ -5,6 +5,20 @@ use crate::schema::{
     TableSchema, ViewSchema,
 };
 use regex::Regex;
+use std::sync::LazyLock;
+
+// ---------------------------------------------------------------------------
+// Compile-once regex statics — avoids recompiling on every call.
+// ---------------------------------------------------------------------------
+
+static RE_VIEW_SOURCES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)").expect("RE_VIEW_SOURCES")
+});
+
+static RE_FUNCTION_SOURCES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+([a-zA-Z_][a-zA-Z0-9_.]*)")
+        .expect("RE_FUNCTION_SOURCES")
+});
 
 /// Strip an optional `schema.` prefix from a table reference.
 ///
@@ -468,9 +482,8 @@ pub fn extract_table_schema(
 /// Extract a `ViewSchema` from a SELECT body, collecting referenced table names.
 pub fn extract_view_schema(body: &str, view_name: &str, file_path: &str) -> ViewSchema {
     // Words that appear immediately after FROM or JOIN are table names.
-    let re = Regex::new(r"(?i)\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)").unwrap();
     let mut source_tables: Vec<String> = Vec::new();
-    for cap in re.captures_iter(body) {
+    for cap in RE_VIEW_SOURCES.captures_iter(body) {
         let tbl = strip_schema_prefix(&cap[1]).to_string();
         if !source_tables.contains(&tbl) {
             source_tables.push(tbl);
@@ -485,10 +498,8 @@ pub fn extract_view_schema(body: &str, view_name: &str, file_path: &str) -> View
 
 /// Extract a `DbFunctionSchema` from function body text.
 pub fn extract_function_schema(body: &str, func_name: &str, file_path: &str) -> DbFunctionSchema {
-    let re =
-        Regex::new(r"(?i)\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+([a-zA-Z_][a-zA-Z0-9_.]*)").unwrap();
     let mut referenced_tables: Vec<String> = Vec::new();
-    for cap in re.captures_iter(body) {
+    for cap in RE_FUNCTION_SOURCES.captures_iter(body) {
         let tbl = strip_schema_prefix(&cap[1]).to_string();
         if !referenced_tables.contains(&tbl) {
             referenced_tables.push(tbl);

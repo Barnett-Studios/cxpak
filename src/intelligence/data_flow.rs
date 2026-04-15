@@ -114,11 +114,16 @@ fn module_boundary_crossed(a: &str, b: &str) -> bool {
 /// Compute confidence for a path based on its individual hop confidences and
 /// whether any parameter could not be matched (passed in as `unresolved`).
 fn path_confidence(hops: &[CallConfidence], unresolved: bool) -> FlowConfidence {
-    if unresolved || hops.contains(&CallConfidence::Approximate) {
-        FlowConfidence::Speculative
-    } else {
-        FlowConfidence::Exact
+    if unresolved {
+        return FlowConfidence::Speculative;
     }
+    if hops
+        .iter()
+        .any(|h| matches!(h, CallConfidence::Approximate))
+    {
+        return FlowConfidence::Approximate;
+    }
+    FlowConfidence::Exact
 }
 
 /// One BFS frontier entry: which hop, which path of nodes built so far, and
@@ -595,6 +600,7 @@ mod tests {
                 callee_file: "src/db.rs".into(),
                 callee_symbol: "save_user".into(),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             }],
             unresolved: Vec::new(),
         };
@@ -626,6 +632,7 @@ mod tests {
                 callee_file: format!("src/f{}.rs", i + 1),
                 callee_symbol: format!("step_{}", i + 1),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             });
         }
         index.call_graph = CallGraph {
@@ -655,6 +662,7 @@ mod tests {
                     callee_file: "src/middle.rs".into(),
                     callee_symbol: "route".into(),
                     confidence: CallConfidence::Exact,
+                    resolution_note: None,
                 },
                 CallEdge {
                     caller_file: "src/middle.rs".into(),
@@ -662,6 +670,7 @@ mod tests {
                     callee_file: "src/db.rs".into(),
                     callee_symbol: "save_user".into(),
                     confidence: CallConfidence::Exact,
+                    resolution_note: None,
                 },
             ],
             unresolved: Vec::new(),
@@ -677,8 +686,8 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_dynamic_dispatch_speculative() {
-        // CallConfidence::Approximate → entire path becomes Speculative.
+    fn test_trace_dynamic_dispatch_approximate() {
+        // CallConfidence::Approximate without unresolved → path is Approximate.
         let mut index = build_index_with_symbols(&[
             ("src/api.rs", "rust", "fn handle_request(req: Request)"),
             ("src/save.rs", "rust", "fn save_record(req: Request)"),
@@ -690,12 +699,13 @@ mod tests {
                 callee_file: "src/save.rs".into(),
                 callee_symbol: "save_record".into(),
                 confidence: CallConfidence::Approximate,
+                resolution_note: None,
             }],
             unresolved: Vec::new(),
         };
         let result = trace_data_flow("handle_request", None, 10, &index);
         assert_eq!(result.paths.len(), 1);
-        assert_eq!(result.paths[0].confidence, FlowConfidence::Speculative);
+        assert_eq!(result.paths[0].confidence, FlowConfidence::Approximate);
     }
 
     #[test]
@@ -712,6 +722,7 @@ mod tests {
                 callee_file: "src/db.rs".into(),
                 callee_symbol: "save_user".into(),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             }],
             unresolved: Vec::new(),
         };
@@ -739,6 +750,7 @@ mod tests {
                     callee_file: "src/b.rs".into(),
                     callee_symbol: "b_fn".into(),
                     confidence: CallConfidence::Exact,
+                    resolution_note: None,
                 },
                 CallEdge {
                     caller_file: "src/b.rs".into(),
@@ -746,6 +758,7 @@ mod tests {
                     callee_file: "src/a.rs".into(),
                     callee_symbol: "a_fn".into(),
                     confidence: CallConfidence::Exact,
+                    resolution_note: None,
                 },
             ],
             unresolved: Vec::new(),
@@ -773,6 +786,7 @@ mod tests {
                 callee_file: "src/db/repo.rs".into(),
                 callee_symbol: "save_row".into(),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             }],
             unresolved: Vec::new(),
         };
@@ -859,6 +873,7 @@ mod tests {
                 callee_file: "src/dbwrite.rs".into(),
                 callee_symbol: "save_user".into(),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             }],
             unresolved: Vec::new(),
         };
@@ -886,6 +901,7 @@ mod tests {
                 callee_file: "src/db.rs".into(),
                 callee_symbol: "save_user".into(),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             }],
             unresolved: Vec::new(),
         };
@@ -967,6 +983,7 @@ mod tests {
                 callee_file: format!("src/f{}.rs", i + 1),
                 callee_symbol: format!("step_{}", i + 1),
                 confidence: CallConfidence::Exact,
+                resolution_note: None,
             });
         }
         index.call_graph = CallGraph {

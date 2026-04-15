@@ -8,6 +8,7 @@ use std::collections::HashSet;
 // Task 12: Embedded SQL detection
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct EmbeddedSqlRef {
     pub table_name: String,
 }
@@ -28,13 +29,15 @@ pub fn detect_embedded_sql(content: &str) -> Vec<EmbeddedSqlRef> {
     let mut seen = HashSet::new();
     let mut refs = Vec::new();
 
-    // Must contain at least one DML keyword AND one structural keyword
+    // Must contain at least one DML keyword AND one structural keyword.
+    // UPDATE is intentionally excluded from the DML guard: it is too often a
+    // method name (e.g. JS .update(), React state updates) and produces false
+    // positives when it appears alone. SELECT / INSERT / DELETE / CREATE are
+    // unambiguous SQL keywords.
     let upper = content.to_uppercase();
-    let has_dml = [
-        "SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ", "ALTER ", "DROP ",
-    ]
-    .iter()
-    .any(|kw| upper.contains(kw));
+    let has_dml = ["SELECT ", "INSERT ", "DELETE ", "CREATE "]
+        .iter()
+        .any(|kw| upper.contains(kw));
     let has_structural = ["FROM ", "INTO ", "TABLE ", "SET ", "UPDATE ", "JOIN "]
         .iter()
         .any(|kw| upper.contains(kw));
@@ -44,6 +47,23 @@ pub fn detect_embedded_sql(content: &str) -> Vec<EmbeddedSqlRef> {
     }
 
     for cap in re.captures_iter(content) {
+        // Skip matches that start on a comment line. This filters the most
+        // common false positives such as `// UPDATE the state` or
+        // `# UPDATE from docs`. It doesn't cover block comments, but eliminates
+        // the overwhelming majority of noise.
+        let match_start = cap.get(0).map(|m| m.start()).unwrap_or(0);
+        let line_start = content[..match_start]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let line_prefix = content[line_start..match_start].trim_start();
+        if line_prefix.starts_with("//")
+            || line_prefix.starts_with('#')
+            || line_prefix.starts_with("--")
+            || line_prefix.starts_with('*')
+        {
+            continue;
+        }
         let table = cap[1].to_string();
         // Filter out SQL reserved words that can appear after FROM/JOIN/INTO/UPDATE/TABLE
         let table_upper = table.to_uppercase();
@@ -371,8 +391,22 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_embedded_sql_update() {
+    fn test_detect_embedded_sql_update_alone_no_edge() {
+        // UPDATE alone no longer qualifies as a DML keyword to prevent false
+        // positives from method calls like `.update()`. A bare UPDATE query
+        // without SELECT / INSERT / DELETE / CREATE does not produce an edge.
         let content = r#"db.run("UPDATE products SET price = 10 WHERE id = 1")"#;
+        let refs = detect_embedded_sql(content);
+        assert!(
+            refs.is_empty(),
+            "UPDATE alone must not trigger embedded SQL detection"
+        );
+    }
+
+    #[test]
+    fn test_detect_embedded_sql_update_with_select() {
+        // UPDATE in a transaction that also contains SELECT does qualify.
+        let content = "SELECT id FROM products; UPDATE products SET price = 10;";
         let refs = detect_embedded_sql(content);
         assert!(refs.iter().any(|r| r.table_name == "products"));
     }
@@ -464,6 +498,39 @@ mod tests {
     fn test_detect_embedded_sql_empty_string() {
         let refs = detect_embedded_sql("");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_detect_embedded_sql_ts_comment_update_no_edge() {
+        // A TypeScript file with only `// UPDATE the state` must not produce an edge.
+        let content = "// UPDATE the state when the user clicks\nconst state = {};\n";
+        let refs = detect_embedded_sql(content);
+        assert!(
+            refs.is_empty(),
+            "comment-only UPDATE must not produce embedded SQL refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_detect_embedded_sql_python_docstring_no_edge() {
+        // Python docstring containing "Update from into_db" — no real SQL.
+        let content = "def save():\n    \"\"\"Update from into_db\"\"\"\n    pass\n";
+        let refs = detect_embedded_sql(content);
+        assert!(
+            refs.is_empty(),
+            "docstring pseudo-SQL must not produce embedded SQL refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_detect_embedded_sql_real_join_query_produces_edge() {
+        let content = "SELECT * FROM users JOIN orders ON users.id = orders.user_id";
+        let refs = detect_embedded_sql(content);
+        let names: Vec<&str> = refs.iter().map(|r| r.table_name.as_str()).collect();
+        assert!(names.contains(&"users"), "must find 'users': {:?}", names);
+        assert!(names.contains(&"orders"), "must find 'orders': {:?}", names);
     }
 
     // -------------------------------------------------------------------------

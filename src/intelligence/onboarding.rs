@@ -227,9 +227,11 @@ pub fn group_into_phases(
             None => continue,
         };
 
-        // Sort within each module by ascending token count (simpler first).
-        let mut sorted_module_files: Vec<String> = files.clone();
-        sorted_module_files.sort_by_key(|f| file_tokens.get(f).copied().unwrap_or(0));
+        // Preserve the topological order passed in — re-sorting by token count
+        // would discard dependency ordering within the module. Files are already
+        // ordered correctly by `group_into_phases` which calls
+        // `topological_sort_files` first.
+        let sorted_module_files: Vec<String> = files.clone();
 
         let chunk_count = sorted_module_files.len().div_ceil(MAX_PHASE_SIZE);
 

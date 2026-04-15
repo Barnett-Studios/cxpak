@@ -27,7 +27,8 @@ fn mermaid_id(id: &str) -> String {
             c => c,
         })
         .collect();
-    if escaped.len() > 32 {
+    let char_count = escaped.chars().count();
+    if char_count > 32 {
         escaped.chars().take(32).collect()
     } else {
         escaped
@@ -40,8 +41,13 @@ pub fn to_mermaid(layout: &ComputedLayout) -> String {
 
     for node in &layout.nodes {
         let mid = mermaid_id(&node.id);
-        // Escape label double-quotes by replacing with single-quotes
-        let label = node.label.replace('"', "'");
+        // Sanitize label: replace characters that break Mermaid syntax.
+        let label = node
+            .label
+            .replace('"', "'")
+            .replace('[', "(")
+            .replace(']', ")")
+            .replace('|', "/");
         out.push_str(&format!("    {}[\"{}\"]\n", mid, label));
     }
 
@@ -183,6 +189,13 @@ pub fn to_png(
     height: u32,
 ) -> Result<Vec<u8>, ExportError> {
     use resvg::{tiny_skia, usvg};
+
+    const MAX_DIM: u32 = 16384;
+    if width > MAX_DIM || height > MAX_DIM {
+        return Err(ExportError::PngRaster(format!(
+            "canvas dimensions {width}x{height} exceed maximum {MAX_DIM}x{MAX_DIM}"
+        )));
+    }
 
     let svg_str = to_svg(layout, metadata);
     let opt = usvg::Options::default();
