@@ -614,10 +614,13 @@ impl CodebaseIndex {
 /// Returns `None` on any error (missing API key, no network, etc.) so that
 /// the rest of the index build always succeeds.
 #[cfg(feature = "embeddings")]
-pub fn build_embedding_index(index: &CodebaseIndex) -> Option<crate::embeddings::EmbeddingIndex> {
+pub fn build_embedding_index(
+    index: &CodebaseIndex,
+    repo_path: &std::path::Path,
+) -> Option<crate::embeddings::EmbeddingIndex> {
     use crate::embeddings::{create_provider, EmbeddingConfig, EmbeddingIndex};
 
-    let config = EmbeddingConfig::local_default();
+    let config = EmbeddingConfig::from_repo_root(repo_path);
     let provider = match create_provider(config.clone()) {
         Ok(p) => p,
         Err(_) => return None,
@@ -651,7 +654,10 @@ pub fn build_embedding_index(index: &CodebaseIndex) -> Option<crate::embeddings:
         let texts: Vec<&str> = chunk.iter().map(|(_, sig)| sig.as_str()).collect();
         let vectors = match provider.embed_batch(&texts) {
             Ok(v) => v,
-            Err(_) => return None,
+            Err(e) => {
+                eprintln!("cxpak: embedding batch failed (skipping): {e}");
+                continue;
+            }
         };
         for ((path, _sig), vector) in chunk.iter().zip(vectors) {
             emb_index.add(path.clone(), vector);

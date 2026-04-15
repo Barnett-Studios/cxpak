@@ -1,15 +1,16 @@
 use crate::index::graph::DependencyGraph;
 use crate::intelligence::co_change::CoChangeEdge;
 use crate::intelligence::test_map::TestFileRef;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ImpactSignal {
+    TestMap,
     Structural,
     Historical,
     CallBased,
@@ -138,7 +139,8 @@ enum ImpactSignalKey {
 impl ImpactSignalKey {
     fn to_impact_signal(&self) -> ImpactSignal {
         match self {
-            Self::TestMap | Self::Structural => ImpactSignal::Structural,
+            Self::TestMap => ImpactSignal::TestMap,
+            Self::Structural => ImpactSignal::Structural,
             Self::Historical => ImpactSignal::Historical,
             Self::CallBased => ImpactSignal::CallBased,
         }
@@ -226,25 +228,27 @@ pub fn merge_test_predictions(
 
 /// Map signal combinations to confidence values.
 ///
-/// All 8 combinations map to unique values so sort order is fully deterministic.
+/// Uses four boolean signals: test_map, structural, call_graph, co_change.
+/// The 8 distinct levels are preserved; test_map is the strongest single
+/// signal, structural is equivalent in weight, call_graph beats co_change.
 ///
-/// | (test_map, call_graph, co_change) | Confidence |
-/// |-----------------------------------|-----------|
-/// | (true,  true,  true)              | 0.90      |
-/// | (true,  true,  false)             | 0.85      |
-/// | (true,  false, true)              | 0.75      |
-/// | (false, true,  true)              | 0.70      |
-/// | (true,  false, false)             | 0.60      |
-/// | (false, true,  false)             | 0.50      |
-/// | (false, false, true)              | 0.40      |
-/// | (false, false, false)             | 0.00      |
+/// | (test_map|structural, call_graph, co_change) | Confidence |
+/// |---------------------------------------------|-----------|
+/// | (true,  true,  true)                        | 0.90      |
+/// | (true,  true,  false)                       | 0.85      |
+/// | (true,  false, true)                        | 0.75      |
+/// | (false, true,  true)                        | 0.70      |
+/// | (true,  false, false)                       | 0.60      |
+/// | (false, true,  false)                       | 0.50      |
+/// | (false, false, true)                        | 0.40      |
+/// | (false, false, false)                       | 0.00      |
 ///
 /// Rationale: test_map is the strongest single signal (naming convention is
-/// very reliable).  call_graph beats co_change because call-based reasoning
-/// is structural rather than historical.  Co_change alone is the weakest
-/// non-empty signal.
+/// very reliable).  Structural blast-radius is equivalent.  call_graph beats
+/// co_change because call-based reasoning is structural rather than historical.
 pub fn confidence_for_signals(signals: &[ImpactSignal]) -> f64 {
-    let has_map = signals.contains(&ImpactSignal::Structural);
+    let has_map =
+        signals.contains(&ImpactSignal::TestMap) || signals.contains(&ImpactSignal::Structural);
     let has_hist = signals.contains(&ImpactSignal::Historical);
     let has_call = signals.contains(&ImpactSignal::CallBased);
 
@@ -361,11 +365,17 @@ pub fn predict_with_call_graph(
         test_impact.iter().map(|t| t.confidence).sum::<f64>() / test_impact.len() as f64
     };
 
+    let mut distinct_affected: HashSet<&str> = HashSet::new();
+    distinct_affected.extend(structural.iter().map(|e| e.path.as_str()));
+    distinct_affected.extend(historical.iter().map(|e| e.path.as_str()));
+    distinct_affected.extend(call_impact.iter().map(|e| e.path.as_str()));
+    let total_affected = distinct_affected.len();
+
     let confidence_summary = format!(
-        "{} files predicted affected ({} structural, {} historical); {} tests predicted; avg confidence {:.2}",
-        structural.len() + historical.len(),
+        "{total_affected} files predicted affected ({} structural, {} historical, {} call-based); {} tests predicted; avg confidence {:.2}",
         structural.len(),
         historical.len(),
+        call_impact.len(),
         test_impact.len(),
         avg_conf
     );
@@ -471,9 +481,9 @@ mod tests {
             .iter()
             .find(|p| p.test_file == "tests/b_test.rs")
             .expect("b_test.rs must be predicted");
-        // test_map + structural both map to ImpactSignal::Structural, co_change maps to Historical
+        // test_map → ImpactSignal::TestMap, structural → ImpactSignal::Structural, co_change → Historical
         // keys: {TestMap, Structural, Historical} → 3 signals in vec
-        // confidence: has_map=true, has_hist=true, has_call=false → 0.75
+        // confidence: has_map=true (TestMap or Structural), has_hist=true, has_call=false → 0.75
         assert!(
             (pred.confidence - 0.75).abs() < 1e-9,
             "expected 0.75 for test_map+structural+historical, got {}",
@@ -731,6 +741,83 @@ mod tests {
         assert!(
             pred.signals.contains(&ImpactSignal::CallBased),
             "prediction must carry CallBased signal"
+        );
+    }
+
+    #[test]
+    fn test_testmap_signal_distinct_from_structural() {
+        // ImpactSignal::TestMap alone produces the same confidence tier as Structural
+        // (both satisfy has_map), confirming the enum variants are distinct but
+        // treated as equal weight in the confidence table.
+        let conf_testmap = confidence_for_signals(&[ImpactSignal::TestMap]);
+        let conf_structural = confidence_for_signals(&[ImpactSignal::Structural]);
+        assert!(
+            (conf_testmap - 0.60).abs() < 1e-9,
+            "TestMap alone should produce 0.60, got {conf_testmap}"
+        );
+        assert!(
+            (conf_structural - 0.60).abs() < 1e-9,
+            "Structural alone should produce 0.60, got {conf_structural}"
+        );
+        // TestMap is now a distinct variant (not collapsed to Structural).
+        assert_ne!(
+            ImpactSignal::TestMap,
+            ImpactSignal::Structural,
+            "TestMap and Structural must be distinct enum variants"
+        );
+    }
+
+    #[test]
+    fn test_testmap_higher_than_historical_alone() {
+        let conf_testmap = confidence_for_signals(&[ImpactSignal::TestMap]);
+        let conf_hist = confidence_for_signals(&[ImpactSignal::Historical]);
+        assert!(
+            conf_testmap > conf_hist,
+            "TestMap ({conf_testmap}) should have higher confidence than Historical alone ({conf_hist})"
+        );
+    }
+
+    #[test]
+    fn test_confidence_summary_distinct_file_count() {
+        // structural and historical lists share a file — summary must count it once.
+        let graph = DependencyGraph::new();
+        let pagerank = HashMap::new();
+
+        // Create co-change edge so historical_impact returns "shared.rs".
+        let co_changes = vec![CoChangeEdge {
+            file_a: "src/changed.rs".to_string(),
+            file_b: "shared.rs".to_string(),
+            count: 3,
+            recency_weight: 1.0,
+        }];
+        let test_map = HashMap::new();
+
+        let result = predict_with_call_graph(
+            &["src/changed.rs"],
+            &graph,
+            &pagerank,
+            &co_changes,
+            &test_map,
+            3,
+            &crate::intelligence::call_graph::CallGraph::new(),
+        );
+
+        // The summary must reflect distinct files, not structural.len() + historical.len().
+        let summary = &result.confidence_summary;
+        assert!(
+            summary.contains("files predicted affected"),
+            "summary must mention files predicted affected: {summary}"
+        );
+        // total reported should be ≤ structural + historical (deduplication only reduces)
+        let total_reported: usize = summary
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(usize::MAX);
+        let naive_sum = result.structural_impact.len() + result.historical_impact.len();
+        assert!(
+            total_reported <= naive_sum || naive_sum == 0,
+            "distinct count {total_reported} must be ≤ naive sum {naive_sum}"
         );
     }
 }

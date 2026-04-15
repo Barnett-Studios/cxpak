@@ -205,46 +205,50 @@ pub fn to_png(
         .map_err(|e| ExportError::PngRaster(e.to_string()))
 }
 
+/// Escape a string for use in a Structurizr C4 DSL string literal.
+///
+/// Removes characters that would break the DSL parser: `"` becomes a space,
+/// `{` and `}` are stripped.
+fn escape_c4(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '"' | '{' | '}' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
 /// Renders a `ComputedLayout` as a C4 model in Structurizr DSL format.
 pub fn to_c4(layout: &ComputedLayout, metadata: &RenderMetadata) -> String {
-    let repo = &metadata.repo_name;
+    let repo = escape_c4(&metadata.repo_name);
     let mut out = format!(
         "workspace {{\n  model {{\n    softwareSystem \"{}\" {{\n",
         repo
     );
 
-    // Emit containers
-    for node in &layout.nodes {
-        let label = node.label.replace('"', "'");
-        out.push_str(&format!("      container \"{}\" {{}}\n", label));
-    }
-
-    // Emit relationships using Structurizr-style variable names
-    let var_name = |label: &str| -> String {
-        label
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect::<String>()
-    };
-
-    // Build id -> label map
-    let id_to_label: std::collections::HashMap<&str, &str> = layout
+    // Build id → index map for relationship lookup.
+    let id_to_index: std::collections::HashMap<&str, usize> = layout
         .nodes
         .iter()
-        .map(|n| (n.id.as_str(), n.label.as_str()))
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
         .collect();
 
+    // Emit containers as named bindings: c0, c1, …
+    for (i, node) in layout.nodes.iter().enumerate() {
+        out.push_str(&format!(
+            "      c{i} = container \"{}\" {{}}\n",
+            escape_c4(&node.label)
+        ));
+    }
+
+    // Emit relationships using the numeric variable names.
     for edge in &layout.edges {
-        if let (Some(src_label), Some(tgt_label)) = (
-            id_to_label.get(edge.source.as_str()),
-            id_to_label.get(edge.target.as_str()),
+        if let (Some(&src), Some(&tgt)) = (
+            id_to_index.get(edge.source.as_str()),
+            id_to_index.get(edge.target.as_str()),
         ) {
-            let src_var = var_name(src_label);
-            let tgt_var = var_name(tgt_label);
-            out.push_str(&format!(
-                "      {} -> {} \"depends on\"\n",
-                src_var, tgt_var
-            ));
+            out.push_str(&format!("      c{src} -> c{tgt} \"depends on\"\n"));
         }
     }
 
@@ -378,6 +382,62 @@ mod tests {
         let meta = make_test_meta();
         let c4 = to_c4(&layout, &meta);
         assert!(c4.contains("container"));
+    }
+
+    #[test]
+    fn test_c4_containers_are_bound() {
+        let layout = make_3_module_layout();
+        let meta = make_test_meta();
+        let c4 = to_c4(&layout, &meta);
+        // Every container must be bound to a cN variable.
+        assert!(c4.contains("c0 = container"), "c0 binding missing:\n{c4}");
+        assert!(c4.contains("c1 = container"), "c1 binding missing:\n{c4}");
+        assert!(c4.contains("c2 = container"), "c2 binding missing:\n{c4}");
+        // Relationships must use numeric variable names.
+        assert!(
+            c4.contains("c0 -> c1") || c4.contains("c0 -> c2"),
+            "c0 relationship missing:\n{c4}"
+        );
+    }
+
+    #[test]
+    fn test_c4_adversarial_repo_name() {
+        // Repo name containing `"`, `{`, `}` must produce valid DSL (no stray chars).
+        let layout = make_3_module_layout();
+        let mut meta = make_test_meta();
+        meta.repo_name = r#"foo"bar{baz}"#.to_string();
+        let c4 = to_c4(&layout, &meta);
+
+        // The softwareSystem line must not contain unescaped `"` after the
+        // opening one, or unbalanced `{`/`}`.
+        let sys_line = c4
+            .lines()
+            .find(|l| l.contains("softwareSystem"))
+            .expect("softwareSystem line must be present");
+        // After stripping the DSL keyword and structural chars, no `"` or `{` or `}` from the name.
+        // The name portion is between the first and last `"` on that line.
+        let between_quotes: Vec<&str> = sys_line.splitn(3, '"').collect();
+        assert_eq!(
+            between_quotes.len(),
+            3,
+            "softwareSystem line must have exactly one quoted string: {sys_line}"
+        );
+        let name_content = between_quotes[1];
+        assert!(
+            !name_content.contains('"'),
+            "repo name must not contain unescaped quotes: {name_content}"
+        );
+        assert!(
+            !name_content.contains('{') && !name_content.contains('}'),
+            "repo name must not contain braces: {name_content}"
+        );
+    }
+
+    #[test]
+    fn test_escape_c4_chars() {
+        assert_eq!(escape_c4(r#"foo"bar"#), "foo bar");
+        assert_eq!(escape_c4("a{b}c"), "a b c");
+        assert_eq!(escape_c4("normal"), "normal");
     }
 
     #[test]

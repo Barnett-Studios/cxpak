@@ -6,6 +6,13 @@ use crate::schema::{
 };
 use regex::Regex;
 
+/// Strip an optional `schema.` prefix from a table reference.
+///
+/// `"public.users"` → `"users"`, `"users"` → `"users"`.
+fn strip_schema_prefix(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(_, t)| t)
+}
+
 // ---------------------------------------------------------------------------
 // Task 5 – SQL column-level extraction
 // ---------------------------------------------------------------------------
@@ -138,7 +145,7 @@ fn parse_references(tokens: &[&str], idx: &mut usize) -> ForeignKeyRef {
     // Strip any trailing ON DELETE / ON UPDATE that may have been lumped in.
     // Split at '(' to separate table from column.
     if let Some(paren_pos) = raw.find('(') {
-        let table = raw[..paren_pos].to_string();
+        let table = strip_schema_prefix(&raw[..paren_pos]).to_string();
         // Extract column up to closing ')'
         let rest = &raw[paren_pos + 1..];
         let col = rest.trim_end_matches(')').to_string();
@@ -157,12 +164,12 @@ fn parse_references(tokens: &[&str], idx: &mut usize) -> ForeignKeyRef {
                 .trim_end_matches(')')
                 .to_string();
             ForeignKeyRef {
-                target_table: raw.to_string(),
+                target_table: strip_schema_prefix(raw).to_string(),
                 target_column: col,
             }
         } else {
             ForeignKeyRef {
-                target_table: raw.to_string(),
+                target_table: strip_schema_prefix(raw).to_string(),
                 target_column: String::new(),
             }
         }
@@ -464,7 +471,7 @@ pub fn extract_view_schema(body: &str, view_name: &str, file_path: &str) -> View
     let re = Regex::new(r"(?i)\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)").unwrap();
     let mut source_tables: Vec<String> = Vec::new();
     for cap in re.captures_iter(body) {
-        let tbl = cap[1].to_string();
+        let tbl = strip_schema_prefix(&cap[1]).to_string();
         if !source_tables.contains(&tbl) {
             source_tables.push(tbl);
         }
@@ -482,7 +489,7 @@ pub fn extract_function_schema(body: &str, func_name: &str, file_path: &str) -> 
         Regex::new(r"(?i)\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+([a-zA-Z_][a-zA-Z0-9_.]*)").unwrap();
     let mut referenced_tables: Vec<String> = Vec::new();
     for cap in re.captures_iter(body) {
-        let tbl = cap[1].to_string();
+        let tbl = strip_schema_prefix(&cap[1]).to_string();
         if !referenced_tables.contains(&tbl) {
             referenced_tables.push(tbl);
         }
@@ -929,11 +936,12 @@ mod tests {
 
     #[test]
     fn test_schema_qualified_reference() {
+        // Schema prefix must be stripped so FKs resolve against the bare table name.
         let sql = "(id INTEGER, user_id INTEGER REFERENCES public.users(id))";
         let schema = extract_table_schema(sql, "orders", "schema.sql", 1);
         let col = schema.columns.iter().find(|c| c.name == "user_id").unwrap();
         let fk = col.foreign_key.as_ref().unwrap();
-        assert_eq!(fk.target_table, "public.users");
+        assert_eq!(fk.target_table, "users");
         assert_eq!(fk.target_column, "id");
     }
 
@@ -1137,5 +1145,68 @@ mod tests {
         let profile = model.fields.iter().find(|f| f.name == "profile").unwrap();
         assert!(profile.is_relation);
         assert_eq!(profile.related_model, Some("Profile".to_string()));
+    }
+
+    #[test]
+    fn fk_with_schema_prefix_is_stripped() {
+        // A REFERENCES clause pointing to `public.users` must resolve to `users`.
+        let sql = r#"
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES public.users(id)
+);"#;
+        let table = extract_table_schema(sql, "orders", "migrations/001.sql", 1);
+        let col = table
+            .columns
+            .iter()
+            .find(|c| c.name == "user_id")
+            .expect("user_id column must exist");
+        let fk = col.foreign_key.as_ref().expect("user_id must have FK");
+        assert_eq!(
+            fk.target_table, "users",
+            "schema prefix must be stripped: got {:?}",
+            fk.target_table
+        );
+        assert_eq!(fk.target_column, "id");
+    }
+
+    #[test]
+    fn view_schema_strips_schema_prefix() {
+        let body = "SELECT u.id FROM public.users u JOIN auth.roles r ON u.role_id = r.id";
+        let view = extract_view_schema(body, "user_roles", "views.sql");
+        assert!(
+            view.source_tables.contains(&"users".to_string()),
+            "source_tables must contain stripped 'users', got {:?}",
+            view.source_tables
+        );
+        assert!(
+            view.source_tables.contains(&"roles".to_string()),
+            "source_tables must contain stripped 'roles', got {:?}",
+            view.source_tables
+        );
+    }
+
+    #[test]
+    fn function_schema_strips_schema_prefix() {
+        let body = "BEGIN SELECT * FROM app.accounts; UPDATE billing.invoices SET paid = true; END";
+        let func = extract_function_schema(body, "process_payment", "funcs.sql");
+        assert!(
+            func.referenced_tables.contains(&"accounts".to_string()),
+            "referenced_tables must contain 'accounts', got {:?}",
+            func.referenced_tables
+        );
+        assert!(
+            func.referenced_tables.contains(&"invoices".to_string()),
+            "referenced_tables must contain 'invoices', got {:?}",
+            func.referenced_tables
+        );
+    }
+
+    #[test]
+    fn strip_schema_prefix_helper() {
+        assert_eq!(strip_schema_prefix("public.users"), "users");
+        assert_eq!(strip_schema_prefix("users"), "users");
+        assert_eq!(strip_schema_prefix("a.b.c"), "c");
+        assert_eq!(strip_schema_prefix(""), "");
     }
 }

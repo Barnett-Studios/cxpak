@@ -1062,6 +1062,19 @@ panels.parentNode.appendChild(dleg);
 "#
 }
 
+/// Sanitize a JSON string for safe embedding inside an HTML `<script>` block.
+///
+/// A `</script>` sequence inside a JSON string value would terminate the
+/// surrounding `<script>` element, allowing XSS injection.  Similarly,
+/// `<!--` can confuse HTML parsers.  Both are neutralised by escaping the
+/// leading `<` with its JSON unicode escape equivalent (`\u003c` is not
+/// used here — we use a simpler backslash form that browsers and JSON
+/// parsers both accept: `<\/script>` and `<\!--`).
+fn escape_script_tag(json: &str) -> String {
+    json.replace("</script>", r"<\/script>")
+        .replace("<!--", r"<\!--")
+}
+
 /// Renders a self-contained HTML file.  All JS/CSS is inlined — no CDN dependencies.
 ///
 /// The layout data is JSON-serialised into a `<script id="cxpak-data">` tag so
@@ -1072,7 +1085,7 @@ pub fn render_html(
     metadata: &RenderMetadata,
 ) -> String {
     let title = visual_type_name(&visual_type);
-    let layout_json = serde_json::to_string(layout).unwrap();
+    let layout_json = escape_script_tag(&serde_json::to_string(layout).unwrap());
 
     // Embed the display name in meta so JS doesn't need its own mapping.
     #[derive(serde::Serialize)]
@@ -1085,7 +1098,7 @@ pub fn render_html(
         inner: metadata,
         visual_type_display: title,
     };
-    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let meta_json = escape_script_tag(&serde_json::to_string(&meta_with_display).unwrap());
     let controller_js = view_controller_js(&visual_type);
 
     format!(
@@ -1410,11 +1423,11 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
 /// - `cxpak-meta` — `RenderMetadata` (repo name, version, etc.).
 pub fn render_dashboard(index: &CodebaseIndex, metadata: &RenderMetadata) -> String {
     let dashboard = build_dashboard_data(index);
-    let dashboard_json = serde_json::to_string(&dashboard).unwrap();
+    let dashboard_json = escape_script_tag(&serde_json::to_string(&dashboard).unwrap());
 
     // Reuse the architecture preview layout for the base graph pane.
     let layout = &dashboard.architecture_preview.layout;
-    let layout_json = serde_json::to_string(layout).unwrap();
+    let layout_json = escape_script_tag(&serde_json::to_string(layout).unwrap());
 
     let title = visual_type_name(&super::VisualType::Dashboard);
 
@@ -1428,7 +1441,7 @@ pub fn render_dashboard(index: &CodebaseIndex, metadata: &RenderMetadata) -> Str
         inner: metadata,
         visual_type_display: title,
     };
-    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let meta_json = escape_script_tag(&serde_json::to_string(&meta_with_display).unwrap());
     let controller_js = view_controller_js(&super::VisualType::Dashboard);
 
     format!(
@@ -1566,11 +1579,11 @@ pub fn render_architecture_explorer(
 ) -> Result<String, super::layout::LayoutError> {
     let config = super::layout::LayoutConfig::default();
     let explorer = build_architecture_explorer_data(index, &config)?;
-    let explorer_json = serde_json::to_string(&explorer).unwrap();
+    let explorer_json = escape_script_tag(&serde_json::to_string(&explorer).unwrap());
 
     // Use the level-1 layout as the initial graph pane data.
     let layout = &explorer.level1;
-    let layout_json = serde_json::to_string(layout).unwrap();
+    let layout_json = escape_script_tag(&serde_json::to_string(layout).unwrap());
 
     let title = visual_type_name(&super::VisualType::Architecture);
 
@@ -1584,7 +1597,7 @@ pub fn render_architecture_explorer(
         inner: metadata,
         visual_type_display: title,
     };
-    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let meta_json = escape_script_tag(&serde_json::to_string(&meta_with_display).unwrap());
     let controller_js = view_controller_js(&super::VisualType::Architecture);
 
     Ok(format!(
@@ -2121,10 +2134,10 @@ pub fn render_flow_diagram(
 ) -> Result<String, super::layout::LayoutError> {
     let config = super::layout::LayoutConfig::default();
     let flow_data = build_flow_diagram_data(flow, index, &config)?;
-    let flow_json = serde_json::to_string(&flow_data).unwrap();
+    let flow_json = escape_script_tag(&serde_json::to_string(&flow_data).unwrap());
 
     // Embed the computed layout as the base graph pane data.
-    let layout_json = serde_json::to_string(&flow_data.layout).unwrap();
+    let layout_json = escape_script_tag(&serde_json::to_string(&flow_data.layout).unwrap());
 
     let title = visual_type_name(&super::VisualType::Flow);
 
@@ -2138,7 +2151,7 @@ pub fn render_flow_diagram(
         inner: metadata,
         visual_type_display: title,
     };
-    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let meta_json = escape_script_tag(&serde_json::to_string(&meta_with_display).unwrap());
     let controller_js = view_controller_js(&super::VisualType::Flow);
 
     Ok(format!(
@@ -2480,13 +2493,18 @@ pub fn render_time_machine(
             layers: vec![],
         };
         (
-            serde_json::to_string(&empty).unwrap(),
-            serde_json::to_string(&layout).unwrap(),
+            escape_script_tag(&serde_json::to_string(&empty).unwrap()),
+            escape_script_tag(&serde_json::to_string(&layout).unwrap()),
         )
     } else {
         let data = build_time_machine_data(snapshots, config)?;
-        let layout_json = serde_json::to_string(&data.steps[data.current_index].layout).unwrap();
-        (serde_json::to_string(&data).unwrap(), layout_json)
+        let layout_json = escape_script_tag(
+            &serde_json::to_string(&data.steps[data.current_index].layout).unwrap(),
+        );
+        (
+            escape_script_tag(&serde_json::to_string(&data).unwrap()),
+            layout_json,
+        )
     };
 
     let title = visual_type_name(&super::VisualType::Timeline);
@@ -2501,7 +2519,7 @@ pub fn render_time_machine(
         inner: metadata,
         visual_type_display: title,
     };
-    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let meta_json = escape_script_tag(&serde_json::to_string(&meta_with_display).unwrap());
     let controller_js = view_controller_js(&super::VisualType::Timeline);
 
     Ok(format!(
@@ -2723,10 +2741,10 @@ pub fn render_diff_view(
     config: &super::layout::LayoutConfig,
 ) -> Result<String, super::layout::LayoutError> {
     let diff_data = build_diff_view_data(index, changed_files, config)?;
-    let diff_json = serde_json::to_string(&diff_data).unwrap();
+    let diff_json = escape_script_tag(&serde_json::to_string(&diff_data).unwrap());
 
     // Use the "after" layout as the initial graph pane.
-    let layout_json = serde_json::to_string(&diff_data.after).unwrap();
+    let layout_json = escape_script_tag(&serde_json::to_string(&diff_data.after).unwrap());
 
     let title = visual_type_name(&super::VisualType::Diff);
 
@@ -2740,7 +2758,7 @@ pub fn render_diff_view(
         inner: metadata,
         visual_type_display: title,
     };
-    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let meta_json = escape_script_tag(&serde_json::to_string(&meta_with_display).unwrap());
     let controller_js = view_controller_js(&super::VisualType::Diff);
 
     Ok(format!(
@@ -2782,7 +2800,7 @@ pub fn render_diff_view(
 /// - `cxpak-meta` — `RenderMetadata` (repo name, version, etc.).
 pub fn render_risk_heatmap(index: &CodebaseIndex, metadata: &RenderMetadata) -> String {
     let heatmap = build_risk_heatmap_data(index);
-    let heatmap_json = serde_json::to_string(&heatmap).unwrap();
+    let heatmap_json = escape_script_tag(&serde_json::to_string(&heatmap).unwrap());
 
     // Provide an empty layout so the base graph renderer has valid (no-op) data.
     let empty_layout = super::layout::ComputedLayout {
@@ -2792,7 +2810,7 @@ pub fn render_risk_heatmap(index: &CodebaseIndex, metadata: &RenderMetadata) -> 
         height: 0.0,
         layers: vec![],
     };
-    let layout_json = serde_json::to_string(&empty_layout).unwrap();
+    let layout_json = escape_script_tag(&serde_json::to_string(&empty_layout).unwrap());
 
     let title = visual_type_name(&super::VisualType::Risk);
 
@@ -2806,7 +2824,7 @@ pub fn render_risk_heatmap(index: &CodebaseIndex, metadata: &RenderMetadata) -> 
         inner: metadata,
         visual_type_display: title,
     };
-    let meta_json = serde_json::to_string(&meta_with_display).unwrap();
+    let meta_json = escape_script_tag(&serde_json::to_string(&meta_with_display).unwrap());
     let controller_js = view_controller_js(&super::VisualType::Risk);
 
     format!(
@@ -4037,5 +4055,37 @@ mod tests {
             html.contains("toExponential"),
             "rendered dashboard HTML must include toExponential fallback"
         );
+    }
+
+    #[test]
+    fn test_escape_script_tag_blocks_closing_tag_injection() {
+        let malicious = r#"{"a":"</script><script>alert(1)</script>"}"#;
+        let escaped = escape_script_tag(malicious);
+        assert!(
+            !escaped.contains("</script>"),
+            "escaped output must not contain </script>, got: {escaped}"
+        );
+        // The escaped form should be present.
+        assert!(
+            escaped.contains(r"<\/script>"),
+            "escaped output must contain <\\/script>, got: {escaped}"
+        );
+    }
+
+    #[test]
+    fn test_escape_script_tag_blocks_html_comment_injection() {
+        let input = r#"{"comment":"<!-- injection -->"}"#;
+        let escaped = escape_script_tag(input);
+        assert!(
+            !escaped.contains("<!--"),
+            "escaped output must not contain <!--, got: {escaped}"
+        );
+    }
+
+    #[test]
+    fn test_escape_script_tag_passthrough_safe_json() {
+        let safe = r#"{"key":"value","num":42}"#;
+        let escaped = escape_script_tag(safe);
+        assert_eq!(escaped, safe, "safe JSON must pass through unchanged");
     }
 }

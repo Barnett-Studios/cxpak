@@ -361,20 +361,28 @@ fn try_detect_active_record(
 
 /// Convert a CamelCase (or PascalCase) class name to snake_case.
 ///
-/// Inserts an underscore before each uppercase letter that follows a lowercase
-/// letter, then lowercases the whole string.  This matches Django's real
-/// default table-naming behaviour (without app_label prefix).
+/// Follows Django's default algorithm: only inserts an underscore when an
+/// uppercase character immediately follows a lowercase character.  Consecutive
+/// uppercase letters are NOT split (matching Django's `str.lower()` fallback
+/// for acronyms).
 ///
 /// Examples:
 /// - `UserProfile` → `user_profile`
-/// - `HTTPServer`  → `h_t_t_p_server`
+/// - `HTTPServer`  → `httpserver`
+/// - `APIKey`      → `apikey`
+/// - `User`        → `user`
+/// - (empty)       → `""`
 pub fn camel_to_snake(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
+    let mut prev_lower = false;
     for c in s.chars() {
-        if c.is_uppercase() && !out.is_empty() {
+        if c.is_uppercase() && prev_lower {
             out.push('_');
         }
-        out.extend(c.to_lowercase());
+        for lc in c.to_lowercase() {
+            out.push(lc);
+        }
+        prev_lower = c.is_lowercase();
     }
     out
 }
@@ -2083,8 +2091,18 @@ mod tests {
 
     #[test]
     fn camel_to_snake_http_server() {
-        // Consecutive uppercase letters each get a separator (simple impl).
-        assert_eq!(camel_to_snake("HTTPServer"), "h_t_t_p_server");
+        // Django default: consecutive uppercase letters are NOT split.
+        assert_eq!(camel_to_snake("HTTPServer"), "httpserver");
+    }
+
+    #[test]
+    fn camel_to_snake_api_key() {
+        assert_eq!(camel_to_snake("APIKey"), "apikey");
+    }
+
+    #[test]
+    fn camel_to_snake_empty() {
+        assert_eq!(camel_to_snake(""), "");
     }
 
     #[test]

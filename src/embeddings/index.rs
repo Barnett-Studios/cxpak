@@ -53,7 +53,11 @@ impl EmbeddingIndex {
     /// Search for the `top_k` most similar paths to `query_vector`.
     ///
     /// Returns `(path, cosine_similarity)` pairs sorted descending by similarity.
+    /// Returns an empty Vec if `query.len() != self.dims`.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(String, f64)> {
+        if query.len() != self.dims {
+            return vec![];
+        }
         if self.paths.is_empty() || top_k == 0 {
             return vec![];
         }
@@ -108,8 +112,12 @@ impl EmbeddingIndex {
 
     /// Cosine similarity of the stored vector for `path` against `query`.
     ///
-    /// Returns `None` if the path is not in the index or dimensions mismatch.
+    /// Returns `None` if the path is not in the index.
+    /// Returns `Some(0.0)` if `query.len() != self.dims`.
     pub fn cosine_similarity(&self, path: &str, query: &[f32]) -> Option<f64> {
+        if query.len() != self.dims {
+            return Some(0.0);
+        }
         let &idx = self.path_index.get(path)?;
         let v = &self.vectors[idx * self.dims..(idx + 1) * self.dims];
         let qn = l2_norm(query);
@@ -234,5 +242,32 @@ mod tests {
         // Results should be sorted descending
         assert!(results[0].1 >= results[1].1);
         assert!(results[1].1 >= results[2].1);
+    }
+
+    #[test]
+    fn search_returns_empty_on_dim_mismatch() {
+        let mut idx = EmbeddingIndex::new(4);
+        idx.add("a.rs", vec![1.0, 0.0, 0.0, 0.0]);
+
+        // Query with wrong dimensionality must return empty vec.
+        let results = idx.search(&[1.0, 0.0], 5);
+        assert!(
+            results.is_empty(),
+            "search with wrong dims should return empty, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_returns_zero_on_dim_mismatch() {
+        let mut idx = EmbeddingIndex::new(4);
+        idx.add("a.rs", vec![1.0, 0.0, 0.0, 0.0]);
+
+        // Wrong dimensionality → Some(0.0), not None.
+        let result = idx.cosine_similarity("a.rs", &[1.0, 0.0]);
+        assert_eq!(
+            result,
+            Some(0.0),
+            "dim mismatch should return Some(0.0), got {result:?}"
+        );
     }
 }

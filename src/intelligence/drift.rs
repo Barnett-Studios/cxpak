@@ -155,7 +155,14 @@ pub fn load_snapshots(repo_root: &Path) -> Vec<ArchitectureSnapshot> {
             serde_json::from_str(&content).ok()
         })
         .collect();
-    snapshots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    snapshots.sort_by(|a, b| {
+        let pa = chrono::DateTime::parse_from_rfc3339(&a.timestamp).ok();
+        let pb = chrono::DateTime::parse_from_rfc3339(&b.timestamp).ok();
+        match (pa, pb) {
+            (Some(ta), Some(tb)) => tb.cmp(&ta), // descending: newest first
+            _ => b.timestamp.cmp(&a.timestamp),  // fallback to lexicographic
+        }
+    });
     snapshots
 }
 
@@ -199,7 +206,6 @@ pub fn snapshot_from_index(
             .push(file.relative_path.clone());
     }
 
-    let module_count = module_files.len();
     let mut coupling_sum = 0.0;
     let mut cohesion_sum = 0.0;
     let mut module_count_qualifying = 0usize;
@@ -262,6 +268,8 @@ pub fn snapshot_from_index(
     } else {
         cohesion_sum / module_count_qualifying as f64
     };
+
+    let module_count = module_count_qualifying;
 
     ArchitectureSnapshot {
         timestamp: timestamp.to_string(),
@@ -559,9 +567,12 @@ mod tests {
         }
 
         let snap = snapshot_from_index(&index, "2026-04-02T00:00:00Z");
-        // module_count counts all unique prefixes, including small ones
-        assert_eq!(snap.metrics.module_count, 1);
-        // But no qualifying modules (< 3 files), so modules vec is empty
+        // module_count reflects qualifying modules only (same denominator as mean_coupling)
+        assert_eq!(
+            snap.metrics.module_count, 0,
+            "no qualifying modules (< 3 files)"
+        );
+        // modules vec is empty
         assert!(
             snap.modules.is_empty(),
             "modules with < 3 files must be skipped"
@@ -705,5 +716,112 @@ mod tests {
         );
         let bc = report.baseline.unwrap();
         assert_eq!(bc.baseline_date, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_load_snapshots_sorted_by_parsed_timestamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Write three snapshots with timestamps that sort differently
+        // lexicographically vs chronologically (UTC vs +01:00 offset).
+        let older = ArchitectureSnapshot {
+            // UTC: 2026-01-01T11:00:00Z — earlier instant
+            timestamp: "2026-01-01T11:00:00Z".to_string(),
+            metrics: ArchitectureMetrics {
+                module_count: 1,
+                mean_coupling: 0.1,
+                mean_cohesion: 0.9,
+                cycle_count: 0,
+                boundary_violation_count: 0,
+            },
+            modules: vec![],
+        };
+        let newer = ArchitectureSnapshot {
+            // offset +01:00: 2026-01-01T12:30:00+01:00 == 2026-01-01T11:30:00Z — later instant
+            timestamp: "2026-01-01T12:30:00+01:00".to_string(),
+            metrics: ArchitectureMetrics {
+                module_count: 2,
+                mean_coupling: 0.2,
+                mean_cohesion: 0.8,
+                cycle_count: 0,
+                boundary_violation_count: 0,
+            },
+            modules: vec![],
+        };
+
+        save_snapshot(dir.path(), &older).unwrap();
+        save_snapshot(dir.path(), &newer).unwrap();
+
+        let loaded = load_snapshots(dir.path());
+        assert_eq!(loaded.len(), 2, "both snapshots must load");
+        // Descending order: newest first — newer has later instant (11:30Z > 11:00Z)
+        assert_eq!(
+            loaded[0].metrics.module_count, 2,
+            "newest snapshot (12:30+01:00 == 11:30Z) must be first"
+        );
+        assert_eq!(
+            loaded[1].metrics.module_count, 1,
+            "oldest snapshot (11:00Z) must be second"
+        );
+    }
+
+    #[test]
+    fn test_module_count_matches_mean_coupling_denominator() {
+        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::schema::EdgeType;
+
+        let mut index = CodebaseIndex::empty();
+
+        // Module A: 3 files → qualifies
+        for name in &["src/a/x.rs", "src/a/y.rs", "src/a/z.rs"] {
+            index.files.push(IndexedFile {
+                relative_path: name.to_string(),
+                language: Some("rust".into()),
+                size_bytes: 100,
+                token_count: 50,
+                parse_result: None,
+                content: "fn f() {}".to_string(),
+                mtime_secs: None,
+            });
+        }
+        // Module B: 2 files → does NOT qualify
+        for name in &["src/b/p.rs", "src/b/q.rs"] {
+            index.files.push(IndexedFile {
+                relative_path: name.to_string(),
+                language: Some("rust".into()),
+                size_bytes: 50,
+                token_count: 25,
+                parse_result: None,
+                content: "fn g() {}".to_string(),
+                mtime_secs: None,
+            });
+        }
+
+        index
+            .graph
+            .add_edge("src/a/x.rs", "src/a/y.rs", EdgeType::Import);
+        index
+            .graph
+            .add_edge("src/a/x.rs", "src/ext/lib.rs", EdgeType::Import);
+
+        let snap = snapshot_from_index(&index, "2026-04-10T00:00:00Z");
+
+        // Only module A qualifies — module_count must equal 1 (the qualifying count).
+        assert_eq!(
+            snap.metrics.module_count, 1,
+            "module_count must reflect qualifying modules, not total prefixes"
+        );
+        // mean_coupling was computed over 1 qualifying module, so module_count
+        // is the correct denominator.
+        assert!(
+            snap.metrics.mean_coupling >= 0.0 && snap.metrics.mean_coupling <= 1.0,
+            "mean_coupling must be in [0,1]"
+        );
+        // The qualifying module's coupling equals mean_coupling (only 1 module).
+        let m = &snap.modules[0];
+        assert!(
+            (snap.metrics.mean_coupling - m.coupling).abs() < 1e-9,
+            "mean_coupling must equal the single qualifying module's coupling"
+        );
     }
 }
