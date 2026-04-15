@@ -1,4 +1,47 @@
-use tower_lsp::lsp_types::{CodeLens, Command, Position, Range};
+use std::path::Path;
+use tower_lsp::lsp_types::{CodeLens, Command, Position, Range, Url};
+
+/// Convert a `file://` URI to a path relative to `repo_root`.
+///
+/// Example: `file:///Users/me/repo/src/main.rs` + `/Users/me/repo` → `src/main.rs`
+pub fn uri_to_rel_path(uri: &Url, repo_root: &Path) -> Option<String> {
+    let abs = uri.to_file_path().ok()?;
+    let rel = abs.strip_prefix(repo_root).ok()?;
+    Some(rel.to_string_lossy().into_owned())
+}
+
+/// Extract the identifier token that spans `char_idx` on `line_idx` inside `content`.
+///
+/// Walks backward and forward from `char_idx` while characters are alphanumeric or `_`.
+pub fn extract_word_at(content: &str, line_idx: usize, char_idx: usize) -> String {
+    let line = match content.lines().nth(line_idx) {
+        Some(l) => l,
+        None => return String::new(),
+    };
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    if char_idx >= len {
+        return String::new();
+    }
+    if !chars[char_idx].is_alphanumeric() && chars[char_idx] != '_' {
+        return String::new();
+    }
+    let start = {
+        let mut i = char_idx;
+        while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+            i -= 1;
+        }
+        i
+    };
+    let end = {
+        let mut i = char_idx + 1;
+        while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        i
+    };
+    chars[start..end].iter().collect()
+}
 
 pub fn code_lens_for_file(uri_path: &str, index: &crate::index::CodebaseIndex) -> Vec<CodeLens> {
     let relative = uri_path
@@ -395,5 +438,61 @@ mod tests {
             let result = handle_custom_method(m, serde_json::Value::Null, &index);
             assert!(result.is_ok(), "method {m} should return Ok");
         }
+    }
+
+    #[test]
+    fn extract_word_at_middle_of_word() {
+        assert_eq!(extract_word_at("foo bar baz", 0, 5), "bar");
+    }
+
+    #[test]
+    fn extract_word_at_start_of_content() {
+        assert_eq!(extract_word_at("hello", 0, 0), "hello");
+    }
+
+    #[test]
+    fn extract_word_at_end_of_word() {
+        assert_eq!(extract_word_at("foo bar baz", 0, 6), "bar");
+    }
+
+    #[test]
+    fn extract_word_at_on_space_returns_empty() {
+        assert_eq!(extract_word_at("foo bar", 0, 3), "");
+    }
+
+    #[test]
+    fn extract_word_at_out_of_bounds_line_returns_empty() {
+        assert_eq!(extract_word_at("hello", 99, 0), "");
+    }
+
+    #[test]
+    fn extract_word_at_out_of_bounds_char_returns_empty() {
+        assert_eq!(extract_word_at("hi", 0, 99), "");
+    }
+
+    #[test]
+    fn extract_word_at_underscore_included() {
+        assert_eq!(extract_word_at("my_func()", 0, 4), "my_func");
+    }
+
+    #[test]
+    fn uri_to_rel_path_strips_repo_root() {
+        let uri = Url::parse("file:///Users/me/repo/src/main.rs").unwrap();
+        let root = std::path::Path::new("/Users/me/repo");
+        assert_eq!(uri_to_rel_path(&uri, root), Some("src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn uri_to_rel_path_returns_none_outside_root() {
+        let uri = Url::parse("file:///other/src/main.rs").unwrap();
+        let root = std::path::Path::new("/Users/me/repo");
+        assert_eq!(uri_to_rel_path(&uri, root), None);
+    }
+
+    #[test]
+    fn uri_to_rel_path_exact_root_returns_empty_string() {
+        let uri = Url::parse("file:///Users/me/repo/file.rs").unwrap();
+        let root = std::path::Path::new("/Users/me/repo");
+        assert_eq!(uri_to_rel_path(&uri, root), Some("file.rs".to_string()));
     }
 }

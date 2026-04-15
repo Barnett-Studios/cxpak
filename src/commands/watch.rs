@@ -8,32 +8,52 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
+/// Maximum total debounce time per event burst to prevent infinite-event streams
+/// from blocking the rebuild indefinitely.
+const MAX_DEBOUNCE_ITERS: usize = 40; // 40 × 50 ms = 2 s
+
 pub fn run(
     path: &Path,
     _token_budget: usize,
     _format: &OutputFormat,
     _verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut index = build_index(path)?;
+    // Canonicalize the base path so that absolute paths delivered by `notify`
+    // can be stripped with `strip_prefix` without mismatch (e.g. "." vs "/abs/path").
+    let canon_path = path
+        .canonicalize()
+        .map_err(|e| format!("cannot canonicalize watch path {}: {e}", path.display()))?;
+
+    let mut index = build_index(&canon_path)?;
 
     eprintln!(
         "cxpak: watching {} ({} files indexed, {} tokens)",
-        path.display(),
+        canon_path.display(),
         index.total_files,
         index.total_tokens
     );
 
-    let watcher = FileWatcher::new(path)?;
+    let watcher = FileWatcher::new(&canon_path)?;
 
     loop {
         if let Some(first) = watcher.recv_timeout(Duration::from_secs(1)) {
             let mut changes = vec![first];
-            std::thread::sleep(Duration::from_millis(50));
-            changes.extend(watcher.drain());
+            // Drain the queue in 50 ms slices until it goes quiet, capped at
+            // MAX_DEBOUNCE_ITERS to avoid being blocked by pathological event floods.
+            let mut iters = 0;
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                let batch = watcher.drain();
+                if batch.is_empty() || iters >= MAX_DEBOUNCE_ITERS {
+                    break;
+                }
+                changes.extend(batch);
+                iters += 1;
+            }
 
-            let (modified_paths, removed_paths) = classify_changes(&changes, path);
+            let (modified_paths, removed_paths) = classify_changes(&changes, &canon_path);
             let update_count =
-                apply_incremental_update(&mut index, path, &modified_paths, &removed_paths);
+                apply_incremental_update(&mut index, &canon_path, &modified_paths, &removed_paths);
 
             if update_count > 0 {
                 eprintln!(
@@ -256,4 +276,23 @@ mod tests {
         // File doesn't exist, read_to_string fails, so no update
         assert_eq!(count, 0);
     }
+
+    /// classify_changes with a canonical absolute base path returns a non-empty result.
+    #[test]
+    fn test_classify_changes_with_canonical_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let abs_file = canon.join("src").join("new.rs");
+
+        let changes = vec![FileChange::Created(abs_file)];
+        let (modified, removed) = classify_changes(&changes, &canon);
+        assert!(
+            modified.contains("src/new.rs"),
+            "canonical base must allow strip_prefix, got modified={modified:?}"
+        );
+        assert!(removed.is_empty());
+    }
+
+    /// The debounce cap constant must be positive (compile-time guarantee).
+    const _: () = assert!(MAX_DEBOUNCE_ITERS > 0);
 }

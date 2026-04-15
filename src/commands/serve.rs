@@ -1251,7 +1251,17 @@ fn mcp_stdio_loop_with_io(
 
         let request: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                let err = json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {"code": -32700, "message": format!("Parse error: {e}")}
+                });
+                serde_json::to_writer(&mut *writer, &err)?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+                continue;
+            }
         };
 
         let id = request.get("id").cloned();
@@ -2256,6 +2266,14 @@ fn handle_tool_call(
                     "Error: 'pattern' argument is required and must not be empty",
                 );
             }
+            if pattern.len() > MAX_PATTERN_LEN {
+                return mcp_tool_result(
+                    id,
+                    &format!(
+                        "Error: pattern exceeds maximum length of {MAX_PATTERN_LEN} characters"
+                    ),
+                );
+            }
             let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
             let focus = args.get("focus").and_then(|f| f.as_str());
             let context_lines = args
@@ -2930,13 +2948,7 @@ fn handle_tool_call(
                 )
             }
         }
-        _ => mcp_response(
-            id,
-            json!({
-                "content": [{"type": "text", "text": format!("Unknown tool: {tool_name}")}],
-                "isError": true
-            }),
-        ),
+        _ => mcp_error_response(id, -32601, &format!("Unknown tool: {tool_name}")),
     }
 }
 
@@ -3427,9 +3439,13 @@ mod tests {
             Path::new("/tmp"),
             &snap,
         );
-        assert_eq!(resp["result"]["isError"], true);
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Unknown tool"));
+        // Unknown tool must return a JSON-RPC error (-32601), not a result+isError.
+        assert_eq!(
+            resp["error"]["code"], -32601,
+            "unknown tool must use error.code -32601"
+        );
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("Unknown tool"), "got: {msg}");
     }
 
     // --- v1.5.0: data_flow and cross_lang MCP tools ---
@@ -3643,7 +3659,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mcp_stdio_loop_invalid_json_skipped() {
+    fn test_mcp_stdio_loop_invalid_json_returns_parse_error() {
+        // Previously the server silently skipped invalid JSON lines (deadlock hazard).
+        // After FIX-HIGH-4, it must respond with a JSON-RPC -32700 error so the client
+        // knows the message was received and rejected.
         let index = make_test_index();
         let input = "not json\n".to_string();
         let cursor = std::io::Cursor::new(input.into_bytes());
@@ -3656,7 +3675,20 @@ mod tests {
             &mut output,
         )
         .unwrap();
-        assert!(output.is_empty());
+        assert!(
+            !output.is_empty(),
+            "server must write a parse-error response for invalid JSON"
+        );
+        let response: Value = serde_json::from_slice(&output).expect("response must be valid JSON");
+        assert!(
+            response["id"].is_null(),
+            "parse error id must be null, got: {}",
+            response["id"]
+        );
+        assert_eq!(
+            response["error"]["code"], -32700,
+            "parse error must use code -32700"
+        );
     }
 
     #[test]
@@ -4780,6 +4812,82 @@ mod tests {
         assert!(
             content.contains("Error") || content.contains("error"),
             "empty pattern should return error"
+        );
+    }
+
+    // --- FIX-HIGH-4: parse error, unknown tool, pattern length guard ---
+
+    #[test]
+    fn test_mcp_malformed_json_returns_parse_error_response() {
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        // Deliberately malformed JSON line.
+        let input = b"{ not valid json !!\n";
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_ref(),
+            &mut output,
+        )
+        .unwrap();
+        let response: Value = serde_json::from_slice(&output)
+            .expect("server must write valid JSON even for bad input");
+        assert!(
+            response["id"].is_null(),
+            "parse error response must have id: null"
+        );
+        assert_eq!(
+            response["error"]["code"], -32700,
+            "parse error must use code -32700"
+        );
+    }
+
+    #[test]
+    fn test_mcp_unknown_tool_returns_json_rpc_error() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(42)),
+            "nonexistent_tool_xyz",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert_eq!(
+            resp["error"]["code"], -32601,
+            "unknown tool must return error.code -32601, got: {resp}"
+        );
+        let msg = resp["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("Unknown tool"),
+            "error message must mention 'Unknown tool', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_search_pattern_exceeds_max_length_returns_error() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let long_pattern = "a".repeat(MAX_PATTERN_LEN + 1);
+        let resp = handle_tool_call(
+            Some(json!(1)),
+            "cxpak_search",
+            &json!({"pattern": long_pattern}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("Error") || text.contains("error"),
+            "oversized pattern must return an error, got: {text}"
+        );
+        assert!(
+            text.contains("maximum length") || text.contains("exceeds"),
+            "error must mention the length limit, got: {text}"
         );
     }
 

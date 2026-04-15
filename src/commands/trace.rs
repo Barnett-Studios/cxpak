@@ -144,8 +144,7 @@ pub fn run(
     } else {
         let content_matches = index.find_content_matches(target);
         if content_matches.is_empty() {
-            eprintln!("cxpak: error: '{}' not found in codebase", target);
-            std::process::exit(1);
+            return Err(format!("'{}' not found in codebase", target).into());
         }
         if verbose {
             eprintln!(
@@ -641,6 +640,66 @@ mod tests {
         assert_eq!(
             edge_type_display(&EdgeType::MigrationSequence),
             "migration_sequence"
+        );
+    }
+
+    /// run() must return Err (not call process::exit) when the target symbol is not found.
+    #[test]
+    fn run_returns_err_for_not_found_symbol() {
+        use crate::cli::OutputFormat;
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Initialise a bare git repo so git::extract_git_context doesn't error out
+        // before we even reach the symbol lookup.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .ok();
+
+        // Write a Rust file and commit it so the scanner can find files.
+        std::fs::write(dir.path().join("main.rs"), "fn hello() {}").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .ok();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty-message", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .ok();
+
+        let result = run(
+            dir.path(),
+            "completely_nonexistent_zzz_symbol_xyz",
+            50_000,
+            &OutputFormat::Markdown,
+            None,
+            false,
+            false,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "run() must return Err for not-found symbol, not exit(1)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not found in codebase"),
+            "error message should mention 'not found in codebase', got: {msg}"
         );
     }
 }

@@ -165,16 +165,42 @@ impl LanguageServer for CxpakLspBackend {
     }
 
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
-        let word = params
-            .text_document_position_params
-            .position
-            .line
-            .to_string();
-        // In a real implementation we'd resolve the word under cursor from
-        // the document.  For now, use the URI path as a fallback and let
-        // hover_for_symbol return None if not found.
-        let _ = word;
-        Ok(None)
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let line_idx = position.line as usize;
+        let char_idx = position.character as usize;
+
+        let index = self.index.read().map_err(Self::lock_err)?;
+
+        // Try to locate the file in the index using a repo-relative path.
+        let file = {
+            let rel_opt = super::methods::uri_to_rel_path(uri, &self.path);
+            let uri_str = uri.as_str();
+            index.files.iter().find(|f| {
+                rel_opt.as_deref().is_some_and(|r| f.relative_path == r)
+                    || uri_str.ends_with(&f.relative_path)
+            })
+        };
+
+        let content: String = match file {
+            Some(f) => f.content.clone(),
+            None => {
+                // Fall back to reading from disk when the file isn't indexed yet.
+                let path_opt =
+                    super::methods::uri_to_rel_path(uri, &self.path).map(|rel| self.path.join(rel));
+                match path_opt.and_then(|p| std::fs::read_to_string(p).ok()) {
+                    Some(c) => c,
+                    None => return Ok(None),
+                }
+            }
+        };
+
+        let word = super::methods::extract_word_at(&content, line_idx, char_idx);
+        if word.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(super::methods::hover_for_symbol(&word, &index))
     }
 
     async fn diagnostic(

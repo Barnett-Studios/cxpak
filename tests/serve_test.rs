@@ -740,9 +740,13 @@ mod serve_tests {
             }),
         );
 
-        let content = response["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(content.contains("Unknown tool"));
-        assert_eq!(response["result"]["isError"], true);
+        // Unknown tool must return a JSON-RPC error (-32601), not a result+isError.
+        assert_eq!(
+            response["error"]["code"], -32601,
+            "unknown tool must use error.code -32601"
+        );
+        let msg = response["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("Unknown tool"), "got: {msg}");
 
         child.kill().ok();
         child.wait().ok();
