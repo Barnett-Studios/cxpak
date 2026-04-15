@@ -10,15 +10,17 @@ use crate::relevance::SignalResult;
 pub fn comment_syntax(language: &str) -> (&'static str, &'static str) {
     match language {
         "rust" | "javascript" | "typescript" | "java" | "go" | "c" | "cpp" | "csharp" | "swift"
-        | "kotlin" | "scala" | "dart" | "zig" | "groovy" | "objc" | "proto" | "graphql" => {
-            ("// ", "")
-        }
+        | "kotlin" | "scala" | "dart" | "zig" | "groovy" | "objc" | "proto" | "graphql" | "php"
+        | "prisma" => ("// ", ""),
         "python" | "ruby" | "bash" | "perl" | "r" | "julia" | "elixir" | "yaml" | "toml"
-        | "makefile" | "dockerfile" => ("# ", ""),
+        | "makefile" | "dockerfile" | "hcl" => ("# ", ""),
         "haskell" | "lua" | "sql" | "ocaml" | "ocaml_interface" => ("-- ", ""),
         "html" | "xml" | "svelte" | "markdown" => ("<!-- ", " -->"),
         "css" | "scss" => ("/* ", " */"),
         "matlab" => ("% ", ""),
+        // JSON does not support comments; we still emit a `// ` header-only
+        // annotation — callers that serialize strict JSON must strip it.
+        // This matches the fallback for unknown languages.
         _ => ("// ", ""),
     }
 }
