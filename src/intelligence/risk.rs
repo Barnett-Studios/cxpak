@@ -1,4 +1,5 @@
 use crate::index::CodebaseIndex;
+use crate::intelligence::health::has_inline_tests;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,7 +70,16 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
         .map(|(i, &path)| {
             let blast_count = blast_map.get(path).copied().unwrap_or(0);
             let norm_blast = (blast_count as f64 / total_files).min(1.0);
-            let has_test = index.test_map.contains_key(path);
+            // A file is "tested" if it has a mapped test file OR contains
+            // inline tests (e.g. `#[cfg(test)]` in Rust).  This mirrors the
+            // logic in score_test_coverage in health.rs.
+            let has_test = index.test_map.contains_key(path)
+                || index
+                    .files
+                    .iter()
+                    .find(|f| f.relative_path == path)
+                    .map(has_inline_tests)
+                    .unwrap_or(false);
             let test_coverage = if has_test { 1.0 } else { 0.0 };
 
             let nc = norm_churn[i].max(0.01_f64);
@@ -180,5 +190,69 @@ mod tests {
         let untested = nc.max(0.01) * nb.max(0.01) * (1.0f64 - 0.0).max(0.01);
         let tested = nc.max(0.01) * nb.max(0.01) * (1.0f64 - 1.0).max(0.01);
         assert!(untested > tested, "untested={untested}, tested={tested}");
+    }
+
+    #[test]
+    fn test_compute_risk_ranking_counts_inline_tests_as_covered() {
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // a.rs has inline tests — should have test_coverage = 1.0
+        let content_a = "pub fn foo() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_foo() { assert!(true); }\n}\n";
+        // b.rs has no tests — should have test_coverage = 0.0
+        let content_b = "pub fn bar() {}";
+
+        let fp_a = dir.path().join("a.rs");
+        let fp_b = dir.path().join("b.rs");
+        std::fs::write(&fp_a, content_a).unwrap();
+        std::fs::write(&fp_b, content_b).unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "a.rs".into(),
+                absolute_path: fp_a,
+                language: Some("rust".into()),
+                size_bytes: content_a.len() as u64,
+            },
+            ScannedFile {
+                relative_path: "b.rs".into(),
+                absolute_path: fp_b,
+                language: Some("rust".into()),
+                size_bytes: content_b.len() as u64,
+            },
+        ];
+
+        let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        // Manually store the content so has_inline_tests can read it
+        for file in &mut index.files {
+            if file.relative_path == "a.rs" {
+                file.content = content_a.to_string();
+            } else {
+                file.content = content_b.to_string();
+            }
+        }
+        // Ensure test_map is empty so the only path to tc=1.0 is inline tests
+        assert!(
+            index.test_map.is_empty(),
+            "test_map must be empty for this test to be meaningful"
+        );
+
+        let entries = compute_risk_ranking(&index);
+
+        let entry_a = entries.iter().find(|e| e.path == "a.rs").unwrap();
+        let entry_b = entries.iter().find(|e| e.path == "b.rs").unwrap();
+
+        assert_eq!(
+            entry_a.test_coverage, 1.0,
+            "a.rs has #[cfg(test)] inline tests — test_coverage must be 1.0"
+        );
+        assert_eq!(
+            entry_b.test_coverage, 0.0,
+            "b.rs has no tests — test_coverage must be 0.0"
+        );
     }
 }

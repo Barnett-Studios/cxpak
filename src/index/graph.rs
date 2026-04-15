@@ -163,12 +163,38 @@ fn try_candidates(candidates: &[String], all_paths: &HashSet<&str>) -> Option<St
     None
 }
 
+/// Returns true when the file acts as a module root (i.e. defines the module
+/// itself rather than being a child file within a module).
+///
+/// In Rust's module system:
+/// - `src/lib.rs` and `src/main.rs` are the crate root — `super::` from here
+///   is invalid (no parent), so we still walk up for completeness but note
+///   that in practice the compiler would reject it.
+/// - `src/foo/mod.rs` defines the `foo` module; `super::` resolves to `src/`.
+/// - Regular files like `src/foo/bar.rs` define the `foo::bar` *submodule*;
+///   their parent module IS `src/foo/mod.rs`, so the first `super::` keeps us
+///   in the same directory (`src/foo/`).
+fn is_module_root_file(path: &str) -> bool {
+    path.ends_with("/mod.rs")
+        || path == "src/lib.rs"
+        || path == "src/main.rs"
+        || path == "lib.rs"
+        || path == "main.rs"
+}
+
 /// Resolve a Rust `use` path to an actual file path present in `all_paths`.
 ///
 /// Handled prefixes:
 /// - `crate::X` → `src/X.rs`, `src/X/mod.rs`
-/// - `self::X`  → `<source_dir>/X.rs`, `<source_dir>/X/mod.rs`
-/// - `super::…::X` (any depth) → walk up that many dirs, then append rest
+/// - `self::X`  → refers to items inline in the current file or re-exported
+///   names; there is no cross-file resolution that makes sense here, so we
+///   return `None`.
+/// - `super::…::X` — semantics depend on the source file type:
+///   * From a **module-root file** (`mod.rs`, `lib.rs`, `main.rs`) every
+///     `super::` walks up one directory, as before.
+///   * From a **regular file** (`src/foo/bar.rs`) the first `super::` keeps
+///     us in the *same* directory (the parent module is `src/foo/mod.rs`,
+///     not `src/`).  Each additional `super::` walks up one more level.
 /// - anything else is treated as an external crate (returns `None`)
 fn resolve_rust_import(
     source_path: &str,
@@ -186,19 +212,19 @@ fn resolve_rust_import(
         );
     }
 
-    // `self::X` → same directory as source
-    if let Some(rest) = import_source.strip_prefix("self::") {
-        let base = rest.replace("::", "/");
-        return try_candidates(
-            &[
-                format!("{source_dir}/{base}.rs"),
-                format!("{source_dir}/{base}/mod.rs"),
-            ],
-            all_paths,
-        );
+    // `self::X` — refers to items defined inline in the current module (same
+    // file) or re-exported via `pub use`.  There is no meaningful file-to-file
+    // resolution for this prefix, so we return None rather than guessing.
+    if import_source.starts_with("self::") {
+        return None;
     }
 
-    // `super::…::X` — count leading `super::` segments, walk up that many dirs
+    // `super::…::X` — count leading `super::` segments.
+    //
+    // For regular .rs files the first `super::` refers to the parent *module*,
+    // which is represented by the containing directory (same directory), not
+    // the parent directory.  Every additional `super::` walks up one directory.
+    // For mod.rs / lib.rs / main.rs every `super::` walks up one directory.
     let mut trimmed = import_source;
     let mut super_count = 0usize;
     while let Some(rest) = trimmed.strip_prefix("super::") {
@@ -206,7 +232,16 @@ fn resolve_rust_import(
         trimmed = rest;
     }
     if super_count > 0 {
-        let target_dir = parent_n(source_dir, super_count);
+        let dir_ups = if is_module_root_file(source_path) {
+            super_count
+        } else {
+            super_count.saturating_sub(1)
+        };
+        let target_dir = if dir_ups == 0 {
+            source_dir.to_string()
+        } else {
+            parent_n(source_dir, dir_ups)
+        };
         let base = trimmed.replace("::", "/");
         let (a, b) = if target_dir.is_empty() {
             (format!("{base}.rs"), format!("{base}/mod.rs"))
@@ -517,7 +552,9 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_rust_self_prefix() {
+    fn test_resolve_rust_self_returns_none() {
+        // self:: refers to items defined inline in the current module — no
+        // cross-file resolution is meaningful, so we always return None.
         let all: HashSet<&str> = [
             "src/intelligence/call_graph.rs",
             "src/intelligence/data_flow.rs",
@@ -525,36 +562,76 @@ mod tests {
         .iter()
         .copied()
         .collect();
-        assert_eq!(
-            resolve_rust_import("src/intelligence/data_flow.rs", "self::call_graph", &all),
-            Some("src/intelligence/call_graph.rs".to_string())
+        assert!(
+            resolve_rust_import("src/intelligence/data_flow.rs", "self::call_graph", &all)
+                .is_none(),
+            "self:: must return None regardless of what files exist"
         );
     }
 
     #[test]
-    fn test_resolve_rust_super_prefix() {
-        let all: HashSet<&str> = ["src/foo.rs", "src/bar.rs", "src/intelligence/data_flow.rs"]
+    fn test_resolve_rust_super_from_regular_file_stays_in_same_dir() {
+        // From a regular file (non mod.rs), `super::X` resolves within the
+        // SAME directory (the parent module IS the containing dir's mod.rs).
+        let all: HashSet<&str> = ["src/visual/layout.rs", "src/visual/render.rs"]
             .iter()
             .copied()
             .collect();
         assert_eq!(
-            resolve_rust_import("src/intelligence/data_flow.rs", "super::foo", &all),
+            resolve_rust_import("src/visual/render.rs", "super::layout", &all),
+            Some("src/visual/layout.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_rust_super_from_mod_rs_walks_up() {
+        // From mod.rs, every `super::` walks up one directory.
+        let all: HashSet<&str> = ["src/foo.rs", "src/visual/mod.rs"]
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            resolve_rust_import("src/visual/mod.rs", "super::foo", &all),
             Some("src/foo.rs".to_string())
         );
     }
 
     #[test]
-    fn test_resolve_rust_double_super() {
-        // `super::super` from `src/intelligence/a/b/file.rs`:
-        //   - file lives in module `b` (dir: src/intelligence/a/b)
-        //   - one `super` → parent of `b` = `a`  (dir: src/intelligence/a)
-        //   - two `super` → parent of `a` = `intelligence`  (dir: src/intelligence)
-        let all: HashSet<&str> = ["src/intelligence/a/b/file.rs", "src/intelligence/target.rs"]
+    fn test_resolve_rust_super_from_lib_rs_walks_up() {
+        // lib.rs is a module root — super:: walks up.
+        let all: HashSet<&str> = ["foo.rs", "src/lib.rs"].iter().copied().collect();
+        assert_eq!(
+            resolve_rust_import("src/lib.rs", "super::foo", &all),
+            Some("foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_rust_double_super_from_regular_file() {
+        // From a regular file:
+        //   super (1) → same dir (dir_ups=0)
+        //   super::super (2) → up 1 level (dir_ups=1)
+        // So `super::super::target` from `src/a/b/file.rs` resolves to `src/a/target.rs`.
+        let all: HashSet<&str> = ["src/a/b/file.rs", "src/a/target.rs"]
             .iter()
             .copied()
             .collect();
         assert_eq!(
-            resolve_rust_import("src/intelligence/a/b/file.rs", "super::super::target", &all),
+            resolve_rust_import("src/a/b/file.rs", "super::super::target", &all),
+            Some("src/a/target.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_rust_double_super_from_mod_rs() {
+        // From mod.rs: every super:: walks up — super::super from
+        // src/intelligence/a/b/mod.rs goes up 2 levels to src/intelligence/.
+        let all: HashSet<&str> = ["src/intelligence/a/b/mod.rs", "src/intelligence/target.rs"]
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            resolve_rust_import("src/intelligence/a/b/mod.rs", "super::super::target", &all),
             Some("src/intelligence/target.rs".to_string())
         );
     }
@@ -750,16 +827,33 @@ mod tests {
     }
 
     #[test]
-    fn test_build_dependency_graph_resolves_super_imports() {
+    fn test_build_dependency_graph_resolves_super_imports_from_mod_rs() {
+        // From src/sub/mod.rs (a module root), super::foo resolves to src/foo.rs.
         let files = vec![
             make_indexed_file("src/foo.rs", "rust", vec![]),
-            make_indexed_file("src/sub/child.rs", "rust", vec!["super::foo"]),
+            make_indexed_file("src/sub/mod.rs", "rust", vec!["super::foo"]),
+        ];
+        let graph = build_dependency_graph(&files, None);
+        let deps = &graph.edges["src/sub/mod.rs"];
+        assert!(
+            deps.iter().any(|e| e.target == "src/foo.rs"),
+            "sub/mod.rs should import foo.rs via super::"
+        );
+    }
+
+    #[test]
+    fn test_build_dependency_graph_resolves_super_imports_from_regular_file() {
+        // From src/sub/child.rs (a regular file), super::sibling resolves to
+        // src/sub/sibling.rs (SAME directory — parent module is sub/mod.rs).
+        let files = vec![
+            make_indexed_file("src/sub/child.rs", "rust", vec!["super::sibling"]),
+            make_indexed_file("src/sub/sibling.rs", "rust", vec![]),
         ];
         let graph = build_dependency_graph(&files, None);
         let deps = &graph.edges["src/sub/child.rs"];
         assert!(
-            deps.iter().any(|e| e.target == "src/foo.rs"),
-            "child.rs should import foo.rs via super::"
+            deps.iter().any(|e| e.target == "src/sub/sibling.rs"),
+            "child.rs should import sibling.rs (same dir) via super:: from regular file"
         );
     }
 

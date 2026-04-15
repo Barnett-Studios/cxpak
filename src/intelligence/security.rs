@@ -451,11 +451,15 @@ pub fn build_security_surface(
         let content = &file.content;
         let pagerank = index.pagerank.get(path).copied().unwrap_or(0.0);
 
-        secret_patterns.extend(scan_secret_patterns(content, path));
-        sql_injection_surface.extend(scan_sql_injection(content, path));
-        input_validation_gaps.extend(scan_validation_gaps(content, path, pagerank));
+        // Strip test blocks before scanning so that literal strings used as
+        // test fixtures (e.g., fake AWS keys, SQL injection examples, sample
+        // routes) do not generate false-positive security findings.
+        let stripped = crate::intelligence::test_stripping::strip_test_blocks(content, path);
+        secret_patterns.extend(scan_secret_patterns(&stripped, path));
+        sql_injection_surface.extend(scan_sql_injection(&stripped, path));
+        input_validation_gaps.extend(scan_validation_gaps(&stripped, path, pagerank));
 
-        let routes = detect_routes(content, path);
+        let routes = detect_routes(&stripped, path);
         for route in routes {
             if !endpoint_is_protected(content, &route.handler, auth_patterns) {
                 unprotected_endpoints.push(UnprotectedEndpoint {
@@ -1025,6 +1029,42 @@ pub fn process_input(data: String) {
         assert_eq!(
             surface.exposure_scores[0].path, "src/b.rs",
             "file with more pub symbols and edges should rank first"
+        );
+    }
+
+    #[test]
+    fn test_build_security_surface_cfg_test_blocks_not_flagged() {
+        // Secrets and SQL patterns inside #[cfg(test)] mod tests { ... } must
+        // NOT generate security findings — they are test fixtures, not real
+        // credentials or injection vectors.
+        let mut index = crate::index::CodebaseIndex::empty();
+        let content = r#"
+pub fn real_function() {}
+
+#[cfg(test)]
+mod tests {
+    // Test fixture: fake AWS key used to verify pattern detection
+    const FAKE_KEY: &str = "AKIAIOSFODNN7EXAMPLE123";
+    // Test fixture: SQL injection pattern used in unit test assertions
+    fn sql_example() {
+        let q = format!("SELECT * FROM users WHERE id = '{}'", id);
+    }
+}
+"#;
+        index
+            .files
+            .push(make_indexed_file("src/security.rs", content, vec![]));
+
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        assert!(
+            surface.secret_patterns.is_empty(),
+            "AWS key inside #[cfg(test)] must not be flagged as a secret: {:?}",
+            surface.secret_patterns
+        );
+        assert!(
+            surface.sql_injection_surface.is_empty(),
+            "SQL format! inside #[cfg(test)] must not be flagged as injection: {:?}",
+            surface.sql_injection_surface
         );
     }
 

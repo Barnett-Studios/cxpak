@@ -16,3 +16,4 @@ pub mod recent_changes;
 pub mod risk;
 pub mod security;
 pub mod test_map;
+pub mod test_stripping;
