@@ -23,7 +23,8 @@ pub fn render_single_section(title: &str, content: &str) -> String {
     let key = title.to_lowercase().replace([' ', '/'], "_");
     let mut map = serde_json::Map::new();
     map.insert(key, serde_json::Value::String(content.to_string()));
-    serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".into())
+    serde_json::to_string_pretty(&serde_json::Value::Object(map))
+        .expect("serde_json::to_string_pretty of a Value is infallible")
 }
 
 pub fn render(sections: &OutputSections) -> String {
@@ -36,7 +37,8 @@ pub fn render(sections: &OutputSections) -> String {
         signatures: sections.signatures.clone(),
         git_context: sections.git_context.clone(),
     };
-    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".into())
+    serde_json::to_string_pretty(&output)
+        .expect("serde_json::to_string_pretty of a Value is infallible")
 }
 
 #[cfg(test)]

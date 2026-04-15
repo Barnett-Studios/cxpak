@@ -5,28 +5,43 @@ use std::collections::{HashMap, HashSet};
 // Task 2: Blocklist noise filter
 // ---------------------------------------------------------------------------
 
-const NOISE_PATH_PATTERNS: &[&str] = &[
-    "vendor/",
-    "node_modules/",
-    "third_party/",
-    "external/",
-    "dist/",
-    "build/",
-    "target/",
-    ".next/",
-    "__pycache__/",
-    "out/",
+/// Directory-component patterns: each value is the exact segment name (without
+/// the trailing `/`).  A path matches iff one of its `/`-separated segments
+/// equals the pattern exactly, preventing false positives like
+/// `src/tools/build/...` matching the `build` pattern.
+const NOISE_DIR_PATTERNS: &[&str] = &[
+    "vendor",
+    "node_modules",
+    "third_party",
+    "external",
+    "dist",
+    "build",
+    "target",
+    ".next",
+    "__pycache__",
+    "out",
+];
+
+/// Suffix/extension patterns matched with `path.ends_with(p)`.  This prevents
+/// `.map` from matching `data.mapping.rs` (substring false positive).
+const NOISE_SUFFIX_PATTERNS: &[&str] = &[
     ".min.js",
     ".min.css",
-    ".generated.",
-    "_generated.",
-    ".gen.",
+    ".generated.ts",
+    ".generated.js",
+    "_generated.ts",
+    "_generated.js",
+    ".gen.go",
     "_pb.go",
     "_pb2.py",
     ".pb.cc",
     ".pb.h",
-    ".map",
+    ".js.map",
+    ".css.map",
 ];
+
+/// Free-substring patterns that are unambiguous regardless of position.
+const NOISE_SUBSTRING_PATTERNS: &[&str] = &[".generated.", "_generated.", ".gen."];
 
 const NOISE_EXACT_FILENAMES: &[&str] = &[
     "package-lock.json",
@@ -50,15 +65,29 @@ const GENERATED_MARKERS: &[&str] = &[
 /// Returns `true` if the given path belongs to a noise category that should
 /// be excluded regardless of relevance score.
 ///
-/// Lock files are matched by exact filename only — e.g. `deadlock.rs` will
-/// NOT be excluded because it happens to contain "lock".  All other patterns
-/// perform a substring match on the full path string.
+/// - Lock files are matched by exact filename only.
+/// - Directory patterns match at segment boundaries (e.g. `build` will not
+///   match `src/builder.rs` because `builder` ≠ `build`).
+/// - Suffix patterns use `ends_with` to avoid substring false positives
+///   (e.g. `.map` would match `data.mapping.rs` as a plain substring).
 pub fn is_blocklisted(path: &str) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path);
     if NOISE_EXACT_FILENAMES.contains(&filename) {
         return true;
     }
-    NOISE_PATH_PATTERNS.iter().any(|p| path.contains(p))
+    // Directory segment check
+    if path.split('/').any(|seg| NOISE_DIR_PATTERNS.contains(&seg)) {
+        return true;
+    }
+    // Suffix check
+    if NOISE_SUFFIX_PATTERNS.iter().any(|p| path.ends_with(p)) {
+        return true;
+    }
+    // Unambiguous substring check
+    if NOISE_SUBSTRING_PATTERNS.iter().any(|p| path.contains(p)) {
+        return true;
+    }
+    false
 }
 
 /// Returns `true` if the first 5 lines of `content` contain one of the
@@ -211,13 +240,24 @@ pub fn filter_noise(
             let filename = entry.path.rsplit('/').next().unwrap_or(&entry.path);
             let reason = if NOISE_EXACT_FILENAMES.contains(&filename) {
                 format!("blocklist: {filename}")
+            } else if let Some(seg) = entry
+                .path
+                .split('/')
+                .find(|seg| NOISE_DIR_PATTERNS.contains(seg))
+            {
+                format!("blocklist: {seg}/")
+            } else if let Some(p) = NOISE_SUFFIX_PATTERNS
+                .iter()
+                .find(|p| entry.path.ends_with(**p))
+            {
+                format!("blocklist: {p}")
+            } else if let Some(p) = NOISE_SUBSTRING_PATTERNS
+                .iter()
+                .find(|p| entry.path.contains(**p))
+            {
+                format!("blocklist: {p}")
             } else {
-                let pattern = NOISE_PATH_PATTERNS
-                    .iter()
-                    .find(|p| entry.path.contains(**p))
-                    .copied()
-                    .unwrap_or("unknown");
-                format!("blocklist: {pattern}")
+                "blocklist: unknown".to_string()
             };
             filtered_out.push(FilteredFile {
                 path: entry.path,
@@ -361,6 +401,18 @@ mod tests {
         assert!(!is_blocklisted("src/file_lock.py"));
         // "build" as part of an identifier in a path segment, not a directory.
         assert!(!is_blocklisted("src/builder.rs"));
+    }
+
+    #[test]
+    fn test_no_false_positives_on_substrings() {
+        // "build/" should not match src/tools/build_helper.rs
+        assert!(!is_blocklisted("src/tools/build_helper.rs"));
+        // ".map" should not match src/data.mapping.rs
+        assert!(!is_blocklisted("src/data.mapping.rs"));
+        // "out" directory should not match src/output.rs
+        assert!(!is_blocklisted("src/output.rs"));
+        // "dist" should not match src/distribute.rs
+        assert!(!is_blocklisted("src/distribute.rs"));
     }
 
     #[test]

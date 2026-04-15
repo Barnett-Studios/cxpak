@@ -433,12 +433,30 @@ fn check_imports(
 }
 
 fn to_snake_case(name: &str) -> String {
-    let mut result = String::new();
-    for (i, ch) in name.chars().enumerate() {
-        if ch.is_uppercase() && i > 0 {
-            result.push('_');
+    // Standard algorithm that treats consecutive uppercase runs as one word:
+    //   HTTPServer → http_server
+    //   userId     → user_id
+    //   parseXML   → parse_xml
+    //   HTTP       → http
+    let chars: Vec<char> = name.chars().collect();
+    let mut result = String::with_capacity(name.len() + 4);
+    for (i, &ch) in chars.iter().enumerate() {
+        if i > 0 && ch.is_uppercase() {
+            let prev = chars[i - 1];
+            let next = chars.get(i + 1).copied();
+            // Insert '_' when:
+            // 1. Transitioning from lowercase/digit to uppercase (camelCase boundary).
+            // 2. Inside an acronym run but the NEXT char is lowercase (XmlParser → xml_parser:
+            //    'P' in 'lP' where prev='l').
+            let prev_lower_or_digit = prev.is_lowercase() || prev.is_ascii_digit();
+            let boundary_in_acronym = prev.is_uppercase() && next.is_some_and(|c| c.is_lowercase());
+            if prev_lower_or_digit || boundary_in_acronym {
+                result.push('_');
+            }
         }
-        result.push(ch.to_lowercase().next().unwrap_or(ch));
+        for c in ch.to_lowercase() {
+            result.push(c);
+        }
     }
     result
 }
@@ -472,6 +490,12 @@ mod tests {
     fn test_to_snake_case() {
         assert_eq!(to_snake_case("handleRequest"), "handle_request");
         assert_eq!(to_snake_case("MyFunc"), "my_func");
+        // Acronym handling
+        assert_eq!(to_snake_case("HTTPServer"), "http_server");
+        assert_eq!(to_snake_case("userId"), "user_id");
+        assert_eq!(to_snake_case("UserProfile"), "user_profile");
+        assert_eq!(to_snake_case("parseXML"), "parse_xml");
+        assert_eq!(to_snake_case("HTTP"), "http");
     }
 
     #[test]

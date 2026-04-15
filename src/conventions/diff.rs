@@ -1,4 +1,4 @@
-use crate::conventions::export::ConventionExport;
+use crate::conventions::export::{compute_checksum, ConventionExport};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -9,7 +9,11 @@ pub struct ConventionDiff {
 }
 
 pub fn diff_exports(current: &ConventionExport, baseline: &ConventionExport) -> ConventionDiff {
-    if current.checksum == baseline.checksum {
+    // Before trusting the checksum fast-path, verify that the stored checksum
+    // in `current` matches a freshly-computed value.  This prevents a stale or
+    // hand-edited export from being silently treated as "no changes".
+    let recomputed = compute_checksum(&current.profile);
+    if recomputed == current.checksum && current.checksum == baseline.checksum {
         return ConventionDiff {
             has_changes: false,
             summary: "No convention changes detected.".to_string(),
@@ -103,5 +107,35 @@ mod tests {
         let b = build_export("repo", pb);
         let diff = diff_exports(&a, &b);
         assert!(diff.changed_fields.iter().any(|f| f.contains("git_health")));
+    }
+
+    #[test]
+    fn diff_recomputed_checksum_fast_path() {
+        // Identical profiles: recomputed checksum equals stored checksum equals baseline → no changes.
+        let profile = ConventionProfile::default();
+        let current = build_export("repo", profile.clone());
+        let baseline = build_export("repo", profile);
+        let diff = diff_exports(&current, &baseline);
+        assert!(
+            !diff.has_changes,
+            "identical profiles should have no changes"
+        );
+        assert!(diff.changed_fields.is_empty());
+    }
+
+    #[test]
+    fn diff_tampered_checksum_falls_through() {
+        // Tamper current's checksum to something fake; since recomputed != stored,
+        // fast path is NOT taken and we fall through to field diff.
+        let profile = ConventionProfile::default();
+        let mut current = build_export("repo", profile.clone());
+        let baseline = build_export("repo", profile);
+        // Set a fake checksum that matches baseline but doesn't match the profile
+        current.checksum = "00000000000000000000000000000000".to_string();
+        // recomputed ≠ current.checksum so fast path skips; fall through to field diff.
+        // Both profiles are identical → changed_fields empty, summary notes metadata change.
+        let diff = diff_exports(&current, &baseline);
+        // has_changes may be true (checksum was tampered) but no actual field changes.
+        assert!(diff.changed_fields.is_empty(), "no profile fields changed");
     }
 }

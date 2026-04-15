@@ -13,6 +13,145 @@ pub struct ImportConventions {
     pub file_contributions: HashMap<String, FileContribution>,
 }
 
+/// Detect import grouping/re-exports for Rust source files.
+fn detect_rust_grouping(
+    content: &str,
+    block_files: &mut usize,
+    single_files: &mut usize,
+    pub_use_count: &mut usize,
+    all_use_count: &mut usize,
+    contribution: &mut FileContribution,
+) {
+    let has_block = content.contains("use ") && content.contains(":{");
+    let use_line_count = content
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("use ") || t.starts_with("pub use ")
+        })
+        .count();
+
+    if use_line_count > 0 {
+        if has_block {
+            *block_files += 1;
+            *contribution
+                .counts
+                .entry("block_imports".into())
+                .or_insert(0) += 1;
+        } else {
+            *single_files += 1;
+            *contribution
+                .counts
+                .entry("single_imports".into())
+                .or_insert(0) += 1;
+        }
+        let pub_lines = content
+            .lines()
+            .filter(|l| l.trim_start().starts_with("pub use "))
+            .count();
+        *pub_use_count += pub_lines;
+        *all_use_count += use_line_count;
+    }
+}
+
+/// Detect import grouping/re-exports for TypeScript/JavaScript source files.
+///
+/// Block style: `import { Foo, Bar } from '...'` — brace in the import clause.
+/// Re-exports: `export * from '...'` or `export { Foo } from '...'` lines.
+fn detect_js_grouping(
+    content: &str,
+    block_files: &mut usize,
+    single_files: &mut usize,
+    re_export_count: &mut usize,
+    all_use_count: &mut usize,
+    contribution: &mut FileContribution,
+) {
+    let import_lines: Vec<&str> = content
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("import ") || t.starts_with("export ")
+        })
+        .collect();
+
+    if import_lines.is_empty() {
+        return;
+    }
+
+    let has_block = import_lines.iter().any(|l| {
+        let t = l.trim_start();
+        (t.starts_with("import ") && t.contains('{'))
+            || (t.starts_with("export ") && t.contains('{'))
+    });
+    if has_block {
+        *block_files += 1;
+        *contribution
+            .counts
+            .entry("block_imports".into())
+            .or_insert(0) += 1;
+    } else {
+        *single_files += 1;
+        *contribution
+            .counts
+            .entry("single_imports".into())
+            .or_insert(0) += 1;
+    }
+
+    let re_exports = import_lines
+        .iter()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("export * from") || t.starts_with("export {")
+        })
+        .count();
+    *re_export_count += re_exports;
+    *all_use_count += import_lines.len();
+}
+
+/// Detect import grouping for Python source files.
+///
+/// Block style: `from x import (...)` — parenthesized import clause.
+/// Python re-exports are tracked via `__all__` but we do not modify pub_use_count
+/// for Python (left as 0 to avoid cross-language pollution).
+fn detect_python_grouping(
+    content: &str,
+    block_files: &mut usize,
+    single_files: &mut usize,
+    all_use_count: &mut usize,
+    contribution: &mut FileContribution,
+) {
+    let import_lines: Vec<&str> = content
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("from ") || t.starts_with("import ")
+        })
+        .collect();
+
+    if import_lines.is_empty() {
+        return;
+    }
+
+    let has_block = import_lines.iter().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("from ") && t.contains('(')
+    });
+    if has_block {
+        *block_files += 1;
+        *contribution
+            .counts
+            .entry("block_imports".into())
+            .or_insert(0) += 1;
+    } else {
+        *single_files += 1;
+        *contribution
+            .counts
+            .entry("single_imports".into())
+            .or_insert(0) += 1;
+    }
+    *all_use_count += import_lines.len();
+}
+
 pub fn extract_imports(index: &CodebaseIndex) -> ImportConventions {
     let mut absolute_count = 0usize;
     let mut relative_count = 0usize;
@@ -39,46 +178,40 @@ pub fn extract_imports(index: &CodebaseIndex) -> ImportConventions {
             }
         }
 
-        // Grouping detection: scan raw file content for block vs single use statements.
-        // Block: `use crate::{a, b}` or `use std::io::{Read, Write}` — multi-name groups.
-        // Single: plain `use module::name;` on separate lines.
+        // Grouping and re-export detection: language-aware.
         if !file.content.is_empty() {
-            let has_block = file.content.contains("use ") && file.content.contains(":{");
-            let use_line_count = file
-                .content
-                .lines()
-                .filter(|l| {
-                    let trimmed = l.trim_start();
-                    trimmed.starts_with("use ") || trimmed.starts_with("pub use ")
-                })
-                .count();
-
-            if use_line_count > 0 {
-                if has_block {
-                    block_files += 1;
-                    *contribution
-                        .counts
-                        .entry("block_imports".into())
-                        .or_insert(0) += 1;
-                } else {
-                    single_files += 1;
-                    *contribution
-                        .counts
-                        .entry("single_imports".into())
-                        .or_insert(0) += 1;
+            let lang = file.language.as_deref().unwrap_or("");
+            match lang {
+                "rust" => {
+                    detect_rust_grouping(
+                        &file.content,
+                        &mut block_files,
+                        &mut single_files,
+                        &mut pub_use_count,
+                        &mut all_use_count,
+                        &mut contribution,
+                    );
                 }
-
-                // Re-exports: count `pub use` lines in this file
-                let pub_use_lines = file
-                    .content
-                    .lines()
-                    .filter(|l| {
-                        let trimmed = l.trim_start();
-                        trimmed.starts_with("pub use ")
-                    })
-                    .count();
-                pub_use_count += pub_use_lines;
-                all_use_count += use_line_count;
+                "typescript" | "tsx" | "javascript" | "jsx" => {
+                    detect_js_grouping(
+                        &file.content,
+                        &mut block_files,
+                        &mut single_files,
+                        &mut pub_use_count,
+                        &mut all_use_count,
+                        &mut contribution,
+                    );
+                }
+                "python" => {
+                    detect_python_grouping(
+                        &file.content,
+                        &mut block_files,
+                        &mut single_files,
+                        &mut all_use_count,
+                        &mut contribution,
+                    );
+                }
+                _ => {}
             }
         }
 
@@ -471,5 +604,53 @@ mod tests {
 
         let contrib = &imports.file_contributions["src/lib.rs"];
         assert_eq!(contrib.counts.get("absolute").copied().unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn test_ts_block_import_grouping() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("app.ts");
+        let content = "import { Foo, Bar } from './foo';\nimport { Baz } from './baz';\n";
+        std::fs::write(&fp, content).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "app.ts".into(),
+            absolute_path: fp,
+            language: Some("typescript".into()),
+            size_bytes: content.len() as u64,
+        }];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let imports = extract_imports(&index);
+
+        let grouping = imports.grouping.expect("grouping should be detected");
+        assert_eq!(
+            grouping.dominant, "block",
+            "TS file with {{}} imports should be block style"
+        );
+    }
+
+    #[test]
+    fn test_python_block_import_grouping() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("mod.py");
+        let content = "from os import (\n    join,\n    exists\n)\nimport sys\n";
+        std::fs::write(&fp, content).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "mod.py".into(),
+            absolute_path: fp,
+            language: Some("python".into()),
+            size_bytes: content.len() as u64,
+        }];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        let imports = extract_imports(&index);
+
+        let grouping = imports.grouping.expect("grouping should be detected");
+        assert_eq!(
+            grouping.dominant, "block",
+            "Python file with parenthesized from-import should be block style"
+        );
     }
 }

@@ -64,17 +64,27 @@ pub fn auto_context(
     opts: &AutoContextOpts,
 ) -> AutoContextResult {
     // Step 0: DNA section — render convention profile, deduct from budget.
+    // If the DNA cost meets or exceeds the total budget, fall back to empty
+    // DNA so that all budget tiers can still produce content sections.
     let counter = crate::budget::counter::TokenCounter::new();
     let (effective_dna, dna_token_cost) = if opts.tokens < 2000 {
         (String::new(), 0)
     } else if opts.tokens < 5000 {
         let compact = crate::conventions::render::render_compact_dna(&index.conventions);
         let cost = counter.count(&compact);
-        (compact, cost)
+        if cost >= opts.tokens {
+            (String::new(), 0)
+        } else {
+            (compact, cost)
+        }
     } else {
         let dna = crate::conventions::render::render_dna_section(&index.conventions);
         let cost = counter.count(&dna);
-        (dna, cost)
+        if cost >= opts.tokens {
+            (String::new(), 0)
+        } else {
+            (dna, cost)
+        }
     };
     let remaining_budget = opts.tokens.saturating_sub(dna_token_cost);
 

@@ -71,81 +71,233 @@ impl RustLanguage {
         full_text.lines().next().unwrap_or("").trim().to_string()
     }
 
-    fn extract_use_import(node: &tree_sitter::Node, source: &[u8]) -> Option<Import> {
-        // use_declaration grammar:
-        //   "use" use_tree ";"
-        // use_tree can be:
-        //   scoped_identifier  ->  path::name
-        //   use_as_clause      ->  path::name as alias
-        //   scoped_use_list    ->  path::{a, b}
-        //   identifier         ->  name (bare)
-        let use_text = Self::node_text(node, source);
-        // Strip "use " prefix and trailing ";"
-        let inner = use_text
-            .trim_start_matches("use")
-            .trim()
-            .trim_end_matches(';')
-            .trim();
+    /// Collect all Import entries from a use_declaration node.
+    /// For multi-source imports (e.g. `use std::{collections::HashMap, io::Write}`)
+    /// this returns one entry per distinct leaf.
+    fn extract_all_use_imports(node: &tree_sitter::Node, source: &[u8]) -> Vec<Import> {
+        let mut results: Vec<Import> = Vec::new();
+        Self::collect_use_leaves(node, "", source, &mut results);
+        // Merge entries that share the same source path.
+        let mut merged: Vec<Import> = Vec::new();
+        for imp in results {
+            if let Some(existing) = merged.iter_mut().find(|m| m.source == imp.source) {
+                existing.names.extend(imp.names);
+            } else {
+                merged.push(imp);
+            }
+        }
+        merged
+    }
 
+    /// Recursively collect leaf Import entries from a use_declaration or
+    /// use_tree node. `prefix` accumulates the path segments seen so far.
+    fn collect_use_leaves(
+        node: &tree_sitter::Node,
+        prefix: &str,
+        source: &[u8],
+        out: &mut Vec<Import>,
+    ) {
+        match node.kind() {
+            "use_declaration" => {
+                // Skip "use" keyword and ";" — recurse into the use_tree child.
+                let prev_len = out.len();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "use_tree" | "scoped_use_list" | "scoped_identifier" | "identifier"
+                        | "use_as_clause" | "use_wildcard" => {
+                            Self::collect_use_leaves(&child, prefix, source, out);
+                        }
+                        _ => {}
+                    }
+                }
+                // Fallback: if no structured children were recognised, parse text directly.
+                if out.len() == prev_len {
+                    let text = Self::node_text(node, source);
+                    let inner = text
+                        .trim_start_matches("use")
+                        .trim()
+                        .trim_end_matches(';')
+                        .trim();
+                    if let Some(imp) = Self::parse_use_text(inner, prefix) {
+                        out.push(imp);
+                    }
+                }
+            }
+
+            "scoped_use_list" => {
+                // grammar: path "::" "{" use_tree,* "}"
+                // Find the path part and then each use_tree inside the braces.
+                let mut path_prefix = prefix.to_string();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "identifier" | "scoped_identifier" => {
+                            let seg = Self::node_text(&child, source);
+                            path_prefix = if path_prefix.is_empty() {
+                                seg.to_string()
+                            } else {
+                                format!("{path_prefix}::{seg}")
+                            };
+                        }
+                        "use_list" => {
+                            let mut inner = child.walk();
+                            for item in child.children(&mut inner) {
+                                match item.kind() {
+                                    "use_tree" | "scoped_use_list" | "scoped_identifier"
+                                    | "identifier" | "use_as_clause" | "use_wildcard" => {
+                                        Self::collect_use_leaves(&item, &path_prefix, source, out);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            "use_tree" => {
+                // Delegate to children
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "use_tree" | "scoped_use_list" | "scoped_identifier" | "identifier"
+                        | "use_as_clause" | "use_wildcard" => {
+                            Self::collect_use_leaves(&child, prefix, source, out);
+                        }
+                        _ => {}
+                    }
+                }
+                // If this use_tree has no recognised children fall back to
+                // text-based parsing so simple paths still work.
+                if out.is_empty() || node.child_count() == 0 {
+                    let text = Self::node_text(node, source);
+                    if let Some(imp) = Self::parse_use_text(text, prefix) {
+                        out.push(imp);
+                    }
+                }
+            }
+
+            "scoped_identifier" => {
+                // e.g. `std::io` or `collections::HashMap`
+                let text = Self::node_text(node, source);
+                if let Some(imp) = Self::parse_use_text(text, prefix) {
+                    out.push(imp);
+                }
+            }
+
+            "identifier" => {
+                let name = Self::node_text(node, source).to_string();
+                if !name.is_empty() && name != "use" && name != "self" {
+                    out.push(Import {
+                        source: prefix.to_string(),
+                        names: vec![name],
+                    });
+                }
+            }
+
+            "use_wildcard" => {
+                // tree-sitter-rust: use_wildcard = scoped_identifier "::" "*"
+                // The scoped_identifier child holds the module path (e.g. "std::collections").
+                // Combine it with any outer prefix.
+                let mut source_path = prefix.to_string();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "scoped_identifier" || child.kind() == "identifier" {
+                        let seg = Self::node_text(&child, source);
+                        source_path = if source_path.is_empty() {
+                            seg.to_string()
+                        } else {
+                            format!("{source_path}::{seg}")
+                        };
+                    }
+                }
+                out.push(Import {
+                    source: source_path,
+                    names: vec!["*".to_string()],
+                });
+            }
+
+            "use_as_clause" => {
+                // e.g. `std::io::Error as IoError` or (when nested) `Error as IoError`
+                let text = Self::node_text(node, source);
+                if let Some(as_idx) = text.find(" as ") {
+                    let before = text[..as_idx].trim();
+                    let alias = text[as_idx + 4..].trim().to_string();
+                    // Derive source from the path up to the last "::" in `before`,
+                    // anchored by `prefix`.
+                    let source_path = if let Some(sep) = before.rfind("::") {
+                        let module = &before[..sep];
+                        if prefix.is_empty() {
+                            module.to_string()
+                        } else {
+                            format!("{prefix}::{module}")
+                        }
+                    } else {
+                        prefix.to_string()
+                    };
+                    out.push(Import {
+                        source: source_path,
+                        names: vec![alias],
+                    });
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Text-level fallback parser for a single use path segment.
+    fn parse_use_text(text: &str, prefix: &str) -> Option<Import> {
+        let inner = text.trim();
         if inner.is_empty() {
             return None;
         }
 
-        // Check for glob: path::*
+        // Glob
         if inner.ends_with("::*") {
-            let source_path = inner.trim_end_matches("::*").to_string();
+            let base = inner.trim_end_matches("::*");
+            let source_path = if prefix.is_empty() {
+                base.to_string()
+            } else {
+                format!("{prefix}::{base}")
+            };
             return Some(Import {
                 source: source_path,
                 names: vec!["*".to_string()],
             });
         }
 
-        // Check for brace list: path::{A, B, C}
-        if let Some(brace_start) = inner.rfind("::{") {
-            let source_path = inner[..brace_start].to_string();
-            let names_str = &inner[brace_start + 3..];
-            let names_str = names_str.trim_end_matches('}');
-            let names: Vec<String> = names_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            return Some(Import {
-                source: source_path,
-                names,
-            });
-        }
-
-        // Check for alias: path::Name as Alias
+        // Alias
         if let Some(as_idx) = inner.find(" as ") {
-            let before_as = inner[..as_idx].trim();
             let alias = inner[as_idx + 4..].trim().to_string();
-            let source_path = if let Some(sep) = before_as.rfind("::") {
-                before_as[..sep].to_string()
-            } else {
-                String::new()
-            };
             return Some(Import {
-                source: source_path,
+                source: prefix.to_string(),
                 names: vec![alias],
             });
         }
 
-        // Simple path: path::Name or just Name
+        // path::Name
         if let Some(sep) = inner.rfind("::") {
-            let source_path = inner[..sep].to_string();
+            let module = &inner[..sep];
             let name = inner[sep + 2..].to_string();
-            Some(Import {
+            let source_path = if prefix.is_empty() {
+                module.to_string()
+            } else {
+                format!("{prefix}::{module}")
+            };
+            return Some(Import {
                 source: source_path,
                 names: vec![name],
-            })
-        } else {
-            // Bare identifier
-            Some(Import {
-                source: String::new(),
-                names: vec![inner.to_string()],
-            })
+            });
         }
+
+        // Bare identifier
+        Some(Import {
+            source: prefix.to_string(),
+            names: vec![inner.to_string()],
+        })
     }
 
     fn extract_impl_methods(node: &tree_sitter::Node, source: &[u8]) -> Vec<Symbol> {
@@ -409,7 +561,7 @@ impl LanguageSupport for RustLanguage {
 
                 "use_declaration" => {
                     let is_pub = Self::is_public(&node, source_bytes);
-                    if let Some(import) = Self::extract_use_import(&node, source_bytes) {
+                    for import in Self::extract_all_use_imports(&node, source_bytes) {
                         if is_pub {
                             for name in &import.names {
                                 exports.push(Export {
@@ -1002,6 +1154,45 @@ trait InternalHelper {
                 .iter()
                 .any(|e| e.name == "foo" && e.kind == SymbolKind::Macro),
             "macro should be in exports"
+        );
+    }
+
+    #[test]
+    fn test_nested_brace_import() {
+        // use std::{collections::{HashMap, BTreeMap}, io}
+        // Should not mangle into a single broken path.
+        let source = "use std::{collections::{HashMap, BTreeMap}, io};\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = RustLanguage;
+        let result = lang.extract(source, &tree);
+
+        // We expect at least one import and none of the names should contain "{"
+        assert!(
+            !result.imports.is_empty(),
+            "expected at least one import from nested braces"
+        );
+        for import in &result.imports {
+            for name in &import.names {
+                assert!(
+                    !name.contains('{') && !name.contains('}'),
+                    "mangled name detected: {name:?}"
+                );
+            }
+        }
+        // HashMap and BTreeMap should appear
+        let all_names: Vec<&str> = result
+            .imports
+            .iter()
+            .flat_map(|i| i.names.iter().map(|n| n.as_str()))
+            .collect();
+        assert!(
+            all_names.contains(&"HashMap"),
+            "HashMap missing: {all_names:?}"
+        );
+        assert!(
+            all_names.contains(&"BTreeMap"),
+            "BTreeMap missing: {all_names:?}"
         );
     }
 

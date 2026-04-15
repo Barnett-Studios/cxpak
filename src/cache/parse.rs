@@ -7,6 +7,10 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Files larger than this are skipped by the parser to avoid runaway memory
+/// usage (e.g. large generated files that slipped through the blocklist).
+const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
+
 /// Get the mtime of a file as seconds since UNIX epoch, or 0 on failure.
 fn file_mtime(path: &Path) -> i64 {
     std::fs::metadata(path)
@@ -79,6 +83,29 @@ pub fn parse_with_cache(
                 // own Parser so there is no shared mutable state.
                 let mut result = None;
                 let mut source_read: Option<String> = None;
+
+                // Skip files that exceed the size cap to avoid runaway memory usage.
+                if size_bytes > MAX_FILE_BYTES {
+                    eprintln!(
+                        "cxpak: skipping parse of {} ({} bytes > {} byte limit)",
+                        file.absolute_path.display(),
+                        size_bytes,
+                        MAX_FILE_BYTES
+                    );
+                    return (
+                        None,
+                        CacheEntry {
+                            relative_path: file.relative_path.clone(),
+                            mtime,
+                            size_bytes,
+                            language: file.language.clone(),
+                            token_count: 0,
+                            parse_result: None,
+                        },
+                        None,
+                    );
+                }
+
                 if let Some(lang_name) = &file.language {
                     if let Some(lang) = registry.get(lang_name) {
                         let source =

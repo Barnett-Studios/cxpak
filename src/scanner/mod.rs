@@ -92,8 +92,8 @@ impl Scanner {
         let mut builder = WalkBuilder::new(&self.root);
         builder
             .git_ignore(true) // respect .gitignore
-            .git_global(false) // skip global gitignore for determinism
-            .git_exclude(false) // skip .git/info/exclude for determinism
+            .git_global(true) // honor ~/.gitignore_global (often excludes .env, *.pem, etc.)
+            .git_exclude(true) // honor .git/info/exclude (per-repo exclusions)
             .hidden(true) // visit hidden files (we handle .git via overrides)
             .overrides(overrides);
 
@@ -178,6 +178,25 @@ pub(crate) fn path_starts_with_workspace(path: &str, ws: &str) -> bool {
     path.starts_with(&needle)
 }
 
+/// Disambiguate `.m` files between Objective-C and MATLAB by sniffing the
+/// first 256 bytes of the file for Objective-C markers.
+///
+/// Returns `"objc"` if the file starts with `#import`, `#include`, `@interface`,
+/// `@implementation`, `@property`, or `@class`.  Returns `"matlab"` otherwise.
+fn disambiguate_m_extension(path: &Path) -> &'static str {
+    let mut buf = [0u8; 256];
+    if let Ok(mut f) = std::fs::File::open(path) {
+        use std::io::Read;
+        if let Ok(n) = f.read(&mut buf) {
+            let head = std::str::from_utf8(&buf[..n]).unwrap_or("").trim_start();
+            if head.starts_with('#') || head.starts_with('@') {
+                return "objc";
+            }
+        }
+    }
+    "matlab"
+}
+
 /// Detect a programming language from a file's name or extension.
 pub fn detect_language(path: &Path) -> Option<String> {
     // First: check by filename (for extensionless files like Dockerfile, Makefile)
@@ -227,7 +246,8 @@ pub fn detect_language(path: &Path) -> Option<String> {
         "zig" => "zig",
         "hs" => "haskell",
         "groovy" | "gradle" => "groovy",
-        "m" | "mm" => "objc",
+        "mm" => "objc", // C++/ObjC mixed — always objc
+        "m" => return Some(disambiguate_m_extension(path).to_string()),
         "r" => "r",
         "jl" => "julia",
         "ml" => "ocaml",
@@ -403,7 +423,7 @@ mod tests {
             ("Main.hs", "haskell"),
             ("build.groovy", "groovy"),
             ("build.gradle", "groovy"),
-            ("ViewController.m", "objc"),
+            // .m disambiguation is tested separately (requires file content sniffing)
             ("ViewController.mm", "objc"),
             ("analysis.r", "r"),
             ("analysis.R", "r"),
@@ -471,11 +491,35 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_matlab_extension_maps_to_objc() {
-        // .m defaults to objc, not matlab (known ambiguity — objc wins unconditionally)
+    fn test_detect_m_extension_nonexistent_defaults_to_matlab() {
+        // A nonexistent .m file cannot be sniffed → falls back to "matlab".
         assert_eq!(
-            detect_language(Path::new("script.m")),
-            Some("objc".to_string())
+            detect_language(Path::new("nonexistent_file_xyz.m")),
+            Some("matlab".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_m_extension_objc_sniffed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ViewController.m");
+        fs::write(&path, "@interface Foo : NSObject\n@end\n").unwrap();
+        assert_eq!(
+            detect_language(&path),
+            Some("objc".to_string()),
+            "file starting with @interface should be detected as objc"
+        );
+    }
+
+    #[test]
+    fn test_detect_m_extension_matlab_sniffed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("solver.m");
+        fs::write(&path, "function y = f(x)\n  y = x^2;\nend\n").unwrap();
+        assert_eq!(
+            detect_language(&path),
+            Some("matlab".to_string()),
+            "file starting with 'function' should be detected as matlab"
         );
     }
 

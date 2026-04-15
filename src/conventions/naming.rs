@@ -78,7 +78,12 @@ pub fn classify_name(name: &str) -> NamingStyle {
         return NamingStyle::CamelCase;
     }
     if has_upper && !has_lower {
-        // All uppercase, no underscore — single word like "API"
+        // All uppercase, no underscore.
+        // Short names (≤6 chars) are likely acronyms (e.g. "API", "HTTP") — classify
+        // as Other to avoid inflating the ScreamingSnake count with ambiguous names.
+        if name.len() <= 6 {
+            return NamingStyle::Other;
+        }
         return NamingStyle::ScreamingSnake;
     }
 
@@ -128,7 +133,15 @@ fn dominant_observation(
     if total == 0 {
         return None;
     }
-    let (dominant_style, &dominant_count) = counts.iter().max_by_key(|(_, &v)| v)?;
+    // Stable tie detection: if two or more styles share the maximum count,
+    // there is no dominant style — return None rather than picking one
+    // non-deterministically.
+    let max_count = counts.values().copied().max()?;
+    let winners: Vec<_> = counts.iter().filter(|(_, &v)| v == max_count).collect();
+    if winners.len() > 1 {
+        return None;
+    }
+    let (dominant_style, &dominant_count) = winners[0];
     let mut obs = PatternObservation::new(name, dominant_style, dominant_count, total)?;
 
     // Collect exceptions (non-dominant names)
@@ -256,6 +269,20 @@ mod tests {
     fn test_classify_screaming_snake() {
         assert_eq!(classify_name("MAX_RETRIES"), NamingStyle::ScreamingSnake);
         assert_eq!(classify_name("API_KEY"), NamingStyle::ScreamingSnake);
+    }
+
+    #[test]
+    fn test_classify_acronym_short_all_caps() {
+        // Short all-caps names without underscore are acronyms → Other.
+        assert_eq!(classify_name("API"), NamingStyle::Other);
+        assert_eq!(classify_name("HTTP"), NamingStyle::Other);
+        assert_eq!(classify_name("ID"), NamingStyle::Other);
+        // Long all-caps without underscore → ScreamingSnake (e.g. old code that
+        // uses all-caps single words for constants).
+        assert_eq!(
+            classify_name("VERY_LONG_CONSTANT"),
+            NamingStyle::ScreamingSnake
+        );
     }
 
     #[test]

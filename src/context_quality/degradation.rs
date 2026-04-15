@@ -160,12 +160,23 @@ pub fn split_oversized_symbol(symbol: &Symbol, _source: &str) -> Vec<DegradedSym
     let mut current_chunk: Vec<&str> = Vec::new();
     let mut current_tokens = 0usize;
 
+    // Contract: every returned chunk satisfies tokens ≤ MAX_SYMBOL_TOKENS
+    // OR contains exactly one line (the pathological giant-line case).
     for line in &lines {
         let line_tokens = counter.count(line) + 1; // +1 for newline
-        if current_tokens + line_tokens > MAX_SYMBOL_TOKENS && !current_chunk.is_empty() {
-            chunks.push(current_chunk);
-            current_chunk = Vec::new();
-            current_tokens = 0;
+        if current_tokens + line_tokens > MAX_SYMBOL_TOKENS {
+            // Flush the current chunk first (if any).
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk);
+                current_chunk = Vec::new();
+                current_tokens = 0;
+            }
+            // If the line itself exceeds the limit, it becomes its own chunk.
+            if line_tokens > MAX_SYMBOL_TOKENS {
+                chunks.push(vec![line]);
+                current_tokens = 0;
+                continue;
+            }
         }
         current_chunk.push(line);
         current_tokens += line_tokens;
@@ -298,6 +309,8 @@ pub fn allocate_with_degradation(
             }
             None => score * 0.7 + cp * 0.3,
         };
+        // Guard against NaN/Inf from upstream calculations — sort requires finite values.
+        let priority = if priority.is_finite() { priority } else { 0.0 };
         roles.push(*role);
         priorities.push(priority);
         all_symbols.push(symbols);

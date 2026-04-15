@@ -22,7 +22,7 @@ pub fn extract_visibility(index: &CodebaseIndex) -> VisibilityConventions {
     let mut file_contributions: HashMap<String, FileContribution> = HashMap::new();
 
     for file in &index.files {
-        if file.relative_path.contains("test") || file.relative_path.starts_with("tests/") {
+        if crate::conventions::errors::is_test_file(&file.relative_path) {
             continue;
         }
 

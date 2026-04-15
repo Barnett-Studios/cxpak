@@ -182,6 +182,19 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
         .collect();
     churn_180d_vec.sort_by(|a, b| b.modifications.cmp(&a.modifications));
 
+    // Compute the 75th-percentile churn threshold from the 180-day data.
+    // This replaces the old absolute threshold of 5.
+    let high_churn_threshold = {
+        let mut vals: Vec<usize> = churn_180d_vec.iter().map(|e| e.modifications).collect();
+        vals.sort_unstable();
+        let p75 = if vals.is_empty() {
+            5
+        } else {
+            vals.get(vals.len() * 3 / 4).copied().unwrap_or(5)
+        };
+        p75.max(3)
+    };
+
     // Bug-fix density per directory
     let mut bugfix_density: HashMap<String, f64> = HashMap::new();
     for (dir, total) in &dir_commits {
@@ -211,7 +224,7 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
             .map(|e| e.modifications)
             .unwrap_or(0);
 
-        let trend = classify_trend(c30, c180);
+        let trend = classify_trend(c30, c180, high_churn_threshold);
         churn_trend.insert(path, trend);
     }
 
@@ -234,11 +247,22 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
     }
 }
 
-fn classify_trend(c30: usize, c180: usize) -> ChurnTrend {
+/// Compute the 75th-percentile churn threshold from a map of file → modification counts.
+/// Falls back to 3 when the map is empty or the computed percentile is below 3.
+pub fn p75_churn_threshold(churn_map: &std::collections::HashMap<String, usize>) -> usize {
+    let mut vals: Vec<usize> = churn_map.values().copied().collect();
+    vals.sort_unstable();
+    let p75 = if vals.is_empty() {
+        5
+    } else {
+        vals.get(vals.len() * 3 / 4).copied().unwrap_or(5)
+    };
+    p75.max(3)
+}
+
+fn classify_trend(c30: usize, c180: usize, high_threshold: usize) -> ChurnTrend {
     // Normalize 30d to 180d scale: c30 * 6
     let c30_normalized = c30 * 6;
-
-    let high_threshold = 5; // at least 5 modifications in window
 
     match (c30 >= high_threshold, c180 >= high_threshold) {
         (true, true) => {
@@ -274,22 +298,22 @@ mod tests {
 
     #[test]
     fn test_classify_trend_hot() {
-        assert_eq!(classify_trend(10, 3), ChurnTrend::Hot);
+        assert_eq!(classify_trend(10, 3, 5), ChurnTrend::Hot);
     }
 
     #[test]
     fn test_classify_trend_stabilized() {
-        assert_eq!(classify_trend(1, 20), ChurnTrend::Stabilized);
+        assert_eq!(classify_trend(1, 20, 5), ChurnTrend::Stabilized);
     }
 
     #[test]
     fn test_classify_trend_chronic() {
-        assert_eq!(classify_trend(10, 80), ChurnTrend::Chronic);
+        assert_eq!(classify_trend(10, 80, 5), ChurnTrend::Chronic);
     }
 
     #[test]
     fn test_classify_trend_cold() {
-        assert_eq!(classify_trend(1, 2), ChurnTrend::Cold);
+        assert_eq!(classify_trend(1, 2, 5), ChurnTrend::Cold);
     }
 
     #[test]
@@ -353,7 +377,35 @@ mod tests {
     fn test_classify_trend_boundary_hot_vs_chronic() {
         // c30_normalized == c180 → Chronic (not strictly greater)
         // c30=10, c180=60 → c30*6=60 == c180=60 → Chronic
-        assert_eq!(classify_trend(10, 60), ChurnTrend::Chronic);
+        assert_eq!(classify_trend(10, 60, 5), ChurnTrend::Chronic);
+    }
+
+    #[test]
+    fn test_p75_churn_threshold_basic() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_string(), 1usize);
+        map.insert("b".to_string(), 2);
+        map.insert("c".to_string(), 3);
+        map.insert("d".to_string(), 100);
+        // sorted: [1,2,3,100], p75 index = 3 → value 100; .max(3) = 100
+        let t = p75_churn_threshold(&map);
+        assert_eq!(t, 100);
+    }
+
+    #[test]
+    fn test_p75_churn_threshold_empty() {
+        let map = std::collections::HashMap::new();
+        // empty → fallback 5, .max(3) = 5
+        assert_eq!(p75_churn_threshold(&map), 5);
+    }
+
+    #[test]
+    fn test_p75_churn_threshold_min_floor() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_string(), 1usize);
+        // sorted: [1], p75 index = 0 → value 1; .max(3) = 3
+        let t = p75_churn_threshold(&map);
+        assert_eq!(t, 3);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

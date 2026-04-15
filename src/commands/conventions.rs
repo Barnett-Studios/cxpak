@@ -13,7 +13,10 @@ pub fn run_export(path: &Path) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&cxpak_dir)?;
     let out = cxpak_dir.join("conventions.json");
     let json = serde_json::to_string_pretty(&export)?;
-    std::fs::write(&out, &json)?;
+    // Atomic write: write to .tmp then rename so the file is never partially written.
+    let tmp_path = out.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json)?;
+    std::fs::rename(&tmp_path, &out)?;
     eprintln!(
         "cxpak: conventions exported to {} (checksum: {})",
         out.display(),

@@ -36,7 +36,7 @@ pub fn extract_testing(index: &CodebaseIndex) -> TestingConventions {
     let mut dir_tested: HashMap<String, usize> = HashMap::new();
 
     for file in &index.files {
-        if file.relative_path.contains("test") || file.relative_path.starts_with("tests/") {
+        if crate::conventions::errors::is_test_file(&file.relative_path) {
             continue;
         }
         let dir = file
@@ -72,7 +72,7 @@ pub fn extract_testing(index: &CodebaseIndex) -> TestingConventions {
     let mut test_files = 0usize;
 
     for file in &index.files {
-        if file.relative_path.contains("test") || file.relative_path.starts_with("tests/") {
+        if crate::conventions::errors::is_test_file(&file.relative_path) {
             test_files += 1;
             if mock_patterns.iter().any(|p| file.content.contains(p)) {
                 mock_files += 1;
@@ -92,7 +92,7 @@ pub fn extract_testing(index: &CodebaseIndex) -> TestingConventions {
     let mut total_test_fns = 0usize;
 
     for file in &index.files {
-        if !(file.relative_path.contains("test") || file.relative_path.starts_with("tests/")) {
+        if !crate::conventions::errors::is_test_file(&file.relative_path) {
             continue;
         }
         if let Some(pr) = &file.parse_result {
@@ -115,14 +115,24 @@ pub fn extract_testing(index: &CodebaseIndex) -> TestingConventions {
     }
 
     let test_naming = if total_test_fns > 0 {
-        let (dominant_pattern, &dominant_count) =
-            test_name_patterns.iter().max_by_key(|(_, &v)| v).unwrap();
-        PatternObservation::new(
-            "test_naming",
-            dominant_pattern,
-            dominant_count,
-            total_test_fns,
-        )
+        // Stable tie detection: if two patterns share the max count,
+        // return None rather than picking one non-deterministically.
+        let max_count = test_name_patterns.values().copied().max().unwrap_or(0);
+        let winners: Vec<_> = test_name_patterns
+            .iter()
+            .filter(|(_, &v)| v == max_count)
+            .collect();
+        if winners.len() == 1 {
+            let (dominant_pattern, &dominant_count) = winners[0];
+            PatternObservation::new(
+                "test_naming",
+                dominant_pattern,
+                dominant_count,
+                total_test_fns,
+            )
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -131,7 +141,7 @@ pub fn extract_testing(index: &CodebaseIndex) -> TestingConventions {
     let total_public_fns = index
         .files
         .iter()
-        .filter(|f| !f.relative_path.contains("test") && !f.relative_path.starts_with("tests/"))
+        .filter(|f| !crate::conventions::errors::is_test_file(&f.relative_path))
         .filter_map(|f| f.parse_result.as_ref())
         .flat_map(|pr| &pr.symbols)
         .filter(|s| {

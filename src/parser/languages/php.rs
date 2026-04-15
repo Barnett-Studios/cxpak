@@ -153,10 +153,27 @@ impl LanguageSupport for PhpLanguage {
         let mut imports: Vec<Import> = Vec::new();
         let mut exports: Vec<Export> = Vec::new();
 
-        let mut cursor = root.walk();
+        // Stack-based DFS so namespace_definition bodies are visited.
+        let mut stack: Vec<tree_sitter::Node> = root.children(&mut root.walk()).collect();
 
-        for node in root.children(&mut cursor) {
+        while let Some(node) = stack.pop() {
             match node.kind() {
+                "namespace_definition" => {
+                    // Recurse into the namespace body — its children may include
+                    // class_declaration, function_definition, namespace_use_declaration, etc.
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if child.kind() == "declaration_list"
+                            || child.kind() == "compound_statement"
+                        {
+                            let mut inner = child.walk();
+                            for item in child.children(&mut inner) {
+                                stack.push(item);
+                            }
+                        }
+                    }
+                }
+
                 "function_definition" => {
                     let name = Self::extract_name(&node, source_bytes);
                     let signature = Self::extract_fn_signature(&node, source_bytes);
@@ -464,6 +481,38 @@ function helper() {
         assert!(!funcs.is_empty(), "expected top-level function");
 
         assert!(!result.imports.is_empty(), "expected imports");
+    }
+
+    #[test]
+    fn test_namespace_block_imports_found() {
+        // namespace_use_declaration nodes inside a namespace_definition block
+        // must be discovered by the stack-based DFS.
+        let source = r#"<?php
+
+namespace App\Http\Controllers {
+    use App\Models\User;
+    use App\Services\AuthService;
+
+    class UserController {
+        public function index() {
+            return [];
+        }
+    }
+}
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = PhpLanguage;
+        let result = lang.extract(source, &tree);
+
+        assert!(
+            !result.imports.is_empty(),
+            "imports inside namespace block should be found, got none"
+        );
+        assert!(
+            result.symbols.iter().any(|s| s.kind == SymbolKind::Class),
+            "class inside namespace block should be found"
+        );
     }
 
     #[test]

@@ -71,8 +71,12 @@ impl PythonLanguage {
                     let module = after_from[..import_idx].trim().to_string();
                     let names_str = after_from[import_idx + 8..].trim();
                     let names: Vec<String> = if names_str.starts_with('(') {
+                        // Strip outer parens then trim whitespace before splitting.
+                        // The raw text may span multiple lines, e.g.:
+                        //   from os import (\n    join,\n    exists \n)
                         names_str
-                            .trim_matches(|c| c == '(' || c == ')')
+                            .trim_matches(|c: char| c == '(' || c == ')')
+                            .trim()
                             .split(',')
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
@@ -445,6 +449,20 @@ from pathlib import Path, PurePath
         assert_eq!(result.imports.len(), 1);
         assert_eq!(result.imports[0].source, "os.path");
         assert!(result.imports[0].names.len() >= 3);
+        // Ensure no name contains a stray ')' character
+        for name in &result.imports[0].names {
+            assert!(!name.contains(')'), "name should not contain ')': {name:?}");
+        }
+        assert!(
+            result.imports[0].names.contains(&"join".to_string()),
+            "names: {:?}",
+            result.imports[0].names
+        );
+        assert!(
+            result.imports[0].names.contains(&"exists".to_string()),
+            "names: {:?}",
+            result.imports[0].names
+        );
     }
 
     #[test]

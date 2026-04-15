@@ -78,6 +78,157 @@ impl RubyLanguage {
         }
         String::new()
     }
+
+    /// Return the method name for a `call` node (the `method` field text).
+    fn extract_call_method_name(node: &tree_sitter::Node, source: &[u8]) -> String {
+        node.child_by_field_name("method")
+            .map(|n| Self::node_text(&n, source).to_string())
+            .unwrap_or_default()
+    }
+
+    /// Walk children of a class or module body node, tracking visibility state.
+    ///
+    /// A bare `private` / `protected` call (no arguments) flips `current_vis`
+    /// for all subsequent `method` nodes in the same scope.  A bare `public`
+    /// resets it.  If a call has arguments (e.g. `private :foo, :bar`) the
+    /// named methods are marked Private but `current_vis` is unchanged.
+    fn walk_body(
+        body_node: &tree_sitter::Node,
+        source_bytes: &[u8],
+        symbols: &mut Vec<Symbol>,
+        imports: &mut Vec<Import>,
+        exports: &mut Vec<Export>,
+    ) {
+        let mut current_vis = Visibility::Public;
+        let mut cursor = body_node.walk();
+        for child in body_node.children(&mut cursor) {
+            match child.kind() {
+                "method" => {
+                    let name = Self::extract_name(&child, source_bytes);
+                    let signature = Self::first_line(&child, source_bytes);
+                    let body = Self::extract_fn_body(&child, source_bytes);
+                    let start_line = child.start_position().row + 1;
+                    let end_line = child.end_position().row + 1;
+                    if current_vis == Visibility::Public {
+                        exports.push(Export {
+                            name: name.clone(),
+                            kind: SymbolKind::Method,
+                        });
+                    }
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Method,
+                        visibility: current_vis.clone(),
+                        signature,
+                        body,
+                        start_line,
+                        end_line,
+                    });
+                }
+                "singleton_method" => {
+                    let name = Self::extract_name(&child, source_bytes);
+                    let signature = Self::first_line(&child, source_bytes);
+                    let body = Self::extract_fn_body(&child, source_bytes);
+                    let start_line = child.start_position().row + 1;
+                    let end_line = child.end_position().row + 1;
+                    exports.push(Export {
+                        name: name.clone(),
+                        kind: SymbolKind::Method,
+                    });
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Method,
+                        visibility: Visibility::Public,
+                        signature,
+                        body,
+                        start_line,
+                        end_line,
+                    });
+                }
+                // In tree-sitter-ruby, a bare `private` / `protected` / `public`
+                // keyword inside a class body is parsed as an `identifier` node,
+                // NOT as a `call` node.  Handle it here.
+                "identifier" => match Self::node_text(&child, source_bytes) {
+                    "private" | "protected" => {
+                        current_vis = Visibility::Private;
+                    }
+                    "public" => {
+                        current_vis = Visibility::Public;
+                    }
+                    _ => {}
+                },
+                "call" => {
+                    if let Some(imp) = Self::extract_require(&child, source_bytes) {
+                        imports.push(imp);
+                        continue;
+                    }
+                    let method_name = Self::extract_call_method_name(&child, source_bytes);
+                    let has_args = child.child_by_field_name("arguments").is_some();
+                    if !has_args {
+                        match method_name.as_str() {
+                            "private" | "protected" => {
+                                current_vis = Visibility::Private;
+                            }
+                            "public" => {
+                                current_vis = Visibility::Public;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // If the call HAS arguments, e.g. `private :foo, :bar`,
+                    // we do NOT change current_vis — the caller's default stands.
+                }
+                "class" => {
+                    // Nested class — recurse
+                    let name = Self::extract_name(&child, source_bytes);
+                    let signature = Self::first_line(&child, source_bytes);
+                    let body = Self::node_text(&child, source_bytes).to_string();
+                    let start_line = child.start_position().row + 1;
+                    let end_line = child.end_position().row + 1;
+                    exports.push(Export {
+                        name: name.clone(),
+                        kind: SymbolKind::Class,
+                    });
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Class,
+                        visibility: Visibility::Public,
+                        signature,
+                        body,
+                        start_line,
+                        end_line,
+                    });
+                    if let Some(nested_body) = child.child_by_field_name("body") {
+                        Self::walk_body(&nested_body, source_bytes, symbols, imports, exports);
+                    }
+                }
+                "module" => {
+                    let name = Self::extract_name(&child, source_bytes);
+                    let signature = Self::first_line(&child, source_bytes);
+                    let body = Self::node_text(&child, source_bytes).to_string();
+                    let start_line = child.start_position().row + 1;
+                    let end_line = child.end_position().row + 1;
+                    exports.push(Export {
+                        name: name.clone(),
+                        kind: SymbolKind::Trait,
+                    });
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Trait,
+                        visibility: Visibility::Public,
+                        signature,
+                        body,
+                        start_line,
+                        end_line,
+                    });
+                    if let Some(nested_body) = child.child_by_field_name("body") {
+                        Self::walk_body(&nested_body, source_bytes, symbols, imports, exports);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl LanguageSupport for RubyLanguage {
@@ -97,21 +248,17 @@ impl LanguageSupport for RubyLanguage {
         let mut imports: Vec<Import> = Vec::new();
         let mut exports: Vec<Export> = Vec::new();
 
-        // Walk top-level and all descendants via a stack. We recurse into
-        // class/module bodies to find nested methods.
-        let mut stack: Vec<tree_sitter::Node> = root.children(&mut root.walk()).collect();
-
-        while let Some(node) = stack.pop() {
+        // Process top-level nodes. Visibility tracking only applies inside
+        // class/module bodies; top-level methods are always public in Ruby.
+        let mut cursor = root.walk();
+        for node in root.children(&mut cursor) {
             match node.kind() {
                 "method" => {
                     let name = Self::extract_name(&node, source_bytes);
-                    // All methods discovered at top-level are public by default in Ruby.
-                    // We do not track private/protected access modifiers in this simple pass.
                     let signature = Self::first_line(&node, source_bytes);
                     let body = Self::extract_fn_body(&node, source_bytes);
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
-
                     exports.push(Export {
                         name: name.clone(),
                         kind: SymbolKind::Method,
@@ -126,15 +273,12 @@ impl LanguageSupport for RubyLanguage {
                         end_line,
                     });
                 }
-
                 "singleton_method" => {
-                    // def self.method_name — always public
                     let name = Self::extract_name(&node, source_bytes);
                     let signature = Self::first_line(&node, source_bytes);
                     let body = Self::extract_fn_body(&node, source_bytes);
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
-
                     exports.push(Export {
                         name: name.clone(),
                         kind: SymbolKind::Method,
@@ -149,14 +293,12 @@ impl LanguageSupport for RubyLanguage {
                         end_line,
                     });
                 }
-
                 "class" => {
                     let name = Self::extract_name(&node, source_bytes);
                     let signature = Self::first_line(&node, source_bytes);
                     let body = Self::node_text(&node, source_bytes).to_string();
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
-
                     exports.push(Export {
                         name: name.clone(),
                         kind: SymbolKind::Class,
@@ -170,23 +312,22 @@ impl LanguageSupport for RubyLanguage {
                         start_line,
                         end_line,
                     });
-
-                    // Recurse into class body
                     if let Some(body_node) = node.child_by_field_name("body") {
-                        let mut cursor = body_node.walk();
-                        for child in body_node.children(&mut cursor) {
-                            stack.push(child);
-                        }
+                        Self::walk_body(
+                            &body_node,
+                            source_bytes,
+                            &mut symbols,
+                            &mut imports,
+                            &mut exports,
+                        );
                     }
                 }
-
                 "module" => {
                     let name = Self::extract_name(&node, source_bytes);
                     let signature = Self::first_line(&node, source_bytes);
                     let body = Self::node_text(&node, source_bytes).to_string();
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
-
                     exports.push(Export {
                         name: name.clone(),
                         kind: SymbolKind::Trait,
@@ -200,22 +341,21 @@ impl LanguageSupport for RubyLanguage {
                         start_line,
                         end_line,
                     });
-
-                    // Recurse into module body
                     if let Some(body_node) = node.child_by_field_name("body") {
-                        let mut cursor = body_node.walk();
-                        for child in body_node.children(&mut cursor) {
-                            stack.push(child);
-                        }
+                        Self::walk_body(
+                            &body_node,
+                            source_bytes,
+                            &mut symbols,
+                            &mut imports,
+                            &mut exports,
+                        );
                     }
                 }
-
                 "call" => {
                     if let Some(imp) = Self::extract_require(&node, source_bytes) {
                         imports.push(imp);
                     }
                 }
-
                 _ => {}
             }
         }
@@ -452,6 +592,72 @@ end
         let lang = RubyLanguage;
         let result = lang.extract(source, &tree);
         assert!(!result.imports.is_empty());
+    }
+
+    #[test]
+    fn test_private_protected_visibility() {
+        let source = r#"class MyService
+  def public_method
+    "pub"
+  end
+
+  private
+
+  def private_method
+    "priv"
+  end
+
+  protected
+
+  def protected_method
+    "prot"
+  end
+end
+"#;
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = RubyLanguage;
+        let result = lang.extract(source, &tree);
+
+        let methods: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+
+        let pub_m = methods
+            .iter()
+            .find(|m| m.name == "public_method")
+            .expect("public_method not found");
+        assert_eq!(pub_m.visibility, Visibility::Public);
+
+        let priv_m = methods
+            .iter()
+            .find(|m| m.name == "private_method")
+            .expect("private_method not found");
+        assert_eq!(priv_m.visibility, Visibility::Private);
+
+        let prot_m = methods
+            .iter()
+            .find(|m| m.name == "protected_method")
+            .expect("protected_method not found");
+        assert_eq!(prot_m.visibility, Visibility::Private);
+
+        // Only public_method should be in exports
+        let exported_names: Vec<&str> = result
+            .exports
+            .iter()
+            .filter(|e| e.kind == SymbolKind::Method)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            exported_names.contains(&"public_method"),
+            "public_method should be exported: {exported_names:?}"
+        );
+        assert!(
+            !exported_names.contains(&"private_method"),
+            "private_method should not be exported: {exported_names:?}"
+        );
     }
 
     #[test]

@@ -10,6 +10,10 @@ pub const CACHE_VERSION: u32 = 2;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileCache {
     pub version: u32,
+    /// SHA-like hash of all tree-sitter grammar versions at compile time.
+    /// When grammars are updated, this hash changes and the cache is invalidated.
+    #[serde(default)]
+    pub grammar_hash: String,
     pub entries: Vec<CacheEntry>,
 }
 
@@ -23,10 +27,14 @@ pub struct CacheEntry {
     pub parse_result: Option<ParseResult>,
 }
 
+/// Grammar hash computed at compile time by build.rs.
+const CURRENT_GRAMMAR_HASH: &str = env!("CXPAK_GRAMMAR_HASH");
+
 impl FileCache {
     pub fn new() -> Self {
         Self {
             version: CACHE_VERSION,
+            grammar_hash: CURRENT_GRAMMAR_HASH.to_string(),
             entries: Vec::new(),
         }
     }
@@ -38,7 +46,11 @@ impl FileCache {
             Err(_) => return Self::new(),
         };
         match serde_json::from_str::<FileCache>(&content) {
-            Ok(cache) if cache.version == CACHE_VERSION => cache,
+            Ok(cache)
+                if cache.version == CACHE_VERSION && cache.grammar_hash == CURRENT_GRAMMAR_HASH =>
+            {
+                cache
+            }
             _ => Self::new(),
         }
     }
@@ -142,6 +154,37 @@ mod tests {
         assert_eq!(pr.imports[0].source, "std::io");
         assert_eq!(pr.exports.len(), 1);
         assert_eq!(pr.exports[0].name, "my_fn");
+    }
+
+    #[test]
+    fn test_grammar_hash_mismatch_returns_empty() {
+        // A cache with a different grammar_hash should be discarded.
+        let stale = serde_json::json!({
+            "version": CACHE_VERSION,
+            "grammar_hash": "stale_grammar_hash_that_does_not_match",
+            "entries": [
+                {
+                    "relative_path": "src/main.rs",
+                    "mtime": 1_700_000_000_i64,
+                    "size_bytes": 512,
+                    "language": null,
+                    "token_count": 10,
+                    "parse_result": null
+                }
+            ]
+        });
+        let json = stale.to_string();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("cache.json"), &json).expect("write");
+
+        let cache = FileCache::load(dir.path());
+        assert_eq!(cache.version, CACHE_VERSION);
+        assert!(
+            cache.entries.is_empty(),
+            "stale grammar hash should invalidate cache"
+        );
+        assert_eq!(cache.grammar_hash, CURRENT_GRAMMAR_HASH);
     }
 
     #[test]
