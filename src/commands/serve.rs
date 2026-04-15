@@ -33,6 +33,51 @@ fn matches_focus(path: &str, focus: Option<&str>) -> bool {
     }
 }
 
+/// Remove PatternObservation entries from a serialized convention JSON value
+/// whose `percentage` field is below `min_pct`.
+fn filter_observations_by_strength(val: &mut Value, min_pct: f64) {
+    match val {
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                // If this value looks like a PatternObservation (has "percentage"),
+                // check against the threshold and nullify if below.
+                if let Some(pct) = v.get("percentage").and_then(|p| p.as_f64()) {
+                    if pct < min_pct {
+                        *v = Value::Null;
+                    }
+                } else {
+                    filter_observations_by_strength(v, min_pct);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                filter_observations_by_strength(v, min_pct);
+            }
+            arr.retain(|v| !v.is_null());
+        }
+        _ => {}
+    }
+}
+
+/// Remove entries from `file_contributions` objects in a serialized convention
+/// value whose key does not start with `focus_prefix`.
+fn filter_contributions_by_focus(val: &mut Value, focus_prefix: &str) {
+    if let Some(map) = val.as_object_mut() {
+        if let Some(contributions) = map.get_mut("file_contributions") {
+            if let Some(contrib_map) = contributions.as_object_mut() {
+                contrib_map.retain(|k, _| k.starts_with(focus_prefix));
+            }
+        }
+        // Recurse into nested objects
+        for v in map.values_mut() {
+            if v.is_object() {
+                filter_contributions_by_focus(v, focus_prefix);
+            }
+        }
+    }
+}
+
 /// Scan and parse all files in a path, returning a fully built CodebaseIndex.
 pub fn build_index(path: &Path) -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
     build_index_with_workspace(path, None)
@@ -1735,7 +1780,7 @@ fn handle_tool_call(
         "cxpak_diff" => {
             let git_ref = args.get("git_ref").and_then(|r| r.as_str());
             let focus = args.get("focus").and_then(|f| f.as_str());
-            let _token_budget = args
+            let token_budget = args
                 .get("tokens")
                 .and_then(|t| t.as_str())
                 .and_then(|t| crate::cli::parse_token_count(t).ok())
@@ -1748,19 +1793,32 @@ fn handle_tool_call(
                         .filter(|c| matches_focus(&c.path, focus))
                         .collect();
 
-                    let files: Vec<Value> = filtered
-                        .iter()
-                        .map(|c| {
-                            json!({
-                                "path": c.path,
-                                "diff": c.diff_text,
-                            })
-                        })
-                        .collect();
+                    let counter = TokenCounter::new();
+                    let mut total_tokens = 0usize;
+                    let mut files: Vec<Value> = Vec::new();
+
+                    for c in &filtered {
+                        let diff_tokens = counter.count(&c.diff_text);
+                        if total_tokens + diff_tokens > token_budget {
+                            // Budget exhausted — truncate remaining entries
+                            break;
+                        }
+                        total_tokens += diff_tokens;
+                        files.push(json!({
+                            "path": c.path,
+                            "diff": c.diff_text,
+                        }));
+                    }
+
+                    let truncated = files.len() < filtered.len();
 
                     let mut result = json!({
                         "git_ref": git_ref.unwrap_or("working tree"),
                         "changed_files": filtered.len(),
+                        "files_shown": files.len(),
+                        "total_tokens": total_tokens,
+                        "token_budget": token_budget,
+                        "truncated": truncated,
                         "files": files,
                     });
                     if let Some(f) = focus {
@@ -2239,15 +2297,15 @@ fn handle_tool_call(
                 .get("category")
                 .and_then(|c| c.as_str())
                 .unwrap_or("all");
-            let _strength = args
+            let strength_filter = args
                 .get("strength")
                 .and_then(|s| s.as_str())
                 .unwrap_or("all");
-            let _focus = args.get("focus").and_then(|f| f.as_str());
+            let focus = args.get("focus").and_then(|f| f.as_str());
 
             let profile = &index.conventions;
 
-            let result = match category {
+            let mut result = match category {
                 "naming" => serde_json::to_value(&profile.naming).unwrap_or_default(),
                 "imports" => serde_json::to_value(&profile.imports).unwrap_or_default(),
                 "errors" => serde_json::to_value(&profile.errors).unwrap_or_default(),
@@ -2258,6 +2316,24 @@ fn handle_tool_call(
                 "git_health" => serde_json::to_value(&profile.git_health).unwrap_or_default(),
                 _ => serde_json::to_value(profile).unwrap_or_default(),
             };
+
+            // Apply strength filter: remove observations whose strength is below threshold.
+            // Valid values: "convention" (≥90%), "trend" (≥70%), "mixed" (≥50%), "all".
+            let min_pct: f64 = match strength_filter {
+                "convention" => 90.0,
+                "trend" => 70.0,
+                "mixed" => 50.0,
+                _ => 0.0, // "all" — no filtering
+            };
+            if min_pct > 0.0 {
+                filter_observations_by_strength(&mut result, min_pct);
+            }
+
+            // Apply focus filter: prune file_contributions (if present) to entries
+            // whose path matches the prefix.
+            if let Some(focus_prefix) = focus {
+                filter_contributions_by_focus(&mut result, focus_prefix);
+            }
 
             mcp_tool_result(
                 id,
@@ -2315,9 +2391,13 @@ fn handle_tool_call(
         "cxpak_call_graph" => {
             let target = args.get("target").and_then(|t| t.as_str());
             let focus = args.get("focus").and_then(|f| f.as_str());
+            let depth = args.get("depth").and_then(|d| d.as_u64()).unwrap_or(1) as usize;
+            let workspace = args.get("workspace").and_then(|w| w.as_str());
             let cg = &index.call_graph;
 
-            let filtered: Vec<&crate::intelligence::call_graph::CallEdge> = cg
+            // BFS from the seed files/symbols up to `depth` hops.
+            // If no target is given, all edges are considered seeds (depth=1 returns all).
+            let seed_edges: Vec<&crate::intelligence::call_graph::CallEdge> = cg
                 .edges
                 .iter()
                 .filter(|e| {
@@ -2330,9 +2410,65 @@ fn handle_tool_call(
                         true
                     }
                 })
+                .collect();
+
+            // BFS: collect files reachable within `depth` hops from seed edges.
+            let filtered: Vec<&crate::intelligence::call_graph::CallEdge> = if target.is_some() {
+                let mut reachable: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut frontier: Vec<String> = seed_edges
+                    .iter()
+                    .flat_map(|e| [e.caller_file.clone(), e.callee_file.clone()])
+                    .collect();
+                for f in &frontier {
+                    reachable.insert(f.clone());
+                }
+                for _ in 0..depth.saturating_sub(1) {
+                    let next: Vec<String> = cg
+                        .edges
+                        .iter()
+                        .filter(|e| {
+                            reachable.contains(&e.caller_file) || reachable.contains(&e.callee_file)
+                        })
+                        .flat_map(|e| [e.caller_file.clone(), e.callee_file.clone()])
+                        .filter(|f| !reachable.contains(f))
+                        .collect();
+                    if next.is_empty() {
+                        break;
+                    }
+                    frontier = next;
+                    for f in &frontier {
+                        reachable.insert(f.clone());
+                    }
+                }
+                cg.edges
+                    .iter()
+                    .filter(|e| {
+                        reachable.contains(&e.caller_file) && reachable.contains(&e.callee_file)
+                    })
+                    .collect()
+            } else {
+                seed_edges
+            };
+
+            // Apply focus filter
+            let filtered: Vec<&crate::intelligence::call_graph::CallEdge> = filtered
+                .into_iter()
                 .filter(|e| {
                     if let Some(f) = focus {
                         e.caller_file.starts_with(f) || e.callee_file.starts_with(f)
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            // Apply workspace filter: both caller and callee must be in workspace prefix
+            let filtered: Vec<&crate::intelligence::call_graph::CallEdge> = filtered
+                .into_iter()
+                .filter(|e| {
+                    if let Some(ws) = workspace {
+                        e.caller_file.starts_with(ws) && e.callee_file.starts_with(ws)
                     } else {
                         true
                     }
@@ -2352,7 +2488,10 @@ fn handle_tool_call(
         "cxpak_dead_code" => {
             let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
             let focus = args.get("focus").and_then(|f| f.as_str());
-            let dead = crate::intelligence::dead_code::detect_dead_code(index, focus);
+            let workspace = args.get("workspace").and_then(|w| w.as_str());
+            // workspace acts as a focus prefix when focus is not set
+            let effective_focus = focus.or(workspace);
+            let dead = crate::intelligence::dead_code::detect_dead_code(index, effective_focus);
             let total_count = dead.len();
             let limited: Vec<_> = dead.into_iter().take(limit).collect();
             let showing = limited.len();
@@ -2368,11 +2507,14 @@ fn handle_tool_call(
         }
         "cxpak_architecture" => {
             let focus = args.get("focus").and_then(|f| f.as_str());
+            let workspace = args.get("workspace").and_then(|w| w.as_str());
+            // workspace acts as a module prefix filter when focus is not set
+            let effective_prefix = focus.or(workspace);
             let map = crate::intelligence::architecture::build_architecture_map(index, 2);
-            let modules: Vec<_> = if let Some(f) = focus {
+            let modules: Vec<_> = if let Some(prefix) = effective_prefix {
                 map.modules
                     .into_iter()
-                    .filter(|m| m.prefix.starts_with(f))
+                    .filter(|m| m.prefix.starts_with(prefix))
                     .collect()
             } else {
                 map.modules
@@ -2404,7 +2546,8 @@ fn handle_tool_call(
             }
             let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
             let depth = args.get("depth").and_then(|d| d.as_u64()).unwrap_or(3) as usize;
-            let result = crate::intelligence::predict::predict(
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let mut result = crate::intelligence::predict::predict(
                 &file_refs,
                 &index.graph,
                 &index.pagerank,
@@ -2412,6 +2555,21 @@ fn handle_tool_call(
                 &index.test_map,
                 depth,
             );
+            // Apply focus filter: keep only impact entries whose path starts with prefix
+            if let Some(focus_prefix) = focus {
+                result
+                    .structural_impact
+                    .retain(|entry| entry.path.starts_with(focus_prefix));
+                result
+                    .historical_impact
+                    .retain(|entry| entry.path.starts_with(focus_prefix));
+                result
+                    .call_impact
+                    .retain(|entry| entry.path.starts_with(focus_prefix));
+                result
+                    .test_impact
+                    .retain(|tp| tp.test_file.starts_with(focus_prefix));
+            }
             mcp_tool_result(
                 id,
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -6147,6 +6305,345 @@ mod tests {
         assert!(
             text.contains("# Codebase Onboarding Map"),
             "markdown output should contain h1 title"
+        );
+    }
+
+    // ── MCP parameter wiring tests ────────────────────────────────────────────
+
+    // cxpak_conventions: strength filter removes low-confidence observations.
+    #[test]
+    fn test_mcp_conventions_strength_convention_filters_weak_observations() {
+        let mut index = make_test_index();
+        // Set a Convention-strength (95%) and a Mixed-strength (55%) observation.
+        index.conventions.naming.function_style =
+            crate::conventions::PatternObservation::new("fn_naming", "snake_case", 95, 100);
+        index.conventions.naming.type_style =
+            crate::conventions::PatternObservation::new("type_naming", "camelCase", 55, 100);
+
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(1)),
+            "cxpak_conventions",
+            &json!({"strength": "convention"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let val: Value = serde_json::from_str(text).unwrap();
+
+        // snake_case has 95% — survives "convention" filter.
+        assert!(
+            !val["naming"]["function_style"].is_null(),
+            "95% observation must survive 'convention' filter"
+        );
+        // camelCase has 55% — must be nullified by the filter.
+        assert!(
+            val["naming"]["type_style"].is_null(),
+            "55% observation must be removed by 'convention' filter"
+        );
+    }
+
+    // cxpak_conventions: focus prefix filters file_contributions.
+    #[test]
+    fn test_mcp_conventions_focus_filters_file_contributions() {
+        let mut index = make_test_index();
+        // Inject a file_contribution manually into naming.
+        let mut contribs = std::collections::HashMap::new();
+        contribs.insert(
+            "src/main.rs".to_string(),
+            crate::conventions::FileContribution {
+                counts: Default::default(),
+            },
+        );
+        contribs.insert(
+            "tests/lib_test.rs".to_string(),
+            crate::conventions::FileContribution {
+                counts: Default::default(),
+            },
+        );
+        index.conventions.naming.file_contributions = contribs;
+
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(2)),
+            "cxpak_conventions",
+            &json!({"focus": "src/"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let val: Value = serde_json::from_str(text).unwrap();
+
+        // Only "src/" entries should remain in naming file_contributions.
+        if let Some(contribs) = val["naming"]["file_contributions"].as_object() {
+            for key in contribs.keys() {
+                assert!(
+                    key.starts_with("src/"),
+                    "focus='src/' must remove non-src contributions, found: {key}"
+                );
+            }
+        }
+        // The tests/ key must not appear.
+        assert!(
+            val["naming"]["file_contributions"]["tests/lib_test.rs"].is_null(),
+            "tests/lib_test.rs must be removed by focus='src/' filter"
+        );
+    }
+
+    // cxpak_diff: tokens budget truncates the files list.
+    #[test]
+    fn test_mcp_diff_tokens_budget_field_present_in_response() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(3)),
+            "cxpak_diff",
+            &json!({"tokens": "1k"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        // When there is no git repo at /tmp the tool returns an error — that's fine;
+        // when it succeeds the response must contain token_budget.
+        if !text.starts_with("Error") {
+            let val: Value = serde_json::from_str(text).unwrap();
+            assert!(
+                val.get("token_budget").is_some(),
+                "token_budget field must be present in diff response"
+            );
+            assert_eq!(
+                val["token_budget"].as_u64().unwrap_or(0),
+                1000,
+                "token_budget must be 1k = 1000"
+            );
+        }
+    }
+
+    // cxpak_call_graph: depth=1 only returns seed edges, depth=2 expands one hop.
+    #[test]
+    fn test_mcp_call_graph_depth_parameter_accepted() {
+        let mut index = make_test_index();
+        use crate::intelligence::call_graph::{CallEdge, CallGraph};
+        index.call_graph = CallGraph {
+            edges: vec![
+                CallEdge {
+                    caller_file: "src/main.rs".to_string(),
+                    caller_symbol: "main".to_string(),
+                    callee_file: "src/lib.rs".to_string(),
+                    callee_symbol: "helper".to_string(),
+                    confidence: crate::intelligence::call_graph::CallConfidence::Exact,
+                },
+                CallEdge {
+                    caller_file: "src/lib.rs".to_string(),
+                    caller_symbol: "helper".to_string(),
+                    callee_file: "src/util.rs".to_string(),
+                    callee_symbol: "util_fn".to_string(),
+                    confidence: crate::intelligence::call_graph::CallConfidence::Exact,
+                },
+            ],
+            unresolved: vec![],
+        };
+
+        let snap = make_shared_snapshot();
+
+        // depth=1: only edges directly involving src/main.rs
+        let resp_d1 = handle_tool_call(
+            Some(json!(4)),
+            "cxpak_call_graph",
+            &json!({"target": "src/main.rs", "depth": 1}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text_d1 = resp_d1["result"]["content"][0]["text"].as_str().unwrap();
+        let val_d1: Value = serde_json::from_str(text_d1).unwrap();
+        let edges_d1 = val_d1["edges"].as_array().unwrap();
+
+        // depth=2: should also include the lib→util edge via BFS
+        let resp_d2 = handle_tool_call(
+            Some(json!(5)),
+            "cxpak_call_graph",
+            &json!({"target": "src/main.rs", "depth": 2}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text_d2 = resp_d2["result"]["content"][0]["text"].as_str().unwrap();
+        let val_d2: Value = serde_json::from_str(text_d2).unwrap();
+        let edges_d2 = val_d2["edges"].as_array().unwrap();
+
+        // depth=2 must reach at least as many edges as depth=1.
+        assert!(
+            edges_d2.len() >= edges_d1.len(),
+            "depth=2 must reach at least as many edges as depth=1"
+        );
+        // At depth=2 the lib→util edge must also be reachable.
+        let has_util_edge = edges_d2.iter().any(|e| {
+            e["callee_file"].as_str() == Some("src/util.rs")
+                || e["caller_file"].as_str() == Some("src/util.rs")
+        });
+        assert!(has_util_edge, "depth=2 must include the util edge via BFS");
+    }
+
+    // cxpak_call_graph: workspace filters so both caller and callee must match.
+    #[test]
+    fn test_mcp_call_graph_workspace_both_sides_must_match() {
+        let mut index = make_test_index();
+        use crate::intelligence::call_graph::{CallEdge, CallGraph};
+        index.call_graph = CallGraph {
+            edges: vec![
+                // Both in src/
+                CallEdge {
+                    caller_file: "src/main.rs".to_string(),
+                    caller_symbol: "main".to_string(),
+                    callee_file: "src/lib.rs".to_string(),
+                    callee_symbol: "helper".to_string(),
+                    confidence: crate::intelligence::call_graph::CallConfidence::Exact,
+                },
+                // Only caller in src/
+                CallEdge {
+                    caller_file: "src/main.rs".to_string(),
+                    caller_symbol: "main".to_string(),
+                    callee_file: "vendor/ext.rs".to_string(),
+                    callee_symbol: "ext_fn".to_string(),
+                    confidence: crate::intelligence::call_graph::CallConfidence::Exact,
+                },
+            ],
+            unresolved: vec![],
+        };
+
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(6)),
+            "cxpak_call_graph",
+            &json!({"workspace": "src/"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let val: Value = serde_json::from_str(text).unwrap();
+        let edges = val["edges"].as_array().unwrap();
+
+        // Only the src/→src/ edge must remain.
+        assert_eq!(
+            edges.len(),
+            1,
+            "workspace filter must keep only src/→src/ edges"
+        );
+        assert_eq!(edges[0]["callee_file"].as_str().unwrap(), "src/lib.rs");
+    }
+
+    // cxpak_dead_code: workspace parameter narrows the dead-code search prefix.
+    #[test]
+    fn test_mcp_dead_code_workspace_parameter_accepted() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(7)),
+            "cxpak_dead_code",
+            &json!({"workspace": "src/"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let val: Value = serde_json::from_str(text).unwrap();
+        // Response must be structured even with workspace filter.
+        assert!(
+            val.get("dead_symbols").is_some(),
+            "dead_code response must contain dead_symbols field"
+        );
+        // Any returned symbols must be within the workspace prefix.
+        if let Some(syms) = val["dead_symbols"].as_array() {
+            for sym in syms {
+                if let Some(path) = sym["file"].as_str() {
+                    assert!(
+                        path.starts_with("src/"),
+                        "workspace='src/' must restrict dead symbols to src/, got: {path}"
+                    );
+                }
+            }
+        }
+    }
+
+    // cxpak_predict: focus prefix filters all impact vectors.
+    #[test]
+    fn test_mcp_predict_focus_filters_impact_entries() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(8)),
+            "cxpak_predict",
+            &json!({"files": ["src/main.rs"], "focus": "src/"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let val: Value = serde_json::from_str(text).unwrap();
+
+        // All entries in structural_impact, historical_impact, call_impact must
+        // have paths starting with "src/".
+        for field in &["structural_impact", "historical_impact", "call_impact"] {
+            if let Some(arr) = val[field].as_array() {
+                for entry in arr {
+                    if let Some(path) = entry["path"].as_str() {
+                        assert!(
+                            path.starts_with("src/"),
+                            "focus='src/' must restrict {field} entries to src/, got: {path}"
+                        );
+                    }
+                }
+            }
+        }
+        // test_impact entries must have test_file starting with "src/".
+        if let Some(arr) = val["test_impact"].as_array() {
+            for entry in arr {
+                if let Some(tf) = entry["test_file"].as_str() {
+                    assert!(
+                        tf.starts_with("src/"),
+                        "focus='src/' must restrict test_impact to src/, got: {tf}"
+                    );
+                }
+            }
+        }
+    }
+
+    // cxpak_architecture: workspace parameter filters modules.
+    #[test]
+    fn test_mcp_architecture_workspace_filters_modules() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(9)),
+            "cxpak_architecture",
+            &json!({"workspace": "src/"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let val: Value = serde_json::from_str(text).unwrap();
+
+        // All returned modules must have prefix starting with "src/".
+        if let Some(modules) = val["modules"].as_array() {
+            for m in modules {
+                if let Some(prefix) = m["prefix"].as_str() {
+                    assert!(
+                        prefix.starts_with("src/"),
+                        "workspace='src/' must restrict modules to src/, got: {prefix}"
+                    );
+                }
+            }
+        }
+        // The response must always contain circular_deps.
+        assert!(
+            val.get("circular_deps").is_some(),
+            "architecture response must contain circular_deps field"
         );
     }
 }

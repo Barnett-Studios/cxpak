@@ -1209,4 +1209,38 @@ mod tests {
         check_errors("src/lib.rs", &symbol, &conventions, &mut violations);
         assert!(violations.is_empty());
     }
+
+    // Bug 6 regression: before the fix, "error_handling" and "imports" were added to
+    // the passed list even when the index had no convention data (None observations).
+    // After the fix, those categories must NOT appear in passed when there is no
+    // extracted convention to compare against.
+    #[test]
+    fn test_verify_changes_passed_list_empty_when_no_conventions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn x() {}").unwrap();
+
+        // Empty index — no conventions extracted.
+        let counter = TokenCounter::new();
+        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+
+        let changed = vec![ChangedFile {
+            path: "lib.rs".to_string(),
+            added_lines: vec![1],
+            is_new: true,
+        }];
+
+        let result = verify_changes(&changed, &index, dir.path());
+
+        // When there is no convention data, no category should appear in passed.
+        assert!(
+            !result.passed.iter().any(|p| p.contains("error_handling")),
+            "error_handling must NOT appear in passed when no convention data exists: {:?}",
+            result.passed
+        );
+        assert!(
+            !result.passed.iter().any(|p| p.contains("imports")),
+            "imports must NOT appear in passed when no convention data exists: {:?}",
+            result.passed
+        );
+    }
 }

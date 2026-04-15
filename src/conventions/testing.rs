@@ -10,7 +10,23 @@ pub struct TestingConventions {
     pub mock_usage: Option<PatternObservation>,
     pub test_naming: Option<PatternObservation>,
     pub density: Option<PatternObservation>,
+    /// Whether the codebase uses inline tests (e.g. `#[cfg(test)]` in Rust,
+    /// `def test_` in Python, `describe(`/`it(` in JS/TS, `func Test` in Go).
+    pub has_inline_tests: Option<PatternObservation>,
     pub additional: Vec<PatternObservation>,
+}
+
+/// Returns true when content contains inline test patterns for the given language.
+fn file_has_inline_tests(content: &str, language: Option<&str>) -> bool {
+    match language {
+        Some("rust") => content.contains("#[test]") || content.contains("#[cfg(test)]"),
+        Some("python") => content.contains("def test_") || content.contains("class Test"),
+        Some("javascript" | "typescript") => {
+            content.contains("describe(") || content.contains("it(") || content.contains("test(")
+        }
+        Some("go") => content.contains("func Test"),
+        _ => false,
+    }
 }
 
 /// Extract testing conventions from the codebase index.
@@ -147,11 +163,35 @@ pub fn extract_testing(index: &CodebaseIndex) -> TestingConventions {
         None
     };
 
+    // Inline test detection
+    let mut files_with_inline = 0usize;
+    let mut total_src_files = 0usize;
+    for file in &index.files {
+        // Check all files — inline tests can appear in source files (e.g. Rust #[cfg(test)])
+        // as well as dedicated test files.
+        total_src_files += 1;
+        if file_has_inline_tests(&file.content, file.language.as_deref()) {
+            files_with_inline += 1;
+        }
+    }
+
+    let has_inline_tests = if total_src_files > 0 {
+        PatternObservation::new(
+            "inline_tests",
+            "inline tests present",
+            files_with_inline,
+            total_src_files,
+        )
+    } else {
+        None
+    };
+
     TestingConventions {
         coverage_by_dir,
         mock_usage,
         test_naming,
         density,
+        has_inline_tests,
         additional: Vec::new(),
     }
 }
@@ -583,5 +623,61 @@ mod tests {
             density.strength,
             crate::conventions::PatternStrength::Trend
         ));
+    }
+
+    // Bug 4 regression: `has_inline_tests` was not populated before the fix.
+    // After the fix, files containing language-appropriate inline test markers
+    // (e.g. `#[test]` / `#[cfg(test)]` for Rust, `def test_` for Python,
+    // `describe(` for JS/TS, `func Test` for Go) must produce a Some observation.
+    #[test]
+    fn test_has_inline_tests_populated_for_rust_content() {
+        use crate::scanner::ScannedFile;
+
+        let counter = crate::budget::counter::TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // File with inline tests.
+        let fp_with = dir.path().join("lib.rs");
+        std::fs::write(
+            &fp_with,
+            "#[cfg(test)] mod tests { #[test] fn it_works() {} }",
+        )
+        .unwrap();
+        // File without inline tests.
+        let fp_without = dir.path().join("main.rs");
+        std::fs::write(&fp_without, "fn main() {}").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/lib.rs".into(),
+                absolute_path: fp_with,
+                language: Some("rust".into()),
+                size_bytes: 50,
+            },
+            ScannedFile {
+                relative_path: "src/main.rs".into(),
+                absolute_path: fp_without,
+                language: Some("rust".into()),
+                size_bytes: 12,
+            },
+        ];
+
+        let mut content_map = std::collections::HashMap::new();
+        content_map.insert(
+            "src/lib.rs".into(),
+            "#[cfg(test)] mod tests { #[test] fn it_works() {} }".into(),
+        );
+        content_map.insert("src/main.rs".into(), "fn main() {}".into());
+
+        let index = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
+        let testing = extract_testing(&index);
+
+        let obs = testing
+            .has_inline_tests
+            .expect("has_inline_tests must be Some when inline tests are present");
+        // 1 out of 2 files has inline tests.
+        assert_eq!(obs.count, 1, "count must be 1 (the file with #[test])");
+        assert_eq!(obs.total, 2, "total must be 2 (all files)");
+        assert_eq!(obs.percentage, 50.0);
     }
 }

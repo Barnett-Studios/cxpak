@@ -61,7 +61,7 @@ pub fn render_dna_section(profile: &ConventionProfile) -> String {
             .function_style
             .as_ref()
             .map(|o| format!("{:?}", o.strength).to_lowercase())
-            .unwrap_or_else(|| "trend".into());
+            .unwrap_or_else(|| "not detected".into());
         sections.push(format!("### Naming ({strength})"));
         sections.extend(naming_lines);
         sections.push(String::new());
@@ -108,7 +108,7 @@ pub fn render_dna_section(profile: &ConventionProfile) -> String {
             .result_return
             .as_ref()
             .map(|o| format!("{:?}", o.strength).to_lowercase())
-            .unwrap_or_else(|| "trend".into());
+            .unwrap_or_else(|| "not detected".into());
         sections.push(format!("### Error Handling ({strength})"));
         sections.extend(error_lines);
         sections.push(String::new());
@@ -235,8 +235,8 @@ pub fn render_dna_section(profile: &ConventionProfile) -> String {
                 .map(|t| format!("{t:?}").to_lowercase())
                 .unwrap_or_else(|| "unknown".into());
             sections.push(format!(
-                "- {}: {} ({} / {}) — {trend}",
-                trend, entry.path, entry.modifications, c180
+                "- {} ({} / {}) — {trend}",
+                entry.path, entry.modifications, c180
             ));
         }
         if !profile.git_health.reverts.is_empty() {
@@ -620,5 +620,85 @@ mod tests {
         let compact = render_compact_dna(&profile);
         let lines: Vec<&str> = compact.lines().filter(|l| l.starts_with("- ")).collect();
         assert_eq!(lines.len(), 3);
+    }
+
+    // Bug 3 regression: the git-health churn format string previously contained the
+    // path field twice ("- {}: {} ({} / {}) — {trend}"), causing the file path to
+    // appear as a duplicate label before the modification count.  After the fix the
+    // line format is "- {path} ({modifications} / {churn_180d}) — {trend}" — only one
+    // occurrence of the path.
+    #[test]
+    fn test_render_dna_churn_line_no_duplicate_path_label() {
+        use crate::conventions::git_health::{ChurnEntry, ChurnTrend, GitHealthProfile};
+        let git_health = GitHealthProfile {
+            churn_30d: vec![ChurnEntry {
+                path: "src/main.rs".to_string(),
+                modifications: 42,
+            }],
+            churn_180d: vec![ChurnEntry {
+                path: "src/main.rs".to_string(),
+                modifications: 15,
+            }],
+            churn_trend: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("src/main.rs".to_string(), ChurnTrend::Hot);
+                m
+            },
+            ..Default::default()
+        };
+        let profile = ConventionProfile {
+            git_health,
+            ..Default::default()
+        };
+
+        let dna = render_dna_section(&profile);
+
+        // Find the churn line for src/main.rs.
+        let churn_lines: Vec<&str> = dna.lines().filter(|l| l.contains("src/main.rs")).collect();
+        assert!(
+            !churn_lines.is_empty(),
+            "churn line for src/main.rs must appear"
+        );
+        for line in &churn_lines {
+            // The path must appear exactly once — no "src/main.rs: src/main.rs ..." duplicate.
+            let occurrences = line.matches("src/main.rs").count();
+            assert_eq!(
+                occurrences, 1,
+                "path must appear exactly once per churn line, got: {line}"
+            );
+        }
+    }
+
+    // Bug 7 regression: when `function_style` is None but other naming observations
+    // exist (e.g. type_style), the DNA section previously used `"trend"` as a literal
+    // fallback for the Naming section header strength label.  After the fix it must
+    // emit `"not detected"` instead.
+    #[test]
+    fn test_render_dna_missing_function_style_shows_not_detected() {
+        let mut profile = ConventionProfile::default();
+        // Set type_style but NOT function_style — this forces the "no function_style"
+        // branch in the Naming section header rendering.
+        profile.naming.type_style = PatternObservation::new("type_naming", "PascalCase", 95, 100);
+
+        let dna = render_dna_section(&profile);
+        // The naming section header should appear (because type_style is set).
+        assert!(
+            dna.contains("Naming"),
+            "Naming section header must be present when type_style is set"
+        );
+        // The header must say "not detected" for the absent function_style strength.
+        assert!(
+            dna.contains("not detected"),
+            "absent function_style must render as 'not detected' in Naming header, got:\n{dna}"
+        );
+        // The bare word "trend" must NOT appear as a spurious fallback in the header.
+        for line in dna.lines() {
+            if line.contains("### Naming") {
+                assert!(
+                    !line.ends_with(" trend)") && !line.contains("(trend)"),
+                    "bare 'trend' fallback must not appear in Naming header: {line}"
+                );
+            }
+        }
     }
 }

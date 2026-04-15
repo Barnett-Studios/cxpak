@@ -55,10 +55,11 @@ pub fn extract_visibility(index: &CodebaseIndex) -> VisibilityConventions {
 
     let total = public_count + private_count;
 
-    // Report as "default to private" if private > public
+    // Report as "default to private" if private > public, or "public" if public > private.
+    // When tied, return None — no clear convention.
     let public_ratio = if private_count > public_count {
         PatternObservation::new("visibility_default", "private", private_count, total)
-    } else if public_count > 0 {
+    } else if public_count > private_count {
         PatternObservation::new("visibility_default", "public", public_count, total)
     } else {
         None
@@ -343,5 +344,61 @@ mod tests {
         update_file_contribution(&mut vis, file);
 
         assert_eq!(vis.file_contributions.len(), before_len);
+    }
+
+    // Bug 2 regression: when public and private counts are exactly equal the
+    // function previously defaulted to "public" with 50 % strength (Mixed).
+    // After the fix it must return None (no dominant pattern).
+    #[test]
+    fn test_extract_visibility_equal_counts_returns_none() {
+        use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, "pub fn a() {} fn b() {}").unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "src/lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 22,
+        }];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/lib.rs".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "a".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn a()".into(),
+                        body: "pub fn a() {}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "b".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn b()".into(),
+                        body: "fn b() {}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let vis = extract_visibility(&index);
+        assert!(
+            vis.public_ratio.is_none(),
+            "equal public/private counts must return None, not a spurious 'public' observation"
+        );
     }
 }
