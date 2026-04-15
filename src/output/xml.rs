@@ -46,6 +46,7 @@ fn escape_xml(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 #[cfg(test)]
@@ -86,6 +87,11 @@ mod tests {
     fn test_escape_xml_special_chars() {
         let escaped = escape_xml("a & b < c > d \"e\"");
         assert_eq!(escaped, "a &amp; b &lt; c &gt; d &quot;e&quot;");
+    }
+
+    #[test]
+    fn test_escape_xml_handles_apostrophe() {
+        assert_eq!(escape_xml("it's"), "it&apos;s");
     }
 
     #[test]

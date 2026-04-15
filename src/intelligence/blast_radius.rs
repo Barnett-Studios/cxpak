@@ -44,14 +44,31 @@ pub struct RiskSummary {
 // Risk scoring
 // --------------------------------------------------------------------------
 
-/// Compute risk for a file affected by a change.
+/// Compute the **blast impact** score for a file affected by a structural change.
 ///
-/// Formula: `clamp(hop_decay * edge_weight * file_pagerank * test_penalty, 0.0, 1.0)`
+/// This is the per-file score used when building blast-radius results.  It
+/// models how much a *change propagation* hurts a particular dependent file.
+///
+/// Formula: `clamp(hop_decay × edge_weight × file_pagerank × untested_boost, 0.0, 1.0)`
 ///
 /// - `hops` = 1 for direct dependents (seeds are NOT included in results)
 /// - `file_pagerank` should already be in `[0.0, 1.0]`
-/// - `test_penalty` = 1.2 when untested (can push raw score above 1.0 before clamp)
-pub fn compute_risk(
+/// - `untested_boost` = 1.2 when the file has no test coverage (untested = riskier),
+///   and 1.0 when it does have coverage (no boost). Can push the raw score above 1.0
+///   before the final clamp.
+///
+/// # Distinction from `risk::compute_risk_ranking`
+///
+/// This function answers: "how badly does *this dependent file* get hurt when
+/// the changed files are modified?" — a structural propagation score.
+///
+/// `risk::compute_risk_ranking` answers a different question: "how risky is
+/// *this file as a source of future bugs?*" — using churn rate, blast-radius
+/// size, and test-coverage absence as an activity/health signal.
+///
+/// Both are valid risk signals; they measure different dimensions and are used
+/// in separate contexts.  Do not conflate them.
+pub fn compute_blast_impact(
     hops: usize,
     edge_type: &EdgeType,
     file_pagerank: f64,
@@ -67,9 +84,10 @@ pub fn compute_risk(
         EdgeType::CrossLanguage(_) => 0.5,
     };
 
-    let test_penalty = if has_test_coverage { 1.0 } else { 1.2 };
+    // Files without test coverage are 1.2× riskier than tested files.
+    let untested_boost = if has_test_coverage { 1.0 } else { 1.2 };
 
-    let raw = hop_decay * edge_weight * file_pagerank * test_penalty;
+    let raw = hop_decay * edge_weight * file_pagerank * untested_boost;
     raw.clamp(0.0, 1.0)
 }
 
@@ -197,7 +215,7 @@ pub fn compute_blast_radius(
             || test_map
                 .values()
                 .any(|refs| refs.iter().any(|r| r.path == path));
-        let risk = compute_risk(hops, &edge_type, file_pagerank, has_test);
+        let risk = compute_blast_impact(hops, &edge_type, file_pagerank, has_test);
 
         // Update best entry: keep highest risk. If equal risk, prefer fewer hops.
         let update = match best.get(&path) {
@@ -377,14 +395,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // compute_risk tests
+    // compute_blast_impact tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_risk_hop_decay() {
         // hop=1 → decay = 1/2 = 0.5, hop=2 → decay = 1/3 ≈ 0.333
-        let r1 = compute_risk(1, &EdgeType::Import, 1.0, true);
-        let r2 = compute_risk(2, &EdgeType::Import, 1.0, true);
+        let r1 = compute_blast_impact(1, &EdgeType::Import, 1.0, true);
+        let r2 = compute_blast_impact(2, &EdgeType::Import, 1.0, true);
         assert!(
             r1 > r2,
             "direct dependent (hops=1) should have higher risk than transitive (hops=2)"
@@ -396,8 +414,8 @@ mod tests {
     #[test]
     fn test_risk_edge_weight() {
         // Import (1.0) vs MigrationSequence (0.5) at same hops and pagerank
-        let r_import = compute_risk(1, &EdgeType::Import, 1.0, true);
-        let r_migration = compute_risk(1, &EdgeType::MigrationSequence, 1.0, true);
+        let r_import = compute_blast_impact(1, &EdgeType::Import, 1.0, true);
+        let r_migration = compute_blast_impact(1, &EdgeType::MigrationSequence, 1.0, true);
         assert!(
             r_import > r_migration,
             "Import edge should score higher than MigrationSequence"
@@ -407,8 +425,8 @@ mod tests {
     #[test]
     fn test_risk_untested_penalty() {
         // Untested file should score higher (penalty 1.2 > 1.0)
-        let r_tested = compute_risk(1, &EdgeType::Import, 0.5, true);
-        let r_untested = compute_risk(1, &EdgeType::Import, 0.5, false);
+        let r_tested = compute_blast_impact(1, &EdgeType::Import, 0.5, true);
+        let r_untested = compute_blast_impact(1, &EdgeType::Import, 0.5, false);
         assert!(
             r_untested > r_tested,
             "untested file should have higher risk than tested file"
@@ -419,7 +437,7 @@ mod tests {
     fn test_risk_clamped_to_one() {
         // Even with max penalty, result must not exceed 1.0
         // hops=1, Import, pagerank=1.0, untested → raw = 0.5 * 1.0 * 1.0 * 1.2 = 0.6
-        let risk = compute_risk(1, &EdgeType::Import, 1.0, false);
+        let risk = compute_blast_impact(1, &EdgeType::Import, 1.0, false);
         assert!(risk <= 1.0, "risk must not exceed 1.0");
         assert!(
             risk > 0.5,
@@ -430,7 +448,7 @@ mod tests {
     #[test]
     fn test_risk_clamped_at_zero() {
         // Pagerank 0.0 → risk is 0.0 regardless
-        let risk = compute_risk(1, &EdgeType::Import, 0.0, false);
+        let risk = compute_blast_impact(1, &EdgeType::Import, 0.0, false);
         assert_eq!(risk, 0.0);
     }
 
@@ -438,28 +456,28 @@ mod tests {
     fn test_risk_all_edge_weights() {
         let pr = 1.0;
         // Import, ForeignKey, OrmModel → weight 1.0
-        let r_import = compute_risk(1, &EdgeType::Import, pr, true);
-        let r_fk = compute_risk(1, &EdgeType::ForeignKey, pr, true);
-        let r_orm = compute_risk(1, &EdgeType::OrmModel, pr, true);
+        let r_import = compute_blast_impact(1, &EdgeType::Import, pr, true);
+        let r_fk = compute_blast_impact(1, &EdgeType::ForeignKey, pr, true);
+        let r_orm = compute_blast_impact(1, &EdgeType::OrmModel, pr, true);
         assert!((r_import - r_fk).abs() < 1e-9);
         assert!((r_import - r_orm).abs() < 1e-9);
 
         // EmbeddedSql, ViewReference, FunctionReference → weight 0.8
-        let r_sql = compute_risk(1, &EdgeType::EmbeddedSql, pr, true);
-        let r_view = compute_risk(1, &EdgeType::ViewReference, pr, true);
-        let r_fn = compute_risk(1, &EdgeType::FunctionReference, pr, true);
+        let r_sql = compute_blast_impact(1, &EdgeType::EmbeddedSql, pr, true);
+        let r_view = compute_blast_impact(1, &EdgeType::ViewReference, pr, true);
+        let r_fn = compute_blast_impact(1, &EdgeType::FunctionReference, pr, true);
         assert!((r_sql - r_view).abs() < 1e-9);
         assert!((r_sql - r_fn).abs() < 1e-9);
         assert!(r_import > r_sql);
 
         // TriggerTarget, IndexTarget → weight 0.6
-        let r_trig = compute_risk(1, &EdgeType::TriggerTarget, pr, true);
-        let r_idx = compute_risk(1, &EdgeType::IndexTarget, pr, true);
+        let r_trig = compute_blast_impact(1, &EdgeType::TriggerTarget, pr, true);
+        let r_idx = compute_blast_impact(1, &EdgeType::IndexTarget, pr, true);
         assert!((r_trig - r_idx).abs() < 1e-9);
         assert!(r_sql > r_trig);
 
         // MigrationSequence → weight 0.5
-        let r_mig = compute_risk(1, &EdgeType::MigrationSequence, pr, true);
+        let r_mig = compute_blast_impact(1, &EdgeType::MigrationSequence, pr, true);
         assert!(r_trig > r_mig);
     }
 

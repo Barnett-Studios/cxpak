@@ -76,6 +76,7 @@ impl RustLanguage {
         //   "use" use_tree ";"
         // use_tree can be:
         //   scoped_identifier  ->  path::name
+        //   use_as_clause      ->  path::name as alias
         //   scoped_use_list    ->  path::{a, b}
         //   identifier         ->  name (bare)
         let use_text = Self::node_text(node, source);
@@ -112,6 +113,21 @@ impl RustLanguage {
             return Some(Import {
                 source: source_path,
                 names,
+            });
+        }
+
+        // Check for alias: path::Name as Alias
+        if let Some(as_idx) = inner.find(" as ") {
+            let before_as = inner[..as_idx].trim();
+            let alias = inner[as_idx + 4..].trim().to_string();
+            let source_path = if let Some(sep) = before_as.rfind("::") {
+                before_as[..sep].to_string()
+            } else {
+                String::new()
+            };
+            return Some(Import {
+                source: source_path,
+                names: vec![alias],
             });
         }
 
@@ -325,6 +341,70 @@ impl LanguageSupport for RustLanguage {
                         }
                     }
                     symbols.extend(methods);
+                }
+
+                "type_item" => {
+                    let name = Self::extract_name(&node, source_bytes);
+                    let is_pub = Self::is_public(&node, source_bytes);
+                    let visibility = if is_pub {
+                        Visibility::Public
+                    } else {
+                        Visibility::Private
+                    };
+                    let signature = Self::node_text(&node, source_bytes)
+                        .trim_end_matches(';')
+                        .trim()
+                        .to_string();
+                    let start_line = node.start_position().row + 1;
+                    let end_line = node.end_position().row + 1;
+
+                    if is_pub {
+                        exports.push(Export {
+                            name: name.clone(),
+                            kind: SymbolKind::TypeAlias,
+                        });
+                    }
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::TypeAlias,
+                        visibility,
+                        signature,
+                        body: String::new(),
+                        start_line,
+                        end_line,
+                    });
+                }
+
+                "const_item" | "static_item" => {
+                    let name = Self::extract_name(&node, source_bytes);
+                    let is_pub = Self::is_public(&node, source_bytes);
+                    let visibility = if is_pub {
+                        Visibility::Public
+                    } else {
+                        Visibility::Private
+                    };
+                    let signature = Self::node_text(&node, source_bytes)
+                        .trim_end_matches(';')
+                        .trim()
+                        .to_string();
+                    let start_line = node.start_position().row + 1;
+                    let end_line = node.end_position().row + 1;
+
+                    if is_pub {
+                        exports.push(Export {
+                            name: name.clone(),
+                            kind: SymbolKind::Constant,
+                        });
+                    }
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Constant,
+                        visibility,
+                        signature,
+                        body: String::new(),
+                        start_line,
+                        end_line,
+                    });
                 }
 
                 "use_declaration" => {
@@ -780,5 +860,100 @@ trait InternalHelper {
             .filter(|s| s.kind == SymbolKind::Trait)
             .collect();
         assert!(!traits.is_empty());
+    }
+
+    #[test]
+    fn test_type_alias_captured() {
+        let source = "pub type Foo = Bar;\ntype X = Y;\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = RustLanguage;
+        let result = lang.extract(source, &tree);
+
+        let aliases: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::TypeAlias)
+            .collect();
+        assert_eq!(
+            aliases.len(),
+            2,
+            "expected 2 type aliases, got: {:?}",
+            aliases.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let foo = aliases.iter().find(|s| s.name == "Foo").expect("Foo alias");
+        assert_eq!(foo.visibility, Visibility::Public);
+        assert!(result
+            .exports
+            .iter()
+            .any(|e| e.name == "Foo" && e.kind == SymbolKind::TypeAlias));
+
+        let x = aliases.iter().find(|s| s.name == "X").expect("X alias");
+        assert_eq!(x.visibility, Visibility::Private);
+        assert!(!result.exports.iter().any(|e| e.name == "X"));
+    }
+
+    #[test]
+    fn test_const_and_static_captured() {
+        let source = "pub const MAX_SIZE: usize = 1024;\nstatic COUNTER: u32 = 0;\npub static mut FLAG: bool = false;\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = RustLanguage;
+        let result = lang.extract(source, &tree);
+
+        let constants: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            3,
+            "expected 3 constants, got: {:?}",
+            constants.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let max = constants
+            .iter()
+            .find(|s| s.name == "MAX_SIZE")
+            .expect("MAX_SIZE");
+        assert_eq!(max.visibility, Visibility::Public);
+        assert!(result
+            .exports
+            .iter()
+            .any(|e| e.name == "MAX_SIZE" && e.kind == SymbolKind::Constant));
+
+        let counter = constants
+            .iter()
+            .find(|s| s.name == "COUNTER")
+            .expect("COUNTER");
+        assert_eq!(counter.visibility, Visibility::Private);
+        assert!(!result.exports.iter().any(|e| e.name == "COUNTER"));
+    }
+
+    #[test]
+    fn test_import_alias_captured() {
+        let source = "use std::io::Error as IoError;\nuse std::collections::HashMap as Map;\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = RustLanguage;
+        let result = lang.extract(source, &tree);
+
+        assert_eq!(result.imports.len(), 2);
+
+        let io_import = result
+            .imports
+            .iter()
+            .find(|i| i.names.contains(&"IoError".to_string()))
+            .expect("IoError import not found");
+        assert_eq!(io_import.source, "std::io");
+
+        let map_import = result
+            .imports
+            .iter()
+            .find(|i| i.names.contains(&"Map".to_string()))
+            .expect("Map import not found");
+        assert_eq!(map_import.source, "std::collections");
     }
 }

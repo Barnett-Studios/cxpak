@@ -144,16 +144,38 @@ impl Scanner {
     /// When `workspace` is `None`, behaves identically to `scan()`.
     /// When `workspace` is `Some(prefix)`, only files whose `relative_path`
     /// starts with `prefix` are returned.
+    ///
+    /// The comparison is path-component-aware: prefix `"src"` matches
+    /// `"src/main.rs"` and `"src"` itself, but NOT `"src_utils/x.rs"`.
     pub fn scan_workspace(&self, workspace: Option<&str>) -> Result<Vec<ScannedFile>, ScanError> {
         let all = self.scan()?;
         match workspace {
             None => Ok(all),
             Some(prefix) => Ok(all
                 .into_iter()
-                .filter(|f| f.relative_path.starts_with(prefix))
+                .filter(|f| path_starts_with_workspace(&f.relative_path, prefix))
                 .collect()),
         }
     }
+}
+
+/// Returns `true` when `path` falls inside the workspace `ws` using
+/// path-component-aware comparison.
+///
+/// Rules:
+/// - Exact match: `"src"` matches `"src"`.
+/// - Directory prefix: `"src"` matches `"src/main.rs"` (a trailing `/` is
+///   inserted before the comparison so `"src"` never matches `"src_utils/…"`).
+pub(crate) fn path_starts_with_workspace(path: &str, ws: &str) -> bool {
+    if path == ws {
+        return true;
+    }
+    let needle = if ws.ends_with('/') {
+        ws.to_string()
+    } else {
+        format!("{ws}/")
+    };
+    path.starts_with(&needle)
 }
 
 /// Detect a programming language from a file's name or extension.
@@ -462,6 +484,40 @@ mod tests {
         assert_eq!(detect_language(Path::new("foo.txt")), None);
         assert_eq!(detect_language(Path::new("foo.unknown")), None);
         assert_eq!(detect_language(Path::new("foo")), None);
+    }
+
+    // ---- path_starts_with_workspace ----
+
+    #[test]
+    fn test_workspace_prefix_matches_subpath() {
+        assert!(
+            path_starts_with_workspace("src/main.rs", "src"),
+            "\"src\" should match \"src/main.rs\""
+        );
+    }
+
+    #[test]
+    fn test_workspace_prefix_does_not_match_lookalike_dir() {
+        assert!(
+            !path_starts_with_workspace("src_utils/x.rs", "src"),
+            "\"src\" must NOT match \"src_utils/x.rs\""
+        );
+    }
+
+    #[test]
+    fn test_workspace_prefix_exact_match() {
+        assert!(
+            path_starts_with_workspace("src", "src"),
+            "exact match \"src\" == \"src\" should return true"
+        );
+    }
+
+    #[test]
+    fn test_workspace_prefix_trailing_slash_still_works() {
+        assert!(
+            path_starts_with_workspace("src/lib.rs", "src/"),
+            "prefix with trailing slash should still match \"src/lib.rs\""
+        );
     }
 
     #[test]

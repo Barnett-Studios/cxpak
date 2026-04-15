@@ -228,10 +228,11 @@ impl LanguageSupport for GoLanguage {
                             let start_line = child.start_position().row + 1;
                             let end_line = child.end_position().row + 1;
 
-                            // Determine kind from underlying type node
+                            // Determine kind from underlying type node.
+                            // If no struct_type or interface_type child found → TypeAlias.
                             let kind = {
                                 let mut spec_cursor = child.walk();
-                                let mut found_kind = SymbolKind::Struct;
+                                let mut found_kind = SymbolKind::TypeAlias;
                                 for spec_child in child.children(&mut spec_cursor) {
                                     match spec_child.kind() {
                                         "struct_type" => {
@@ -600,5 +601,62 @@ type Reader interface {
         let result = lang.extract(source, &tree);
         // The interface should be extracted as a type
         assert!(!result.symbols.is_empty());
+    }
+
+    #[test]
+    fn test_type_alias_not_struct() {
+        let source =
+            "package main\n\ntype MyString string\ntype Handler func(http.ResponseWriter)\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = GoLanguage;
+        let result = lang.extract(source, &tree);
+
+        let aliases: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::TypeAlias)
+            .collect();
+        assert_eq!(
+            aliases.len(),
+            2,
+            "expected 2 type aliases, got: {:?}",
+            aliases.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let my_string = aliases
+            .iter()
+            .find(|s| s.name == "MyString")
+            .expect("MyString");
+        assert_eq!(my_string.visibility, Visibility::Public);
+        assert!(result
+            .exports
+            .iter()
+            .any(|e| e.name == "MyString" && e.kind == SymbolKind::TypeAlias));
+
+        let handler = aliases
+            .iter()
+            .find(|s| s.name == "Handler")
+            .expect("Handler");
+        assert_eq!(handler.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn test_private_type_alias() {
+        let source = "package main\n\ntype myAlias int\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = GoLanguage;
+        let result = lang.extract(source, &tree);
+
+        let aliases: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::TypeAlias)
+            .collect();
+        assert_eq!(aliases.len(), 1, "expected 1 private type alias");
+        assert_eq!(aliases[0].name, "myAlias");
+        assert_eq!(aliases[0].visibility, Visibility::Private);
+        assert!(!result.exports.iter().any(|e| e.name == "myAlias"));
     }
 }

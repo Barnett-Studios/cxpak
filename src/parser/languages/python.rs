@@ -96,6 +96,41 @@ impl PythonLanguage {
         }
     }
 
+    /// Extract the inner `function_definition` or `async_function_definition` from a node,
+    /// walking through a `decorated_definition` wrapper if present.
+    fn resolve_fn_node<'a>(node: &'a tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+        match node.kind() {
+            "function_definition" | "async_function_definition" => Some(*node),
+            "decorated_definition" => {
+                // The last child of decorated_definition is the actual definition.
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "function_definition"
+                        || child.kind() == "async_function_definition"
+                    {
+                        return Some(child);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Collect decorator names from a decorated_definition node.
+    fn collect_decorators(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+        let mut decorators = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "decorator" {
+                let text = Self::node_text(&child, source);
+                // Strip leading "@"
+                decorators.push(text.trim_start_matches('@').trim().to_string());
+            }
+        }
+        decorators
+    }
+
     fn extract_methods(node: &tree_sitter::Node, source: &[u8]) -> Vec<Symbol> {
         let mut methods = Vec::new();
         let mut cursor = node.walk();
@@ -103,28 +138,43 @@ impl PythonLanguage {
             if child.kind() == "block" {
                 let mut inner_cursor = child.walk();
                 for item in child.children(&mut inner_cursor) {
-                    if item.kind() == "function_definition" {
-                        let name = Self::extract_name(&item, source);
-                        let is_pub = Self::is_public(&name);
-                        let visibility = if is_pub {
-                            Visibility::Public
+                    let (fn_node, decorators) = if let Some(fn_node) = Self::resolve_fn_node(&item)
+                    {
+                        let decorators = if item.kind() == "decorated_definition" {
+                            Self::collect_decorators(&item, source)
                         } else {
-                            Visibility::Private
+                            vec![]
                         };
-                        let signature = Self::extract_fn_signature(&item, source);
-                        let body = Self::extract_fn_body(&item, source);
-                        let start_line = item.start_position().row + 1;
-                        let end_line = item.end_position().row + 1;
-                        methods.push(Symbol {
-                            name,
-                            kind: SymbolKind::Method,
-                            visibility,
-                            signature,
-                            body,
-                            start_line,
-                            end_line,
-                        });
-                    }
+                        (fn_node, decorators)
+                    } else {
+                        continue;
+                    };
+
+                    let name = Self::extract_name(&fn_node, source);
+                    let is_pub = Self::is_public(&name);
+                    let visibility = if is_pub {
+                        Visibility::Public
+                    } else {
+                        Visibility::Private
+                    };
+                    let base_sig = Self::extract_fn_signature(&fn_node, source);
+                    let signature = if decorators.is_empty() {
+                        base_sig
+                    } else {
+                        format!("@{} {}", decorators.join(" @"), base_sig)
+                    };
+                    let body = Self::extract_fn_body(&fn_node, source);
+                    let start_line = item.start_position().row + 1;
+                    let end_line = item.end_position().row + 1;
+                    methods.push(Symbol {
+                        name,
+                        kind: SymbolKind::Method,
+                        visibility,
+                        signature,
+                        body,
+                        start_line,
+                        end_line,
+                    });
                 }
             }
         }
@@ -153,7 +203,7 @@ impl LanguageSupport for PythonLanguage {
 
         for node in root.children(&mut cursor) {
             match node.kind() {
-                "function_definition" => {
+                "function_definition" | "async_function_definition" => {
                     let name = Self::extract_name(&node, source_bytes);
                     let is_pub = Self::is_public(&name);
                     let visibility = if is_pub {
@@ -182,6 +232,45 @@ impl LanguageSupport for PythonLanguage {
                         start_line,
                         end_line,
                     });
+                }
+
+                "decorated_definition" => {
+                    let decorators = Self::collect_decorators(&node, source_bytes);
+                    if let Some(fn_node) = Self::resolve_fn_node(&node) {
+                        let name = Self::extract_name(&fn_node, source_bytes);
+                        let is_pub = Self::is_public(&name);
+                        let visibility = if is_pub {
+                            Visibility::Public
+                        } else {
+                            Visibility::Private
+                        };
+                        let base_sig = Self::extract_fn_signature(&fn_node, source_bytes);
+                        let signature = if decorators.is_empty() {
+                            base_sig
+                        } else {
+                            format!("@{} {}", decorators.join(" @"), base_sig)
+                        };
+                        let body = Self::extract_fn_body(&fn_node, source_bytes);
+                        let start_line = node.start_position().row + 1;
+                        let end_line = node.end_position().row + 1;
+
+                        if is_pub {
+                            exports.push(Export {
+                                name: name.clone(),
+                                kind: SymbolKind::Function,
+                            });
+                        }
+
+                        symbols.push(Symbol {
+                            name,
+                            kind: SymbolKind::Function,
+                            visibility,
+                            signature,
+                            body,
+                            start_line,
+                            end_line,
+                        });
+                    }
                 }
 
                 "class_definition" => {
@@ -484,5 +573,106 @@ from pathlib import Path, PurePath
         let lang = PythonLanguage;
         let result = lang.extract(source, &tree);
         let _ = result;
+    }
+
+    #[test]
+    fn test_async_function_extracted() {
+        let source = "async def fetch_data(url):\n    pass\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = PythonLanguage;
+        let result = lang.extract(source, &tree);
+
+        let funcs: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected 1 async function");
+        assert_eq!(funcs[0].name, "fetch_data");
+        assert_eq!(funcs[0].visibility, Visibility::Public);
+        assert!(result.exports.iter().any(|e| e.name == "fetch_data"));
+    }
+
+    #[test]
+    fn test_private_async_function_extracted() {
+        let source = "async def _private_fetch():\n    pass\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = PythonLanguage;
+        let result = lang.extract(source, &tree);
+
+        let funcs: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "_private_fetch");
+        assert_eq!(funcs[0].visibility, Visibility::Private);
+        assert!(!result.exports.iter().any(|e| e.name == "_private_fetch"));
+    }
+
+    #[test]
+    fn test_decorated_definition_top_level() {
+        let source = "@property\ndef value(self):\n    return self._value\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = PythonLanguage;
+        let result = lang.extract(source, &tree);
+
+        let funcs: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected 1 decorated function");
+        assert_eq!(funcs[0].name, "value");
+        assert!(
+            funcs[0].signature.contains("property"),
+            "signature should include decorator: {}",
+            funcs[0].signature
+        );
+    }
+
+    #[test]
+    fn test_decorated_method_in_class() {
+        let source = "class Service:\n    @staticmethod\n    def create():\n        return Service()\n\n    @classmethod\n    def from_config(cls, cfg):\n        return cls()\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = PythonLanguage;
+        let result = lang.extract(source, &tree);
+
+        let methods: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert_eq!(
+            methods.len(),
+            2,
+            "expected 2 decorated methods, got: {:?}",
+            methods.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+
+        let create = methods
+            .iter()
+            .find(|m| m.name == "create")
+            .expect("create method");
+        assert!(
+            create.signature.contains("staticmethod"),
+            "create signature: {}",
+            create.signature
+        );
+
+        let from_config = methods
+            .iter()
+            .find(|m| m.name == "from_config")
+            .expect("from_config method");
+        assert!(
+            from_config.signature.contains("classmethod"),
+            "from_config signature: {}",
+            from_config.signature
+        );
     }
 }

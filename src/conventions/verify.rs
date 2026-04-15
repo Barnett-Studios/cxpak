@@ -217,7 +217,8 @@ pub fn verify_changes(
         }
     }
 
-    // Build passed list
+    // Build passed list — only include categories where convention data exists
+    // AND no violations were found. Skip categories with no extracted convention.
     if violations.iter().all(|v| v.category != "naming") {
         if let Some(ref obs) = index.conventions.naming.function_style {
             passed.push(format!(
@@ -227,12 +228,22 @@ pub fn verify_changes(
                 changed_files.len()
             ));
         }
+        // else: insufficient data — do not add to passed
     }
     if violations.iter().all(|v| v.category != "error_handling") {
-        passed.push("error_handling: no violations in changed code".to_string());
+        // Only report passed when we have a convention to compare against
+        if index.conventions.errors.unwrap_usage.is_some()
+            || index.conventions.errors.result_return.is_some()
+        {
+            passed.push("error_handling: no violations in changed code".to_string());
+        }
+        // else: insufficient data — do not add to passed
     }
-    if violations.iter().all(|v| v.category != "imports") {
+    if violations.iter().all(|v| v.category != "imports")
+        && index.conventions.imports.style.is_some()
+    {
         passed.push("imports: style consistent with codebase".to_string());
+        // else: insufficient data — do not add to passed
     }
 
     let summary = ViolationSummary {
@@ -936,7 +947,14 @@ mod tests {
         std::fs::write(dir.path().join("lib.rs"), "fn x() {}").unwrap();
 
         let counter = TokenCounter::new();
-        let index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+
+        // Populate convention data so that error_handling and imports can appear in passed.
+        // count/total must be >= 50% for PatternObservation::new to return Some.
+        index.conventions.errors.unwrap_usage =
+            PatternObservation::new("unwrap_usage", "no .unwrap() in src/", 95, 100);
+        index.conventions.imports.style =
+            PatternObservation::new("import_style", "absolute", 95, 100);
 
         let changed = vec![ChangedFile {
             path: "lib.rs".to_string(),
@@ -945,7 +963,8 @@ mod tests {
         }];
 
         let result = verify_changes(&changed, &index, dir.path());
-        // error_handling and imports passes are always included
+        // error_handling and imports passes appear when convention data is present and
+        // the changed file has no violations.
         assert!(result.passed.iter().any(|p| p.contains("error_handling")));
         assert!(result.passed.iter().any(|p| p.contains("imports")));
     }

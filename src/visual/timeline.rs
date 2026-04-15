@@ -55,13 +55,16 @@ pub fn compute_timeline_snapshots(
     }
 
     // Determine sampling stride so total committed ≤ max_snapshots.
+    // Ceiling division prevents under-sampling when `total` is not an exact
+    // multiple of `max_snapshots`; integer truncation would otherwise leave
+    // the last group of commits unreachable.
     let total = oids.len();
     let stride = if max_snapshots == 0 {
         return Ok(vec![]);
     } else if total <= max_snapshots {
         1
     } else {
-        total / max_snapshots
+        total.div_ceil(max_snapshots)
     };
 
     // Sample commits.  We want to include the most-recent (index 0) and step

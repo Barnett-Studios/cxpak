@@ -31,12 +31,13 @@ impl CSharpLanguage {
 
     /// C# visibility is determined by `modifier` nodes that contain "public",
     /// "private", "protected", or "internal". Default is private (package-private).
+    /// `protected` maps to Public because it is part of the inherited API surface.
     fn extract_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == "modifier" {
                 let text = Self::node_text(&child, source);
-                if text == "public" {
+                if text == "public" || text == "protected" {
                     return Visibility::Public;
                 }
             }
@@ -638,6 +639,38 @@ using System.Linq;
         let lang = CSharpLanguage;
         let result = lang.extract(source, &tree);
         let _ = result;
+    }
+
+    #[test]
+    fn test_protected_method_is_public() {
+        let source = "public class Base {\n    protected virtual void OnInit() {}\n    private void Secret() {}\n}\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = CSharpLanguage;
+        let result = lang.extract(source, &tree);
+
+        let methods: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        let on_init = methods
+            .iter()
+            .find(|m| m.name == "OnInit")
+            .expect("OnInit method");
+        assert_eq!(
+            on_init.visibility,
+            Visibility::Public,
+            "protected should map to Public"
+        );
+        assert!(result.exports.iter().any(|e| e.name == "OnInit"));
+
+        let secret = methods
+            .iter()
+            .find(|m| m.name == "Secret")
+            .expect("Secret method");
+        assert_eq!(secret.visibility, Visibility::Private);
+        assert!(!result.exports.iter().any(|e| e.name == "Secret"));
     }
 
     #[test]

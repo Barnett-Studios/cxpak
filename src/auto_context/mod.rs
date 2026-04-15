@@ -124,14 +124,31 @@ pub fn auto_context(
         .collect();
 
     // Step 7: Resolve test files.
+    //
+    // Two sources of tests are combined:
+    // 1. Separate test files referenced by `index.test_map` (the common case
+    //    for languages with dedicated test directories).
+    // 2. Seed files that *are their own tests* — i.e. files containing inline
+    //    test blocks (e.g. Rust `#[cfg(test)]`, Python `class Test…`, etc.).
+    //    These files are already in `target_files`, but we also list them in
+    //    the `test_files` section so consumers know inline tests are present.
     let test_files: Vec<(String, String)> = if opts.include_tests {
         let mut tests: Vec<(String, String)> = Vec::new();
         for entry in &kept {
+            // Source 1: explicitly mapped test files.
             if let Some(test_refs) = index.test_map.get(&entry.path) {
                 for tr in test_refs {
                     if let Some(f) = index.files.iter().find(|f| f.relative_path == tr.path) {
                         tests.push((f.relative_path.clone(), f.content.clone()));
                     }
+                }
+            }
+            // Source 2: seed file contains inline tests (e.g. Rust #[cfg(test)]).
+            // Include the file itself so the test section is populated for repos
+            // that co-locate tests with source instead of using separate files.
+            if let Some(f) = index.files.iter().find(|f| f.relative_path == entry.path) {
+                if crate::intelligence::health::has_inline_tests(f) {
+                    tests.push((f.relative_path.clone(), f.content.clone()));
                 }
             }
         }
@@ -675,6 +692,86 @@ mod tests {
         // The test resolver only emits a test if the seed file ("src/handler.rs") was kept.
         // We just verify the include_tests branch executed without crashing and the budget
         // invariant still holds.
+        assert_eq!(
+            result.budget.used + result.budget.remaining,
+            result.budget.total
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // include_tests: inline tests detection (no separate test file)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_context_include_tests_inline_tests_detected() {
+        // A Rust file with an inline #[cfg(test)] block has no entry in the
+        // test_map, yet include_tests=true should still surface it as a test
+        // file because has_inline_tests() returns true for it.
+        //
+        // We construct a two-file index where one file is the implementation
+        // and the other carries inline tests.  We then manually verify that
+        // the inline-test source appears in the test_files section.  Because
+        // the auto_context pipeline must first select the file as a seed, we
+        // use a task string that directly matches the file's content and path.
+        let rust_with_inline_tests = concat!(
+            "pub fn authenticate(user: &str) -> bool { !user.is_empty() }\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    use super::*;\n",
+            "    #[test]\n",
+            "    fn test_authenticate() { assert!(authenticate(\"alice\")); }\n",
+            "}\n",
+        );
+        // Build the index.  The helper writes content to disk so that
+        // CodebaseIndex::build can read it into IndexedFile::content.
+        let (index, _dir) = make_index(&[("src/auth.rs", rust_with_inline_tests)]);
+
+        // Verify the index actually stored the inline content so has_inline_tests works.
+        let stored_content = index
+            .files
+            .iter()
+            .find(|f| f.relative_path == "src/auth.rs")
+            .map(|f| f.content.as_str())
+            .unwrap_or("");
+        assert!(
+            stored_content.contains("#[cfg(test)]"),
+            "IndexedFile content must contain inline test block; got: {stored_content:?}"
+        );
+
+        let opts = AutoContextOpts {
+            tokens: 50_000,
+            focus: None,
+            include_tests: true,
+            include_blast_radius: false,
+            mode: "full".to_string(),
+        };
+        let result = auto_context("user authentication", &index, &opts);
+
+        // The file must appear in test_files because it carries inline tests,
+        // provided it was selected as a seed (which it should be given the task).
+        // We check that IF the file was kept as a seed it also appears in test_files.
+        let in_target = result
+            .sections
+            .target_files
+            .files
+            .iter()
+            .any(|f| f.path == "src/auth.rs");
+        let in_tests = result
+            .sections
+            .test_files
+            .files
+            .iter()
+            .any(|f| f.path == "src/auth.rs");
+
+        if in_target {
+            assert!(
+                in_tests,
+                "src/auth.rs was selected as a target and has #[cfg(test)]; \
+                 it must also appear in test_files"
+            );
+        }
+        // Budget invariant always holds.
         assert_eq!(
             result.budget.used + result.budget.remaining,
             result.budget.total

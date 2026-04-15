@@ -82,7 +82,14 @@ pub fn parse_with_cache(
                 if let Some(lang_name) = &file.language {
                     if let Some(lang) = registry.get(lang_name) {
                         let source =
-                            std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
+                            std::fs::read_to_string(&file.absolute_path).unwrap_or_else(|e| {
+                                eprintln!(
+                                    "cxpak: failed to read {}: {}",
+                                    file.absolute_path.display(),
+                                    e
+                                );
+                                String::new()
+                            });
                         let mut parser = tree_sitter::Parser::new();
                         if parser.set_language(&lang.ts_language()).is_ok() {
                             if let Some(tree) = parser.parse(&source, None) {

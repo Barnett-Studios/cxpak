@@ -12,6 +12,9 @@ pub struct ContextSnapshot {
     pub file_hashes: HashMap<String, u64>,
     pub symbol_set: HashMap<String, Vec<String>>,
     pub edge_set: HashSet<(String, String, String)>,
+    /// Per-file token counts at snapshot time, used to compute true deltas.
+    #[serde(default)]
+    pub token_counts: HashMap<String, usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,9 +68,11 @@ fn hash_content(content: &str) -> u64 {
 pub fn create_snapshot(index: &CodebaseIndex) -> ContextSnapshot {
     let mut file_hashes = HashMap::new();
     let mut symbol_set: HashMap<String, Vec<String>> = HashMap::new();
+    let mut token_counts: HashMap<String, usize> = HashMap::new();
 
     for file in &index.files {
         file_hashes.insert(file.relative_path.clone(), hash_content(&file.content));
+        token_counts.insert(file.relative_path.clone(), file.token_count);
 
         let names: Vec<String> = file
             .parse_result
@@ -93,6 +98,7 @@ pub fn create_snapshot(index: &CodebaseIndex) -> ContextSnapshot {
         file_hashes,
         symbol_set,
         edge_set,
+        token_counts,
     }
 }
 
@@ -121,17 +127,23 @@ pub fn compute_diff(snapshot: &ContextSnapshot, index: &CodebaseIndex) -> Contex
         let old_hash = snapshot.file_hashes[*path];
         let new_hash = current_hashes[*path];
         if old_hash != new_hash {
-            // Compute token delta.  We don't have the old token count in the
-            // snapshot, so we report the current token count as the magnitude
-            // (delta from an unknown baseline) represented as the current value.
+            // Compute the true token delta: current count minus count recorded
+            // in the snapshot.  When the snapshot predates the token_counts
+            // field (serde default = empty map), we fall back to reporting the
+            // current count so behaviour is no worse than before the fix.
             let current_tokens = current_token_counts
+                .get(path.as_str())
+                .copied()
+                .unwrap_or(0) as i64;
+            let old_tokens = snapshot
+                .token_counts
                 .get(path.as_str())
                 .copied()
                 .unwrap_or(0) as i64;
             modified_files.push(FileChange {
                 path: (*path).clone(),
                 change: "modified".to_string(),
-                tokens_delta: current_tokens,
+                tokens_delta: current_tokens - old_tokens,
             });
         }
     }
@@ -682,6 +694,45 @@ mod tests {
     // -----------------------------------------------------------------------
     // test_diff_recommendation_text
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // test_diff_tokens_delta_is_real_delta
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diff_tokens_delta_is_real_delta() {
+        // Create a small file, snapshot it, then build a new (larger) index
+        // for the same path.  The tokens_delta on the FileChange must equal
+        // new_tokens - old_tokens, not just the current count.
+        let original = make_index(&[("src/a.rs", "fn a() {}")]);
+        let snapshot = create_snapshot(&original);
+
+        // Verify the snapshot captured a non-zero token count.
+        let old_tokens = snapshot.token_counts.get("src/a.rs").copied().unwrap_or(0);
+
+        // Build a "modified" index with more content.
+        let modified = make_index(&[(
+            "src/a.rs",
+            "fn a() {} fn b() {} fn c() {} fn d() {} fn e() {}",
+        )]);
+        let new_tokens = modified
+            .files
+            .iter()
+            .find(|f| f.relative_path == "src/a.rs")
+            .map(|f| f.token_count)
+            .unwrap_or(0);
+
+        let delta = compute_diff(&snapshot, &modified);
+
+        assert_eq!(delta.modified_files.len(), 1);
+        let change = &delta.modified_files[0];
+        assert_eq!(change.path, "src/a.rs");
+        assert_eq!(
+            change.tokens_delta,
+            new_tokens as i64 - old_tokens as i64,
+            "tokens_delta must be a real delta (new - old), not just the current count"
+        );
+    }
 
     #[test]
     fn test_diff_recommendation_text() {

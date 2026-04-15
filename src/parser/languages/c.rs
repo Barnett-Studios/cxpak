@@ -94,6 +94,29 @@ impl CLanguage {
         String::new()
     }
 
+    /// Returns true if the function_definition node has a `static` storage class specifier,
+    /// which means it has file-local (internal) linkage.
+    fn has_static_storage_class(node: &tree_sitter::Node, source: &[u8]) -> bool {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "storage_class_specifier" => {
+                    if Self::node_text(&child, source) == "static" {
+                        return true;
+                    }
+                }
+                "type_qualifier" => {
+                    // "static" may sometimes appear as type_qualifier in some grammars
+                    if Self::node_text(&child, source) == "static" {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn extract_include(node: &tree_sitter::Node, source: &[u8]) -> Option<Import> {
         // preproc_include: "#include" (<path> | "path")
         let text = Self::node_text(node, source);
@@ -143,20 +166,28 @@ impl LanguageSupport for CLanguage {
 
                 "function_definition" => {
                     let name = Self::extract_fn_name(&node, source_bytes);
-                    // C has no access modifiers — all top-level functions are public
+                    // `static` storage class = file-local linkage → Private
+                    let is_static = Self::has_static_storage_class(&node, source_bytes);
+                    let visibility = if is_static {
+                        Visibility::Private
+                    } else {
+                        Visibility::Public
+                    };
                     let signature = Self::extract_fn_signature(&node, source_bytes);
                     let body = Self::extract_fn_body(&node, source_bytes);
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
 
-                    exports.push(Export {
-                        name: name.clone(),
-                        kind: SymbolKind::Function,
-                    });
+                    if visibility == Visibility::Public {
+                        exports.push(Export {
+                            name: name.clone(),
+                            kind: SymbolKind::Function,
+                        });
+                    }
                     symbols.push(Symbol {
                         name,
                         kind: SymbolKind::Function,
-                        visibility: Visibility::Public,
+                        visibility,
                         signature,
                         body,
                         start_line,
@@ -429,6 +460,32 @@ mod tests {
             .collect();
         assert!(!funcs.is_empty(), "expected static function");
         assert_eq!(funcs[0].name, "helper");
+        assert_eq!(
+            funcs[0].visibility,
+            Visibility::Private,
+            "static fn should be Private"
+        );
+        assert!(
+            result.exports.iter().all(|e| e.name != "helper"),
+            "static fn should not be exported"
+        );
+    }
+
+    #[test]
+    fn test_non_static_function_is_public() {
+        let source = "int compute(int x) {\n    return x * 2;\n}\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = CLanguage;
+        let result = lang.extract(source, &tree);
+        let funcs: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(!funcs.is_empty());
+        assert_eq!(funcs[0].visibility, Visibility::Public);
+        assert!(result.exports.iter().any(|e| e.name == "compute"));
     }
 
     #[test]

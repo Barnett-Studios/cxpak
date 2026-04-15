@@ -199,6 +199,82 @@ impl LanguageSupport for JavaScriptLanguage {
                     });
                 }
 
+                // Arrow functions and function expressions assigned to variables:
+                // const handler = (e) => { ... }
+                // const add = function(a, b) { ... }
+                "lexical_declaration" | "variable_declaration" => {
+                    let mut decl_cursor = node.walk();
+                    for child in node.children(&mut decl_cursor) {
+                        if child.kind() == "variable_declarator" {
+                            let value_is_fn = {
+                                let mut vc = child.walk();
+                                let x = child.children(&mut vc).any(|c| {
+                                    c.kind() == "arrow_function"
+                                        || c.kind() == "function_expression"
+                                });
+                                x
+                            };
+                            if value_is_fn {
+                                let name = Self::extract_name(&child, source_bytes);
+                                if name.is_empty() {
+                                    continue;
+                                }
+                                let is_pub = Self::is_exported(&node);
+                                let visibility = if is_pub {
+                                    Visibility::Public
+                                } else {
+                                    Visibility::Private
+                                };
+                                let signature = Self::first_line(&child, source_bytes);
+                                let body = Self::node_text(&child, source_bytes).to_string();
+                                let start_line = child.start_position().row + 1;
+                                let end_line = child.end_position().row + 1;
+
+                                if is_pub {
+                                    exports.push(Export {
+                                        name: name.clone(),
+                                        kind: SymbolKind::Function,
+                                    });
+                                }
+                                symbols.push(Symbol {
+                                    name,
+                                    kind: SymbolKind::Function,
+                                    visibility,
+                                    signature,
+                                    body,
+                                    start_line,
+                                    end_line,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Re-exports: export { A, B } from 'module'
+                "export_clause" => {
+                    let mut ec_cursor = node.walk();
+                    for child in node.children(&mut ec_cursor) {
+                        if child.kind() == "export_specifier" {
+                            let name = Self::extract_name(&child, source_bytes);
+                            if !name.is_empty() {
+                                exports.push(Export {
+                                    name: name.clone(),
+                                    kind: SymbolKind::Variable,
+                                });
+                                symbols.push(Symbol {
+                                    name,
+                                    kind: SymbolKind::Variable,
+                                    visibility: Visibility::Public,
+                                    signature: Self::node_text(&child, source_bytes).to_string(),
+                                    body: String::new(),
+                                    start_line: child.start_position().row + 1,
+                                    end_line: child.end_position().row + 1,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -456,5 +532,80 @@ mod tests {
             .collect();
         assert!(!classes.is_empty());
         assert_eq!(classes[0].visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn test_arrow_function_extracted() {
+        let source = "const handler = (e) => { console.log(e); };\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = JavaScriptLanguage;
+        let result = lang.extract(source, &tree);
+
+        let funcs: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected arrow function symbol");
+        assert_eq!(funcs[0].name, "handler");
+        assert_eq!(funcs[0].visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn test_exported_arrow_function_extracted() {
+        let source = "export const add = (a, b) => a + b;\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = JavaScriptLanguage;
+        let result = lang.extract(source, &tree);
+
+        let funcs: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected exported arrow function");
+        assert_eq!(funcs[0].name, "add");
+        assert_eq!(funcs[0].visibility, Visibility::Public);
+        assert!(result.exports.iter().any(|e| e.name == "add"));
+    }
+
+    #[test]
+    fn test_function_expression_extracted() {
+        let source = "const multiply = function(a, b) { return a * b; };\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = JavaScriptLanguage;
+        let result = lang.extract(source, &tree);
+
+        let funcs: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected function expression symbol");
+        assert_eq!(funcs[0].name, "multiply");
+    }
+
+    #[test]
+    fn test_re_exports_captured() {
+        let source = "export { Foo, Bar } from './module';\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).expect("parse failed");
+        let lang = JavaScriptLanguage;
+        let result = lang.extract(source, &tree);
+
+        let export_names: Vec<&str> = result.exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            export_names.contains(&"Foo"),
+            "expected Foo in exports: {:?}",
+            export_names
+        );
+        assert!(
+            export_names.contains(&"Bar"),
+            "expected Bar in exports: {:?}",
+            export_names
+        );
     }
 }

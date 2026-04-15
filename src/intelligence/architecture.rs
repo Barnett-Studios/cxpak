@@ -122,7 +122,13 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
                     .map(|f| index.pagerank.get(f.as_str()).copied().unwrap_or(0.0))
                     .sum();
 
-                // Coupling: cross-module edge ratio
+                // Coupling: ratio of cross-module outgoing edges to total outgoing edges.
+                //
+                // Only outgoing edges (graph.edges) are iterated here.  Previously
+                // the loop also iterated reverse_edges, which counted every edge
+                // twice in `total_edges` while intra-module edges were only counted
+                // once — inflating the denominator and making cohesion appear near
+                // zero even for tightly coupled modules.
                 let mut total_edges = 0usize;
                 let mut cross_edges = 0usize;
                 let mut intra_edges = 0usize;
@@ -136,16 +142,6 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
                             } else {
                                 intra_edges += 1;
                             }
-                        }
-                    }
-                    if let Some(deps) = index.graph.reverse_edges.get(file.as_str()) {
-                        for edge in deps {
-                            total_edges += 1;
-                            let src_mod = module_prefix(&edge.target, module_depth);
-                            if src_mod != *prefix {
-                                cross_edges += 1;
-                            }
-                            // Don't double-count intra for reverse edges
                         }
                     }
                 }

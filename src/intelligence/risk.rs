@@ -13,11 +13,24 @@ pub struct RiskEntry {
 
 /// Compute standing risk per file, sorted descending by risk_score.
 ///
-/// Formula: risk = max(norm_churn, 0.01) * max(norm_blast, 0.01) * max(1.0 - test_coverage, 0.01)
+/// Formula: risk = max(norm_churn, 0.01) × max(norm_blast, 0.01) × max(1.0 - test_coverage, 0.01)
 ///
-/// norm_churn: percentile rank across all files (robust against outliers)
-/// norm_blast: blast_radius_count / total_files
-/// test_coverage: 1.0 if has_test, 0.0 otherwise (binary in v1.2.0)
+/// - norm_churn: percentile rank across all files (robust against outliers)
+/// - norm_blast: blast_radius_count / total_files
+/// - test_coverage: 1.0 if has_test, 0.0 otherwise (binary in v1.2.0)
+///
+/// # Distinction from `blast_radius::compute_blast_impact`
+///
+/// This function answers: "how risky is *this file as a source of future bugs?*"
+/// — based on past activity (churn), structural reach (blast-radius size), and
+/// test absence.  It is a **file health / change-risk** signal used for
+/// prioritisation and dashboards.
+///
+/// `blast_radius::compute_blast_impact` answers a different question: "how
+/// badly does *this dependent file* get hurt when the *changed* files are
+/// modified?" — a per-edge structural propagation score.
+///
+/// Both are valid risk signals that measure different dimensions.
 pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
     let total_files = index.total_files.max(1) as f64;
 

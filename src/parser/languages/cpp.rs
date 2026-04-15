@@ -119,6 +119,80 @@ impl CppLanguage {
         }
         String::new()
     }
+
+    /// Walk a class_specifier or struct_specifier body and extract method symbols,
+    /// respecting access labels (`public:`, `protected:`, `private:`).
+    fn extract_class_methods(
+        class_node: &tree_sitter::Node,
+        source: &[u8],
+        class_default: Visibility,
+        symbols: &mut Vec<Symbol>,
+        exports: &mut Vec<Export>,
+    ) {
+        let mut cursor = class_node.walk();
+        for child in class_node.children(&mut cursor) {
+            if child.kind() == "field_declaration_list" {
+                let mut current_access = class_default.clone();
+                let mut body_cursor = child.walk();
+                for member in child.children(&mut body_cursor) {
+                    match member.kind() {
+                        "access_specifier" => {
+                            let text = Self::node_text(&member, source);
+                            if text.starts_with("public") || text.starts_with("protected") {
+                                current_access = Visibility::Public;
+                            } else if text.starts_with("private") {
+                                current_access = Visibility::Private;
+                            }
+                        }
+                        // Inline method definitions (with body), forward declarations,
+                        // and field_declaration (member declarations in class body)
+                        "function_definition" | "declaration" | "field_declaration" => {
+                            let name = Self::find_fn_identifier(&member, source, 0);
+                            if name.is_empty() {
+                                continue;
+                            }
+                            let visibility = current_access.clone();
+                            let signature = Self::extract_fn_signature(&member, source);
+                            let body = Self::extract_fn_body(&member, source);
+                            let start_line = member.start_position().row + 1;
+                            let end_line = member.end_position().row + 1;
+
+                            if visibility == Visibility::Public {
+                                exports.push(Export {
+                                    name: name.clone(),
+                                    kind: SymbolKind::Method,
+                                });
+                            }
+                            symbols.push(Symbol {
+                                name,
+                                kind: SymbolKind::Method,
+                                visibility,
+                                signature,
+                                body,
+                                start_line,
+                                end_line,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns true if the function_definition node has a `static` storage class specifier
+    /// (file-local linkage for free functions).
+    fn has_static_linkage(node: &tree_sitter::Node, source: &[u8]) -> bool {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "storage_class_specifier"
+                && Self::node_text(&child, source) == "static"
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl LanguageSupport for CppLanguage {
@@ -153,19 +227,27 @@ impl LanguageSupport for CppLanguage {
                     if name.is_empty() {
                         continue;
                     }
+                    // Free functions with `static` have file-local linkage → Private
+                    let visibility = if Self::has_static_linkage(&node, source_bytes) {
+                        Visibility::Private
+                    } else {
+                        Visibility::Public
+                    };
                     let signature = Self::extract_fn_signature(&node, source_bytes);
                     let body = Self::extract_fn_body(&node, source_bytes);
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
 
-                    exports.push(Export {
-                        name: name.clone(),
-                        kind: SymbolKind::Function,
-                    });
+                    if visibility == Visibility::Public {
+                        exports.push(Export {
+                            name: name.clone(),
+                            kind: SymbolKind::Function,
+                        });
+                    }
                     symbols.push(Symbol {
                         name,
                         kind: SymbolKind::Function,
-                        visibility: Visibility::Public,
+                        visibility,
                         signature,
                         body,
                         start_line,
@@ -182,6 +264,15 @@ impl LanguageSupport for CppLanguage {
                     let body = Self::node_text(&node, source_bytes).to_string();
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
+
+                    // Struct members default to Public; extract methods from body
+                    Self::extract_class_methods(
+                        &node,
+                        source_bytes,
+                        Visibility::Public,
+                        &mut symbols,
+                        &mut exports,
+                    );
 
                     exports.push(Export {
                         name: name.clone(),
@@ -207,6 +298,15 @@ impl LanguageSupport for CppLanguage {
                     let body = Self::node_text(&node, source_bytes).to_string();
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
+
+                    // Class members default to Private; extract methods from body
+                    Self::extract_class_methods(
+                        &node,
+                        source_bytes,
+                        Visibility::Private,
+                        &mut symbols,
+                        &mut exports,
+                    );
 
                     exports.push(Export {
                         name: name.clone(),
@@ -728,5 +828,107 @@ public:
         let result = lang.extract(source, &tree);
         // Forward declaration is a `declaration`, not a `function_definition`, so no function symbol
         let _ = result;
+    }
+
+    #[test]
+    fn test_static_free_function_is_private() {
+        let source = "static int helper(int x) {\n    return x;\n}\nint compute(int x) {\n    return x * 2;\n}\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = CppLanguage;
+        let result = lang.extract(source, &tree);
+
+        let helper = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("helper");
+        assert_eq!(
+            helper.visibility,
+            Visibility::Private,
+            "static fn should be Private"
+        );
+        assert!(
+            result.exports.iter().all(|e| e.name != "helper"),
+            "static fn should not be exported"
+        );
+
+        let compute = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "compute")
+            .expect("compute");
+        assert_eq!(compute.visibility, Visibility::Public);
+        assert!(result.exports.iter().any(|e| e.name == "compute"));
+    }
+
+    #[test]
+    fn test_class_access_labels_respected() {
+        let source = "class Widget {\npublic:\n    void draw();\n    void resize();\nprivate:\n    void internal();\n};\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = CppLanguage;
+        let result = lang.extract(source, &tree);
+
+        let methods: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert!(!methods.is_empty(), "expected methods from class body");
+
+        if let Some(draw) = methods.iter().find(|m| m.name == "draw") {
+            assert_eq!(draw.visibility, Visibility::Public, "draw should be Public");
+            assert!(result.exports.iter().any(|e| e.name == "draw"));
+        }
+        if let Some(internal) = methods.iter().find(|m| m.name == "internal") {
+            assert_eq!(
+                internal.visibility,
+                Visibility::Private,
+                "internal should be Private"
+            );
+            assert!(result.exports.iter().all(|e| e.name != "internal"));
+        }
+    }
+
+    #[test]
+    fn test_struct_members_default_public() {
+        let source = "struct Point {\n    void print() {}\nprivate:\n    void secret() {}\n};\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = CppLanguage;
+        let result = lang.extract(source, &tree);
+
+        if let Some(print) = result.symbols.iter().find(|s| s.name == "print") {
+            assert_eq!(
+                print.visibility,
+                Visibility::Public,
+                "struct method default is Public"
+            );
+        }
+        if let Some(secret) = result.symbols.iter().find(|s| s.name == "secret") {
+            assert_eq!(
+                secret.visibility,
+                Visibility::Private,
+                "explicitly private struct method"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protected_class_member_is_public() {
+        let source = "class Base {\nprotected:\n    void onEvent() {}\n};\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = CppLanguage;
+        let result = lang.extract(source, &tree);
+
+        if let Some(on_event) = result.symbols.iter().find(|s| s.name == "onEvent") {
+            assert_eq!(
+                on_event.visibility,
+                Visibility::Public,
+                "protected maps to Public"
+            );
+        }
     }
 }

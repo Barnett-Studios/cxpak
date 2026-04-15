@@ -53,7 +53,11 @@ fn truncate_to_budget_inner(
     let mut used = 0;
     for line in content.lines() {
         let line_tokens = counter.count(line) + 1;
-        if used + line_tokens > budget.saturating_sub(50) {
+        // Reserve 150 tokens for the omission marker.  The marker text can
+        // reach ~100 tokens for long section names and large token counts, so
+        // 50 was too small and could result in the final content exceeding the
+        // caller's budget once the marker is appended.
+        if used + line_tokens > budget.saturating_sub(150) {
             break;
         }
         lines.push(line);

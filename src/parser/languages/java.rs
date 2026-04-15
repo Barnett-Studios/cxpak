@@ -30,7 +30,7 @@ impl JavaLanguage {
         for child in node.children(&mut cursor) {
             if child.kind() == "modifiers" {
                 let text = Self::node_text(&child, source);
-                if text.contains("public") {
+                if text.contains("public") || text.contains("protected") {
                     return Visibility::Public;
                 }
                 return Visibility::Private;
@@ -606,5 +606,37 @@ import java.util.HashMap;
             .collect();
         assert!(!classes.is_empty());
         assert_eq!(classes[0].visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn test_protected_method_is_public() {
+        let source = "public class Base {\n    protected void onEvent() {}\n    private void secret() {}\n}\n";
+        let mut parser = make_parser();
+        let tree = parser.parse(source, None).unwrap();
+        let lang = JavaLanguage;
+        let result = lang.extract(source, &tree);
+
+        let methods: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        let on_event = methods
+            .iter()
+            .find(|m| m.name == "onEvent")
+            .expect("onEvent method");
+        assert_eq!(
+            on_event.visibility,
+            Visibility::Public,
+            "protected should map to Public"
+        );
+        assert!(result.exports.iter().any(|e| e.name == "onEvent"));
+
+        let secret = methods
+            .iter()
+            .find(|m| m.name == "secret")
+            .expect("secret method");
+        assert_eq!(secret.visibility, Visibility::Private);
+        assert!(!result.exports.iter().any(|e| e.name == "secret"));
     }
 }

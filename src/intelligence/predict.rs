@@ -224,32 +224,89 @@ pub fn merge_test_predictions(
     predictions
 }
 
-/// Map signal combinations to confidence values (all 7 non-empty subsets).
+/// Map signal combinations to confidence values.
 ///
-/// | Signals present                     | Confidence |
-/// |-------------------------------------|-----------|
-/// | co_change only                      | 0.3       |
-/// | test_map only                       | 0.4       |
-/// | call_graph only                     | 0.5       |
-/// | test_map + co_change                | 0.5       |
-/// | call_graph + co_change              | 0.6       |
-/// | test_map + call_graph               | 0.7       |
-/// | test_map + call_graph + co_change   | 0.9       |
+/// All 8 combinations map to unique values so sort order is fully deterministic.
+///
+/// | (test_map, call_graph, co_change) | Confidence |
+/// |-----------------------------------|-----------|
+/// | (true,  true,  true)              | 0.90      |
+/// | (true,  true,  false)             | 0.85      |
+/// | (true,  false, true)              | 0.75      |
+/// | (false, true,  true)              | 0.70      |
+/// | (true,  false, false)             | 0.60      |
+/// | (false, true,  false)             | 0.50      |
+/// | (false, false, true)              | 0.40      |
+/// | (false, false, false)             | 0.00      |
+///
+/// Rationale: test_map is the strongest single signal (naming convention is
+/// very reliable).  call_graph beats co_change because call-based reasoning
+/// is structural rather than historical.  Co_change alone is the weakest
+/// non-empty signal.
 pub fn confidence_for_signals(signals: &[ImpactSignal]) -> f64 {
     let has_map = signals.contains(&ImpactSignal::Structural);
     let has_hist = signals.contains(&ImpactSignal::Historical);
     let has_call = signals.contains(&ImpactSignal::CallBased);
 
     match (has_map, has_call, has_hist) {
-        (true, true, true) => 0.9,
-        (true, true, false) => 0.7,
-        (false, true, true) => 0.6,
-        (true, false, true) => 0.5,
-        (false, true, false) => 0.5,
-        (true, false, false) => 0.4,
-        (false, false, true) => 0.3,
-        (false, false, false) => 0.0,
+        (true, true, true) => 0.90,
+        (true, true, false) => 0.85,
+        (true, false, true) => 0.75,
+        (false, true, true) => 0.70,
+        (true, false, false) => 0.60,
+        (false, true, false) => 0.50,
+        (false, false, true) => 0.40,
+        (false, false, false) => 0.00,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Call-graph impact
+// ---------------------------------------------------------------------------
+
+/// Compute call-graph-based impact for a set of changed files.
+///
+/// For every edge whose callee is in `changed_files`, the caller file scores
+/// +`weight` where weight is 1.0 for `Exact` edges and 0.5 for `Approximate`.
+/// Scores are accumulated across all matching edges then normalised to [0, 1]
+/// by dividing by the maximum raw score (clamped to ≥ 1.0).
+pub fn call_graph_impact(
+    changed: &[&str],
+    call_graph: &crate::intelligence::call_graph::CallGraph,
+) -> Vec<ImpactEntry> {
+    let changed_set: HashSet<&str> = changed.iter().copied().collect();
+    let mut scores: HashMap<String, f64> = HashMap::new();
+
+    for edge in &call_graph.edges {
+        if changed_set.contains(edge.callee_file.as_str()) {
+            let weight = match edge.confidence {
+                crate::intelligence::call_graph::CallConfidence::Exact => 1.0,
+                crate::intelligence::call_graph::CallConfidence::Approximate => 0.5,
+            };
+            *scores.entry(edge.caller_file.clone()).or_default() += weight;
+        }
+    }
+
+    // Normalise so every score is in [0, 1].
+    let max = scores.values().copied().fold(0.0_f64, f64::max).max(1.0);
+
+    let mut entries: Vec<ImpactEntry> = scores
+        .into_iter()
+        // Exclude the changed files themselves from impact results.
+        .filter(|(file, _)| !changed_set.contains(file.as_str()))
+        .map(|(file, raw)| ImpactEntry {
+            path: file,
+            signal: ImpactSignal::CallBased,
+            score: raw / max,
+        })
+        .collect();
+
+    entries.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    entries
 }
 
 // ---------------------------------------------------------------------------
@@ -265,9 +322,30 @@ pub fn predict(
     test_map: &HashMap<String, Vec<TestFileRef>>,
     depth: usize,
 ) -> PredictionResult {
+    predict_with_call_graph(
+        changed_files,
+        graph,
+        pagerank,
+        co_changes,
+        test_map,
+        depth,
+        &crate::intelligence::call_graph::CallGraph::new(),
+    )
+}
+
+/// Like [`predict`] but also incorporates call-graph signals.
+pub fn predict_with_call_graph(
+    changed_files: &[&str],
+    graph: &DependencyGraph,
+    pagerank: &HashMap<String, f64>,
+    co_changes: &[CoChangeEdge],
+    test_map: &HashMap<String, Vec<TestFileRef>>,
+    depth: usize,
+    call_graph: &crate::intelligence::call_graph::CallGraph,
+) -> PredictionResult {
     let structural = structural_impact(changed_files, graph, pagerank, depth);
     let historical = historical_impact(changed_files, co_changes);
-    let call_impact: Vec<ImpactEntry> = vec![];
+    let call_impact = call_graph_impact(changed_files, call_graph);
 
     let test_impact = merge_test_predictions(
         changed_files,
@@ -395,10 +473,10 @@ mod tests {
             .expect("b_test.rs must be predicted");
         // test_map + structural both map to ImpactSignal::Structural, co_change maps to Historical
         // keys: {TestMap, Structural, Historical} → 3 signals in vec
-        // confidence: has_map=true, has_hist=true, has_call=false → 0.5
+        // confidence: has_map=true, has_hist=true, has_call=false → 0.75
         assert!(
-            (pred.confidence - 0.5).abs() < 1e-9,
-            "expected 0.5 for test_map+structural+historical, got {}",
+            (pred.confidence - 0.75).abs() < 1e-9,
+            "expected 0.75 for test_map+structural+historical, got {}",
             pred.confidence
         );
         assert_eq!(pred.signals.len(), 3);
@@ -419,25 +497,31 @@ mod tests {
             .iter()
             .find(|p| p.test_file == "tests/b_test.rs")
             .expect("b_test.rs must be predicted");
-        assert!((pred.confidence - 0.4).abs() < 1e-9);
+        // test_map only → has_map=true, has_call=false, has_hist=false → 0.60
+        assert!(
+            (pred.confidence - 0.60).abs() < 1e-9,
+            "expected 0.60 for test_map only, got {}",
+            pred.confidence
+        );
     }
 
     #[test]
     fn test_confidence_map_values() {
+        // All 7 non-empty subsets must map to their documented unique values.
         let cases: &[(&[ImpactSignal], f64)] = &[
-            (&[ImpactSignal::Historical], 0.3),
-            (&[ImpactSignal::Structural], 0.4),
-            (&[ImpactSignal::CallBased], 0.5),
-            (&[ImpactSignal::Structural, ImpactSignal::Historical], 0.5),
-            (&[ImpactSignal::CallBased, ImpactSignal::Historical], 0.6),
-            (&[ImpactSignal::Structural, ImpactSignal::CallBased], 0.7),
+            (&[ImpactSignal::Historical], 0.40),
+            (&[ImpactSignal::Structural], 0.60),
+            (&[ImpactSignal::CallBased], 0.50),
+            (&[ImpactSignal::Structural, ImpactSignal::Historical], 0.75),
+            (&[ImpactSignal::CallBased, ImpactSignal::Historical], 0.70),
+            (&[ImpactSignal::Structural, ImpactSignal::CallBased], 0.85),
             (
                 &[
                     ImpactSignal::Structural,
                     ImpactSignal::CallBased,
                     ImpactSignal::Historical,
                 ],
-                0.9,
+                0.90,
             ),
         ];
         for (signals, expected) in cases {
@@ -462,27 +546,26 @@ mod tests {
     fn test_all_seven_confidence_subsets_are_distinct() {
         use std::collections::HashSet;
         let cases: Vec<(&[ImpactSignal], f64)> = vec![
-            (&[ImpactSignal::Historical], 0.3),
-            (&[ImpactSignal::Structural], 0.4),
-            (&[ImpactSignal::CallBased], 0.5),
-            (&[ImpactSignal::Structural, ImpactSignal::Historical], 0.5),
-            (&[ImpactSignal::CallBased, ImpactSignal::Historical], 0.6),
-            (&[ImpactSignal::Structural, ImpactSignal::CallBased], 0.7),
+            (&[ImpactSignal::Historical], 0.40),
+            (&[ImpactSignal::Structural], 0.60),
+            (&[ImpactSignal::CallBased], 0.50),
+            (&[ImpactSignal::Structural, ImpactSignal::Historical], 0.75),
+            (&[ImpactSignal::CallBased, ImpactSignal::Historical], 0.70),
+            (&[ImpactSignal::Structural, ImpactSignal::CallBased], 0.85),
             (
                 &[
                     ImpactSignal::Structural,
                     ImpactSignal::CallBased,
                     ImpactSignal::Historical,
                 ],
-                0.9,
+                0.90,
             ),
         ];
-        let values: HashSet<u64> = cases.iter().map(|(_, v)| (v * 100.0) as u64).collect();
-        // 0.5 appears for both (CallBased only) and (Structural+Historical) — 6 distinct levels
+        let values: HashSet<u64> = cases.iter().map(|(_, v)| (v * 1000.0) as u64).collect();
         assert_eq!(
             values.len(),
-            6,
-            "6 distinct confidence levels in the 7 subsets"
+            7,
+            "all 7 non-empty subsets must map to distinct confidence levels"
         );
     }
 
@@ -526,5 +609,128 @@ mod tests {
                 "structural impact must be sorted descending by score"
             );
         }
+    }
+
+    #[test]
+    fn test_call_graph_impact_basic() {
+        use crate::intelligence::call_graph::{CallConfidence, CallEdge, CallGraph};
+
+        // caller.rs calls src/b.rs::my_fn (Exact), other.rs calls it too (Approximate).
+        let call_graph = CallGraph {
+            edges: vec![
+                CallEdge {
+                    caller_file: "src/caller.rs".into(),
+                    caller_symbol: "do_thing".into(),
+                    callee_file: "src/b.rs".into(),
+                    callee_symbol: "my_fn".into(),
+                    confidence: CallConfidence::Exact,
+                },
+                CallEdge {
+                    caller_file: "src/other.rs".into(),
+                    caller_symbol: "do_other".into(),
+                    callee_file: "src/b.rs".into(),
+                    callee_symbol: "my_fn".into(),
+                    confidence: CallConfidence::Approximate,
+                },
+            ],
+            unresolved: Vec::new(),
+        };
+
+        let entries = call_graph_impact(&["src/b.rs"], &call_graph);
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"src/caller.rs"), "caller.rs must appear");
+        assert!(paths.contains(&"src/other.rs"), "other.rs must appear");
+        for e in &entries {
+            assert_eq!(e.signal, ImpactSignal::CallBased);
+            assert!(e.score > 0.0 && e.score <= 1.0, "score must be in (0,1]");
+        }
+        // Exact caller should score higher than Approximate caller after normalisation.
+        let exact_score = entries
+            .iter()
+            .find(|e| e.path == "src/caller.rs")
+            .unwrap()
+            .score;
+        let approx_score = entries
+            .iter()
+            .find(|e| e.path == "src/other.rs")
+            .unwrap()
+            .score;
+        assert!(
+            exact_score > approx_score,
+            "Exact caller ({exact_score}) must outscore Approximate caller ({approx_score})"
+        );
+    }
+
+    #[test]
+    fn test_call_graph_impact_excludes_changed_files() {
+        use crate::intelligence::call_graph::{CallConfidence, CallEdge, CallGraph};
+
+        // src/b.rs calls itself — must not appear in impact results.
+        let call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "src/b.rs".into(),
+                caller_symbol: "inner".into(),
+                callee_file: "src/b.rs".into(),
+                callee_symbol: "helper".into(),
+                confidence: CallConfidence::Exact,
+            }],
+            unresolved: Vec::new(),
+        };
+
+        let entries = call_graph_impact(&["src/b.rs"], &call_graph);
+        assert!(
+            entries.iter().all(|e| e.path != "src/b.rs"),
+            "changed file must not appear in call impact results"
+        );
+    }
+
+    #[test]
+    fn test_predict_with_call_graph_produces_callbased_predictions() {
+        use crate::intelligence::call_graph::{CallConfidence, CallEdge, CallGraph};
+
+        // tests/b_test.rs calls src/b.rs::my_fn — should be a CallBased prediction.
+        let call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "tests/b_test.rs".into(),
+                caller_symbol: "test_it".into(),
+                callee_file: "src/b.rs".into(),
+                callee_symbol: "my_fn".into(),
+                confidence: CallConfidence::Exact,
+            }],
+            unresolved: Vec::new(),
+        };
+
+        let graph = DependencyGraph::new();
+        let pagerank = HashMap::new();
+        let co_changes = vec![];
+        let test_map = HashMap::new();
+
+        let result = predict_with_call_graph(
+            &["src/b.rs"],
+            &graph,
+            &pagerank,
+            &co_changes,
+            &test_map,
+            3,
+            &call_graph,
+        );
+
+        assert!(
+            !result.call_impact.is_empty(),
+            "call_impact must be populated when call graph has matching edges"
+        );
+        let pred = result
+            .test_impact
+            .iter()
+            .find(|p| p.test_file == "tests/b_test.rs");
+        assert!(
+            pred.is_some(),
+            "tests/b_test.rs must appear in test predictions via CallBased signal"
+        );
+        let pred = pred.unwrap();
+        assert!(
+            pred.signals.contains(&ImpactSignal::CallBased),
+            "prediction must carry CallBased signal"
+        );
     }
 }
