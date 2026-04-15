@@ -133,6 +133,183 @@ pub fn strip_python_test_blocks(content: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Rust comment stripping (// line comments and /* ... */ block comments)
+// ---------------------------------------------------------------------------
+
+/// Remove Rust-style `//` line comments and `/* ... */` block comments from
+/// source content. Preserves line count by emitting newlines for stripped
+/// regions.
+///
+/// Purpose: detector regexes (security, routes, secrets) should not match on
+/// literal example patterns embedded in comments describing what they match.
+///
+/// Does NOT distinguish comment-in-string from actual comment — e.g., the
+/// literal string `"// not a comment"` will be treated as starting a comment.
+/// This is acceptable for detector input where we'd rather miss a match than
+/// flag a doc example.
+pub fn strip_rust_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    // String state: 0 = not in string, N = in raw string opened with N hashes
+    // (e.g., r#"..."# = 1, r##"..."## = 2). For regular strings, use raw_hashes = 0
+    // and track via in_string flag.
+    let mut in_string = false;
+    let mut raw_hashes: usize = 0; // 0 = not raw; >0 = raw with that many hashes
+    let mut in_char = false;
+    let mut escape = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if escape {
+            escape = false;
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        // Backslash escapes only apply to non-raw strings and char literals
+        if b == b'\\' && ((in_string && raw_hashes == 0) || in_char) {
+            escape = true;
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            // For raw strings, the closing is `"` followed by the same number of `#`s.
+            if raw_hashes > 0 {
+                if b == b'"'
+                    && i + raw_hashes < bytes.len()
+                    && bytes[(i + 1)..=(i + raw_hashes)].iter().all(|&c| c == b'#')
+                {
+                    // Emit the `"` and the closing `#`s
+                    for k in 0..=raw_hashes {
+                        out.push(bytes[i + k] as char);
+                    }
+                    i += raw_hashes + 1;
+                    in_string = false;
+                    raw_hashes = 0;
+                    continue;
+                }
+            } else if b == b'"' {
+                in_string = false;
+            }
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if in_char {
+            if b == b'\'' {
+                in_char = false;
+            }
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+
+        // Line comment: `// ...` up to end of line (preserve the newline).
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                out.push('\n');
+                i += 1;
+            }
+            continue;
+        }
+
+        // Block comment: `/* ... */` (can span multiple lines — preserve newlines)
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+
+        // Detect raw string: r#"..."# or r##"..."## etc.
+        // Also handle `br#"..."#` (byte raw strings).
+        let raw_start = if b == b'r' || (b == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r') {
+            let prefix_len = if b == b'b' { 2 } else { 1 };
+            let mut j = i + prefix_len;
+            let hash_start = j;
+            while j < bytes.len() && bytes[j] == b'#' {
+                j += 1;
+            }
+            let hashes = j - hash_start;
+            if hashes > 0 && j < bytes.len() && bytes[j] == b'"' {
+                // Found r#"... or r##"... etc.
+                Some((j + 1, hashes, prefix_len + hashes + 1))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((string_start, hashes, prefix_total)) = raw_start {
+            // Emit the prefix `r#"` (or `br#"`) verbatim
+            for k in 0..prefix_total {
+                out.push(bytes[i + k] as char);
+            }
+            i = string_start;
+            in_string = true;
+            raw_hashes = hashes;
+            continue;
+        }
+
+        // Enter regular string literal
+        if b == b'"' {
+            in_string = true;
+            raw_hashes = 0;
+        } else if b == b'\'' {
+            // Heuristic for char vs lifetime: look ahead for closing `'` within 5 bytes
+            let end = (i + 5).min(bytes.len());
+            let found_close = bytes[(i + 1)..end].contains(&b'\'');
+            if found_close {
+                in_char = true;
+            }
+        }
+
+        out.push(b as char);
+        i += 1;
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Regex-pattern heuristic for secret detection
+// ---------------------------------------------------------------------------
+
+/// Returns true if `snippet` contains regex meta-sequences that strongly
+/// suggest it's a regex pattern DEFINITION rather than real secret-looking
+/// user content.
+///
+/// Used by the secret-pattern detector to skip matches on the pattern strings
+/// themselves (e.g., `"://[^:]+:[^@]+@"` matching its own definition).
+pub fn looks_like_regex_pattern(snippet: &str) -> bool {
+    snippet.contains("[^")
+        || snippet.contains("(?:")
+        || snippet.contains("(?P")
+        || snippet.contains("\\w")
+        || snippet.contains("\\d")
+        || snippet.contains("\\s")
+        || snippet.contains("\\b")
+        || snippet.contains("[A-Z")
+        || snippet.contains("[a-z")
+        || snippet.contains("[0-9")
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -152,6 +329,26 @@ pub fn strip_test_blocks(content: &str, file_path: &str) -> String {
         .unwrap_or_default();
     match ext.as_str() {
         "rs" => strip_rust_test_blocks(content),
+        "py" | "pyi" => strip_python_test_blocks(content),
+        _ => content.to_string(),
+    }
+}
+
+/// Strip both test blocks AND comments from source content. Appropriate
+/// input for security / route / secret detectors, which shouldn't match on
+/// literal example patterns inside either test fixtures or documentation
+/// comments.
+///
+/// - `.rs` → strips `#[cfg(test)] mod … { … }` blocks AND `//` / `/* */` comments
+/// - `.py` / `.pyi` → strips test classes/functions (no comment stripping yet)
+/// - Other → unchanged
+pub fn strip_test_blocks_and_comments(content: &str, file_path: &str) -> String {
+    let ext = file_path
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "rs" => strip_rust_comments(&strip_rust_test_blocks(content)),
         "py" | "pyi" => strip_python_test_blocks(content),
         _ => content.to_string(),
     }
@@ -267,7 +464,84 @@ mod tests {
         assert!(out.contains("def helper"), "helper must survive");
     }
 
+    // ── Comment stripping ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_rust_comments_removes_line_comments() {
+        let input =
+            "fn real() {\n    // this is a comment with secret AKIA123\n    println!(\"hi\");\n}\n";
+        let out = strip_rust_comments(input);
+        assert!(
+            !out.contains("AKIA123"),
+            "secret in line comment must be stripped"
+        );
+        assert!(out.contains("fn real"), "real code must survive");
+        assert!(
+            out.contains("println!"),
+            "code outside comment must survive"
+        );
+    }
+
+    #[test]
+    fn test_strip_rust_comments_removes_block_comments() {
+        let input = "fn real() {\n    /* example: secret AKIA123 in docs */\n    let x = 1;\n}";
+        let out = strip_rust_comments(input);
+        assert!(
+            !out.contains("AKIA123"),
+            "secret in block comment must be stripped"
+        );
+        assert!(out.contains("fn real"));
+        assert!(out.contains("let x = 1"));
+    }
+
+    #[test]
+    fn test_strip_rust_comments_preserves_string_with_double_slash() {
+        let input = "let url = \"https://example.com/path\";\n";
+        let out = strip_rust_comments(input);
+        // The `//` inside the string should NOT be treated as starting a comment
+        assert!(
+            out.contains("https://example.com/path"),
+            "double-slash inside string must survive"
+        );
+    }
+
+    #[test]
+    fn test_strip_rust_comments_preserves_line_count() {
+        let input = "line1\n// comment\nline3\n/* block\ncomment */\nline6\n";
+        let out = strip_rust_comments(input);
+        assert_eq!(out.lines().count(), input.lines().count());
+    }
+
+    // ── Regex pattern heuristic ──────────────────────────────────────────────
+
+    #[test]
+    fn test_looks_like_regex_pattern_detects_negated_class() {
+        assert!(looks_like_regex_pattern("://[^:]+:[^@]+@"));
+    }
+
+    #[test]
+    fn test_looks_like_regex_pattern_detects_word_metacharacter() {
+        assert!(looks_like_regex_pattern("AKIA[A-Z0-9]{16}"));
+    }
+
+    #[test]
+    fn test_looks_like_regex_pattern_skips_real_secrets() {
+        assert!(!looks_like_regex_pattern("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!looks_like_regex_pattern("postgres://user:pass@host/db"));
+        assert!(!looks_like_regex_pattern("ghp_1234567890abcdefghij"));
+    }
+
     // ── Dispatch ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_test_blocks_and_comments_strips_both() {
+        let input = "fn real() {}\n// secret AKIA1 in comment\n#[cfg(test)]\nmod tests {\n    let s = \"AKIA2\";\n}\nfn after() {}";
+        let out = strip_test_blocks_and_comments(input, "src/lib.rs");
+        assert!(!out.contains("AKIA1"), "comment-secret stripped");
+        assert!(!out.contains("AKIA2"), "test-block-secret stripped");
+        assert!(out.contains("fn real"));
+        assert!(out.contains("fn after"));
+    }
 
     #[test]
     fn test_strip_test_blocks_dispatches_by_extension() {

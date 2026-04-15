@@ -358,6 +358,14 @@ pub fn detect_routes(content: &str, file_path: &str) -> Vec<RouteEndpoint> {
         return vec![];
     }
 
+    // Strip test blocks AND comments before regex scanning. This prevents
+    // routes described in example documentation comments (e.g., this file
+    // at lines 555+ describes axum route patterns in its own comments) from
+    // being detected as real endpoints. Line numbers are preserved.
+    let scanned =
+        crate::intelligence::test_stripping::strip_test_blocks_and_comments(content, file_path);
+    let content = scanned.as_str();
+
     let mut routes = vec![];
 
     // Helper to compute 1-based line number from a byte offset.

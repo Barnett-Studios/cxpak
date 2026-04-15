@@ -141,6 +141,12 @@ pub fn scan_secret_patterns(content: &str, file_path: &str) -> Vec<SecretPattern
                 .count()
                 + 1;
             let matched = cap.as_str();
+            // Skip matches that are clearly regex pattern definitions, not real
+            // secret-shaped user data. Examples: the SECRET_PATTERNS array's own
+            // entries, regex strings in test fixtures, etc.
+            if crate::intelligence::test_stripping::looks_like_regex_pattern(matched) {
+                continue;
+            }
             // Take the first 4 characters by Unicode scalar, not bytes — a
             // multi-byte char (e.g. `…` = 3 bytes) inside the match will
             // panic `&matched[..4]` on a char boundary.
@@ -451,10 +457,15 @@ pub fn build_security_surface(
         let content = &file.content;
         let pagerank = index.pagerank.get(path).copied().unwrap_or(0.0);
 
-        // Strip test blocks before scanning so that literal strings used as
-        // test fixtures (e.g., fake AWS keys, SQL injection examples, sample
-        // routes) do not generate false-positive security findings.
-        let stripped = crate::intelligence::test_stripping::strip_test_blocks(content, path);
+        // Strip test blocks AND comments before scanning so literal example
+        // patterns (fake AWS keys, SQL injection demos, sample routes) in test
+        // fixtures or documentation comments don't generate false-positive
+        // security findings.
+        let stripped =
+            crate::intelligence::test_stripping::strip_test_blocks_and_comments(content, path);
+        // scan_secret_patterns internally skips matches that look like regex
+        // pattern definitions (filtered against the full match content, not
+        // the truncated snippet).
         secret_patterns.extend(scan_secret_patterns(&stripped, path));
         sql_injection_surface.extend(scan_sql_injection(&stripped, path));
         input_validation_gaps.extend(scan_validation_gaps(&stripped, path, pagerank));
