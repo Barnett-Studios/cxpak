@@ -6150,9 +6150,40 @@ mod tests {
 
     // --- MAX_PATTERN_LEN tests ---
 
+    // Replaced cheater test "max_pattern_len_constant_is_1000" (which merely
+    // asserted the constant value and would pass even if the guard were
+    // disabled) with a real behavioural test: a pattern of exactly 1000 chars
+    // must succeed while a pattern of 1001 chars must be rejected.
+
     #[test]
-    fn max_pattern_len_constant_is_1000() {
-        assert_eq!(MAX_PATTERN_LEN, 1000);
+    fn search_accepts_pattern_at_exact_limit() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let repo_path = Arc::new(std::path::PathBuf::from("/tmp"));
+            let app = build_router_for_test(shared, repo_path);
+
+            // Exactly MAX_PATTERN_LEN characters — must NOT return 400.
+            let exact_pattern = "a".repeat(MAX_PATTERN_LEN);
+            let body = serde_json::to_vec(&serde_json::json!({"pattern": exact_pattern})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/search")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "pattern at exactly MAX_PATTERN_LEN must NOT return 400; \
+                 if 400, the guard uses > instead of >"
+            );
+        });
     }
 
     #[test]

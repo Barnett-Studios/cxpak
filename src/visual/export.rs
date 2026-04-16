@@ -371,6 +371,51 @@ mod tests {
         assert_eq!(mermaid_id("src/index/mod.rs"), "src_index_mod_rs");
     }
 
+    // ── Mermaid label bracket/pipe escape regression (46ced99) ──────────────
+    //
+    // Bug: node labels containing `[`, `]`, or `|` were emitted verbatim into
+    // the Mermaid output.  Both `[`/`]` are Mermaid node-shape syntax and `|`
+    // is flow-chart syntax, causing parse errors in Mermaid renderers.
+    //
+    // The test would FAIL against the pre-fix code because to_mermaid() would
+    // write the literal `[bracket]` in the label, which Mermaid parsers treat
+    // as a nested node definition rather than label content.
+
+    #[test]
+    fn test_to_mermaid_escapes_brackets_in_label() {
+        let layout = ComputedLayout {
+            nodes: vec![LayoutNode {
+                id: "src/api".into(),
+                // Label with square brackets and pipe that would break Mermaid.
+                label: "[Handler|Route]".into(),
+                layer: 0,
+                position: Point { x: 0.0, y: 0.0 },
+                width: 160.0,
+                height: 48.0,
+                node_type: NodeType::Module,
+                metadata: NodeMetadata::default(),
+            }],
+            edges: vec![],
+            width: 200.0,
+            height: 100.0,
+            layers: vec![vec!["src/api".into()]],
+        };
+        let mermaid = to_mermaid(&layout);
+
+        // Raw `[`, `]`, and `|` must not appear inside the label string.
+        // The fix maps `[` → `(`, `]` → `)`, `|` → `/`.
+        assert!(
+            !mermaid.contains("[Handler|Route]"),
+            "raw brackets and pipe in label must be escaped; \
+             if present, the 46ced99 fix has been reverted.\nGot:\n{mermaid}"
+        );
+        // The sanitised form must appear.
+        assert!(
+            mermaid.contains("(Handler/Route)"),
+            "label must be sanitised to '(Handler/Route)', got:\n{mermaid}"
+        );
+    }
+
     #[test]
     fn test_to_svg_valid() {
         let layout = make_3_module_layout();

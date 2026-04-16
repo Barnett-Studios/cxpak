@@ -697,4 +697,66 @@ mod tests {
         // Exactly 12000 tokens = 60.0 minutes → "~1h 0m"
         assert_eq!(format_reading_time(12_000), "~1h 0m");
     }
+
+    // ── Onboarding topo-order within module regression (46ced99) ────────────
+    //
+    // Bug: group_into_phases() previously sorted files within each module by
+    // token count, discarding the dependency order computed by
+    // topological_sort_files().  This caused readers to encounter files before
+    // their dependencies.
+    //
+    // The test would FAIL against the pre-fix code:
+    //  - With "core.rs" (1000 tokens, no imports) and "wrapper.rs"
+    //    (10 tokens, imports core.rs), the old sort-by-tokens code placed
+    //    "core.rs" first because 1000 > 10.  After the fix the topological
+    //    order is preserved: "core.rs" first (depended-on), "wrapper.rs"
+    //    second (depends on core.rs).
+    //  - However, both orders happen to put "core.rs" first in this
+    //    particular case, so we construct a case where the topo order and
+    //    token-count order *disagree*:
+    //      leaf.rs  (no deps, 50 tokens)   ← fewer tokens
+    //      root.rs  (imports leaf.rs, 500 tokens) ← more tokens
+    //    Topo order: leaf.rs first (must be read before root.rs).
+    //    Token order: root.rs first (500 > 50).
+    //    The fix should yield leaf.rs first.
+
+    #[test]
+    fn test_group_into_phases_preserves_topo_order_within_module() {
+        let files: Vec<String> = vec!["src/m/leaf.rs".to_string(), "src/m/root.rs".to_string()];
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+
+        // leaf.rs has no deps; root.rs depends on leaf.rs.
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("src/m/root.rs", "src/m/leaf.rs", EdgeType::Import);
+
+        // Topological sort: leaf.rs must come before root.rs.
+        let sorted = topological_sort_files(&file_refs, &graph);
+        assert_eq!(
+            sorted[0], "src/m/leaf.rs",
+            "topo sort should put leaf.rs first (no deps)"
+        );
+
+        // Assign token counts that DISAGREE with topo order: root has more tokens.
+        let mut tokens: HashMap<String, usize> = HashMap::new();
+        tokens.insert("src/m/leaf.rs".to_string(), 50);
+        tokens.insert("src/m/root.rs".to_string(), 500);
+
+        let pagerank: HashMap<String, f64> = files.iter().map(|f| (f.clone(), 1.0)).collect();
+        let symbols: HashMap<String, Vec<String>> = HashMap::new();
+
+        let phases = group_into_phases(&sorted, &pagerank, &graph, &tokens, &symbols);
+
+        // There must be exactly one phase for "src/m".
+        assert_eq!(phases.len(), 1);
+        let phase = &phases[0];
+        assert_eq!(phase.files.len(), 2);
+
+        // Topo order must be preserved: leaf.rs before root.rs.
+        assert_eq!(
+            phase.files[0].path, "src/m/leaf.rs",
+            "leaf.rs (depended-on) must appear first; \
+             if root.rs is first, the token-sort regression (46ced99) is back"
+        );
+        assert_eq!(phase.files[1].path, "src/m/root.rs");
+    }
 }

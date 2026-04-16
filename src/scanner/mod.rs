@@ -332,6 +332,61 @@ mod tests {
         );
     }
 
+    // ── Scanner .gitignore regression (1cc621c fix 11) ──────────────────────
+    //
+    // Bug: WalkBuilder was built without `git_ignore(true)` and
+    // `git_exclude(true)`, so files listed in `.gitignore` were still scanned.
+    //
+    // This test requires a real git repo (git2::Repository::init with a
+    // committed file) because the `ignore` crate only respects `.gitignore`
+    // when the directory is a valid git repository.
+    //
+    // The test would FAIL against the pre-fix code: `secret.log` would appear
+    // in the scanned files even though `.gitignore` excludes `*.log`.
+
+    fn make_real_git_repo(dir: &Path) {
+        let repo = git2::Repository::init(dir).expect("git init");
+        let sig = git2::Signature::now("Test", "test@test.com").expect("sig");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            // Write a placeholder file and commit it so the repo is non-empty.
+            let placeholder = dir.join("placeholder.rs");
+            fs::write(&placeholder, "fn p() {}").expect("write placeholder");
+            index
+                .add_path(std::path::Path::new("placeholder.rs"))
+                .expect("add");
+            index.write().expect("write index");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .expect("commit");
+    }
+
+    #[test]
+    fn test_scanner_respects_gitignore() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        make_real_git_repo(tmp.path());
+
+        // Create a `.gitignore` that excludes `*.log`.
+        fs::write(tmp.path().join(".gitignore"), "*.log\n").unwrap();
+        // Create a file that matches and one that doesn't.
+        fs::write(tmp.path().join("keep.rs"), "fn keep() {}").unwrap();
+        fs::write(tmp.path().join("secret.log"), "super secret").unwrap();
+
+        let scanner = Scanner::new(tmp.path()).unwrap();
+        let files = scanner.scan().unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+
+        assert!(paths.contains(&"keep.rs"), "keep.rs must be scanned");
+        assert!(
+            !paths.contains(&"secret.log"),
+            "secret.log must be excluded by .gitignore; \
+             if present, the 1cc621c gitignore fix has been reverted. \
+             Scanned: {paths:?}"
+        );
+    }
+
     #[test]
     fn test_detect_language_existing_extensions() {
         let cases = vec![

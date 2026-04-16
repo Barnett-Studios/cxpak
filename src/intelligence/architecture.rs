@@ -494,6 +494,78 @@ mod tests {
         assert!(gods.is_empty(), "single file should never be a god file");
     }
 
+    // --- Coupling double-count regression (a7ef720) ---
+    //
+    // Bug: build_architecture_map() iterated BOTH graph.edges AND
+    // graph.reverse_edges when computing total_edges, counting every edge
+    // twice.  This inflated the denominator so cohesion appeared near zero
+    // even for tightly-coupled modules.
+    //
+    // The test would FAIL against the pre-fix code:
+    //  - With 2 intra-module edges and 0 cross-module edges the pre-fix code
+    //    would set total_edges = 4 (edges counted via forward AND reverse),
+    //    but intra_edges = 2.  cohesion = compute_cohesion(2, 2) = 1.0 because
+    //    that helper was not the bug — the bug was the denominator passed into
+    //    the coupling calculation.  However, with coupling = 0/4 = 0.0 and
+    //    cohesion = 2/(2*(2-1)) = 1.0 for 2 intra-module files both sides were
+    //    actually correct for the simple 2-file case.
+    //
+    //  The observable symptom is coupling reported as 0/total where total is
+    //  double the actual edge count.  With 1 cross + 1 intra edge:
+    //    pre-fix:  total = 4 (2 forward + 2 reverse), coupling = 1/4 = 0.25
+    //    post-fix: total = 2 (forward only),           coupling = 1/2 = 0.50
+    #[test]
+    fn test_coupling_not_double_counted_via_reverse_edges() {
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Build a small index: src/a/x.rs → src/a/y.rs (intra) and
+        //                       src/a/x.rs → src/b/z.rs (cross).
+        let make = |name: &str| {
+            let fp = dir.path().join(name.replace('/', "_"));
+            std::fs::write(&fp, "fn f() {}").unwrap();
+            ScannedFile {
+                relative_path: name.to_string(),
+                absolute_path: fp,
+                language: Some("rust".into()),
+                size_bytes: 9,
+            }
+        };
+        let mut index = CodebaseIndex::build(
+            vec![make("src/a/x.rs"), make("src/a/y.rs"), make("src/b/z.rs")],
+            HashMap::new(),
+            &counter,
+        );
+
+        // One intra-module edge (a→a) and one cross-module edge (a→b).
+        index
+            .graph
+            .add_edge("src/a/x.rs", "src/a/y.rs", EdgeType::Import);
+        index
+            .graph
+            .add_edge("src/a/x.rs", "src/b/z.rs", EdgeType::Import);
+
+        let map = build_architecture_map(&index, 2);
+        let mod_a = map
+            .modules
+            .iter()
+            .find(|m| m.prefix == "src/a")
+            .expect("src/a module must exist");
+
+        // Post-fix: 2 total outgoing edges, 1 cross → coupling = 0.5
+        // Pre-fix: 4 total (each edge counted twice via reverse) → coupling = 0.25
+        assert!(
+            (mod_a.coupling - 0.5).abs() < 1e-9,
+            "coupling must be 0.5 (1 cross / 2 total), got {}; \
+             if 0.25 then reverse-edge double-count bug is back",
+            mod_a.coupling
+        );
+    }
+
     // --- ModuleInfo v1.3.0 fields ---
 
     #[test]

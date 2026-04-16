@@ -399,6 +399,49 @@ mod tests {
         map
     }
 
+    // ── is_test_path bare-filename regression (46ced99) ─────────────────────
+    //
+    // Bug: is_test_path only checked for "test"/"spec"/"__tests__" as
+    // *directory components* (non-final path segments).  A bare filename like
+    // "tests" (with no extension) or "spec" was missed.
+    //
+    // The test would FAIL against the pre-fix code because is_test_path
+    // returns false for "tests" — so a directory entry named "tests" would
+    // not be classified as a test file and blast-radius categorisation would
+    // skip it.
+
+    #[test]
+    fn test_is_test_path_bare_tests_filename() {
+        // A path whose last component is exactly "tests" must be recognised.
+        assert!(
+            is_test_path("tests"),
+            "bare 'tests' filename must be a test path; \
+             if false, the 46ced99 fix has been reverted"
+        );
+    }
+
+    #[test]
+    fn test_is_test_path_bare_spec_filename() {
+        assert!(
+            is_test_path("spec"),
+            "bare 'spec' filename must be a test path"
+        );
+    }
+
+    #[test]
+    fn test_is_test_path_directory_component_still_works() {
+        // Existing behaviour: "tests" as a non-final segment still matches.
+        assert!(is_test_path("tests/api_test.rs"));
+    }
+
+    #[test]
+    fn test_is_test_path_non_test_file() {
+        assert!(
+            !is_test_path("src/main.rs"),
+            "normal source file must not be a test path"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // compute_blast_impact tests
     // -----------------------------------------------------------------------

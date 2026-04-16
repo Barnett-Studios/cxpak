@@ -223,6 +223,43 @@ mod tests {
         assert_eq!(suf, "");
     }
 
+    // ── HCL / PHP / Prisma regression (d4979b0) ─────────────────────────────
+    //
+    // Bug: hcl, php, and prisma were missing from comment_syntax(), so they
+    // fell through to the default `"// "`.  For HCL this is wrong — Terraform
+    // uses `#` comments.  PHP and Prisma happen to use `//` but must be
+    // explicit so future changes don't silently regress.
+    //
+    // The test would FAIL against the pre-fix code for HCL: the function
+    // returned `("// ", "")` instead of `("# ", "")`, so HCL annotations
+    // would embed invalid Terraform syntax.
+
+    #[test]
+    fn comment_syntax_hcl_uses_hash() {
+        // HCL (Terraform) uses `#` not `//`.
+        let (pre, suf) = comment_syntax("hcl");
+        assert_eq!(
+            pre, "# ",
+            "HCL must use '#' comment prefix, not '//'; \
+             if '// ' then the d4979b0 fix has been reverted"
+        );
+        assert_eq!(suf, "");
+    }
+
+    #[test]
+    fn comment_syntax_php_uses_double_slash() {
+        let (pre, suf) = comment_syntax("php");
+        assert_eq!(pre, "// ", "PHP must use '//' comment prefix");
+        assert_eq!(suf, "");
+    }
+
+    #[test]
+    fn comment_syntax_prisma_uses_double_slash() {
+        let (pre, suf) = comment_syntax("prisma");
+        assert_eq!(pre, "// ", "Prisma must use '//' comment prefix");
+        assert_eq!(suf, "");
+    }
+
     // ---------------------------------------------------------------------------
     // annotate_file helpers
     // ---------------------------------------------------------------------------

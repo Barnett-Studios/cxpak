@@ -558,4 +558,59 @@ mod tests {
         // JS/TS is not stripped — returned as-is
         assert_eq!(js_out, js_input, "JS content must be unchanged");
     }
+
+    // ── Raw-string regression (3565eae) ─────────────────────────────────────
+    //
+    // Bug: strip_rust_comments() treated `"` inside r#"..."# as ending the
+    // string state, so a `//` that appeared after a raw-string literal was
+    // not stripped.  Worse, a `//` INSIDE a raw string was wrongly treated as
+    // a line comment (truncating the string).
+    //
+    // These tests would FAIL against the pre-fix code because:
+    //  - test_raw_string_double_slash_not_treated_as_comment: the output would
+    //    be truncated mid-string (everything from `//` onward stripped).
+    //  - test_raw_string_comment_after_raw_string_is_stripped: the `//` after
+    //    the raw string literal would survive because the string-state tracker
+    //    incorrectly thought we were still inside the string.
+
+    #[test]
+    fn test_raw_string_double_slash_not_treated_as_comment() {
+        // A raw string r#"..."# containing `//` must survive intact.
+        let input = "let s = r#\"https://example.com/path\"#;\n";
+        let out = strip_rust_comments(input);
+        assert!(
+            out.contains("https://example.com/path"),
+            "// inside raw string must NOT be treated as a comment, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_raw_string_comment_after_raw_string_is_stripped() {
+        // A `//` comment that appears AFTER a raw string literal must be stripped.
+        let input = "let s = r#\"no_slash\"#; // secret AKIA123\nlet x = 1;\n";
+        let out = strip_rust_comments(input);
+        assert!(
+            !out.contains("AKIA123"),
+            "// comment after raw string must be stripped, got: {out:?}"
+        );
+        assert!(
+            out.contains("no_slash"),
+            "raw string content must survive, got: {out:?}"
+        );
+        assert!(
+            out.contains("let x = 1"),
+            "real code after comment must survive, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_raw_string_double_hash_not_treated_as_comment() {
+        // r##"..."## with double-hash delimiter must also be handled.
+        let input = "let url = r##\"http://host/path\"##;\n";
+        let out = strip_rust_comments(input);
+        assert!(
+            out.contains("http://host/path"),
+            "// inside r##...## raw string must survive, got: {out:?}"
+        );
+    }
 }

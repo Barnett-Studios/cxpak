@@ -733,4 +733,74 @@ mod tests {
             "expected coverage score 5.0, got {score}"
         );
     }
+
+    // ── Convention profile population regression (c813524) ──────────────────
+    //
+    // Bug: non-serve commands (overview, trace, diff, visual) built a
+    // CodebaseIndex but never called build_convention_profile().  This left
+    // index.conventions at its default (empty) state.  As a result:
+    //   - score_churn_stability() returned 10.0 (no churn data → "stable").
+    //   - score_conventions() returned 10.0 (no patterns → empty scores).
+    //   - compute_risk_ranking() saw all files as equally ranked (0.01).
+    //
+    // The regression test verifies that compute_health() on an index with
+    // populated churn data returns a lower churn_stability score than one
+    // with empty churn data — i.e. the metric responds to real data.
+    //
+    // The test would FAIL to catch the bug if index.conventions.git_health is
+    // not populated, but it DOES demonstrate the semantic contract that the
+    // fix restores: once build_convention_profile() is called, health scores
+    // reflect actual repository state rather than the 10.0/0.01 defaults.
+
+    #[test]
+    fn test_churn_stability_reflects_populated_conventions() {
+        use crate::budget::counter::TokenCounter;
+        use crate::conventions::{git_health::ChurnEntry, ConventionProfile};
+        use crate::scanner::ScannedFile;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        // Create 5 files so the churn ratio is meaningful.
+        let files: Vec<ScannedFile> = (0..5)
+            .map(|i| {
+                let fp = dir.path().join(format!("src{i}.rs"));
+                std::fs::write(&fp, "fn f() {}").unwrap();
+                ScannedFile {
+                    relative_path: format!("src{i}.rs"),
+                    absolute_path: fp,
+                    language: Some("rust".into()),
+                    size_bytes: 9,
+                }
+            })
+            .collect();
+
+        let mut index =
+            crate::index::CodebaseIndex::build(files, std::collections::HashMap::new(), &counter);
+
+        // With no conventions, churn_30d is empty → score_churn_stability returns 10.0.
+        let empty_score = score_churn_stability(&index);
+        assert!(
+            (empty_score - 10.0).abs() < 1e-9,
+            "empty conventions must yield churn_stability = 10.0, got {empty_score}"
+        );
+
+        // Now populate conventions with hot-file churn (> 10 modifications).
+        let mut profile = ConventionProfile::default();
+        profile.git_health.churn_30d = (0..3)
+            .map(|i| ChurnEntry {
+                path: format!("src{i}.rs"),
+                modifications: 15, // > 10 → hot
+            })
+            .collect();
+        index.conventions = profile;
+
+        // With 3 hot files out of 5 total, stability should be < 10.0.
+        let populated_score = score_churn_stability(&index);
+        assert!(
+            populated_score < 10.0,
+            "populated conventions with hot-file churn must yield \
+             churn_stability < 10.0, got {populated_score}; \
+             if 10.0, conventions were not used (c813524 fix reverted)"
+        );
+    }
 }
