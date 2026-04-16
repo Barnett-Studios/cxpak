@@ -3,6 +3,14 @@
 use crate::schema::EdgeType;
 use regex::Regex;
 use std::collections::HashSet;
+use std::sync::LazyLock;
+
+static RE_EMBEDDED_SQL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
+    )
+    .expect("RE_EMBEDDED_SQL")
+});
 
 // ---------------------------------------------------------------------------
 // Task 12: Embedded SQL detection
@@ -20,11 +28,7 @@ pub struct EmbeddedSqlRef {
 /// Pure SQL files should be excluded by callers (they define tables, not
 /// embed SQL as string literals in other languages).
 pub fn detect_embedded_sql(content: &str) -> Vec<EmbeddedSqlRef> {
-    // The pattern optionally skips IF [NOT] EXISTS between TABLE and the table name.
-    let re = Regex::new(
-        r"(?i)\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
-    )
-    .unwrap();
+    let re = &*RE_EMBEDDED_SQL;
 
     let mut seen = HashSet::new();
     let mut refs = Vec::new();
@@ -531,6 +535,26 @@ mod tests {
         let names: Vec<&str> = refs.iter().map(|r| r.table_name.as_str()).collect();
         assert!(names.contains(&"users"), "must find 'users': {:?}", names);
         assert!(names.contains(&"orders"), "must find 'orders': {:?}", names);
+    }
+
+    #[test]
+    fn test_detect_embedded_sql_lazy_lock_consistent() {
+        // Call detect_embedded_sql twice with the same content. Both calls must
+        // return identical results, confirming the static regex is reused
+        // rather than compiled fresh each invocation.
+        let content = "SELECT * FROM users JOIN orders ON users.id = orders.user_id";
+        let first = detect_embedded_sql(content);
+        let second = detect_embedded_sql(content);
+
+        let first_names: Vec<&str> = first.iter().map(|r| r.table_name.as_str()).collect();
+        let second_names: Vec<&str> = second.iter().map(|r| r.table_name.as_str()).collect();
+
+        assert_eq!(
+            first_names, second_names,
+            "two calls with same input must produce identical results"
+        );
+        assert!(first_names.contains(&"users"));
+        assert!(first_names.contains(&"orders"));
     }
 
     // -------------------------------------------------------------------------

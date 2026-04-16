@@ -67,16 +67,16 @@ CX.header = function() {
     '<span class="cxpak-timestamp">' + CX.esc(CX.meta.generated_at) + '</span>';
   CX.app.appendChild(h);
   /* navigation links */
-  var typeMap = { 'Dashboard': 'dashboard', 'Architecture Explorer': 'architecture', 'Risk Heatmap': 'risk', 'Diff View': 'diff' };
+  var typeMap = { 'Dashboard': 'dashboard', 'Architecture Explorer': 'architecture', 'Risk Heatmap': 'risk', 'Diff View': 'diff', 'Flow Diagram': 'flow', 'Time Machine': 'timeline' };
   var curType = typeMap[CX.meta.visual_type_display] || '';
   // Derive filename prefix from the current page so nav works regardless of naming convention.
   var curPath = window.location.pathname.split('/').pop() || '';
-  var m = curPath.match(/^(.+?)(dashboard|architecture|risk|diff)(\.html?)$/i);
+  var m = curPath.match(/^(.+?)(dashboard|architecture|risk|diff|flow|timeline)(\.html?)$/i);
   var prefix = m ? m[1] : 'cxpak-';
   var ext = m ? m[3] : '.html';
   var nav = document.createElement('nav');
   nav.className = 'cxpak-nav';
-  ['dashboard','architecture','risk','diff'].forEach(function(v) {
+  ['dashboard','architecture','risk','diff','flow','timeline'].forEach(function(v) {
     var a = document.createElement('a');
     a.href = prefix + v + ext;
     a.className = 'cxpak-nav-link' + (curType === v ? ' active' : '');
@@ -4093,5 +4093,36 @@ mod tests {
         let safe = r#"{"key":"value","num":42}"#;
         let escaped = escape_script_tag(safe);
         assert_eq!(escaped, safe, "safe JSON must pass through unchanged");
+    }
+
+    #[test]
+    fn test_html_nav_includes_flow_and_timeline() {
+        // The HTML navigation bar must contain all 6 view types, including
+        // 'flow' and 'timeline' which were missing before this fix.
+        let layout = make_test_layout_5_nodes();
+        let meta = make_test_metadata();
+        let html = render_html(&layout, super::super::VisualType::Dashboard, &meta);
+
+        assert!(
+            html.contains("'flow'") || html.contains("\"flow\"") || html.contains("'flow',"),
+            "nav forEach array must include 'flow'; html nav section: {}",
+            html.find("cxpak-nav")
+                .map(|i| &html[i..i + 500])
+                .unwrap_or("not found")
+        );
+        assert!(
+            html.contains("'timeline'")
+                || html.contains("\"timeline\"")
+                || html.contains("'timeline'"),
+            "nav forEach array must include 'timeline'"
+        );
+        assert!(
+            html.contains("'Flow Diagram'") || html.contains("Flow Diagram"),
+            "typeMap must include 'Flow Diagram'"
+        );
+        assert!(
+            html.contains("'Time Machine'") || html.contains("Time Machine"),
+            "typeMap must include 'Time Machine'"
+        );
     }
 }

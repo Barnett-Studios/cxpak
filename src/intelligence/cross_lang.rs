@@ -202,7 +202,6 @@ pub fn detect_http_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
         }
 
         let source_language = file.language.clone().unwrap_or_else(|| "unknown".into());
-        let source_symbol = guess_containing_symbol(file, 0);
         // Strip the inline test module from Rust files so `fetch(...)` in
         // test fixtures doesn't register as a real HTTP call.
         let content = scannable_content(file.language.as_deref(), &file.content);
@@ -244,7 +243,6 @@ pub fn detect_http_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
                     target_language,
                     bridge_type: BridgeType::HttpCall,
                 });
-                let _ = source_symbol.clone();
             }
         }
     }

@@ -429,7 +429,7 @@ fn try_detect_prisma(
     if symbol.kind != SymbolKind::Struct {
         return None;
     }
-    if language != Some("prisma") {
+    if !matches!(language, Some(l) if l.eq_ignore_ascii_case("prisma")) {
         return None;
     }
 
@@ -1851,6 +1851,48 @@ mod tests {
         let index = make_index(vec![file]);
         let models = detect_orm_models(&index);
         assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_prisma_model_detected_case_insensitive_language() {
+        // try_detect_prisma must accept "Prisma" (capital P) in addition to
+        // "prisma" (lowercase). The scanner returns lowercase, but the
+        // case-insensitive guard makes the code defensive against future changes.
+        let sym = make_symbol(
+            "User",
+            SymbolKind::Struct,
+            "model User",
+            "  id   Int    @id\n  name String\n",
+        );
+
+        // Test uppercase "Prisma"
+        let file_upper = make_file(
+            "schema.prisma",
+            Some("Prisma"),
+            "",
+            vec![sym.clone()],
+            vec![],
+        );
+        let index_upper = make_index(vec![file_upper]);
+        let models_upper = detect_orm_models(&index_upper);
+        assert_eq!(
+            models_upper.len(),
+            1,
+            "language='Prisma' (capital P) must detect models; got {:?}",
+            models_upper
+        );
+        assert_eq!(models_upper[0].class_name, "User");
+
+        // Test lowercase "prisma" (normal scanner output)
+        let file_lower = make_file("schema.prisma", Some("prisma"), "", vec![sym], vec![]);
+        let index_lower = make_index(vec![file_lower]);
+        let models_lower = detect_orm_models(&index_lower);
+        assert_eq!(
+            models_lower.len(),
+            1,
+            "language='prisma' (lowercase) must detect models; got {:?}",
+            models_lower
+        );
     }
 
     #[test]

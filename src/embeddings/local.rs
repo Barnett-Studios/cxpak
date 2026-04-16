@@ -154,9 +154,19 @@ impl LocalEmbeddingProvider {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve the home directory from environment variables.
+///
+/// Checks `HOME` (Unix) then `USERPROFILE` (Windows). Returns an error when
+/// neither is set.
+pub(crate) fn resolve_home_dir() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| "cannot find home directory: neither HOME nor USERPROFILE set".to_string())
+}
+
 fn model_cache_dir() -> Result<PathBuf, String> {
-    #[allow(deprecated)]
-    let home = std::env::home_dir().ok_or_else(|| "cannot find home directory".to_string())?;
+    let home = resolve_home_dir()?;
     let dir = home.join(".cxpak").join("models").join(CACHE_SUBDIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create dirs error: {e}"))?;
     Ok(dir)
@@ -250,6 +260,34 @@ mod tests {
     fn test_local_provider_dimensions() {
         let provider = LocalEmbeddingProvider::new().expect("should construct");
         assert_eq!(provider.dimensions(), 384);
+    }
+
+    #[test]
+    fn test_resolve_home_dir_uses_home_env() {
+        // Verify that resolve_home_dir() reads from HOME, not deprecated
+        // std::env::home_dir(). We set HOME to a known tempdir and confirm
+        // the function returns a path under that directory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_path_buf();
+
+        // Safety: single-threaded test; we restore or note that other tests
+        // in this module are #[ignore] and don't rely on HOME.
+        let original = std::env::var_os("HOME");
+        std::env::set_var("HOME", &dir_path);
+
+        let result = super::resolve_home_dir();
+
+        // Restore before asserting to avoid leaking env state.
+        match original {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let resolved = result.expect("resolve_home_dir should succeed when HOME is set");
+        assert_eq!(
+            resolved, dir_path,
+            "resolve_home_dir must return the HOME env var value"
+        );
     }
 
     #[test]

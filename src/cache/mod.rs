@@ -1,8 +1,10 @@
 pub mod parse;
 
 use crate::parser::language::ParseResult;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::path::Path;
 
 pub const CACHE_VERSION: u32 = 2;
@@ -30,6 +32,17 @@ pub struct CacheEntry {
 /// Grammar hash computed at compile time by build.rs.
 const CURRENT_GRAMMAR_HASH: &str = env!("CXPAK_GRAMMAR_HASH");
 
+fn lock_cache(cache_dir: &Path) -> std::io::Result<std::fs::File> {
+    let lock_path = cache_dir.join("cache.lock");
+    let lock_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_file.lock_exclusive()?;
+    Ok(lock_file)
+}
+
 impl FileCache {
     pub fn new() -> Self {
         Self {
@@ -41,6 +54,10 @@ impl FileCache {
 
     pub fn load(cache_dir: &Path) -> Self {
         let cache_file = cache_dir.join("cache.json");
+        // Acquire lock before reading so concurrent processes don't read a
+        // partially-written file. Failures to lock are non-fatal: fall back to
+        // a fresh cache rather than blocking or crashing.
+        let _lock = lock_cache(cache_dir).ok();
         let content = match std::fs::read_to_string(&cache_file) {
             Ok(c) => c,
             Err(_) => return Self::new(),
@@ -57,6 +74,9 @@ impl FileCache {
 
     pub fn save(&self, cache_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(cache_dir)?;
+        // Hold the lock for the entire write + rename sequence so concurrent
+        // processes cannot observe an incomplete cache.json.
+        let _lock = lock_cache(cache_dir)?;
         let json = serde_json::to_string(self)?;
         let tmp = cache_dir.join("cache.json.tmp");
         std::fs::write(&tmp, &json)?;
@@ -271,6 +291,94 @@ mod tests {
         let cache = FileCache::default();
         assert_eq!(cache.version, CACHE_VERSION);
         assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_save_no_corruption() {
+        // Two threads both call save() with distinct data. After both finish,
+        // the resulting cache.json must deserialize cleanly (not be corrupted)
+        // and must contain the data from exactly one of the two writers.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_path_buf();
+
+        let dir_a = dir_path.clone();
+        let dir_b = dir_path.clone();
+
+        let handle_a = std::thread::spawn(move || {
+            let mut cache = FileCache::new();
+            for i in 0..5 {
+                let mut e = make_entry(&format!("src/file_a_{i}.rs"));
+                e.token_count = 100 + i;
+                cache.entries.push(e);
+            }
+            cache.save(&dir_a).expect("thread A save");
+        });
+
+        let handle_b = std::thread::spawn(move || {
+            let mut cache = FileCache::new();
+            for i in 0..5 {
+                let mut e = make_entry(&format!("src/file_b_{i}.rs"));
+                e.token_count = 200 + i;
+                cache.entries.push(e);
+            }
+            cache.save(&dir_b).expect("thread B save");
+        });
+
+        handle_a.join().expect("thread A panicked");
+        handle_b.join().expect("thread B panicked");
+
+        // The file must load without error (no partial JSON).
+        let loaded = FileCache::load(&dir_path);
+        assert_eq!(loaded.version, CACHE_VERSION);
+        // Must contain exactly 5 entries — data from one writer, not a mix.
+        assert_eq!(
+            loaded.entries.len(),
+            5,
+            "expected 5 entries from one writer, got: {:?}",
+            loaded
+                .entries
+                .iter()
+                .map(|e| &e.relative_path)
+                .collect::<Vec<_>>()
+        );
+        // All entries must share the same writer prefix.
+        let all_a = loaded
+            .entries
+            .iter()
+            .all(|e| e.relative_path.contains("file_a"));
+        let all_b = loaded
+            .entries
+            .iter()
+            .all(|e| e.relative_path.contains("file_b"));
+        assert!(
+            all_a || all_b,
+            "entries must come from exactly one writer, not a mix: {:?}",
+            loaded
+                .entries
+                .iter()
+                .map(|e| &e.relative_path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_load_acquires_lock_before_read() {
+        // Verify that load() does not panic or return corrupt data when the
+        // lock file already exists (created by a previous save or lock_cache).
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Pre-create the lock file to simulate a scenario where it was left
+        // behind by a previous process.
+        std::fs::write(dir.path().join("cache.lock"), b"").expect("create lock file");
+
+        let mut cache = FileCache::new();
+        cache.entries.push(make_entry("src/main.rs"));
+        cache
+            .save(dir.path())
+            .expect("save with existing lock file");
+
+        let loaded = FileCache::load(dir.path());
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].relative_path, "src/main.rs");
     }
 
     #[test]

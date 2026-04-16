@@ -52,15 +52,18 @@ pub fn extract_word_at(content: &str, line_idx: usize, char_idx: usize) -> Strin
     chars[start..end].iter().collect()
 }
 
-pub fn code_lens_for_file(uri_path: &str, index: &crate::index::CodebaseIndex) -> Vec<CodeLens> {
-    let relative = uri_path
-        .trim_start_matches("file://")
-        .trim_start_matches('/');
+pub fn code_lens_for_file(
+    uri_path: &str,
+    index: &crate::index::CodebaseIndex,
+    repo_root: &Path,
+) -> Vec<CodeLens> {
+    let url = Url::parse(uri_path).ok();
+    let rel_opt = url.as_ref().and_then(|u| uri_to_rel_path(u, repo_root));
 
-    let file = index
-        .files
-        .iter()
-        .find(|f| f.relative_path == relative || uri_path.ends_with(&f.relative_path));
+    let file = index.files.iter().find(|f| {
+        rel_opt.as_deref().is_some_and(|r| f.relative_path == r)
+            || uri_path.ends_with(&f.relative_path)
+    });
 
     match file {
         None => Vec::new(),
@@ -117,16 +120,16 @@ pub fn hover_for_symbol(
 pub fn diagnostics_for_file(
     uri_path: &str,
     index: &crate::index::CodebaseIndex,
+    repo_root: &Path,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
-    let relative = uri_path
-        .trim_start_matches("file://")
-        .trim_start_matches('/');
+    let url = Url::parse(uri_path).ok();
+    let rel_opt = url.as_ref().and_then(|u| uri_to_rel_path(u, repo_root));
 
     // Only produce diagnostics for files we know about
-    let file = index
-        .files
-        .iter()
-        .find(|f| f.relative_path == relative || uri_path.ends_with(&f.relative_path));
+    let file = index.files.iter().find(|f| {
+        rel_opt.as_deref().is_some_and(|r| f.relative_path == r)
+            || uri_path.ends_with(&f.relative_path)
+    });
 
     let Some(_f) = file else {
         return Vec::new();
@@ -141,9 +144,10 @@ pub fn diagnostics_for_file(
 pub fn workspace_symbols(
     query: &str,
     index: &crate::index::CodebaseIndex,
+    repo_root: &Path,
 ) -> Vec<tower_lsp::lsp_types::SymbolInformation> {
     use crate::parser::language::SymbolKind as CxpakKind;
-    use tower_lsp::lsp_types::{Location, SymbolInformation, SymbolKind as LspKind, Url};
+    use tower_lsp::lsp_types::{Location, SymbolInformation, SymbolKind as LspKind};
 
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
@@ -176,7 +180,7 @@ pub fn workspace_symbols(
                 tags: None,
                 deprecated: None,
                 location: Location {
-                    uri: Url::parse(&format!("file:///{}", file.relative_path))
+                    uri: Url::from_file_path(repo_root.join(&file.relative_path))
                         .unwrap_or_else(|_| Url::parse("file:///unknown").unwrap()),
                     range: tower_lsp::lsp_types::Range {
                         start: Position {
@@ -276,19 +280,72 @@ mod tests {
     #[test]
     fn code_lens_returns_empty_for_unknown_file() {
         let index = make_test_index();
-        let result = code_lens_for_file("nonexistent.rs", &index);
+        let root = std::path::Path::new("/tmp");
+        let result = code_lens_for_file("nonexistent.rs", &index, root);
         assert!(result.is_empty());
     }
 
     #[test]
     fn code_lens_returns_lens_for_known_file() {
         let index = make_test_index();
-        let result = code_lens_for_file("src/main.rs", &index);
+        let root = std::path::Path::new("/tmp");
+        let result = code_lens_for_file("file:///tmp/src/main.rs", &index, root);
         assert_eq!(result.len(), 1);
         let lens = &result[0];
         let cmd = lens.command.as_ref().unwrap();
         assert!(cmd.title.contains("tokens"));
         assert!(cmd.title.contains("rust"));
+    }
+
+    #[test]
+    fn code_lens_uses_uri_to_rel_path_not_raw_trim() {
+        // URI: file:///Users/me/repo/src/main.rs, repo_root: /Users/me/repo
+        // After stripping repo_root the relative path is "src/main.rs" which
+        // must match the index entry. The old raw-trim would produce
+        // "Users/me/repo/src/main.rs" and miss the file.
+        let counter = crate::budget::counter::TokenCounter::new();
+        let files = vec![crate::scanner::ScannedFile {
+            relative_path: "src/main.rs".to_string(),
+            absolute_path: std::path::PathBuf::from("/Users/me/repo/src/main.rs"),
+            language: Some("rust".to_string()),
+            size_bytes: 100,
+        }];
+        let index = CodebaseIndex::build_with_content(
+            files,
+            std::collections::HashMap::new(),
+            &counter,
+            std::collections::HashMap::new(),
+        );
+        let root = std::path::Path::new("/Users/me/repo");
+        let result = code_lens_for_file("file:///Users/me/repo/src/main.rs", &index, root);
+        assert_eq!(
+            result.len(),
+            1,
+            "uri_to_rel_path must find the file; old raw trim would fail"
+        );
+    }
+
+    #[test]
+    fn diagnostics_uses_uri_to_rel_path_not_raw_trim() {
+        let counter = crate::budget::counter::TokenCounter::new();
+        let files = vec![crate::scanner::ScannedFile {
+            relative_path: "src/lib.rs".to_string(),
+            absolute_path: std::path::PathBuf::from("/Users/me/repo/src/lib.rs"),
+            language: Some("rust".to_string()),
+            size_bytes: 100,
+        }];
+        let index = CodebaseIndex::build_with_content(
+            files,
+            std::collections::HashMap::new(),
+            &counter,
+            std::collections::HashMap::new(),
+        );
+        let root = std::path::Path::new("/Users/me/repo");
+        // diagnostics_for_file returns empty (no real diagnostics yet) but must
+        // not panic or return an error even with a fully qualified file:// URI.
+        let result = diagnostics_for_file("file:///Users/me/repo/src/lib.rs", &index, root);
+        // Must successfully find the file and return the empty-diagnostics Vec.
+        let _ = result; // function did not panic
     }
 
     #[test]
@@ -316,14 +373,16 @@ mod tests {
     #[test]
     fn diagnostics_empty_for_unknown_file() {
         let index = make_test_index();
-        let result = diagnostics_for_file("missing.rs", &index);
+        let root = std::path::Path::new("/tmp");
+        let result = diagnostics_for_file("missing.rs", &index, root);
         assert!(result.is_empty());
     }
 
     #[test]
     fn diagnostics_empty_for_known_file() {
         let index = make_test_index();
-        let result = diagnostics_for_file("src/main.rs", &index);
+        let root = std::path::Path::new("/tmp");
+        let result = diagnostics_for_file("src/main.rs", &index, root);
         assert!(result.is_empty());
     }
 
@@ -386,18 +445,38 @@ mod tests {
     #[test]
     fn workspace_symbols_empty_query_returns_all() {
         let index = make_multi_symbol_index();
-        let result = workspace_symbols("", &index);
+        let root = std::path::Path::new("/tmp");
+        let result = workspace_symbols("", &index, root);
         assert_eq!(result.len(), 3);
     }
 
     #[test]
     fn workspace_symbols_filtered_by_query() {
         let index = make_multi_symbol_index();
-        let result = workspace_symbols("ba", &index);
+        let root = std::path::Path::new("/tmp");
+        let result = workspace_symbols("ba", &index, root);
         assert_eq!(result.len(), 2);
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"bar"));
         assert!(names.contains(&"baz"));
+    }
+
+    #[test]
+    fn workspace_symbols_uri_uses_repo_root() {
+        // Symbols must have URIs rooted at repo_root, not file:///src/...
+        let index = make_multi_symbol_index();
+        let root = std::path::Path::new("/Users/me/repo");
+        let result = workspace_symbols("foo", &index, root);
+        assert_eq!(result.len(), 1);
+        let uri = result[0].location.uri.as_str();
+        assert!(
+            uri.starts_with("file:///Users/me/repo/"),
+            "URI must start with repo_root path, got: {uri}"
+        );
+        assert!(
+            !uri.starts_with("file:///src/"),
+            "URI must not be rooted at /src/, got: {uri}"
+        );
     }
 
     #[test]

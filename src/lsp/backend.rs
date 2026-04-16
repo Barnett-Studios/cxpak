@@ -189,7 +189,7 @@ impl LanguageServer for CxpakLspBackend {
     async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
         let uri = params.text_document.uri.to_string();
         let idx = self.index.read().map_err(Self::lock_err)?;
-        let lenses = super::methods::code_lens_for_file(&uri, &idx);
+        let lenses = super::methods::code_lens_for_file(&uri, &idx, &self.path);
         Ok(if lenses.is_empty() {
             None
         } else {
@@ -254,7 +254,7 @@ impl LanguageServer for CxpakLspBackend {
     ) -> LspResult<DocumentDiagnosticReportResult> {
         let uri = params.text_document.uri.to_string();
         let idx = self.index.read().map_err(Self::lock_err)?;
-        let diags = super::methods::diagnostics_for_file(&uri, &idx);
+        let diags = super::methods::diagnostics_for_file(&uri, &idx, &self.path);
         Ok(DocumentDiagnosticReportResult::Report(
             DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
                 related_documents: None,
@@ -272,7 +272,7 @@ impl LanguageServer for CxpakLspBackend {
         params: WorkspaceSymbolParams,
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
         let idx = self.index.read().map_err(Self::lock_err)?;
-        let symbols = super::methods::workspace_symbols(&params.query, &idx);
+        let symbols = super::methods::workspace_symbols(&params.query, &idx, &self.path);
         Ok(if symbols.is_empty() {
             None
         } else {

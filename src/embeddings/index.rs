@@ -98,10 +98,15 @@ impl EmbeddingIndex {
     }
 
     /// Serialize to `path` using bincode 1.x.
+    ///
+    /// Uses a write-to-temp + rename pattern so a concurrent reader never
+    /// observes a partially-written file.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let bytes =
             bincode::serialize(self).map_err(|e| format!("bincode serialize error: {e}"))?;
-        std::fs::write(path, bytes).map_err(|e| format!("write error: {e}"))
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| format!("write error: {e}"))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename error: {e}"))
     }
 
     /// Deserialize from `path` using bincode 1.x.
@@ -222,6 +227,37 @@ mod tests {
             .cosine_similarity("alpha.rs", &[0.5, 0.5, 0.0])
             .unwrap();
         assert!(sim > 0.99, "loaded similarity: {sim}");
+    }
+
+    #[test]
+    fn save_atomic_no_tmp_file_remains() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.bin");
+
+        let mut idx = EmbeddingIndex::new(4);
+        for i in 0..10 {
+            idx.add(format!("file{i}.rs"), vec![i as f32 * 0.1, 0.0, 0.0, 0.0]);
+        }
+
+        idx.save(&path).expect("save should succeed");
+
+        // The .tmp file must not persist after a successful save.
+        let tmp = path.with_extension("tmp");
+        assert!(!tmp.exists(), ".tmp file must not remain after save");
+
+        // The destination file must exist and round-trip cleanly.
+        assert!(path.exists(), "index.bin must exist after save");
+        let loaded = EmbeddingIndex::load(&path).expect("load should succeed");
+        assert_eq!(loaded.len(), 10, "all 10 entries must survive round-trip");
+
+        // Verify a specific entry's vector is preserved.
+        let sim = loaded
+            .cosine_similarity("file3.rs", &[0.3, 0.0, 0.0, 0.0])
+            .unwrap();
+        assert!(
+            sim > 0.99,
+            "vector for file3.rs should be preserved; sim={sim}"
+        );
     }
 
     #[test]
