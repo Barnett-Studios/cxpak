@@ -113,6 +113,15 @@ CX.svgCanvas = function(parent, w, h) {
     .attr('height', '100%')
     .attr('preserveAspectRatio', 'xMidYMid meet')
     .attr('viewBox', (-20) + ' ' + (-padY) + ' ' + (W + 40) + ' ' + contentH);
+  var defs = svg.append('defs');
+  defs.append('marker')
+    .attr('id', 'cxpak-arrow')
+    .attr('viewBox', '0 0 10 10')
+    .attr('refX', 10).attr('refY', 5)
+    .attr('markerWidth', 8).attr('markerHeight', 8)
+    .attr('orient', 'auto-start-reverse')
+    .attr('class', 'cxpak-arrowhead')
+    .append('path').attr('d', 'M 0 0 L 10 5 L 0 10 z');
   var zg = svg.append('g');
   svg.call(d3.zoom().scaleExtent([0.1, 10]).on('zoom', function(ev) {
     zg.attr('transform', ev.transform);
@@ -149,14 +158,26 @@ CX.renderGraph = function(root, data, opts) {
   nodes.forEach(function(n) { nmap[n.id] = n; });
   function nx(id) { var n = nmap[id]; return n ? n.position.x + n.width/2 : 0; }
   function ny(id) { var n = nmap[id]; return n ? n.position.y + n.height/2 : 0; }
+  function clipEdge(sx, sy, tx, ty, tid) {
+    var tn = nmap[tid];
+    if (!tn) return {x: tx, y: ty};
+    var hw = tn.width/2 + 4, hh = tn.height/2 + 4;
+    var dx = tx - sx, dy = ty - sy;
+    if (dx === 0 && dy === 0) return {x: tx, y: ty};
+    var scaleX = Math.abs(dx) > 0 ? hw / Math.abs(dx) : Infinity;
+    var scaleY = Math.abs(dy) > 0 ? hh / Math.abs(dy) : Infinity;
+    var s = Math.min(scaleX, scaleY, 1);
+    return {x: tx - dx * s, y: ty - dy * s};
+  }
 
   root.append('g').attr('class','cxpak-edges').selectAll('line').data(edges).join('line')
     .attr('class', function(d) { return 'cxpak-edge' + (d.is_cycle ? ' cycle' : ''); })
     .attr('x1', function(d) { return nx(d.source); })
     .attr('y1', function(d) { return ny(d.source); })
-    .attr('x2', function(d) { return nx(d.target); })
-    .attr('y2', function(d) { return ny(d.target); })
-    .attr('stroke-width', function(d) { return Math.max(1, Math.min(3, d.weight)); });
+    .attr('x2', function(d) { var c = clipEdge(nx(d.source), ny(d.source), nx(d.target), ny(d.target), d.target); return c.x; })
+    .attr('y2', function(d) { var c = clipEdge(nx(d.source), ny(d.source), nx(d.target), ny(d.target), d.target); return c.y; })
+    .attr('stroke-width', function(d) { return Math.max(1, Math.min(3, d.weight)); })
+    .attr('marker-end', 'url(#cxpak-arrow)');
 
   var ng = root.append('g').attr('class','cxpak-nodes').selectAll('g').data(nodes).join('g')
     .attr('class', opts.nodeClass || CX.nodeClass)
@@ -772,6 +793,7 @@ function renderSnapshot(data) {
     .attr('y1', function(d) { return ny(d.source); })
     .attr('x2', function(d) { return nx(d.target); })
     .attr('y2', function(d) { return ny(d.target); })
+    .attr('marker-end', 'url(#cxpak-arrow)')
     .style('opacity', 0);
 
   edgeEnter.merge(edgeSel)

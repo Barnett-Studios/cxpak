@@ -169,7 +169,7 @@ line.cxpak-edge.cross-lang,
 path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4; opacity: 0.6; }
 
 /* Edge arrowheads */
-.cxpak-arrowhead { fill: var(--edge-default); }
+.cxpak-arrowhead { fill: var(--edge-default); opacity: 0.8; }
 
 /* ── Tooltip ─────────────────────────────────────────────────────── */
 
