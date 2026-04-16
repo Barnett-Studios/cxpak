@@ -130,9 +130,27 @@ pub fn save_snapshot(
     let dir = repo_root.join(".cxpak").join("snapshots");
     std::fs::create_dir_all(&dir)?;
     let filename = snapshot_filename(&snapshot.timestamp);
-    let path = dir.join(filename);
+    let path = dir.join(&filename);
     let json = serde_json::to_string_pretty(snapshot)?;
-    std::fs::write(path, json)?;
+    // Atomic write: write to a tmp file then rename to prevent partial reads.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, &path)?;
+
+    // Cap snapshots directory at 100 entries: remove the oldest beyond the limit.
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect();
+    files.sort_by_key(|e| e.file_name());
+    while files.len() > 100 {
+        if let Some(oldest) = files.first() {
+            let _ = std::fs::remove_file(oldest.path());
+        }
+        files.remove(0);
+    }
     Ok(())
 }
 
@@ -183,7 +201,10 @@ pub fn save_baseline(
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("baseline.json");
     let json = serde_json::to_string_pretty(snapshot)?;
-    std::fs::write(path, json)?;
+    // Atomic write: write to a tmp file then rename to prevent partial reads.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 

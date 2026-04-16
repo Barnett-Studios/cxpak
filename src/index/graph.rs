@@ -41,7 +41,7 @@ pub struct TypedEdge {
     pub edge_type: EdgeType,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DependencyGraph {
     pub edges: HashMap<String, HashSet<TypedEdge>>,
     pub reverse_edges: HashMap<String, HashSet<TypedEdge>>,

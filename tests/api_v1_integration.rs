@@ -38,10 +38,9 @@ mod api_v1 {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .method("POST")
+                    .method("GET")
                     .uri("/v1/health")
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
@@ -99,11 +98,10 @@ mod api_v1 {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .method("POST")
+                    .method("GET")
                     .uri("/v1/health")
-                    .header("content-type", "application/json")
                     .header("authorization", "Bearer secret")
-                    .body(Body::from("{}"))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await

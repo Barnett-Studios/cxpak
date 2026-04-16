@@ -20,7 +20,7 @@ pub fn compute_recent_changes(index: &CodebaseIndex) -> Vec<RecentChange> {
         .map(|e| RecentChange {
             path: e.path.clone(),
             days_ago: 0, // days_ago is not stored per-file in v1.2.0; use 0 as placeholder
-            modifications_30d: e.modifications as u32,
+            modifications_30d: e.modifications.min(u32::MAX as usize) as u32,
         })
         .collect();
 

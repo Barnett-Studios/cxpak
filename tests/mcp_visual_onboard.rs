@@ -347,17 +347,17 @@ mod mcp_visual_onboard_tests {
         }));
 
         assert_eq!(resp["id"], 5);
-        // Now returns -32602 InvalidParams in the error field, not a tool result.
-        let code = resp["error"]["code"]
-            .as_i64()
-            .expect("must have error.code");
-        assert_eq!(code, -32602, "flow without symbol must return -32602");
-        let msg = resp["error"]["message"]
+        // Per MCP spec, tool parameter validation uses mcp_tool_result with Error: prefix.
+        let text = resp["result"]["content"][0]["text"]
             .as_str()
-            .expect("must have error.message");
+            .expect("must have result.content[0].text");
         assert!(
-            msg.to_lowercase().contains("symbol"),
-            "error message must mention 'symbol', got: {msg}"
+            text.starts_with("Error:"),
+            "flow without symbol must return Error: tool result, got: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("symbol"),
+            "error text must mention 'symbol', got: {text}"
         );
     }
 
@@ -408,17 +408,17 @@ mod mcp_visual_onboard_tests {
         }));
 
         assert_eq!(resp["id"], 7);
-        // Now returns -32602 InvalidParams in the error field, not a tool result.
-        let code = resp["error"]["code"]
-            .as_i64()
-            .expect("must have error.code");
-        assert_eq!(code, -32602, "diff without files must return -32602");
-        let msg = resp["error"]["message"]
+        // Per MCP spec, tool parameter validation uses mcp_tool_result with Error: prefix.
+        let text = resp["result"]["content"][0]["text"]
             .as_str()
-            .expect("must have error.message");
+            .expect("must have result.content[0].text");
         assert!(
-            msg.to_lowercase().contains("files"),
-            "error message must mention 'files', got: {msg}"
+            text.starts_with("Error:"),
+            "diff without files must return Error: tool result, got: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("files"),
+            "error text must mention 'files', got: {text}"
         );
     }
 

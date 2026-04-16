@@ -221,22 +221,14 @@ pub fn score_coupling(index: &CodebaseIndex, module_depth: usize) -> f64 {
             let mut cross_edges = 0usize;
 
             for &file in files.iter() {
-                // Outgoing edges from this file
+                // Outgoing edges only — counting reverse_edges as well would
+                // double-count every edge and inflate the denominator, making
+                // coupling appear lower than it is (fixed in FIX-WAVE5).
                 if let Some(deps) = index.graph.edges.get(file) {
                     for edge in deps {
                         total_edges += 1;
                         let target_mod = module_prefix(&edge.target, module_depth);
                         if &target_mod != *mod_name {
-                            cross_edges += 1;
-                        }
-                    }
-                }
-                // Incoming edges (reverse direction)
-                if let Some(deps) = index.graph.reverse_edges.get(file) {
-                    for edge in deps {
-                        total_edges += 1;
-                        let src_mod = module_prefix(&edge.target, module_depth);
-                        if &src_mod != *mod_name {
                             cross_edges += 1;
                         }
                     }
@@ -347,7 +339,9 @@ fn tarjan_sccs_count(graph: &DependencyGraph) -> usize {
                 if lowlinks[v] == indices[v] {
                     let mut scc_size = 0;
                     loop {
-                        let w = scc_stack.pop().unwrap();
+                        let Some(w) = scc_stack.pop() else {
+                            break;
+                        };
                         on_stack[w] = false;
                         scc_size += 1;
                         if w == v {
@@ -499,6 +493,46 @@ mod tests {
         assert_eq!(module_prefix("src/api/handler.rs", 2), "src/api");
         assert_eq!(module_prefix("src/lib.rs", 2), "src");
         assert_eq!(module_prefix("main.rs", 2), "main.rs");
+    }
+
+    /// FIX-WAVE5 #4: score_coupling must count only forward edges.
+    /// 1 intra-edge + 1 cross-edge → coupling ratio = 1/2 = 0.5 → score = 5.0.
+    /// Pre-fix (reverse_edges also counted): total=4, ratio=1/4=0.25, score=7.5.
+    #[test]
+    fn test_score_coupling_no_reverse_double_count() {
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+        use crate::schema::EdgeType;
+        use std::collections::HashMap;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let make = |name: &str| {
+            let fp = dir.path().join(name.replace('/', "_"));
+            std::fs::write(&fp, "fn f() {}").unwrap();
+            ScannedFile {
+                relative_path: name.to_string(),
+                absolute_path: fp,
+                language: Some("rust".into()),
+                size_bytes: 9,
+            }
+        };
+        let mut index = CodebaseIndex::build(
+            vec![make("m/a.rs"), make("m/b.rs"), make("m/c.rs")],
+            HashMap::new(),
+            &counter,
+        );
+        // 1 intra-module edge (m→m) + 1 cross-module edge (m→other)
+        index.graph.add_edge("m/a.rs", "m/b.rs", EdgeType::Import);
+        index.graph.add_edge("m/a.rs", "ext/z.rs", EdgeType::Import);
+
+        let score = score_coupling(&index, 1);
+        // Post-fix: total=2 forward, cross=1 → ratio=0.5 → score=5.0
+        assert!(
+            (score - 5.0).abs() < 1e-6,
+            "coupling score must be 5.0 (forward-only count), got {score}; \
+             if 7.5 then reverse-edge double-count is back"
+        );
     }
 
     #[test]

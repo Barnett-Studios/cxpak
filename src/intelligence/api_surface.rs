@@ -134,7 +134,9 @@ pub fn extract_public_symbols(
     files_with_symbols.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     for (file, pagerank) in files_with_symbols {
-        let pr = file.parse_result.as_ref().unwrap();
+        let Some(pr) = file.parse_result.as_ref() else {
+            continue;
+        };
         let symbols: Vec<ApiSymbol> = pr
             .symbols
             .iter()

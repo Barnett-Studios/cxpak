@@ -1,4 +1,10 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+
+/// Compiled-once regex for identifier call patterns.
+static RE_CALL_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b([a-zA-Z_]\w*)\s*\(").expect("RE_CALL_PATTERN"));
 
 /// Confidence level for a resolved call edge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,8 +137,7 @@ fn extract_regex_calls_from_function(source: &str, symbol_name: &str) -> Vec<Str
     let body = extract_body_from_offset(source, m.end());
 
     // Extract all identifier(...) patterns from the body
-    let call_re = regex::Regex::new(r"\b([a-zA-Z_]\w*)\s*\(").unwrap();
-    let mut calls: Vec<String> = call_re
+    let mut calls: Vec<String> = RE_CALL_PATTERN
         .captures_iter(&body)
         .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
         .filter(|name| {

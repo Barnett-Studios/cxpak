@@ -20,6 +20,21 @@ static RE_FUNCTION_SOURCES: LazyLock<Regex> = LazyLock::new(|| {
         .expect("RE_FUNCTION_SOURCES")
 });
 
+static RE_CYPHER_CONSTRAINT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)CREATE\s+CONSTRAINT\s+\w+\s+(?:ON|FOR)\s+\(\w+:(\w+)\)")
+        .expect("RE_CYPHER_CONSTRAINT")
+});
+
+static RE_CYPHER_INDEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)CREATE\s+INDEX\s+\w+\s+(?:ON|FOR)\s+\(\w+:(\w+)\)").expect("RE_CYPHER_INDEX")
+});
+
+static RE_CYPHER_NODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\(\w+:(\w+)\)").expect("RE_CYPHER_NODE"));
+
+static RE_CYPHER_RELATIONSHIP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-\[:(\w+)\]->").expect("RE_CYPHER_RELATIONSHIP"));
+
 /// Strip an optional `schema.` prefix from a table reference.
 ///
 /// `"public.users"` → `"users"`, `"users"` → `"users"`.
@@ -538,9 +553,7 @@ pub fn extract_cypher_schema(content: &str, _file_path: &str) -> Vec<CypherEntry
     let mut entries: Vec<CypherEntry> = Vec::new();
 
     // CREATE CONSTRAINT ... FOR (alias:Label)
-    let constraint_re =
-        Regex::new(r"(?i)CREATE\s+CONSTRAINT\s+\w+\s+(?:ON|FOR)\s+\(\w+:(\w+)\)").unwrap();
-    for cap in constraint_re.captures_iter(content) {
+    for cap in RE_CYPHER_CONSTRAINT.captures_iter(content) {
         entries.push(CypherEntry {
             labels: vec![cap[1].to_string()],
             entry_type: "constraint".to_string(),
@@ -548,8 +561,7 @@ pub fn extract_cypher_schema(content: &str, _file_path: &str) -> Vec<CypherEntry
     }
 
     // CREATE INDEX ... FOR (alias:Label)
-    let index_re = Regex::new(r"(?i)CREATE\s+INDEX\s+\w+\s+(?:ON|FOR)\s+\(\w+:(\w+)\)").unwrap();
-    for cap in index_re.captures_iter(content) {
+    for cap in RE_CYPHER_INDEX.captures_iter(content) {
         entries.push(CypherEntry {
             labels: vec![cap[1].to_string()],
             entry_type: "index".to_string(),
@@ -557,12 +569,11 @@ pub fn extract_cypher_schema(content: &str, _file_path: &str) -> Vec<CypherEntry
     }
 
     // Bare node label patterns: (alias:Label) — not already captured above.
-    let node_re = Regex::new(r"\(\w+:(\w+)\)").unwrap();
     let mut seen_labels: Vec<String> = entries
         .iter()
         .flat_map(|e| e.labels.iter().cloned())
         .collect();
-    for cap in node_re.captures_iter(content) {
+    for cap in RE_CYPHER_NODE.captures_iter(content) {
         let label = cap[1].to_string();
         if !seen_labels.contains(&label) {
             seen_labels.push(label.clone());
@@ -574,8 +585,7 @@ pub fn extract_cypher_schema(content: &str, _file_path: &str) -> Vec<CypherEntry
     }
 
     // Relationship types: -[:TYPE]->
-    let rel_re = Regex::new(r"-\[:(\w+)\]->").unwrap();
-    for cap in rel_re.captures_iter(content) {
+    for cap in RE_CYPHER_RELATIONSHIP.captures_iter(content) {
         entries.push(CypherEntry {
             labels: vec![cap[1].to_string()],
             entry_type: "relationship".to_string(),

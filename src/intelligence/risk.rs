@@ -103,7 +103,11 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
 
             RiskEntry {
                 path: path.to_string(),
-                churn_30d: churn_map.get(path).copied().unwrap_or(0) as u32,
+                churn_30d: churn_map
+                    .get(path)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(u32::MAX as usize) as u32,
                 blast_radius: blast_count,
                 test_coverage,
                 risk_score,

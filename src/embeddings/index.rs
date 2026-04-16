@@ -4,7 +4,7 @@ use std::path::Path;
 
 /// Flat-matrix vector index. Vectors are stored contiguously:
 /// `vectors[i * dims .. (i + 1) * dims]` is the embedding for `paths[i]`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingIndex {
     paths: Vec<String>,
     path_index: HashMap<String, usize>,

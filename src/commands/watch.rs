@@ -58,6 +58,16 @@ pub fn run(
                 apply_incremental_update(&mut index, &canon_path, &modified_paths, &removed_paths);
 
             if update_count > 0 {
+                index.rebuild_graph();
+                index.pagerank =
+                    crate::intelligence::pagerank::compute_pagerank(&index.graph, 0.85, 100);
+                let paths: std::collections::HashSet<String> = index
+                    .files
+                    .iter()
+                    .map(|f| f.relative_path.clone())
+                    .collect();
+                index.test_map =
+                    crate::intelligence::test_map::build_test_map(&index.files, &paths);
                 eprintln!(
                     "cxpak: updated {} file(s), {} files / {} tokens total",
                     update_count, index.total_files, index.total_tokens
@@ -317,4 +327,78 @@ mod tests {
 
     /// The debounce cap constant must be positive (compile-time guarantee).
     const _: () = assert!(MAX_DEBOUNCE_ITERS > 0);
+
+    /// After `apply_incremental_update` removes a file, `rebuild_graph` must
+    /// purge stale edges from the dependency graph.
+    ///
+    /// This verifies the FIX-WAVE5 #1 fix: without the rebuild_graph() call
+    /// after apply_incremental_update(), the graph retains edges from/to the
+    /// removed file indefinitely.
+    #[test]
+    fn test_graph_rebuilt_after_remove() {
+        use crate::budget::counter::TokenCounter;
+        use crate::index::CodebaseIndex;
+        use crate::scanner::ScannedFile;
+        use crate::schema::EdgeType;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let counter = TokenCounter::new();
+        // Three files: a.rs → b.rs → c.rs
+        let files = vec![
+            ScannedFile {
+                relative_path: "a.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/a.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 10,
+            },
+            ScannedFile {
+                relative_path: "b.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/b.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 10,
+            },
+            ScannedFile {
+                relative_path: "c.rs".to_string(),
+                absolute_path: PathBuf::from("/tmp/c.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 10,
+            },
+        ];
+        let mut content_map = HashMap::new();
+        content_map.insert("a.rs".to_string(), "fn a() {}".to_string());
+        content_map.insert("b.rs".to_string(), "fn b() {}".to_string());
+        content_map.insert("c.rs".to_string(), "fn c() {}".to_string());
+        let mut index =
+            CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
+
+        // Manually inject edges so the graph has known edges
+        index.graph.add_edge("a.rs", "b.rs", EdgeType::Import);
+        index.graph.add_edge("b.rs", "c.rs", EdgeType::Import);
+
+        assert!(
+            index.graph.edges.contains_key("a.rs"),
+            "edge a→b must exist before remove"
+        );
+
+        // Remove b.rs via apply_incremental_update, then rebuild graph
+        let mut removed = HashSet::new();
+        removed.insert("b.rs".to_string());
+        let count = apply_incremental_update(
+            &mut index,
+            std::path::Path::new("/tmp"),
+            &HashSet::new(),
+            &removed,
+        );
+        assert_eq!(count, 1);
+
+        // Now rebuild graph as the watch loop does after update_count > 0
+        index.rebuild_graph();
+
+        // b.rs edges must be gone after rebuild
+        assert!(
+            !index.graph.edges.contains_key("b.rs"),
+            "stale edges from removed file b.rs must be purged after rebuild_graph"
+        );
+    }
 }

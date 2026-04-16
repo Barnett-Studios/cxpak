@@ -77,6 +77,9 @@ pub fn detect_god_files<'a>(inbound_counts: &[(&'a str, usize)]) -> Vec<&'a str>
     let mean = counts.iter().sum::<f64>() / counts.len() as f64;
     let variance = counts.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / counts.len() as f64;
     let sigma = variance.sqrt();
+    if sigma == 0.0 {
+        return vec![];
+    }
     let threshold = mean + 2.0 * sigma;
     inbound_counts
         .iter()
@@ -459,6 +462,23 @@ mod tests {
     }
 
     // --- God file tests ---
+
+    #[test]
+    fn test_god_file_sigma_zero_returns_empty() {
+        // All files have exactly the same inbound count → sigma == 0 → no god files.
+        let inbound_counts = vec![
+            ("a.rs", 3usize),
+            ("b.rs", 3),
+            ("c.rs", 3),
+            ("d.rs", 3),
+            ("e.rs", 3),
+        ];
+        let god_files = detect_god_files(&inbound_counts);
+        assert!(
+            god_files.is_empty(),
+            "when all files have the same inbound count (sigma=0), detect_god_files must return empty, got: {god_files:?}"
+        );
+    }
 
     #[test]
     fn test_god_file_detection_mean_plus_2sigma() {

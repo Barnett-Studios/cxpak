@@ -13,7 +13,7 @@ use crate::scanner::ScannedFile;
 use crate::schema::SchemaIndex;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CodebaseIndex {
     pub files: Vec<IndexedFile>,
     pub language_stats: HashMap<String, LanguageStats>,
@@ -39,7 +39,7 @@ pub struct CodebaseIndex {
     pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IndexedFile {
     pub relative_path: String,
     pub language: Option<String>,
@@ -50,7 +50,7 @@ pub struct IndexedFile {
     pub mtime_secs: Option<u64>, // Unix epoch seconds, None if unavailable
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LanguageStats {
     pub file_count: usize,
     pub total_bytes: u64,

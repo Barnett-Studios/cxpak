@@ -10,7 +10,7 @@ use crate::parser::LanguageRegistry;
 use crate::scanner::Scanner;
 use crate::schema::EdgeType;
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     response::Json,
     routing::get,
@@ -311,6 +311,7 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath, token: Option<String
         )
         .route("/data_flow", axum::routing::post(data_flow_handler))
         .route("/cross_lang", get(cross_lang_handler))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .merge(build_v1_router(state.clone()))
         .with_state(state)
 }
@@ -338,7 +339,7 @@ fn build_v1_router(state: AppState) -> Router<AppState> {
     }
 
     Router::new()
-        .route("/v1/health", axum::routing::post(v1_health_handler))
+        .route("/v1/health", axum::routing::get(v1_health_handler))
         .route("/v1/risks", axum::routing::post(v1_risks_handler))
         .route(
             "/v1/architecture",
@@ -402,9 +403,14 @@ async fn v1_briefing_handler(
     State(index): State<SharedIndex>,
     Json(params): Json<V1BriefingParams>,
 ) -> Result<Json<Value>, StatusCode> {
-    let idx = index
-        .read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Clone the index out before releasing the read lock so the lock is not held
+    // across the auto_context computation, which would starve the watcher thread.
+    let idx = {
+        let guard = index
+            .read()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        guard.clone()
+    };
     let opts = crate::auto_context::AutoContextOpts {
         tokens: params.tokens.unwrap_or(50_000),
         focus: params.focus,
@@ -419,43 +425,66 @@ async fn v1_briefing_handler(
 }
 
 async fn v1_risks_handler() -> Json<Value> {
-    Json(serde_json::json!({"risks": [], "note": "full risk analysis available via /risks"}))
+    Json(serde_json::json!({
+        "status": "not_implemented",
+        "note": "Full implementation available via MCP tools"
+    }))
 }
 
 async fn v1_architecture_handler() -> Json<Value> {
-    Json(
-        serde_json::json!({"modules": [], "circular_deps": [], "note": "full analysis available via /architecture"}),
-    )
+    Json(serde_json::json!({
+        "status": "not_implemented",
+        "note": "Full implementation available via MCP tools"
+    }))
 }
 
 async fn v1_call_graph_handler() -> Json<Value> {
-    Json(serde_json::json!({"call_graph": {}, "note": "full analysis available via /call_graph"}))
+    Json(serde_json::json!({
+        "status": "not_implemented",
+        "note": "Full implementation available via MCP tools"
+    }))
 }
 
 async fn v1_dead_code_handler() -> Json<Value> {
-    Json(serde_json::json!({"dead_code": [], "note": "full analysis available via /dead_code"}))
+    Json(serde_json::json!({
+        "status": "not_implemented",
+        "note": "Full implementation available via MCP tools"
+    }))
 }
 
 async fn v1_predict_handler() -> Json<Value> {
-    Json(serde_json::json!({"predictions": [], "note": "full analysis available via /predict"}))
+    Json(serde_json::json!({
+        "status": "not_implemented",
+        "note": "Full implementation available via MCP tools"
+    }))
 }
 
 async fn v1_drift_handler() -> Json<Value> {
-    Json(serde_json::json!({"drift": {}, "note": "full analysis available via /drift"}))
+    Json(serde_json::json!({
+        "status": "not_implemented",
+        "note": "Full implementation available via MCP tools"
+    }))
 }
 
 async fn v1_security_surface_handler() -> Json<Value> {
-    Json(
-        serde_json::json!({"security": {}, "note": "full analysis available via /security_surface"}),
-    )
+    Json(serde_json::json!({
+        "status": "not_implemented",
+        "note": "Full implementation available via MCP tools"
+    }))
 }
 
 async fn v1_data_flow_handler() -> Json<Value> {
-    Json(serde_json::json!({"data_flow": {}, "note": "full analysis available via /data_flow"}))
+    Json(serde_json::json!({
+        "status": "not_implemented",
+        "note": "Full implementation available via MCP tools"
+    }))
 }
 
 async fn v1_cross_lang_handler() -> Json<Value> {
-    Json(serde_json::json!({"cross_lang": [], "note": "full analysis available via /cross_lang"}))
+    Json(serde_json::json!({
+        "status": "not_implemented",
+        "note": "Full implementation available via MCP tools"
+    }))
 }
 
 pub fn run(
@@ -510,7 +539,13 @@ pub fn run(
     rt.block_on(async move {
         eprintln!("cxpak: listening on http://{addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        let shutdown = async {
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("cxpak: shutting down gracefully...");
+        };
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
         Ok::<(), std::io::Error>(())
     })?;
 
@@ -848,9 +883,15 @@ async fn auto_context_handler(
     if params.task.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let idx = index
-        .read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Clone the index out from behind the read lock so the lock is not held
+    // across the (potentially slow) auto_context computation, which would
+    // starve the background watcher thread waiting on the write lock.
+    let idx = {
+        let guard = index
+            .read()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        guard.clone()
+    };
     let token_budget = params
         .tokens
         .as_deref()
@@ -1263,6 +1304,19 @@ fn mcp_stdio_loop_with_io(
                 continue;
             }
         };
+
+        // Reject JSON-RPC batch requests (arrays): not supported per MCP spec.
+        if request.is_array() {
+            let err = json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32600, "message": "Batch requests are not supported"}
+            });
+            serde_json::to_writer(&mut *writer, &err)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+            continue;
+        }
 
         let id = request.get("id").cloned();
         let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -2188,7 +2242,9 @@ fn handle_tool_call(
                             EdgeType::OrmModel => "orm_model".to_string(),
                             EdgeType::MigrationSequence => "migration_sequence".to_string(),
                             EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
-                            EdgeType::Import => unreachable!(),
+                            // Import edges are excluded by the guard `*et != EdgeType::Import`
+                            // above; this arm is unreachable at runtime.
+                            EdgeType::Import => return p.clone(),
                         };
                         format!("{p} (via: {label})")
                     }
@@ -2776,19 +2832,13 @@ fn handle_tool_call(
             let files_arg = args.get("files").and_then(|v| v.as_str());
 
             // Validate parameter requirements before rendering.
+            // Per MCP spec, tool parameter errors use mcp_tool_result with isError,
+            // not the JSON-RPC error response used for protocol-level errors.
             if visual_type == "flow" && symbol.is_none() {
-                return mcp_error_response(
-                    id,
-                    -32602,
-                    "Invalid params: symbol is required when type=flow",
-                );
+                return mcp_tool_result(id, "Error: symbol is required when type=flow");
             }
             if visual_type == "diff" && files_arg.is_none() {
-                return mcp_error_response(
-                    id,
-                    -32602,
-                    "Invalid params: files is required when type=diff",
-                );
+                return mcp_tool_result(id, "Error: files is required when type=diff");
             }
 
             #[cfg(feature = "visual")]
@@ -2988,6 +3038,11 @@ pub(crate) fn process_watcher_changes(
         let update_count =
             apply_incremental_update(&mut idx, base_path, &modified_paths, &removed_paths);
         if update_count > 0 {
+            idx.rebuild_graph();
+            idx.pagerank = crate::intelligence::pagerank::compute_pagerank(&idx.graph, 0.85, 100);
+            let paths: std::collections::HashSet<String> =
+                idx.files.iter().map(|f| f.relative_path.clone()).collect();
+            idx.test_map = crate::intelligence::test_map::build_test_map(&idx.files, &paths);
             {
                 let mod_vec: Vec<String> = modified_paths.iter().cloned().collect();
                 let rem_vec: Vec<String> = removed_paths.iter().cloned().collect();
@@ -6268,14 +6323,12 @@ mod tests {
         rt.block_on(async {
             let state = make_app_state_with_token(None);
             let app = build_full_router_with_state(state);
-            let body = serde_json::to_vec(&json!({})).unwrap();
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
-                        .method("POST")
+                        .method("GET")
                         .uri("/v1/health")
-                        .header("content-type", "application/json")
-                        .body(axum::body::Body::from(body))
+                        .body(axum::body::Body::empty())
                         .unwrap(),
                 )
                 .await
@@ -6318,15 +6371,13 @@ mod tests {
         rt.block_on(async {
             let state = make_app_state_with_token(Some("secret"));
             let app = build_full_router_with_state(state);
-            let body = serde_json::to_vec(&json!({})).unwrap();
             let response = app
                 .oneshot(
                     axum::http::Request::builder()
-                        .method("POST")
+                        .method("GET")
                         .uri("/v1/health")
-                        .header("content-type", "application/json")
                         .header("authorization", "Bearer secret")
-                        .body(axum::body::Body::from(body))
+                        .body(axum::body::Body::empty())
                         .unwrap(),
                 )
                 .await
@@ -6490,16 +6541,15 @@ mod tests {
             &snap,
         );
         assert_eq!(resp["jsonrpc"], "2.0");
-        // Now returns an error response (-32602 InvalidParams), not a tool result.
-        let code = resp["error"]["code"].as_i64().unwrap();
-        assert_eq!(
-            code, -32602,
-            "flow without symbol must return -32602 InvalidParams"
-        );
-        let msg = resp["error"]["message"].as_str().unwrap();
+        // Per MCP spec, tool parameter validation uses mcp_tool_result with an Error: prefix.
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            msg.contains("symbol"),
-            "error message must mention 'symbol', got: {msg}"
+            text.starts_with("Error:"),
+            "flow without symbol must return Error: tool result, got: {text}"
+        );
+        assert!(
+            text.contains("symbol"),
+            "error text must mention 'symbol', got: {text}"
         );
     }
 
@@ -6516,16 +6566,15 @@ mod tests {
             &snap,
         );
         assert_eq!(resp["jsonrpc"], "2.0");
-        // Now returns an error response (-32602 InvalidParams), not a tool result.
-        let code = resp["error"]["code"].as_i64().unwrap();
-        assert_eq!(
-            code, -32602,
-            "diff without files must return -32602 InvalidParams"
-        );
-        let msg = resp["error"]["message"].as_str().unwrap();
+        // Per MCP spec, tool parameter validation uses mcp_tool_result with an Error: prefix.
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            msg.contains("files"),
-            "error message must mention 'files', got: {msg}"
+            text.starts_with("Error:"),
+            "diff without files must return Error: tool result, got: {text}"
+        );
+        assert!(
+            text.contains("files"),
+            "error text must mention 'files', got: {text}"
         );
     }
 
@@ -6981,6 +7030,108 @@ mod tests {
         assert!(
             val.get("circular_deps").is_some(),
             "architecture response must contain circular_deps field"
+        );
+    }
+
+    // --- FIX-WAVE5 #2: body size limit (413 Payload Too Large) ---
+
+    #[test]
+    fn test_body_size_limit_returns_413() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
+            // Build a 3 MB body (exceeds the 2 MB DefaultBodyLimit)
+            let oversized_body = vec![b'x'; 3 * 1024 * 1024];
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/search")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(oversized_body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "requests with >2MB body must be rejected with 413"
+            );
+        });
+    }
+
+    // --- FIX-WAVE5 #4: score_coupling uses forward edges only ---
+
+    #[test]
+    fn test_score_coupling_forward_edges_only() {
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+        use crate::schema::EdgeType;
+        use std::collections::HashMap;
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let make = |name: &str| {
+            let fp = dir.path().join(name.replace('/', "_"));
+            std::fs::write(&fp, "fn f() {}").unwrap();
+            ScannedFile {
+                relative_path: name.to_string(),
+                absolute_path: fp,
+                language: Some("rust".into()),
+                size_bytes: 9,
+            }
+        };
+        // 2 files in src/mod, 1 in src/other → 3 files in "src" module (depth=1)
+        let mut index = CodebaseIndex::build(
+            vec![
+                make("src/mod/a.rs"),
+                make("src/mod/b.rs"),
+                make("src/mod/c.rs"),
+            ],
+            HashMap::new(),
+            &counter,
+        );
+        // 1 intra-module edge, 1 cross-module edge → coupling = 1/2 = 0.5
+        index
+            .graph
+            .add_edge("src/mod/a.rs", "src/mod/b.rs", EdgeType::Import);
+        index
+            .graph
+            .add_edge("src/mod/a.rs", "other/x.rs", EdgeType::Import);
+
+        let score = crate::intelligence::health::score_coupling(&index, 2);
+        // With the fix, total=2 forward edges, cross=1 → ratio=0.5 → score=5.0
+        // Pre-fix (double-counting reverse_edges) would give ratio=1/3 → score=6.67
+        assert!(
+            (score - 5.0).abs() < 1e-6,
+            "coupling score must be 5.0 (1 cross / 2 total forward edges), got {score}; \
+             if 6.67 reverse-edge double-count is back"
+        );
+    }
+
+    // --- FIX-WAVE5 #12: batch requests rejected ---
+
+    #[test]
+    fn test_mcp_batch_request_rejected() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        // A JSON array is a batch request
+        let input = concat!(
+            r#"[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]"#,
+            "\n"
+        );
+        let cursor = std::io::Cursor::new(input.as_bytes().to_vec());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(Path::new("/tmp"), &index, &snap, cursor, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        let resp: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(resp["error"]["code"], -32600);
+        assert!(
+            resp["error"]["message"].as_str().unwrap().contains("Batch"),
+            "batch request error message must mention Batch"
         );
     }
 }
