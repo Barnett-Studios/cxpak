@@ -207,7 +207,7 @@ All `/v1/` endpoints are POST and accept JSON bodies. Pass the token as `Authori
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/health` | Index stats (total_files, total_tokens) |
+| `GET /v1/health` | Index stats (total_files, total_tokens) |
 | `POST /v1/conventions` | Full convention profile |
 | `POST /v1/briefing` | Compact orientation for a task (requires `task` field) |
 | `POST /v1/risks` | Top risky files (stub) |
@@ -236,7 +236,7 @@ cxpak lsp /path/to/repo
 | Method | Description |
 |--------|-------------|
 | `textDocument/codeLens` | Code lenses showing symbol token counts |
-| `textDocument/hover` | Hover info (placeholder — returns nil) |
+| `textDocument/hover` | Hover info with symbol details from the index |
 | `textDocument/diagnostic` | Diagnostics for convention violations |
 | `workspace/symbol` | Workspace symbol search across the index |
 
@@ -259,7 +259,7 @@ cxpak lsp /path/to/repo
 | `cxpak/securitySurface` | Security surface (stub) |
 | `cxpak/dataFlow` | Data flow analysis (stub) |
 
-The LSP server builds the codebase index once at startup and serves requests synchronously over stdio.
+The LSP server builds the codebase index at startup and supports `textDocument/didOpen`, `didChange`, and `didClose` for in-editor reactivity. A background file watcher keeps the index hot for on-disk changes.
 
 ## What You Get
 
@@ -489,13 +489,13 @@ Extend cxpak with custom analyzers and detectors via WASM plugins:
 - **Plugin manifest** — `.cxpak/plugins.json` declares plugins with file pattern scoping, content access control, and SHA-256 checksum verification
 - **Analyzer plugins** — receive an `IndexSnapshot` (filtered by declared patterns), return `Vec<Finding>` with severity levels and metadata
 - **Detector plugins** — receive individual `FileSnapshot` per matching file, return `Vec<Detection>` with line-level precision
-- **Security** — 10 MB plugin size limit, 1 MB return payload cap, content access warnings displayed on first load
+- **Security** — SHA-256 checksum verification before WASM compilation, 10 MB plugin size limit, 1 MB return payload cap, wasmtime epoch interruption (CPU time limit), memory growth capped at 64 MB via `ResourceLimiter`, capability enforcement (Analyzer-only plugins cannot call Detector methods), content access warnings displayed on first load
 
 The plugin loader uses wasmtime for sandboxed execution. Plugin types (`PluginCapability`, `Finding`, `Detection`, `IndexSnapshot`, `FileSnapshot`) are always compiled; the wasmtime runtime is behind the `plugins` feature flag.
 
 ## Stable API
 
-v1.0.0 establishes semver for the MCP API. Tool names, required parameters, and response structures are stable in 1.x.
+v2.0.0 establishes semver for the MCP API. Tool names, required parameters, and response structures are stable across 2.x.
 
 ## Pack Mode
 
