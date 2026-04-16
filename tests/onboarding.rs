@@ -333,21 +333,50 @@ mod onboarding_tests {
     }
 
     // -------------------------------------------------------------------------
-    // Test 8: CLI `cxpak onboard` exits 0 on the fixture repo
+    // Test 8: CLI `cxpak onboard` exits 0 on a real git repo
     // -------------------------------------------------------------------------
+
+    fn make_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "t@t.com").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() { println!(\"hello\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn greet() { println!(\"hi\"); }\n",
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        dir
+    }
 
     #[test]
     fn cli_onboard_exits_zero_on_simple_repo() {
+        let repo = make_git_repo();
         cxpak()
-            .args(["onboard", "tests/fixtures/simple_repo"])
+            .args(["onboard", repo.path().to_str().unwrap()])
             .assert()
             .success();
     }
 
     #[test]
     fn cli_onboard_json_is_valid() {
+        let repo = make_git_repo();
         let output = cxpak()
-            .args(["onboard", "--format", "json", "tests/fixtures/simple_repo"])
+            .args(["onboard", "--format", "json", repo.path().to_str().unwrap()])
             .output()
             .expect("failed to run cxpak onboard");
 
@@ -359,8 +388,9 @@ mod onboarding_tests {
 
     #[test]
     fn cli_onboard_markdown_contains_overview_section() {
+        let repo = make_git_repo();
         let output = cxpak()
-            .args(["onboard", "tests/fixtures/simple_repo"])
+            .args(["onboard", repo.path().to_str().unwrap()])
             .output()
             .expect("failed to run cxpak onboard");
 

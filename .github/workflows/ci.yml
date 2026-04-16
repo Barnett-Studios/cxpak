@@ -55,9 +55,9 @@ jobs:
     needs: [fmt, clippy]
     steps:
       - uses: actions/checkout@v6.0.2
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2.9.1
-      - name: Verify build on declared MSRV (1.88.0)
+      - name: Verify build on declared MSRV (1.91.0)
         run: cargo build --verbose
 
   coverage:
