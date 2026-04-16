@@ -152,8 +152,8 @@ html, body {
 
 /* ── Edge styles ─────────────────────────────────────────────────── */
 
-.cxpak-edge line,
-.cxpak-edge path {
+line.cxpak-edge,
+path.cxpak-edge {
   fill: none;
   stroke: var(--edge-default);
   stroke-width: 1.5;
@@ -161,12 +161,12 @@ html, body {
   transition: stroke 0.15s, opacity 0.15s;
 }
 
-.cxpak-edge line:hover,
-.cxpak-edge path:hover { stroke: var(--accent-blue); opacity: 1; }
-.cxpak-edge.cycle line,
-.cxpak-edge.cycle path { stroke: var(--accent-purple); stroke-dasharray: 5 3; opacity: 0.7; }
-.cxpak-edge.cross-lang line,
-.cxpak-edge.cross-lang path { stroke: var(--accent-orange); stroke-dasharray: 8 4; opacity: 0.6; }
+line.cxpak-edge:hover,
+path.cxpak-edge:hover { stroke: var(--accent-blue); opacity: 1; }
+line.cxpak-edge.cycle,
+path.cxpak-edge.cycle { stroke: var(--accent-purple); stroke-dasharray: 5 3; opacity: 0.7; }
+line.cxpak-edge.cross-lang,
+path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4; opacity: 0.6; }
 
 /* Edge arrowheads */
 .cxpak-arrowhead { fill: var(--edge-default); }
