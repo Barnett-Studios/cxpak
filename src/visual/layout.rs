@@ -841,12 +841,6 @@ pub fn build_module_layout(
         })
         .collect();
 
-    // Populate aria_label on each module node.
-    let mut nodes = nodes;
-    for node in &mut nodes {
-        node.aria_label = build_aria_label(node);
-    }
-
     // Build module id set for O(1) lookup.
     let module_ids: std::collections::HashSet<String> =
         nodes.iter().map(|n| n.id.clone()).collect();
@@ -899,7 +893,12 @@ pub fn build_module_layout(
     }
 
     // Apply cognitive-limit clustering.
-    let nodes = enforce_cognitive_limit(nodes, &mut layer_order, config.max_nodes_per_layer);
+    let mut nodes = enforce_cognitive_limit(nodes, &mut layer_order, config.max_nodes_per_layer);
+
+    // Populate aria_label on all nodes (including cluster nodes synthesised above).
+    for node in &mut nodes {
+        node.aria_label = build_aria_label(node);
+    }
 
     compute_layout(nodes, edges, config)
 }
@@ -987,12 +986,6 @@ pub fn build_file_layout(
         })
         .collect();
 
-    // Populate aria_label on each file node.
-    let mut nodes = nodes;
-    for node in &mut nodes {
-        node.aria_label = build_aria_label(node);
-    }
-
     // Build intra-module import edges.
     let file_ids: std::collections::HashSet<&str> = module_files
         .iter()
@@ -1034,7 +1027,12 @@ pub fn build_file_layout(
         layer_order[l].push(id.clone());
     }
 
-    let nodes = enforce_cognitive_limit(nodes, &mut layer_order, config.max_nodes_per_layer);
+    let mut nodes = enforce_cognitive_limit(nodes, &mut layer_order, config.max_nodes_per_layer);
+
+    // Populate aria_label on all nodes (including cluster nodes synthesised above).
+    for node in &mut nodes {
+        node.aria_label = build_aria_label(node);
+    }
 
     compute_layout(nodes, edges, config)
 }
@@ -1088,11 +1086,7 @@ pub fn build_symbol_layout(
         })
         .collect();
 
-    // Populate aria_label on each symbol node.
     let mut nodes = nodes;
-    for node in &mut nodes {
-        node.aria_label = build_aria_label(node);
-    }
 
     // Build call-graph edges between symbols in this file.
     let symbol_id_map: HashMap<&str, String> = symbols
@@ -1135,6 +1129,11 @@ pub fn build_symbol_layout(
                 waypoints: vec![],
             });
         }
+    }
+
+    // Populate aria_label on all nodes (including any cluster nodes synthesised above).
+    for node in &mut nodes {
+        node.aria_label = build_aria_label(node);
     }
 
     compute_layout(nodes, edges, config)
@@ -1873,5 +1872,48 @@ mod tests {
         }"#;
         let node: LayoutNode = serde_json::from_str(json).expect("must deserialize v2.0.0 JSON");
         assert_eq!(node.aria_label, "");
+    }
+
+    #[test]
+    fn cluster_nodes_from_enforce_cognitive_limit_have_nonempty_aria_labels() {
+        // Build a layer with 12 nodes, forcing enforce_cognitive_limit (default max=9)
+        // to synthesise a cluster node with aria_label: String::new().
+        // After the fix the build_file_layout aria loop runs post-clustering, so the
+        // cluster node must also receive a non-empty label.
+        // We test this directly: call enforce_cognitive_limit on a synthetic set of
+        // nodes, then apply build_aria_label to every resulting node and assert none
+        // are empty.
+        let nodes: Vec<LayoutNode> = (0..12)
+            .map(|i| {
+                let mut n = make_node(&i.to_string(), 0);
+                // Pre-populate labels as build_*_layout would have done for non-cluster nodes.
+                n.aria_label = build_aria_label(&n);
+                n
+            })
+            .collect();
+        let mut layer_order = vec![(0..12).map(|i: usize| i.to_string()).collect::<Vec<_>>()];
+        let mut result = enforce_cognitive_limit(nodes, &mut layer_order, 9);
+
+        // Simulate the post-enforce loop that the fixed builders now run.
+        for node in &mut result {
+            node.aria_label = build_aria_label(node);
+        }
+
+        // Every node — originals and the synthesised cluster — must have a non-empty label.
+        for node in &result {
+            assert!(
+                !node.aria_label.is_empty(),
+                "node '{}' (type {:?}) has an empty aria_label",
+                node.id,
+                node.node_type
+            );
+        }
+
+        // Confirm there is at least one cluster node in the result (otherwise the
+        // test would vacuously pass without actually covering the bug scenario).
+        let has_cluster = result
+            .iter()
+            .any(|n| matches!(n.node_type, NodeType::Cluster { .. }));
+        assert!(has_cluster, "expected at least one cluster node in result");
     }
 }
