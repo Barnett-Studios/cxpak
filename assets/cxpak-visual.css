@@ -811,3 +811,129 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
 ::-webkit-scrollbar-track { background: var(--bg-primary); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
+
+/* ── Light Mode ────────────────────────────────────────────────── */
+:root[data-theme="light"] {
+  --bg-primary: #f8f9fc;
+  --bg-secondary: #f0f1f5;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f0f0f8;
+  --text-primary: #1a1a2e;
+  --text-secondary: #5a5a7a;
+  --text-dim: #8888a0;
+  --accent-blue: #2563eb;
+  --accent-green: #059669;
+  --accent-yellow: #d97706;
+  --accent-red: #dc2626;
+  --accent-purple: #7c3aed;
+  --accent-orange: #ea580c;
+  --accent-cyan: #0891b2;
+  --border: #e2e2f0;
+  --border-light: #d0d0e0;
+  --node-default: #f0f0f8;
+  --node-hover: #e0e0f0;
+  --edge-default: #b0b0c8;
+  --edge-hover: #6060a0;
+  --shadow: rgba(0, 0, 0, 0.1);
+}
+
+/* ── Reduced Motion ────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+  }
+}
+
+/* ── Focus Ring ────────────────────────────────────────────────── */
+.cxpak-node rect:focus,
+.cxpak-node:focus rect,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+/* ── Command Palette ───────────────────────────────────────────── */
+.cxpak-palette-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+  z-index: 500; display: flex; justify-content: center; padding-top: 20vh;
+}
+.cxpak-palette {
+  width: 520px; max-height: 420px;
+  background: var(--bg-card); border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg); box-shadow: 0 16px 48px var(--shadow);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.cxpak-palette-input {
+  width: 100%; padding: 14px 18px;
+  background: transparent; border: none; border-bottom: 1px solid var(--border);
+  color: var(--text-primary); font-size: 15px; font-family: inherit; outline: none;
+}
+.cxpak-palette-input::placeholder { color: var(--text-dim); }
+.cxpak-palette-results { flex: 1; overflow-y: auto; padding: 6px 0; }
+.cxpak-palette-item {
+  display: flex; align-items: center; gap: 10px; padding: 8px 18px;
+  cursor: pointer; font-size: 13px; transition: background 0.08s;
+}
+.cxpak-palette-item:hover, .cxpak-palette-item.active { background: var(--bg-card-hover); }
+.cxpak-palette-item .kind {
+  font-size: 10px; font-weight: 600; padding: 2px 6px;
+  border-radius: 4px; text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0;
+}
+.cxpak-palette-item .kind.file    { background: rgba(8,145,178,0.15);  color: var(--accent-cyan); }
+.cxpak-palette-item .kind.symbol  { background: rgba(124,58,237,0.15); color: var(--accent-purple); }
+.cxpak-palette-item .kind.module  { background: rgba(99,102,241,0.15); color: #6366f1; }
+.cxpak-palette-item .kind.view    { background: rgba(5,150,105,0.15);  color: var(--accent-green); }
+.cxpak-palette-item .label { font-weight: 500; color: var(--text-primary); }
+.cxpak-palette-item .detail { color: var(--text-secondary); font-size: 11px; margin-left: auto; }
+.cxpak-palette-empty { padding: 20px; text-align: center; color: var(--text-dim); font-size: 13px; }
+.cxpak-palette-hint {
+  padding: 8px 18px; font-size: 11px; color: var(--text-dim);
+  border-top: 1px solid var(--border); display: flex; gap: 16px;
+}
+.cxpak-palette-hint kbd {
+  background: var(--bg-secondary); padding: 1px 5px; border-radius: 3px;
+  font-size: 10px; border: 1px solid var(--border);
+}
+
+/* ── Inspector Panel ───────────────────────────────────────────── */
+.cxpak-inspector {
+  position: fixed; right: 0; top: 0; bottom: 0; width: 340px;
+  background: var(--bg-card); border-left: 1px solid var(--border);
+  z-index: 100; transform: translateX(100%);
+  transition: transform 0.2s ease-out;
+  overflow-y: auto; display: flex; flex-direction: column;
+}
+.cxpak-inspector.open { transform: translateX(0); }
+.cxpak-inspector-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.cxpak-inspector-title {
+  font-size: 13px; font-weight: 700; color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cxpak-inspector-close {
+  background: none; border: none; color: var(--text-secondary);
+  cursor: pointer; font-size: 16px; padding: 4px; border-radius: 4px;
+}
+.cxpak-inspector-close:hover { background: var(--bg-card-hover); }
+.cxpak-inspector-body { padding: 16px; flex: 1; }
+.cxpak-inspector-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 12px; }
+.cxpak-inspector-label { color: var(--text-secondary); }
+.cxpak-inspector-value { font-weight: 600; text-align: right; }
+
+/* ── Theme Toggle ──────────────────────────────────────────────── */
+.cxpak-theme-toggle {
+  background: var(--bg-card); border: 1px solid var(--border);
+  color: var(--text-secondary); cursor: pointer;
+  padding: 4px 8px; border-radius: 6px;
+  font-size: 14px; line-height: 1; transition: all 0.15s;
+}
+.cxpak-theme-toggle:hover { background: var(--bg-card-hover); color: var(--text-primary); }
+
+/* ── Data Freshness Badge ──────────────────────────────────────── */
+.cxpak-freshness { font-size: 11px; padding: 2px 8px; border-radius: 8px; font-weight: 500; }
+.cxpak-freshness.fresh { color: var(--text-dim); }
+.cxpak-freshness.stale { background: rgba(217,119,6,0.15); color: var(--accent-yellow); }
+.cxpak-freshness.old   { background: rgba(220,38,38,0.15); color: var(--accent-red); }
