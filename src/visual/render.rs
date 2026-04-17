@@ -45,7 +45,7 @@ fn visual_type_name(vt: &super::VisualType) -> &'static str {
 /// graph renderer, and helper functions.
 ///
 /// Returned as a string that is prepended to each view-specific controller.
-fn common_js() -> &'static str {
+pub(crate) fn common_js() -> &'static str {
     r#"
 var CX = {};
 CX.layout = JSON.parse(document.getElementById('cxpak-data').textContent);
@@ -232,7 +232,7 @@ CX.fmtNum = function(v) {
 ///
 /// Each visual type gets a dedicated renderer that reads its own embedded
 /// `<script>` data tag and builds the correct DOM/SVG elements.
-fn view_controller_js(visual_type: &super::VisualType) -> String {
+pub(crate) fn view_controller_js(visual_type: &super::VisualType) -> String {
     let common = common_js();
     let view_js = match visual_type {
         super::VisualType::Dashboard => dashboard_js(),
@@ -1092,7 +1092,7 @@ panels.parentNode.appendChild(dleg);
 /// leading `<` with its JSON unicode escape equivalent (`\u003c` is not
 /// used here — we use a simpler backslash form that browsers and JSON
 /// parsers both accept: `<\/script>` and `<\!--`).
-fn escape_script_tag(json: &str) -> String {
+pub(crate) fn escape_script_tag(json: &str) -> String {
     json.replace("</script>", r"<\/script>")
         .replace("<!--", r"<\!--")
 }

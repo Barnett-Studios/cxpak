@@ -1725,4 +1725,14 @@ mod tests {
         assert_eq!(aug_nodes.len(), 2);
         assert_eq!(aug_edges.len(), 1);
     }
+
+    #[test]
+    fn pub_crate_render_helpers_are_reachable_from_sibling_module() {
+        // These calls test pub(crate) visibility. Same-crate sibling modules can
+        // only reach private items that are marked pub(crate) or higher.
+        let _common: &'static str = crate::visual::render::common_js();
+        let _escaped: String = crate::visual::render::escape_script_tag("{}");
+        let _ctrl: String =
+            crate::visual::render::view_controller_js(&crate::visual::VisualType::Dashboard);
+    }
 }
