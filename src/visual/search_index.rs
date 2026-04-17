@@ -17,7 +17,9 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
     const CAP: usize = 20_000;
     let mut entries: Vec<SearchEntry> = Vec::new();
 
-    // 1. Views (always first in sort order because "view" < "file" < "module" < "symbol" lexically — use explicit kind rank later).
+    // 1. Views (6 fixed navigation entries). Lexicographically "view" > "symbol" > "module" > "file",
+    // so views will sort to the END of the final list after step 5. The cap branch at step 6 filters
+    // views explicitly to ensure they are always retained regardless of sort position.
     for (label, hash) in [
         ("Dashboard", "#dashboard"),
         ("Architecture Explorer", "#architecture"),
@@ -75,7 +77,7 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
     let mut modules: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for f in &index.files {
         let segs: Vec<&str> = f.relative_path.split('/').collect();
-        if segs.len() >= 2 {
+        if segs.len() >= 3 {
             modules.insert(format!("{}/{}", segs[0], segs[1]));
         }
         // Also pick up single first-segment modules (e.g. "src" from "src/foo.rs")
@@ -87,7 +89,7 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
         let count = index
             .files
             .iter()
-            .filter(|f| f.relative_path.starts_with(m.as_str()))
+            .filter(|f| f.relative_path == *m || f.relative_path.starts_with(&format!("{m}/")))
             .count();
         entries.push(SearchEntry {
             label: m.clone(),
@@ -112,7 +114,11 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
             .filter(|e| e.kind == "view")
             .cloned()
             .collect();
-        let room_for_modules = CAP.saturating_sub(keep.len()) / 4; // reserve 75% for files/symbols
+        // Plan deviation: the plan specified "keep all modules" unconditionally, but a codebase with many
+        // unique 2-segment prefixes can produce >CAP module entries on its own (e.g. 21k flat files →
+        // 21k unique module entries). Reserve 75% of remaining capacity for ranked files/symbols and
+        // truncate modules to the first 25% (in sorted order, for determinism).
+        let room_for_modules = CAP.saturating_sub(keep.len()) / 4;
         let mut mods: Vec<SearchEntry> = entries
             .iter()
             .filter(|e| e.kind == "module")
@@ -243,6 +249,25 @@ mod tests {
         assert!(
             !sym_labels.contains(&"private_helper"),
             "private symbols must be excluded"
+        );
+    }
+
+    #[test]
+    fn filenames_are_not_module_entries() {
+        let index = make_test_index();
+        let entries = build_search_index(&index);
+        let mods: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.kind == "module")
+            .map(|e| e.label.as_str())
+            .collect();
+        assert!(
+            !mods.contains(&"src/main.rs"),
+            "filename src/main.rs must not appear as a module; modules were {mods:?}"
+        );
+        assert!(
+            !mods.contains(&"src/lib.rs"),
+            "filename src/lib.rs must not appear as a module; modules were {mods:?}"
         );
     }
 
