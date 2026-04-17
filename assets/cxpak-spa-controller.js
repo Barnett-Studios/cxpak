@@ -1,0 +1,401 @@
+// cxpak SPA controller
+// Sections: 1) Bootstrap  2) Router  3) Palette  4) Inspector  5) Theme  6) Keyboard+a11y+freshness
+
+(function() {
+  'use strict';
+
+  // =============================================================================
+  // 1) BOOTSTRAP
+  // =============================================================================
+  var CX = window.CX = {};
+  CX.state = {
+    view: 'dashboard',
+    focus: null, module: null, file: null, symbol: null, files: null,
+    inspector: null,
+    prePaletteFocus: null,
+    paletteOpen: false,
+    helpOverlayOpen: false,
+    localStorageAvailable: true,
+    clipboardAvailable: (typeof navigator.clipboard !== 'undefined' && typeof navigator.clipboard.writeText === 'function'),
+  };
+
+  try { localStorage.getItem('cxpak-theme'); } catch (e) { CX.state.localStorageAvailable = false; }
+
+  CX.data = {};
+  ['dashboard','architecture','risk','timeline','flow','diff','meta','search-index'].forEach(function(name) {
+    var el = document.getElementById('cxpak-' + name + '-data');
+    if (!el) { throw new Error('missing data tag: cxpak-' + name + '-data'); }
+    try {
+      CX.data[name] = JSON.parse(el.textContent);
+    } catch (e) {
+      console.error('failed to parse cxpak-' + name + '-data', e);
+      CX.data[name] = null;
+    }
+  });
+
+  // Router-param sanitization regex (matches spec § 1.3).
+  var ROUTE_PARAM_RE = /^[A-Za-z0-9._/\-]{1,512}$/;
+  function sanitizeRouteParam(v) {
+    if (typeof v !== 'string' || !ROUTE_PARAM_RE.test(v)) return '';
+    return v;
+  }
+
+  // Shared format helper — all score formatting routes through this.
+  CX.format = {
+    score: function(x) { return (typeof x === 'number') ? x.toFixed(1) : '--'; }
+  };
+
+  // =============================================================================
+  // 2) ROUTER
+  // =============================================================================
+  var VIEWS = ['dashboard','architecture','risk','flow','timeline','diff'];
+  var initialized = {};
+
+  function parseHash() {
+    var raw = window.location.hash.replace(/^#/, '') || 'dashboard';
+    var qidx = raw.indexOf('?');
+    var name = qidx >= 0 ? raw.slice(0, qidx) : raw;
+    var params = {};
+    if (qidx >= 0) {
+      raw.slice(qidx + 1).split('&').forEach(function(pair) {
+        var eq = pair.indexOf('=');
+        if (eq > 0) {
+          var k = decodeURIComponent(pair.slice(0, eq));
+          var v = sanitizeRouteParam(decodeURIComponent(pair.slice(eq + 1)));
+          params[k] = v;
+        }
+      });
+    }
+    if (VIEWS.indexOf(name) < 0) name = 'dashboard';
+    return { name: name, params: params };
+  }
+
+  function closeInspector() {
+    CX.state.inspector = null;
+    var el = document.getElementById('cxpak-inspector');
+    if (el) el.setAttribute('hidden', '');
+  }
+
+  function interruptView(name) {
+    if (window.d3) {
+      window.d3.selectAll('#view-' + name + ' *').interrupt();
+    }
+  }
+
+  function navigate() {
+    var parsed = parseHash();
+    var newView = parsed.name;
+    CX.state.focus = parsed.params.focus || null;
+    CX.state.module = parsed.params.module || null;
+    CX.state.file = parsed.params.file || null;
+    CX.state.symbol = parsed.params.symbol || null;
+
+    // Interrupt old, close inspector
+    if (CX.state.view && CX.state.view !== newView) {
+      interruptView(CX.state.view);
+      closeInspector();
+    }
+
+    // Hide all, show target
+    VIEWS.forEach(function(v) {
+      var el = document.getElementById('view-' + v);
+      if (!el) return;
+      if (v === newView) el.removeAttribute('hidden');
+      else el.setAttribute('hidden', '');
+    });
+
+    CX.state.view = newView;
+
+    // Init if first visit
+    if (!initialized[newView]) {
+      var initFn = CX.init && CX.init[newView];
+      if (typeof initFn === 'function') initFn();
+      initialized[newView] = true;
+    } else {
+      var updateFn = CX.update && CX.update[newView];
+      if (typeof updateFn === 'function') updateFn();
+    }
+
+    // Announce to screen readers
+    var live = document.getElementById('cxpak-live');
+    if (live) live.textContent = 'Switched to ' + newView;
+
+    // Update active nav tab
+    document.querySelectorAll('.cxpak-nav-link').forEach(function(a) {
+      a.classList.toggle('active', a.getAttribute('data-view') === newView);
+    });
+  }
+
+  CX.navigate = navigate;
+  window.addEventListener('hashchange', navigate);
+  window.addEventListener('DOMContentLoaded', function() {
+    // Initial focus on first nav tab.
+    var firstNav = document.querySelector('.cxpak-nav-link[data-view="dashboard"]');
+    if (firstNav) firstNav.setAttribute('tabindex', '0');
+    navigate();
+  });
+
+  // Programmatic hash updates use pushState (no re-entrant hashchange).
+  CX.pushHash = function(hash) {
+    try { window.history.pushState(null, '', hash); } catch (e) { window.location.hash = hash; }
+  };
+
+  // =============================================================================
+  // 3) COMMAND PALETTE
+  // =============================================================================
+  function openPalette() {
+    if (CX.state.paletteOpen) return;
+    CX.state.prePaletteFocus = document.activeElement;
+    CX.state.paletteOpen = true;
+    var overlay = document.getElementById('cxpak-palette-overlay');
+    overlay.removeAttribute('hidden');
+    var input = document.getElementById('cxpak-palette-input');
+    input.value = '';
+    input.focus();
+    renderPaletteResults('');
+  }
+  function closePalette() {
+    if (!CX.state.paletteOpen) return;
+    CX.state.paletteOpen = false;
+    document.getElementById('cxpak-palette-overlay').setAttribute('hidden', '');
+    try { CX.state.prePaletteFocus && CX.state.prePaletteFocus.focus(); }
+    catch (e) { document.querySelector('.cxpak-nav-link').focus(); }
+  }
+
+  function rankEntry(entry, q) {
+    var lbl = entry.label.toLowerCase();
+    var ql = q.toLowerCase();
+    if (ql === '') return [3, 0, kindRank(entry.kind), lbl.length, lbl, entry.context];
+    if (lbl === ql) return [4, 0, kindRank(entry.kind), lbl.length, lbl, entry.context];
+    if (lbl.indexOf(ql) === 0) return [3, 0, kindRank(entry.kind), lbl.length, lbl, entry.context];
+    var idx = lbl.indexOf(ql);
+    if (idx >= 0) return [2, -idx, kindRank(entry.kind), lbl.length, lbl, entry.context];
+    // Subsequence
+    var i = 0;
+    for (var j = 0; j < lbl.length && i < ql.length; j++) if (lbl[j] === ql[i]) i++;
+    if (i === ql.length) return [1, 0, kindRank(entry.kind), lbl.length, lbl, entry.context];
+    return null;
+  }
+  function kindRank(kind) {
+    return kind === 'view' ? 3 : kind === 'module' ? 2 : kind === 'file' ? 1 : 0;
+  }
+  function cmpKey(a, b) {
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return a[i] > b[i] ? -1 : 1;
+    }
+    return 0;
+  }
+
+  function renderPaletteResults(q) {
+    var list = document.getElementById('cxpak-palette-results');
+    list.textContent = '';
+    var index = CX.data['search-index'] || [];
+    var scored = [];
+    for (var i = 0; i < index.length; i++) {
+      var s = rankEntry(index[i], q);
+      if (s) scored.push({ s: s, e: index[i] });
+    }
+    scored.sort(function(a, b) { return cmpKey(a.s, b.s); });
+    // Empty query: show 6 views + top-10 files by PageRank (first views by sort, then files).
+    if (q === '') {
+      var views = scored.filter(function(x) { return x.e.kind === 'view'; });
+      var files = scored.filter(function(x) { return x.e.kind === 'file'; }).slice(0, 10);
+      scored = views.concat(files);
+    }
+    scored = scored.slice(0, 50);
+    scored.forEach(function(x, idx) {
+      var li = document.createElement('div');
+      li.className = 'cxpak-palette-item' + (idx === 0 ? ' active' : '');
+      var k = document.createElement('span');
+      k.className = 'kind ' + x.e.kind;
+      k.textContent = x.e.kind;
+      var l = document.createElement('span');
+      l.className = 'label';
+      l.textContent = x.e.label;
+      var d = document.createElement('span');
+      d.className = 'detail';
+      d.textContent = x.e.detail;
+      li.appendChild(k); li.appendChild(l); li.appendChild(d);
+      li.setAttribute('data-target', x.e.target);
+      li.addEventListener('click', function() {
+        CX.pushHash(x.e.target);
+        navigate();
+        closePalette();
+      });
+      list.appendChild(li);
+    });
+    if (scored.length === 0 && q !== '') {
+      var empty = document.createElement('div');
+      empty.className = 'cxpak-palette-empty';
+      empty.textContent = 'No results for "';
+      empty.appendChild(document.createTextNode(q));
+      empty.appendChild(document.createTextNode('"'));
+      list.appendChild(empty);
+    }
+  }
+  CX.openPalette = openPalette;
+  CX.closePalette = closePalette;
+
+  // =============================================================================
+  // 4) INSPECTOR PANEL
+  // =============================================================================
+  function openInspector(node) {
+    CX.state.inspector = node;
+    var el = document.getElementById('cxpak-inspector');
+    if (!el) return;
+    el.removeAttribute('hidden');
+    el.classList.add('open');
+    var title = el.querySelector('.cxpak-inspector-title');
+    if (title) title.textContent = node.label || node.id || 'details';
+    // Populate body via textContent only.
+    var body = el.querySelector('.cxpak-inspector-body');
+    if (body) {
+      body.textContent = '';
+      var rows = [
+        ['PageRank', node.metadata && node.metadata.pagerank != null ? CX.format.score(node.metadata.pagerank * 100) : '--'],
+        ['Risk score', node.metadata && node.metadata.risk_score != null ? CX.format.score(node.metadata.risk_score * 100) : '--'],
+        ['Tokens', String(node.metadata && node.metadata.token_count || 0)],
+      ];
+      rows.forEach(function(r) {
+        var row = document.createElement('div');
+        row.className = 'cxpak-inspector-row';
+        var lab = document.createElement('span'); lab.className = 'cxpak-inspector-label'; lab.textContent = r[0];
+        var val = document.createElement('span'); val.className = 'cxpak-inspector-value'; val.textContent = r[1];
+        row.appendChild(lab); row.appendChild(val);
+        body.appendChild(row);
+      });
+    }
+  }
+  CX.openInspector = openInspector;
+  CX.closeInspector = closeInspector;
+
+  // =============================================================================
+  // 5) THEME TOGGLE
+  // =============================================================================
+  function readTheme() {
+    if (!CX.state.localStorageAvailable) return null;
+    try {
+      var v = localStorage.getItem('cxpak-theme');
+      return (v === 'dark' || v === 'light') ? v : null;
+    } catch (e) { return null; }
+  }
+  function writeTheme(v) {
+    if (!CX.state.localStorageAvailable) return;
+    try { localStorage.setItem('cxpak-theme', v); } catch (e) { /* ignore */ }
+  }
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    var btn = document.querySelector('.cxpak-theme-toggle');
+    if (btn) {
+      btn.textContent = t === 'dark' ? '☀' : '☾';
+      btn.setAttribute('aria-label', 'Switch to ' + (t === 'dark' ? 'light' : 'dark') + ' mode');
+    }
+  }
+  var savedTheme = readTheme();
+  var initialTheme = savedTheme || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  applyTheme(initialTheme);
+  CX.toggleTheme = function() {
+    var curr = document.documentElement.getAttribute('data-theme') || 'dark';
+    var next = curr === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    writeTheme(next);
+  };
+
+  // =============================================================================
+  // 6) KEYBOARD + A11Y + FRESHNESS
+  // =============================================================================
+  document.addEventListener('keydown', function(ev) {
+    var mod = ev.metaKey || ev.ctrlKey;
+    if (mod && ev.key === 'k') { ev.preventDefault(); openPalette(); return; }
+    if (ev.key === '/') { ev.preventDefault(); openPalette(); return; }
+    if (ev.key === 'Escape') {
+      if (CX.state.paletteOpen) { closePalette(); return; }
+      if (CX.state.inspector) { closeInspector(); return; }
+      if (CX.state.helpOverlayOpen) { CX.state.helpOverlayOpen = false; var ho = document.getElementById('cxpak-help-overlay'); if (ho) ho.setAttribute('hidden', ''); return; }
+    }
+    if (['1','2','3','4','5','6'].indexOf(ev.key) >= 0 && !CX.state.paletteOpen) {
+      var v = VIEWS[parseInt(ev.key) - 1];
+      if (v) { CX.pushHash('#' + v); navigate(); }
+    }
+    if (ev.key === 't' && !CX.state.paletteOpen) { CX.toggleTheme(); }
+    if (ev.key === '?' && !CX.state.paletteOpen) {
+      var ho = document.getElementById('cxpak-help-overlay');
+      if (ho) { ho.removeAttribute('hidden'); CX.state.helpOverlayOpen = true; }
+    }
+  });
+
+  // Palette input handling
+  document.addEventListener('DOMContentLoaded', function() {
+    var input = document.getElementById('cxpak-palette-input');
+    if (input) {
+      input.addEventListener('input', function() { renderPaletteResults(input.value); });
+      input.addEventListener('keydown', function(ev) {
+        var items = document.querySelectorAll('.cxpak-palette-item');
+        var active = document.querySelector('.cxpak-palette-item.active');
+        var idx = Array.prototype.indexOf.call(items, active);
+        if (ev.key === 'ArrowDown') {
+          ev.preventDefault();
+          if (active) active.classList.remove('active');
+          idx = Math.min(idx + 1, items.length - 1);
+          if (items[idx]) items[idx].classList.add('active');
+        } else if (ev.key === 'ArrowUp') {
+          ev.preventDefault();
+          if (active) active.classList.remove('active');
+          idx = Math.max(idx - 1, 0);
+          if (items[idx]) items[idx].classList.add('active');
+        } else if (ev.key === 'Enter') {
+          ev.preventDefault();
+          if (active) active.click();
+        }
+      });
+    }
+  });
+
+  // Freshness badge — updates every 60s, pauses on hidden.
+  var freshnessInterval = null;
+  function updateFreshness() {
+    var el = document.querySelector('.cxpak-freshness');
+    if (!el) return;
+    var meta = CX.data.meta;
+    if (!meta || !meta.generated_at) return;
+    var genMs = Date.parse(meta.generated_at);
+    var ageHours = (Date.now() - genMs) / 3600000;
+    el.className = 'cxpak-freshness';
+    if (ageHours < 1) { el.textContent = 'just now'; el.classList.add('fresh'); }
+    else if (ageHours < 24) { el.textContent = Math.floor(ageHours) + 'h ago'; el.classList.add('fresh'); }
+    else if (ageHours < 72) { el.textContent = Math.floor(ageHours / 24) + 'd ago'; el.classList.add('stale'); }
+    else {
+      var days = Math.floor(ageHours / 24);
+      el.textContent = '';
+      el.appendChild(document.createTextNode(days + 'd ago · '));
+      if (CX.state.clipboardAvailable) {
+        var btn = document.createElement('button');
+        btn.textContent = 'copy refresh command';
+        btn.addEventListener('click', function() {
+          navigator.clipboard.writeText('cxpak visual').then(function() { btn.textContent = 'Copied!'; setTimeout(function() { updateFreshness(); }, 2000); });
+        });
+        el.appendChild(btn);
+      } else {
+        var code = document.createElement('code');
+        code.textContent = 'cxpak visual';
+        el.appendChild(code);
+      }
+      el.classList.add('old');
+    }
+    el.title = meta.generated_at;
+  }
+  function startFreshness() {
+    updateFreshness();
+    if (freshnessInterval) clearInterval(freshnessInterval);
+    freshnessInterval = setInterval(updateFreshness, 60000);
+  }
+  function stopFreshness() {
+    if (freshnessInterval) { clearInterval(freshnessInterval); freshnessInterval = null; }
+  }
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) stopFreshness();
+    else startFreshness();
+  });
+  window.addEventListener('DOMContentLoaded', startFreshness);
+
+})();
