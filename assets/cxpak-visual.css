@@ -846,8 +846,8 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
 }
 
 /* ── Focus Ring ────────────────────────────────────────────────── */
-.cxpak-node rect:focus,
-.cxpak-node:focus rect,
+.cxpak-node rect:focus-visible,
+.cxpak-node:focus-visible rect,
 [tabindex]:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
