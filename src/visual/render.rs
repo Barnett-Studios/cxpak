@@ -2025,7 +2025,7 @@ pub fn build_flow_diagram_data(
     }
 
     // ── 2. Build LayoutNodes ──────────────────────────────────────────────────
-    let layout_nodes: Vec<LayoutNode> = ordered_nodes
+    let mut layout_nodes: Vec<LayoutNode> = ordered_nodes
         .iter()
         .map(|n| {
             let id = flow_node_id(n);
@@ -2052,6 +2052,9 @@ pub fn build_flow_diagram_data(
             }
         })
         .collect();
+    for node in &mut layout_nodes {
+        node.aria_label = crate::visual::layout::build_aria_label(node);
+    }
 
     // ── 3. Build LayoutEdges from consecutive nodes in each path ──────────────
     let mut edge_set: HashSet<(String, String)> = HashSet::new();
@@ -2277,7 +2280,7 @@ fn layout_from_snapshot(
     }
 
     // Build one LayoutNode per file.
-    let nodes: Vec<LayoutNode> = files
+    let mut nodes: Vec<LayoutNode> = files
         .iter()
         .map(|f| LayoutNode {
             id: f.path.clone(),
@@ -2291,6 +2294,9 @@ fn layout_from_snapshot(
             aria_label: String::new(),
         })
         .collect();
+    for node in &mut nodes {
+        node.aria_label = crate::visual::layout::build_aria_label(node);
+    }
 
     // Heuristic edges: connect files that share the same directory.
     let mut dir_to_files: HashMap<String, Vec<String>> = HashMap::new();
@@ -3447,6 +3453,54 @@ mod tests {
             parsed.get("dividers").is_some(),
             "flow JSON must have 'dividers'"
         );
+    }
+
+    #[test]
+    fn test_flow_diagram_nodes_have_nonempty_aria_labels() {
+        let flow = make_minimal_flow(3, false);
+        let index = make_minimal_index();
+        let config = crate::visual::layout::LayoutConfig::default();
+
+        let data = build_flow_diagram_data(&flow, &index, &config)
+            .expect("build_flow_diagram_data must succeed for a 3-node flow");
+
+        for node in &data.layout.nodes {
+            assert!(
+                !node.aria_label.is_empty(),
+                "node '{}' has an empty aria_label — screen-reader accessibility regression",
+                node.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_layout_from_snapshot_nodes_have_nonempty_aria_labels() {
+        use crate::visual::timeline::SnapshotFile;
+
+        let files: Vec<SnapshotFile> = vec![
+            SnapshotFile {
+                path: "src/main.rs".to_string(),
+                imports: vec![],
+            },
+            SnapshotFile {
+                path: "src/lib.rs".to_string(),
+                imports: vec![],
+            },
+        ];
+        let config = crate::visual::layout::LayoutConfig::default();
+        let layout = layout_from_snapshot(&files, &config);
+
+        assert!(
+            !layout.nodes.is_empty(),
+            "layout must have nodes for non-empty file list"
+        );
+        for node in &layout.nodes {
+            assert!(
+                !node.aria_label.is_empty(),
+                "node '{}' has an empty aria_label — screen-reader accessibility regression",
+                node.id
+            );
+        }
     }
 
     // ── Time Machine tests ────────────────────────────────────────────────────
