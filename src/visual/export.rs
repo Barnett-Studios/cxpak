@@ -295,6 +295,7 @@ mod tests {
                     height: 48.0,
                     node_type: NodeType::Module,
                     metadata: NodeMetadata::default(),
+                    aria_label: String::new(),
                 },
                 LayoutNode {
                     id: "src/db".into(),
@@ -305,6 +306,7 @@ mod tests {
                     height: 48.0,
                     node_type: NodeType::Module,
                     metadata: NodeMetadata::default(),
+                    aria_label: String::new(),
                 },
                 LayoutNode {
                     id: "src/util".into(),
@@ -315,6 +317,7 @@ mod tests {
                     height: 48.0,
                     node_type: NodeType::Module,
                     metadata: NodeMetadata::default(),
+                    aria_label: String::new(),
                 },
             ],
             edges: vec![
@@ -394,6 +397,7 @@ mod tests {
                 height: 48.0,
                 node_type: NodeType::Module,
                 metadata: NodeMetadata::default(),
+                aria_label: String::new(),
             }],
             edges: vec![],
             width: 200.0,
@@ -526,6 +530,7 @@ mod tests {
                 height: 48.0,
                 node_type: NodeType::Module,
                 metadata: NodeMetadata::default(),
+                aria_label: String::new(),
             },
             LayoutNode {
                 id: "src/b".into(),
@@ -536,6 +541,7 @@ mod tests {
                 height: 48.0,
                 node_type: NodeType::Module,
                 metadata: NodeMetadata::default(),
+                aria_label: String::new(),
             },
         ];
         let edges = vec![LayoutEdge {
@@ -566,6 +572,7 @@ mod tests {
                 height: 48.0,
                 node_type: NodeType::Module,
                 metadata: NodeMetadata::default(),
+                aria_label: String::new(),
             },
             LayoutNode {
                 id: "src/b".into(),
@@ -576,6 +583,7 @@ mod tests {
                 height: 48.0,
                 node_type: NodeType::Module,
                 metadata: NodeMetadata::default(),
+                aria_label: String::new(),
             },
         ];
         let edges = vec![LayoutEdge {

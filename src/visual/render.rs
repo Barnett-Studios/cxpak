@@ -2048,6 +2048,7 @@ pub fn build_flow_diagram_data(
                     flow_node_kind: Some(kind.to_string()),
                     ..NodeMetadata::default()
                 },
+                aria_label: String::new(),
             }
         })
         .collect();
@@ -2287,6 +2288,7 @@ fn layout_from_snapshot(
             height: config.node_height,
             node_type: NodeType::File,
             metadata: NodeMetadata::default(),
+            aria_label: String::new(),
         })
         .collect();
 
@@ -2900,6 +2902,7 @@ mod tests {
             height: 40.0,
             node_type: NodeType::File,
             metadata: NodeMetadata::default(),
+            aria_label: String::new(),
         };
 
         let nodes = vec![

@@ -22,6 +22,8 @@ pub struct LayoutNode {
     pub height: f64,
     pub node_type: NodeType,
     pub metadata: NodeMetadata,
+    #[serde(default)]
+    pub aria_label: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -118,6 +120,47 @@ impl Default for LayoutConfig {
             max_nodes_per_layer: 9,
         }
     }
+}
+
+/// Build a screen-reader label describing the node's key properties.
+/// Field access is restricted to the content allowlist documented in spec § 1.9.
+pub fn build_aria_label(node: &LayoutNode) -> String {
+    let m = &node.metadata;
+    let mut parts: Vec<String> = vec![node.label.clone()];
+
+    match &node.node_type {
+        NodeType::Module => parts.push("module".to_string()),
+        NodeType::File => parts.push("file".to_string()),
+        NodeType::Symbol => parts.push("symbol".to_string()),
+        NodeType::Cluster { member_ids } => {
+            parts.push(format!("group of {} items", member_ids.len()));
+        }
+    }
+
+    if m.risk_score > 0.0 {
+        let severity = if m.risk_score >= 0.7 {
+            "high"
+        } else if m.risk_score >= 0.4 {
+            "medium"
+        } else {
+            "low"
+        };
+        parts.push(format!("{severity} risk ({:.0}%)", m.risk_score * 100.0));
+    }
+    if m.token_count > 0 {
+        parts.push(format!("{} tokens", m.token_count));
+    }
+    if m.is_god_file {
+        parts.push("god file".to_string());
+    }
+    if m.has_dead_code {
+        parts.push("contains dead code".to_string());
+    }
+    if m.is_circular {
+        parts.push("participates in circular dependency".to_string());
+    }
+
+    parts.join(", ")
 }
 
 /// Assigns each node a layer index via longest-path layering.
@@ -279,6 +322,7 @@ pub(crate) fn insert_dummy_nodes(
                 height: 0.0,
                 node_type: NodeType::Symbol,
                 metadata: NodeMetadata::default(),
+                aria_label: String::new(),
             };
             aug_nodes.push(dummy_node);
             dummy_ids.push(dummy_id.clone());
@@ -694,6 +738,7 @@ fn enforce_cognitive_limit(
                 member_ids: excess.clone(),
             },
             metadata: NodeMetadata::default(),
+            aria_label: String::new(),
         };
 
         // Mark excess nodes for removal.
@@ -791,9 +836,16 @@ pub fn build_module_layout(
                     is_god_file: !m.god_files.is_empty(),
                     ..NodeMetadata::default()
                 },
+                aria_label: String::new(),
             }
         })
         .collect();
+
+    // Populate aria_label on each module node.
+    let mut nodes = nodes;
+    for node in &mut nodes {
+        node.aria_label = build_aria_label(node);
+    }
 
     // Build module id set for O(1) lookup.
     let module_ids: std::collections::HashSet<String> =
@@ -930,9 +982,16 @@ pub fn build_file_layout(
                     health_score: None,
                     flow_node_kind: None,
                 },
+                aria_label: String::new(),
             }
         })
         .collect();
+
+    // Populate aria_label on each file node.
+    let mut nodes = nodes;
+    for node in &mut nodes {
+        node.aria_label = build_aria_label(node);
+    }
 
     // Build intra-module import edges.
     let file_ids: std::collections::HashSet<&str> = module_files
@@ -1024,9 +1083,16 @@ pub fn build_symbol_layout(
                     pagerank: file_pr,
                     ..NodeMetadata::default()
                 },
+                aria_label: String::new(),
             }
         })
         .collect();
+
+    // Populate aria_label on each symbol node.
+    let mut nodes = nodes;
+    for node in &mut nodes {
+        node.aria_label = build_aria_label(node);
+    }
 
     // Build call-graph edges between symbols in this file.
     let symbol_id_map: HashMap<&str, String> = symbols
@@ -1088,6 +1154,7 @@ mod tests {
             height: 48.0,
             node_type: NodeType::Module,
             metadata: NodeMetadata::default(),
+            aria_label: String::new(),
         }
     }
 
@@ -1734,5 +1801,77 @@ mod tests {
         let _escaped: String = crate::visual::render::escape_script_tag("{}");
         let _ctrl: String =
             crate::visual::render::view_controller_js(&crate::visual::VisualType::Dashboard);
+    }
+
+    #[test]
+    fn aria_label_includes_name_and_type() {
+        let node = LayoutNode {
+            id: "src/main.rs".into(),
+            label: "main.rs".into(),
+            layer: 0,
+            position: Point { x: 0.0, y: 0.0 },
+            width: 160.0,
+            height: 48.0,
+            node_type: NodeType::File,
+            metadata: NodeMetadata::default(),
+            aria_label: String::new(),
+        };
+        let label = build_aria_label(&node);
+        assert!(label.contains("main.rs"));
+        assert!(label.contains("file"));
+    }
+
+    #[test]
+    fn aria_label_includes_high_risk_phrase() {
+        let node = LayoutNode {
+            id: "src/main.rs".into(),
+            label: "main.rs".into(),
+            layer: 0,
+            position: Point::default(),
+            width: 160.0,
+            height: 48.0,
+            node_type: NodeType::File,
+            metadata: NodeMetadata {
+                risk_score: 0.85,
+                ..NodeMetadata::default()
+            },
+            aria_label: String::new(),
+        };
+        let label = build_aria_label(&node);
+        assert!(label.contains("high risk"));
+        assert!(label.contains("85%"));
+    }
+
+    #[test]
+    fn aria_label_cluster_reports_count() {
+        let node = LayoutNode {
+            id: "cluster-1".into(),
+            label: "others".into(),
+            layer: 0,
+            position: Point::default(),
+            width: 160.0,
+            height: 48.0,
+            node_type: NodeType::Cluster {
+                member_ids: vec!["a".into(), "b".into(), "c".into()],
+            },
+            metadata: NodeMetadata::default(),
+            aria_label: String::new(),
+        };
+        let label = build_aria_label(&node);
+        assert!(label.contains("group of 3 items"));
+    }
+
+    #[test]
+    fn aria_label_backward_compatible_via_serde_default() {
+        // JSON from v2.0.0 had no aria_label field.
+        let json = r#"{
+            "id":"n1","label":"foo","layer":0,
+            "position":{"x":0,"y":0},
+            "width":100,"height":50,
+            "node_type":"File",
+            "metadata":{"pagerank":0,"risk_score":0,"token_count":0,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false,"flow_node_kind":null}
+        }"#;
+        let node: LayoutNode = serde_json::from_str(json).expect("must deserialize v2.0.0 JSON");
+        assert_eq!(node.aria_label, "");
     }
 }
