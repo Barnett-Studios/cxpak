@@ -73,7 +73,10 @@
   function closeInspector() {
     CX.state.inspector = null;
     var el = document.getElementById('cxpak-inspector');
-    if (el) el.setAttribute('hidden', '');
+    if (el) {
+      el.setAttribute('hidden', '');
+      el.classList.remove('open');
+    }
   }
 
   function interruptView(name) {
@@ -127,7 +130,10 @@
   }
 
   CX.navigate = navigate;
-  window.addEventListener('hashchange', navigate);
+  window.addEventListener('hashchange', function() {
+    if (CX._suppressHashChange) return;
+    navigate();
+  });
   window.addEventListener('DOMContentLoaded', function() {
     // Initial focus on first nav tab.
     var firstNav = document.querySelector('.cxpak-nav-link[data-view="dashboard"]');
@@ -136,8 +142,15 @@
   });
 
   // Programmatic hash updates use pushState (no re-entrant hashchange).
+  // The fallback path assigns location.hash, which fires `hashchange` synchronously;
+  // suppress the synchronous re-navigate so callers can drive `navigate()` themselves.
   CX.pushHash = function(hash) {
-    try { window.history.pushState(null, '', hash); } catch (e) { window.location.hash = hash; }
+    try {
+      window.history.pushState(null, '', hash);
+    } catch (e) {
+      CX._suppressHashChange = true;
+      try { window.location.hash = hash; } finally { CX._suppressHashChange = false; }
+    }
   };
 
   // =============================================================================

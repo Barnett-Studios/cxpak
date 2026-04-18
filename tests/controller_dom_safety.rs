@@ -66,25 +66,70 @@ fn no_eval_or_function_constructor() {
 #[test]
 #[allow(non_snake_case)]
 fn localStorage_is_guarded_with_try() {
-    // Every `localStorage.` reference must appear inside a `try` block.
-    // Simple heuristic: split into lines, ensure no bare localStorage.X assignment outside a `try {` region.
-    let mut depth = 0usize;
-    let mut in_try = false;
-    for line in CONTROLLER.lines() {
-        if line.contains("try {") || line.contains("try{") {
-            in_try = true;
-            depth = 0;
+    // For each `localStorage.` byte offset, find the nearest preceding `try {` AND a `catch`
+    // that opens AFTER our offset. If none exists, the call is unguarded.
+    let mut search_from = 0usize;
+    while let Some(rel) = CONTROLLER[search_from..].find("localStorage.") {
+        let abs = search_from + rel;
+        // Skip if the line is a comment.
+        let line_start = CONTROLLER[..abs].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line = &CONTROLLER[line_start..abs];
+        if line.trim_start().starts_with("//") {
+            search_from = abs + "localStorage.".len();
+            continue;
         }
-        if in_try {
-            depth += line.matches('{').count();
-            depth = depth.saturating_sub(line.matches('}').count());
-            if depth == 0 && (line.contains("}") || line.contains("catch")) {
-                // still inside try/catch
+        // Find the nearest preceding `try {` (or `try{`).
+        let try_open = CONTROLLER[..abs]
+            .rfind("try {")
+            .or_else(|| CONTROLLER[..abs].rfind("try{"));
+        let mut guarded = false;
+        if let Some(t) = try_open {
+            // Walk forward from `t` counting braces; the try block ends when depth returns to 0.
+            let mut depth = 0i64;
+            let mut end = t;
+            for (i, b) in CONTROLLER[t..].bytes().enumerate() {
+                if b == b'{' {
+                    depth += 1;
+                } else if b == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = t + i;
+                        break;
+                    }
+                }
+            }
+            // "guarded" means the localStorage call's offset is between t and end (inside try block).
+            if abs > t && abs < end {
+                guarded = true;
+            }
+            // OR between end and end-of-catch-block.
+            if !guarded {
+                if let Some(catch_off) = CONTROLLER[end..].find("catch") {
+                    let catch_abs = end + catch_off;
+                    let mut depth2 = 0i64;
+                    let mut catch_end = catch_abs;
+                    for (i, b) in CONTROLLER[catch_abs..].bytes().enumerate() {
+                        if b == b'{' {
+                            depth2 += 1;
+                        } else if b == b'}' {
+                            depth2 -= 1;
+                            if depth2 == 0 {
+                                catch_end = catch_abs + i;
+                                break;
+                            }
+                        }
+                    }
+                    if abs > catch_abs && abs < catch_end {
+                        guarded = true;
+                    }
+                }
             }
         }
-        if line.contains("localStorage.") && !line.trim_start().starts_with("//") {
-            assert!(in_try, "unguarded localStorage access: {line:?}");
-        }
+        assert!(
+            guarded,
+            "unguarded localStorage access at byte {abs}: line={line:?}"
+        );
+        search_from = abs + "localStorage.".len();
     }
 }
 
@@ -120,33 +165,43 @@ fn format_score_helper_defined() {
 #[test]
 #[allow(non_snake_case)]
 fn toFixed_only_inside_format_helper() {
-    // Every toFixed call must appear after the definition of CX.format.score and inside its body only.
-    // Heuristic: find the first occurrence of "CX.format.score" and check all toFixed matches appear
-    // after it AND within 2 lines of a format.score reference or inside the helper.
-    // Simpler: count toFixed occurrences; at least one inside a function that references score.
     let count = CONTROLLER.matches(".toFixed(").count();
-    assert!(
-        count > 0,
-        "expected at least one toFixed inside CX.format.score"
+    assert_eq!(
+        count, 1,
+        "expected exactly one .toFixed(...) call (in CX.format.score), found {count}"
     );
-    // Relaxed: allow toFixed anywhere the value is formatted, but require CX.format.score to exist.
+    let format_helper_idx = CONTROLLER
+        .find("CX.format = {")
+        .or_else(|| CONTROLLER.find("CX.format ="))
+        .expect("CX.format helper definition missing");
+    let to_fixed_idx = CONTROLLER.find(".toFixed(").unwrap();
+    let helper_end = CONTROLLER[format_helper_idx..]
+        .find("};")
+        .expect("CX.format block closing not found")
+        + format_helper_idx;
+    assert!(
+        to_fixed_idx > format_helper_idx && to_fixed_idx < helper_end,
+        ".toFixed(...) must appear inside the CX.format helper definition"
+    );
 }
 
 #[test]
 fn escape_priority_palette_before_inspector() {
-    // The Escape key handler must reference paletteOpen BEFORE inspectorOpen in source order.
-    let pal_idx = CONTROLLER
-        .find("paletteOpen")
-        .or_else(|| CONTROLLER.find("paletteEl"))
-        .or_else(|| CONTROLLER.find("palette.open"));
-    let insp_idx = CONTROLLER
-        .find("inspectorOpen")
-        .or_else(|| CONTROLLER.find("inspectorEl"))
-        .or_else(|| CONTROLLER.find("inspector.open"));
-    if let (Some(p), Some(i)) = (pal_idx, insp_idx) {
-        assert!(
-            p < i,
-            "palette references must come before inspector in escape handler"
-        );
-    }
+    // Within the Escape-key handler, the palette check must come before the inspector check.
+    // We anchor on the substring "ev.key === 'Escape'" and inspect the source text from there
+    // forward to confirm paletteOpen is referenced before CX.state.inspector.
+    let escape_idx = CONTROLLER
+        .find("ev.key === 'Escape'")
+        .expect("escape handler missing");
+    let after = &CONTROLLER[escape_idx..];
+    let pal = after
+        .find("CX.state.paletteOpen")
+        .expect("palette check missing in escape handler");
+    let insp = after
+        .find("CX.state.inspector")
+        .expect("inspector check missing in escape handler");
+    assert!(
+        pal < insp,
+        "palette check must precede inspector check in escape handler (pal={pal}, insp={insp})"
+    );
 }
