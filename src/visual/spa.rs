@@ -11,17 +11,33 @@ static SPA_CONTROLLER: &str = include_str!("../../assets/cxpak-spa-controller.js
 
 /// Escapes JSON for safe embedding inside an HTML `<script type="application/json">` block.
 ///
-/// In addition to the base `escape_script_tag` replacements (`</script>` and `<!--`), this
-/// function escapes `<`, `>`, and `=` as their JSON unicode equivalents so that arbitrary
-/// HTML attribute syntax (e.g. `onerror=alert`) encoded in string values cannot be misread
-/// by a browser's HTML parser or pass naive substring-based injection checks.
-/// Unicode escapes are valid JSON (RFC 8259 §7) and are decoded transparently by all JSON
-/// parsers.
+/// Replaces every `<`, `>`, `&`, and `=` with the corresponding JSON `\u00XX` Unicode escape.
+/// All five chars (`<`, `>`, `&`, `=`, plus `</script>` substring elimination) are covered:
+/// the per-character `<` and `>` escapes alone make `</script>` impossible to form, so the
+/// `escape_script_tag` substring rewrites are no longer needed. Unicode escapes are valid
+/// JSON per RFC 8259 §7 and decoded transparently by all JSON parsers.
 fn spa_escape(json: &str) -> String {
-    render::escape_script_tag(json)
-        .replace('<', r"\u003c")
-        .replace('>', r"\u003e")
-        .replace('=', r"\u003d")
+    let mut out = String::with_capacity(json.len() + (json.len() / 16));
+    for ch in json.chars() {
+        match ch {
+            '<' => out.push_str(r"\u003c"),
+            '>' => out.push_str(r"\u003e"),
+            '&' => out.push_str(r"\u0026"),
+            '=' => out.push_str(r"\u003d"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Escapes a string for safe inclusion in HTML element text content.
+/// Replaces `&`, `<`, `>`, `"`, `'` with their named or numeric entities.
+fn escape_html_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<String, LayoutError> {
@@ -55,8 +71,10 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     let flow_json = spa_escape(&flow_json);
     let diff_json = spa_escape(&diff_json);
     let search_json = spa_escape(&serde_json::to_string(&search).unwrap_or_else(|_| "[]".into()));
-    let meta_json = spa_escape(&serde_json::to_string(metadata).unwrap_or_else(|_| "{}".into()));
-    let repo = render::escape_script_tag(&metadata.repo_name);
+    let meta_json = spa_escape(
+        &serde_json::to_string(metadata).expect("RenderMetadata serialization is infallible"),
+    );
+    let repo = escape_html_text(&metadata.repo_name);
 
     // Build the HTML via string concatenation to avoid format! choking on CSS/JS
     // brace characters. The JSON data blobs and asset files are appended directly.

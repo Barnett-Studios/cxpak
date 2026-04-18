@@ -151,3 +151,32 @@ fn injection_safe_for_malicious_filename() {
         "raw onerror payload leaked"
     );
 }
+
+#[test]
+fn repo_name_is_html_escaped_in_title_and_span() {
+    let counter = TokenCounter::new();
+    let files = vec![ScannedFile {
+        relative_path: "src/main.rs".into(),
+        absolute_path: "/tmp/src/main.rs".into(),
+        language: Some("rust".into()),
+        size_bytes: 10,
+    }];
+    let mut content = HashMap::new();
+    content.insert("src/main.rs".into(), "fn main() {}".into());
+    let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content);
+    let mut meta = fixture_meta();
+    meta.repo_name = "<script>alert('xss')</script> & special \"chars\"".into();
+    let html = cxpak::visual::spa::render_spa(&idx, &meta).unwrap();
+    // The raw payload must NOT appear unescaped in the HTML output.
+    assert!(
+        !html.contains("<script>alert('xss')</script>"),
+        "raw script tag leaked"
+    );
+    // Escaped form must appear in the title.
+    assert!(
+        html.contains(
+            "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt; &amp; special &quot;chars&quot;"
+        ),
+        "escaped repo_name not present in HTML output"
+    );
+}
