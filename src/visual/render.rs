@@ -1270,7 +1270,6 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
     let risk_entries = crate::intelligence::risk::compute_risk_ranking(index);
     let top_risks: Vec<RiskDisplayEntry> = risk_entries
         .into_iter()
-        .filter(|e| e.risk_score >= 0.05)
         .take(5)
         .map(|e| {
             let has_tests = index.test_map.contains_key(e.path.as_str());
@@ -3845,17 +3844,54 @@ mod tests {
 
     #[test]
     fn test_build_dashboard_data_filters_risks_below_threshold() {
-        // A codebase with a single tiny file will have near-zero risk score.
-        // The dashboard filter drops entries with risk_score < 0.05 from top_risks.
+        // Contract 9: top_risks is the first-5 of compute_risk_ranking without a 0.05 filter.
+        // An entry with score < 0.05 is allowed if fewer than 5 entries exceed that threshold.
+        // Filter removal is asserted by `top_risks_includes_entries_below_005` below.
         let index = make_minimal_index();
-        let data = build_dashboard_data(&index);
-        for entry in &data.risks.top_risks {
-            assert!(
-                entry.risk_score >= 0.05,
-                "top_risks must only include entries with risk_score >= 0.05, found {}",
-                entry.risk_score
-            );
+        let _ = build_dashboard_data(&index);
+    }
+
+    #[test]
+    fn top_risks_includes_entries_below_005() {
+        // An index where no file exceeds 0.05 risk — top_risks should still contain entries.
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+        let counter = TokenCounter::new();
+        let files = (0..3)
+            .map(|i| ScannedFile {
+                relative_path: format!("src/tiny_{i}.rs"),
+                absolute_path: std::path::PathBuf::from(format!("/tmp/{i}.rs")),
+                language: Some("rust".into()),
+                size_bytes: 10,
+            })
+            .collect();
+        let mut c = HashMap::new();
+        for i in 0..3 {
+            c.insert(format!("src/tiny_{i}.rs"), "fn x(){}".into());
         }
+        let idx =
+            crate::index::CodebaseIndex::build_with_content(files, HashMap::new(), &counter, c);
+        let data = build_dashboard_data(&idx);
+        let ranking = crate::intelligence::risk::compute_risk_ranking(&idx);
+        // Top_risks must equal the first min(5, total) of compute_risk_ranking.
+        let expected_n = ranking.len().min(5);
+        assert_eq!(data.risks.top_risks.len(), expected_n);
+        for (a, b) in data
+            .risks
+            .top_risks
+            .iter()
+            .zip(ranking.iter().take(expected_n))
+        {
+            assert_eq!(a.path, b.path);
+            assert_eq!(a.risk_score.to_bits(), b.risk_score.to_bits());
+        }
+        // Strong invariant: at least one entry must be below 0.05 (proving the filter is gone).
+        // The fixture files have minimal metadata so all scores are near 0 and below 0.05.
+        assert!(
+            data.risks.top_risks.iter().any(|r| r.risk_score < 0.05),
+            "at least one top_risks entry must be below 0.05 — otherwise the filter may still be active"
+        );
     }
 
     #[test]
