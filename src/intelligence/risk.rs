@@ -119,6 +119,7 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
         b.risk_score
             .partial_cmp(&a.risk_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
     });
     entries
 }
@@ -207,6 +208,44 @@ mod tests {
         let untested = nc.max(0.01) * nb.max(0.01) * (1.0f64 - 0.0).max(0.01);
         let tested = nc.max(0.01) * nb.max(0.01) * (1.0f64 - 1.0).max(0.01);
         assert!(untested > tested, "untested={untested}, tested={tested}");
+    }
+
+    #[test]
+    fn risk_ranking_ties_break_by_path_ascending() {
+        use crate::budget::counter::TokenCounter;
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+        let counter = TokenCounter::new();
+        // Two files with identical risk-score inputs.
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/b.rs".into(),
+                absolute_path: "/tmp/src/b.rs".into(),
+                language: Some("rust".into()),
+                size_bytes: 100,
+            },
+            ScannedFile {
+                relative_path: "src/a.rs".into(),
+                absolute_path: "/tmp/src/a.rs".into(),
+                language: Some("rust".into()),
+                size_bytes: 100,
+            },
+        ];
+        let mut c = HashMap::new();
+        c.insert("src/b.rs".into(), "fn x(){}".into());
+        c.insert("src/a.rs".into(), "fn x(){}".into());
+        let idx =
+            crate::index::CodebaseIndex::build_with_content(files, HashMap::new(), &counter, c);
+        let ranked = compute_risk_ranking(&idx);
+        let a_idx = ranked.iter().position(|r| r.path == "src/a.rs");
+        let b_idx = ranked.iter().position(|r| r.path == "src/b.rs");
+        if let (Some(a), Some(b)) = (a_idx, b_idx) {
+            // a should come before b alphabetically when scores tie.
+            assert!(
+                a < b,
+                "src/a.rs ({a}) must sort before src/b.rs ({b}) on tie"
+            );
+        }
     }
 
     #[test]
