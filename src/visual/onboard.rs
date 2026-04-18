@@ -39,6 +39,15 @@ fn is_entry_point(path: &str) -> bool {
         || path.ends_with("/index.js")
 }
 
+/// Returns true if `path` lives in a conventional test directory (top-level or nested).
+/// Excludes `tests/`, `test/`, and any nested `*/tests/*`, `*/test/*` paths.
+fn is_test_path(path: &str) -> bool {
+    path.starts_with("tests/")
+        || path.starts_with("test/")
+        || path.contains("/tests/")
+        || path.contains("/test/")
+}
+
 /// Compute an onboarding map from the index using the intelligence pipeline.
 ///
 /// Entry points are placed first as their own phase. The remaining files are
@@ -55,7 +64,8 @@ pub fn compute_onboarding_map(
     use std::collections::HashMap;
 
     // Build exclusion set: test files (from test_map values, not keys —
-    // keys are source files, values are the test file refs) and
+    // keys are source files, values are the test file refs), files in
+    // conventional test directories (tests/, test/, including nested), and
     // generated/vendored paths (noise filter blocklist).
     let excluded: std::collections::HashSet<&str> = index
         .test_map
@@ -66,7 +76,7 @@ pub fn compute_onboarding_map(
                 .files
                 .iter()
                 .map(|f| f.relative_path.as_str())
-                .filter(|p| crate::auto_context::noise::is_blocklisted(p)),
+                .filter(|p| crate::auto_context::noise::is_blocklisted(p) || is_test_path(p)),
         )
         .collect();
 
