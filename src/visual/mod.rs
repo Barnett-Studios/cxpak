@@ -15,6 +15,8 @@ pub mod render;
 #[cfg(feature = "visual")]
 pub mod search_index;
 #[cfg(feature = "visual")]
+pub mod spa;
+#[cfg(feature = "visual")]
 pub mod timeline;
 
 /// Which visualization type to generate
