@@ -44,6 +44,7 @@ fn ext_for_format(format: &VisualFormatArg) -> &'static str {
 
 fn type_slug(visual_type: &VisualTypeArg) -> &'static str {
     match visual_type {
+        VisualTypeArg::All => "all",
         VisualTypeArg::Dashboard => "dashboard",
         VisualTypeArg::Architecture => "architecture",
         VisualTypeArg::Risk => "risk",
@@ -84,6 +85,7 @@ pub fn run(
 
     // Render the HTML string for the chosen visual type.
     let html: String = match visual_type {
+        VisualTypeArg::All => crate::visual::spa::render_spa(&index, &metadata)?,
         VisualTypeArg::Dashboard => render::render_dashboard(&index, &metadata),
         VisualTypeArg::Architecture => render::render_architecture_explorer(&index, &metadata)?,
         VisualTypeArg::Risk => render::render_risk_heatmap(&index, &metadata),
@@ -210,6 +212,7 @@ mod tests {
 
     #[test]
     fn test_type_slug_all_variants() {
+        assert_eq!(type_slug(&VisualTypeArg::All), "all");
         assert_eq!(type_slug(&VisualTypeArg::Dashboard), "dashboard");
         assert_eq!(type_slug(&VisualTypeArg::Architecture), "architecture");
         assert_eq!(type_slug(&VisualTypeArg::Risk), "risk");
@@ -319,6 +322,7 @@ mod tests {
     #[test]
     fn test_default_filename_all_types_and_formats_are_non_empty() {
         let types = [
+            VisualTypeArg::All,
             VisualTypeArg::Dashboard,
             VisualTypeArg::Architecture,
             VisualTypeArg::Risk,

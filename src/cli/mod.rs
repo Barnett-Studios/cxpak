@@ -113,8 +113,8 @@ pub enum Commands {
     /// Generate interactive visual dashboard
     #[cfg(feature = "visual")]
     Visual {
-        /// dashboard | architecture | risk | flow | timeline | diff
-        #[arg(long, default_value = "dashboard")]
+        /// all | dashboard | architecture | risk | flow | timeline | diff
+        #[arg(long, default_value = "all")]
         visual_type: VisualTypeArg,
         /// html | mermaid | svg | png | c4 | json
         #[arg(long, default_value = "html")]
@@ -228,6 +228,7 @@ pub enum PluginSubcommand {
 #[cfg(feature = "visual")]
 #[derive(Clone, Debug, clap::ValueEnum)]
 pub enum VisualTypeArg {
+    All,
     Dashboard,
     Architecture,
     Risk,
@@ -678,6 +679,17 @@ mod tests {
                 _ => panic!("expected List"),
             },
             _ => panic!("expected Plugin"),
+        }
+    }
+
+    #[cfg(feature = "visual")]
+    #[test]
+    fn visual_default_type_is_all() {
+        let cli = Cli::try_parse_from(["cxpak", "visual"]).unwrap();
+        if let Commands::Visual { visual_type, .. } = cli.command {
+            assert_eq!(format!("{:?}", visual_type).to_lowercase(), "all");
+        } else {
+            panic!("expected Visual command");
         }
     }
 
