@@ -203,7 +203,7 @@ pub fn workspace_symbols(
 
 pub fn handle_custom_method(
     method: &str,
-    _params: serde_json::Value,
+    params: serde_json::Value,
     index: &crate::index::CodebaseIndex,
 ) -> Result<Option<serde_json::Value>, LspMethodError> {
     match method {
@@ -229,20 +229,128 @@ pub fn handle_custom_method(
         "cxpak/blastRadius" => Ok(Some(serde_json::json!({
             "note": "use cxpak/health for file counts; blast radius requires file param"
         }))),
-        "cxpak/overview"
-        | "cxpak/trace"
-        | "cxpak/diff"
-        | "cxpak/search"
-        | "cxpak/apiSurface"
-        | "cxpak/deadCode"
-        | "cxpak/callGraph"
-        | "cxpak/predict"
-        | "cxpak/drift"
-        | "cxpak/securitySurface"
-        | "cxpak/dataFlow" => Ok(Some(serde_json::json!({
-            "status": "available",
-            "method": method,
+        "cxpak/overview" => Ok(Some(serde_json::json!({
+            "total_files": index.total_files,
+            "total_tokens": index.total_tokens,
+            "languages": index.language_stats.len(),
         }))),
+        "cxpak/trace" => {
+            let symbol = params.get("symbol").and_then(|v| v.as_str());
+            match symbol {
+                Some(sym) => {
+                    let matches = index.find_symbol(sym);
+                    let locations: Vec<_> = matches
+                        .into_iter()
+                        .map(|(file, s)| {
+                            serde_json::json!({
+                                "file": file,
+                                "start_line": s.start_line,
+                                "end_line": s.end_line,
+                                "kind": format!("{:?}", s.kind),
+                            })
+                        })
+                        .collect();
+                    Ok(Some(
+                        serde_json::json!({"count": locations.len(), "locations": locations}),
+                    ))
+                }
+                None => Ok(Some(
+                    serde_json::json!({"count": 0, "locations": [], "note": "provide symbol parameter"}),
+                )),
+            }
+        }
+        "cxpak/diff" => Ok(Some(
+            serde_json::json!({"note": "diff requires git ref; use cxpak diff CLI"}),
+        )),
+        "cxpak/search" => {
+            let query = params
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if query.is_empty() {
+                return Ok(Some(
+                    serde_json::json!({"matches": [], "note": "provide query parameter"}),
+                ));
+            }
+            let matches: Vec<_> = index
+                .files
+                .iter()
+                .filter(|f| f.relative_path.to_lowercase().contains(&query))
+                .take(20)
+                .map(|f| serde_json::json!({"path": f.relative_path, "language": f.language}))
+                .collect();
+            Ok(Some(serde_json::json!({"matches": matches})))
+        }
+        "cxpak/apiSurface" => {
+            let surface =
+                crate::intelligence::api_surface::extract_api_surface(index, None, "all", 5000);
+            Ok(Some(
+                serde_json::to_value(surface).unwrap_or_else(|_| serde_json::json!({})),
+            ))
+        }
+        "cxpak/deadCode" => {
+            let dead = crate::intelligence::dead_code::detect_dead_code(index, None);
+            Ok(Some(serde_json::json!({"dead_symbols": dead})))
+        }
+        "cxpak/callGraph" => Ok(Some(serde_json::json!({
+            "edges": index.call_graph.edges,
+            "total": index.call_graph.edges.len(),
+        }))),
+        "cxpak/predict" => {
+            let files = params
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                return Ok(Some(serde_json::json!({"note": "provide files parameter"})));
+            }
+            let refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+            let result = crate::intelligence::predict::predict(
+                &refs,
+                &index.graph,
+                &index.pagerank,
+                &index.co_changes,
+                &index.test_map,
+                3,
+            );
+            Ok(Some(
+                serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
+            ))
+        }
+        "cxpak/drift" => Ok(Some(
+            serde_json::json!({"note": "drift requires repo path; use cxpak drift CLI"}),
+        )),
+        "cxpak/securitySurface" => {
+            let result = crate::intelligence::security::build_security_surface(
+                index,
+                crate::intelligence::security::DEFAULT_AUTH_PATTERNS,
+                None,
+            );
+            Ok(Some(
+                serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
+            ))
+        }
+        "cxpak/dataFlow" => {
+            let symbol = params.get("symbol").and_then(|v| v.as_str());
+            match symbol {
+                Some(sym) => {
+                    let result =
+                        crate::intelligence::data_flow::trace_data_flow(sym, None, 6, index);
+                    Ok(Some(
+                        serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
+                    ))
+                }
+                None => Ok(Some(
+                    serde_json::json!({"note": "provide symbol parameter"}),
+                )),
+            }
+        }
         _ => Err(LspMethodError::NotFound(method.to_string())),
     }
 }
