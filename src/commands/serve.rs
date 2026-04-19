@@ -378,6 +378,84 @@ struct V1BriefingParams {
     focus: Option<String>,
 }
 
+pub fn v1_error(
+    status: StatusCode,
+    code: &'static str,
+    msg: impl Into<String>,
+) -> (StatusCode, Json<Value>) {
+    (status, Json(json!({"error": code, "message": msg.into()})))
+}
+
+pub fn normalize_path_param(value: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    if value.len() > 1024 {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "param_too_long",
+            "path exceeds 1024 chars",
+        ));
+    }
+    if value.contains('\0') || value.contains('\\') {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_param",
+            "illegal character",
+        ));
+    }
+    if value.split('/').any(|seg| seg == "..") {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_param",
+            "path traversal segment",
+        ));
+    }
+    if value.starts_with('/') {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_param",
+            "absolute path",
+        ));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_param",
+            "illegal character class",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+pub fn normalize_symbol_param(value: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    if value.len() > 512 {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "param_too_long",
+            "symbol exceeds 512 chars",
+        ));
+    }
+    if value.contains('\0') {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_param",
+            "null byte",
+        ));
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '/' | '\\' | '`' | '$' | ';' | '|'))
+    {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_param",
+            "illegal character",
+        ));
+    }
+    Ok(value.to_string())
+}
+
 async fn v1_health_handler(State(index): State<SharedIndex>) -> Result<Json<Value>, StatusCode> {
     let idx = index
         .read()
