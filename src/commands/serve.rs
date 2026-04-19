@@ -486,9 +486,19 @@ async fn v1_health_handler(State(index): State<SharedIndex>) -> Result<Json<Valu
     let idx = index
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let health = crate::intelligence::health::compute_health(&idx);
     Ok(Json(serde_json::json!({
         "total_files": idx.total_files,
         "total_tokens": idx.total_tokens,
+        "composite": health.composite,
+        "dimensions": {
+            "conventions": health.conventions,
+            "test_coverage": health.test_coverage,
+            "churn_stability": health.churn_stability,
+            "coupling": health.coupling,
+            "cycles": health.cycles,
+            "dead_code": health.dead_code,
+        },
     })))
 }
 

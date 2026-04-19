@@ -207,10 +207,22 @@ pub fn handle_custom_method(
     index: &crate::index::CodebaseIndex,
 ) -> Result<Option<serde_json::Value>, LspMethodError> {
     match method {
-        "cxpak/health" => Ok(Some(serde_json::json!({
-            "total_files": index.total_files,
-            "total_tokens": index.total_tokens,
-        }))),
+        "cxpak/health" => {
+            let health = crate::intelligence::health::compute_health(index);
+            Ok(Some(serde_json::json!({
+                "total_files": index.total_files,
+                "total_tokens": index.total_tokens,
+                "composite": health.composite,
+                "dimensions": {
+                    "conventions": health.conventions,
+                    "test_coverage": health.test_coverage,
+                    "churn_stability": health.churn_stability,
+                    "coupling": health.coupling,
+                    "cycles": health.cycles,
+                    "dead_code": health.dead_code,
+                },
+            })))
+        }
         "cxpak/conventions" => serde_json::to_value(&index.conventions)
             .map(Some)
             .map_err(|e| LspMethodError::Internal(format!("serialization failed: {e}"))),
