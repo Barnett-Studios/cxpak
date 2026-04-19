@@ -338,6 +338,7 @@ fn build_v1_router(state: AppState) -> Router<AppState> {
         }
     }
 
+    let repo_path = state.repo_path.clone();
     Router::new()
         .route("/v1/health", axum::routing::get(v1_health_handler))
         .route("/v1/risks", axum::routing::post(v1_risks_handler))
@@ -360,13 +361,38 @@ fn build_v1_router(state: AppState) -> Router<AppState> {
             axum::routing::post(v1_conventions_handler),
         )
         .route("/v1/briefing", axum::routing::post(v1_briefing_handler))
+        .layer(axum::Extension(repo_path))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer))
         .with_state(state)
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct V1FocusParams {
+    focus: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct V1PredictParams {
+    files: Option<Vec<String>>,
+    depth: Option<usize>,
+    #[allow(dead_code)]
+    focus: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct V1DataFlowParams {
+    symbol: Option<String>,
+    depth: Option<usize>,
+    #[allow(dead_code)]
+    focus: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct V1CallGraphParams {
+    target: Option<String>,
     focus: Option<String>,
     workspace: Option<String>,
 }
@@ -502,67 +528,333 @@ async fn v1_briefing_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn v1_risks_handler() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "not_implemented",
-        "note": "Full implementation available via MCP tools"
-    }))
+async fn v1_risks_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(params): axum::Json<V1FocusParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let focus = match params
+        .focus
+        .as_deref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s) })
+    {
+        Some(f) => Some(normalize_path_param(f)?),
+        None => None,
+    };
+    if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(ws)?;
+    }
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    let mut risks = crate::intelligence::risk::compute_risk_ranking(&idx);
+    if let Some(ref prefix) = focus {
+        risks.retain(|r| r.path.starts_with(prefix));
+    }
+    Ok(axum::Json(serde_json::json!({"risks": risks})))
 }
 
-async fn v1_architecture_handler() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "not_implemented",
-        "note": "Full implementation available via MCP tools"
-    }))
+async fn v1_architecture_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(params): axum::Json<V1FocusParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let focus = match params
+        .focus
+        .as_deref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s) })
+    {
+        Some(f) => Some(normalize_path_param(f)?),
+        None => None,
+    };
+    if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(ws)?;
+    }
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    let mut map = crate::intelligence::architecture::build_architecture_map(&idx, 2);
+    if let Some(ref prefix) = focus {
+        map.modules.retain(|m| m.prefix.starts_with(prefix));
+    }
+    Ok(axum::Json(
+        serde_json::json!({"modules": map.modules, "circular_deps": map.circular_deps}),
+    ))
 }
 
-async fn v1_call_graph_handler() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "not_implemented",
-        "note": "Full implementation available via MCP tools"
-    }))
+async fn v1_call_graph_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(params): axum::Json<V1CallGraphParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let target = match params
+        .target
+        .as_deref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s) })
+    {
+        Some(t) => Some(normalize_path_param(t)?),
+        None => None,
+    };
+    let focus = match params
+        .focus
+        .as_deref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s) })
+    {
+        Some(f) => Some(normalize_path_param(f)?),
+        None => None,
+    };
+    if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(ws)?;
+    }
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    let cg = &idx.call_graph;
+    let filtered: Vec<_> = cg
+        .edges
+        .iter()
+        .filter(|e| {
+            let t_match = target
+                .as_ref()
+                .map(|t| {
+                    e.caller_file.contains(t.as_str())
+                        || e.callee_file.contains(t.as_str())
+                        || e.caller_symbol.contains(t.as_str())
+                        || e.callee_symbol.contains(t.as_str())
+                })
+                .unwrap_or(true);
+            let f_match = focus
+                .as_ref()
+                .map(|f| {
+                    e.caller_file.starts_with(f.as_str()) || e.callee_file.starts_with(f.as_str())
+                })
+                .unwrap_or(true);
+            t_match && f_match
+        })
+        .collect();
+    Ok(axum::Json(
+        serde_json::json!({"edges": filtered, "total": cg.edges.len()}),
+    ))
 }
 
-async fn v1_dead_code_handler() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "not_implemented",
-        "note": "Full implementation available via MCP tools"
-    }))
+async fn v1_dead_code_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(params): axum::Json<V1FocusParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let focus = match params
+        .focus
+        .as_deref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s) })
+    {
+        Some(f) => Some(normalize_path_param(f)?),
+        None => None,
+    };
+    if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(ws)?;
+    }
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    let dead = crate::intelligence::dead_code::detect_dead_code(&idx, focus.as_deref());
+    let total = dead.len();
+    Ok(axum::Json(
+        serde_json::json!({"dead_symbols": dead, "total": total}),
+    ))
 }
 
-async fn v1_predict_handler() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "not_implemented",
-        "note": "Full implementation available via MCP tools"
-    }))
+async fn v1_predict_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(params): axum::Json<V1PredictParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let files = params
+        .files
+        .as_ref()
+        .ok_or_else(|| v1_error(StatusCode::BAD_REQUEST, "missing_required_param", "files"))?;
+    if files.is_empty() {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "missing_required_param",
+            "files must be non-empty",
+        ));
+    }
+    if files.len() > 100 {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "param_too_long",
+            "max 100 files",
+        ));
+    }
+    let mut normalized: Vec<String> = Vec::with_capacity(files.len());
+    for f in files {
+        normalized.push(normalize_path_param(f)?);
+    }
+    let depth = params.depth.unwrap_or(3);
+    if depth > 10 {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "depth_exceeds_max",
+            "max depth 10",
+        ));
+    }
+    if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(ws)?;
+    }
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    let refs: Vec<&str> = normalized.iter().map(|s| s.as_str()).collect();
+    let result = crate::intelligence::predict::predict(
+        &refs,
+        &idx.graph,
+        &idx.pagerank,
+        &idx.co_changes,
+        &idx.test_map,
+        depth,
+    );
+    Ok(axum::Json(serde_json::to_value(result).unwrap()))
 }
 
-async fn v1_drift_handler() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "not_implemented",
-        "note": "Full implementation available via MCP tools"
-    }))
+async fn v1_drift_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::extract::Extension(repo): axum::extract::Extension<SharedPath>,
+    axum::Json(params): axum::Json<V1FocusParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let focus = match params
+        .focus
+        .as_deref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s) })
+    {
+        Some(f) => Some(normalize_path_param(f)?),
+        None => None,
+    };
+    if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(ws)?;
+    }
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    let mut report = crate::intelligence::drift::build_drift_report(&idx, &repo, false);
+    if let Some(ref prefix) = focus {
+        report.hotspots.retain(|h| h.module.starts_with(prefix));
+    }
+    Ok(axum::Json(serde_json::to_value(report).unwrap()))
 }
 
-async fn v1_security_surface_handler() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "not_implemented",
-        "note": "Full implementation available via MCP tools"
-    }))
+async fn v1_security_surface_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(params): axum::Json<V1FocusParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let focus_owned =
+        match params
+            .focus
+            .as_deref()
+            .and_then(|s| if s.is_empty() { None } else { Some(s) })
+        {
+            Some(f) => Some(normalize_path_param(f)?),
+            None => None,
+        };
+    if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(ws)?;
+    }
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    let result = crate::intelligence::security::build_security_surface(
+        &idx,
+        crate::intelligence::security::DEFAULT_AUTH_PATTERNS,
+        focus_owned.as_deref(),
+    );
+    Ok(axum::Json(serde_json::to_value(result).unwrap()))
 }
 
-async fn v1_data_flow_handler() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "not_implemented",
-        "note": "Full implementation available via MCP tools"
-    }))
+async fn v1_data_flow_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(params): axum::Json<V1DataFlowParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let symbol = params
+        .symbol
+        .as_deref()
+        .ok_or_else(|| v1_error(StatusCode::BAD_REQUEST, "missing_required_param", "symbol"))?;
+    let symbol = normalize_symbol_param(symbol)?;
+    let depth = params.depth.unwrap_or(6);
+    if depth > 10 {
+        return Err(v1_error(
+            StatusCode::BAD_REQUEST,
+            "depth_exceeds_max",
+            "max depth 10",
+        ));
+    }
+    if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(ws)?;
+    }
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    let result = crate::intelligence::data_flow::trace_data_flow(&symbol, None, depth, &idx);
+    Ok(axum::Json(serde_json::to_value(result).unwrap()))
 }
 
-async fn v1_cross_lang_handler() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "not_implemented",
-        "note": "Full implementation available via MCP tools"
-    }))
+async fn v1_cross_lang_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(params): axum::Json<V1FocusParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let focus = match params
+        .focus
+        .as_deref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s) })
+    {
+        Some(f) => Some(normalize_path_param(f)?),
+        None => None,
+    };
+    if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(ws)?;
+    }
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    let edges: Vec<_> = if let Some(ref prefix) = focus {
+        idx.cross_lang_edges
+            .iter()
+            .filter(|e| format!("{:?}", e).contains(prefix.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        idx.cross_lang_edges.clone()
+    };
+    Ok(axum::Json(serde_json::json!({"edges": edges})))
 }
 
 pub fn run(
@@ -6487,21 +6779,22 @@ mod tests {
     }
 
     #[test]
-    fn v1_stub_endpoints_return_ok() {
+    fn v1_wired_endpoints_return_ok() {
+        // These endpoints now call real intelligence functions. Verify that
+        // each returns 200 with a valid (non-stub) payload for a well-formed request.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let stubs = vec![
+            // Endpoints that accept empty {} body
+            let simple_endpoints = vec![
                 "/v1/risks",
                 "/v1/architecture",
                 "/v1/call_graph",
                 "/v1/dead_code",
-                "/v1/predict",
                 "/v1/drift",
                 "/v1/security_surface",
-                "/v1/data_flow",
                 "/v1/cross_lang",
             ];
-            for uri in stubs {
+            for uri in simple_endpoints {
                 let state = make_app_state_with_token(None);
                 let app = build_full_router_with_state(state);
                 let body = serde_json::to_vec(&json!({})).unwrap();
@@ -6517,6 +6810,52 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK, "expected 200 for {uri}");
+            }
+
+            // /v1/predict requires files
+            {
+                let state = make_app_state_with_token(None);
+                let app = build_full_router_with_state(state);
+                let body = serde_json::to_vec(&json!({"files": ["src/main.rs"]})).unwrap();
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/predict")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "expected 200 for /v1/predict"
+                );
+            }
+
+            // /v1/data_flow requires symbol
+            {
+                let state = make_app_state_with_token(None);
+                let app = build_full_router_with_state(state);
+                let body = serde_json::to_vec(&json!({"symbol": "main"})).unwrap();
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/data_flow")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "expected 200 for /v1/data_flow"
+                );
             }
         });
     }
