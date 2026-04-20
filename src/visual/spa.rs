@@ -44,7 +44,31 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     let cfg = LayoutConfig::default();
 
     let dashboard_data = render::build_dashboard_data(index);
-    let arch_data = render::build_architecture_explorer_data(index, &cfg)?;
+    // An empty index produces LayoutError::Empty from the module layout step.
+    // That is not a bug — it simply means there are no files to visualise.
+    // The SPA must still render all six view containers so the controller can
+    // boot cleanly; the architecture view will display an empty graph.
+    let arch_data = match render::build_architecture_explorer_data(index, &cfg) {
+        Ok(d) => d,
+        Err(LayoutError::Empty) => render::ArchitectureExplorerData {
+            level1: crate::visual::layout::ComputedLayout {
+                nodes: vec![],
+                edges: vec![],
+                width: 0.0,
+                height: 0.0,
+                layers: vec![],
+            },
+            level2: std::collections::HashMap::new(),
+            level3: std::collections::HashMap::new(),
+            initial_level: 1,
+            breadcrumbs: vec![render::BreadcrumbEntry {
+                label: "Repository".to_string(),
+                level: 1,
+                target_id: "root".to_string(),
+            }],
+        },
+        Err(e) => return Err(e),
+    };
     let risk_data = render::build_risk_heatmap_data(index);
     let search = search_index::build_search_index(index);
 

@@ -37,8 +37,12 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
         });
     }
 
-    // 2. Files (all — including parse-failed).
+    // 2. Files (all — including parse-failed). Skip paths with NUL bytes; they
+    // are invalid on all target platforms and would corrupt JSON output.
     for file in &index.files {
+        if file.relative_path.contains('\0') {
+            continue;
+        }
         let language = file.language.clone().unwrap_or_else(|| "unknown".into());
         let detail = if file.parse_result.is_none() {
             format!("{language} · parse error")
