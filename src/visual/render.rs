@@ -1506,10 +1506,10 @@ pub struct ArchitectureExplorerData {
     pub level1: super::layout::ComputedLayout,
     /// Level 2 — one entry per module; each value is the file-level layout
     /// for that module.  Keyed by module prefix string.
-    pub level2: std::collections::HashMap<String, super::layout::ComputedLayout>,
+    pub level2: std::collections::BTreeMap<String, super::layout::ComputedLayout>,
     /// Level 3 — one entry per high-PageRank file; each value is the
     /// symbol-level layout for that file.  Keyed by relative file path.
-    pub level3: std::collections::HashMap<String, super::layout::ComputedLayout>,
+    pub level3: std::collections::BTreeMap<String, super::layout::ComputedLayout>,
     /// Which zoom level to display initially (always 1).
     pub initial_level: u8,
     /// Navigation breadcrumb trail.  Starts at `["Repository"]`.
@@ -1541,8 +1541,8 @@ pub fn build_architecture_explorer_data(
     let level1 = super::layout::build_module_layout(index, config)?;
 
     // ── Level 2: per-module file graphs ──────────────────────────────────────
-    let mut level2: std::collections::HashMap<String, super::layout::ComputedLayout> =
-        std::collections::HashMap::new();
+    let mut level2: std::collections::BTreeMap<String, super::layout::ComputedLayout> =
+        std::collections::BTreeMap::new();
 
     for node in &level1.nodes {
         // Only expand Module-typed nodes; skip Cluster virtual nodes.
@@ -1554,8 +1554,8 @@ pub fn build_architecture_explorer_data(
     }
 
     // ── Level 3: per-file symbol graphs (top-20 by PageRank) ─────────────────
-    let mut level3: std::collections::HashMap<String, super::layout::ComputedLayout> =
-        std::collections::HashMap::new();
+    let mut level3: std::collections::BTreeMap<String, super::layout::ComputedLayout> =
+        std::collections::BTreeMap::new();
 
     // Collect and sort by descending PageRank, take up to 20.
     let mut ranked_files: Vec<(&str, f64)> = index
@@ -1781,11 +1781,12 @@ pub fn build_risk_heatmap_data(index: &CodebaseIndex) -> RiskHeatmapData {
         })
         .collect();
 
-    // Sort module nodes by descending area_value for a stable, deterministic layout.
+    // Sort module nodes by descending area_value; break ties by id for determinism.
     module_nodes.sort_by(|a, b| {
         b.area_value
             .partial_cmp(&a.area_value)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
     });
 
     let root_area: f64 = module_nodes.iter().map(|n| n.area_value).sum();

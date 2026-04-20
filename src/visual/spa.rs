@@ -58,8 +58,8 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
                 height: 0.0,
                 layers: vec![],
             },
-            level2: std::collections::HashMap::new(),
-            level3: std::collections::HashMap::new(),
+            level2: std::collections::BTreeMap::new(),
+            level3: std::collections::BTreeMap::new(),
             initial_level: 1,
             breadcrumbs: vec![render::BreadcrumbEntry {
                 label: "Repository".to_string(),
