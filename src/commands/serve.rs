@@ -376,7 +376,6 @@ struct V1FocusParams {
 struct V1PredictParams {
     files: Option<Vec<String>>,
     depth: Option<usize>,
-    #[allow(dead_code)]
     focus: Option<String>,
     workspace: Option<String>,
 }
@@ -385,7 +384,6 @@ struct V1PredictParams {
 struct V1DataFlowParams {
     symbol: Option<String>,
     depth: Option<usize>,
-    #[allow(dead_code)]
     focus: Option<String>,
     workspace: Option<String>,
 }
@@ -719,6 +717,9 @@ async fn v1_predict_handler(
             "max depth 10",
         ));
     }
+    if let Some(f) = params.focus.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(f)?;
+    }
     if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
         normalize_path_param(ws)?;
     }
@@ -819,6 +820,9 @@ async fn v1_data_flow_handler(
             "max depth 10",
         ));
     }
+    if let Some(f) = params.focus.as_deref().filter(|s| !s.is_empty()) {
+        normalize_path_param(f)?;
+    }
     if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
         normalize_path_param(ws)?;
     }
@@ -858,7 +862,9 @@ async fn v1_cross_lang_handler(
     let edges: Vec<_> = if let Some(ref prefix) = focus {
         idx.cross_lang_edges
             .iter()
-            .filter(|e| format!("{:?}", e).contains(prefix.as_str()))
+            .filter(|e| {
+                e.source_file.contains(prefix.as_str()) || e.target_file.contains(prefix.as_str())
+            })
             .cloned()
             .collect()
     } else {

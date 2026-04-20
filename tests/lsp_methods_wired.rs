@@ -48,7 +48,8 @@ fn all_14_lsp_methods_return_non_stub() {
     ];
     for m in methods {
         let params = match m {
-            "cxpak/trace" | "cxpak/search" => serde_json::json!({"symbol": "main"}),
+            "cxpak/trace" => serde_json::json!({"symbol": "main"}),
+            "cxpak/search" => serde_json::json!({"query": "main"}),
             "cxpak/predict" => serde_json::json!({"files": ["src/main.rs"]}),
             "cxpak/dataFlow" => serde_json::json!({"symbol": "main"}),
             _ => serde_json::Value::Null,

@@ -1,3 +1,4 @@
+#![cfg(feature = "daemon")]
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
@@ -148,4 +149,34 @@ async fn v1_cross_lang_returns_non_stub() {
     let (status, body) = post(build_app(), "/v1/cross_lang", serde_json::json!({})).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!is_stub(&body));
+}
+
+#[tokio::test]
+async fn v1_predict_rejects_traversal_in_focus() {
+    let (status, body) = post(
+        build_app(),
+        "/v1/predict",
+        serde_json::json!({
+            "files": ["src/main.rs"],
+            "focus": "../../../etc/passwd"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_param");
+}
+
+#[tokio::test]
+async fn v1_data_flow_rejects_traversal_in_focus() {
+    let (status, body) = post(
+        build_app(),
+        "/v1/data_flow",
+        serde_json::json!({
+            "symbol": "main",
+            "focus": "../../../etc/passwd"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_param");
 }
