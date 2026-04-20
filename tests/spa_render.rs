@@ -74,12 +74,12 @@ fn contains_all_six_view_containers() {
 fn contains_all_data_tags() {
     let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
     for tag in [
-        r#"id="cxpak-dashboard-data""#,
-        r#"id="cxpak-architecture-data""#,
-        r#"id="cxpak-risk-data""#,
-        r#"id="cxpak-timeline-data""#,
-        r#"id="cxpak-flow-data""#,
-        r#"id="cxpak-diff-data""#,
+        r#"id="cxpak-dashboard""#,
+        r#"id="cxpak-explorer""#,
+        r#"id="cxpak-heatmap""#,
+        r#"id="cxpak-timeline""#,
+        r#"id="cxpak-flow""#,
+        r#"id="cxpak-diff""#,
         r#"id="cxpak-meta""#,
         r#"id="cxpak-search-index""#,
     ] {
@@ -98,7 +98,7 @@ fn no_cdn_references() {
 #[test]
 fn empty_flow_is_null_not_empty_object() {
     let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
-    let marker = r#"<script id="cxpak-flow-data" type="application/json">"#;
+    let marker = r#"<script id="cxpak-flow" type="application/json">"#;
     let start = html.find(marker).expect("flow tag present") + marker.len();
     let end = html[start..].find("</script>").unwrap() + start;
     assert_eq!(

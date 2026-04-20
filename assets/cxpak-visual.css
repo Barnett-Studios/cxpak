@@ -1,6 +1,10 @@
 /* cxpak visual -- production dashboard stylesheet */
 /* Dark mode, OKLab-inspired vibrant palette on deep navy */
 
+/* HTML `hidden` attribute must always hide; individual rules override display
+ * (e.g. .cxpak-palette-overlay { display: flex }) which would otherwise leak. */
+[hidden] { display: none !important; }
+
 :root {
   --bg-primary: #0f0f23;
   --bg-secondary: #131330;

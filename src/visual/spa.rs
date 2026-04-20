@@ -169,30 +169,46 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("      </div>\n");
     html.push_str("    </div>\n");
     html.push_str("  </div>\n");
-    html.push_str("  <div id=\"cxpak-help-overlay\" hidden></div>\n\n");
+    html.push_str("  <div id=\"cxpak-help-overlay\" class=\"cxpak-palette-overlay\" hidden>\n");
+    html.push_str("    <div class=\"cxpak-palette\">\n");
+    html.push_str("      <div class=\"cxpak-inspector-header\">\n");
+    html.push_str("        <span class=\"cxpak-inspector-title\">Keyboard shortcuts</span>\n");
+    html.push_str("        <button class=\"cxpak-inspector-close\" aria-label=\"Close help\">\u{d7}</button>\n");
+    html.push_str("      </div>\n");
+    html.push_str("      <div class=\"cxpak-inspector-body\">\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Cmd/Ctrl+K</kbd> or <kbd>/</kbd></span><span class=\"cxpak-inspector-value\">Open command palette</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>1</kbd>\u{2013}<kbd>6</kbd></span><span class=\"cxpak-inspector-value\">Switch to Dashboard / Architecture / Risk / Flow / Timeline / Diff</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>t</kbd></span><span class=\"cxpak-inspector-value\">Toggle dark / light theme</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>?</kbd></span><span class=\"cxpak-inspector-value\">This help overlay</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Esc</kbd></span><span class=\"cxpak-inspector-value\">Close palette / inspector / help overlay</span></div>\n");
+    html.push_str("      </div>\n");
+    html.push_str("    </div>\n");
+    html.push_str("  </div>\n\n");
 
-    // JSON data blobs — each escaped to prevent </script> injection.
-    html.push_str("  <script id=\"cxpak-dashboard-data\" type=\"application/json\">");
+    // JSON data blobs — tag IDs match the names each per-view renderer in render.rs
+    // expects (dashboard_js → `cxpak-dashboard`, architecture_js → `cxpak-explorer`,
+    // risk_js → `cxpak-heatmap`, etc.) so the shared renderers work unchanged.
+    html.push_str("  <script id=\"cxpak-dashboard\" type=\"application/json\">");
     html.push_str(&dashboard_json);
     html.push_str("</script>\n");
 
-    html.push_str("  <script id=\"cxpak-architecture-data\" type=\"application/json\">");
+    html.push_str("  <script id=\"cxpak-explorer\" type=\"application/json\">");
     html.push_str(&arch_json);
     html.push_str("</script>\n");
 
-    html.push_str("  <script id=\"cxpak-risk-data\" type=\"application/json\">");
+    html.push_str("  <script id=\"cxpak-heatmap\" type=\"application/json\">");
     html.push_str(&risk_json);
     html.push_str("</script>\n");
 
-    html.push_str("  <script id=\"cxpak-timeline-data\" type=\"application/json\">");
+    html.push_str("  <script id=\"cxpak-timeline\" type=\"application/json\">");
     html.push_str(&timeline_json);
     html.push_str("</script>\n");
 
-    html.push_str("  <script id=\"cxpak-flow-data\" type=\"application/json\">");
+    html.push_str("  <script id=\"cxpak-flow\" type=\"application/json\">");
     html.push_str(&flow_json);
     html.push_str("</script>\n");
 
-    html.push_str("  <script id=\"cxpak-diff-data\" type=\"application/json\">");
+    html.push_str("  <script id=\"cxpak-diff\" type=\"application/json\">");
     html.push_str(&diff_json);
     html.push_str("</script>\n");
 
@@ -209,9 +225,52 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str(D3_BUNDLE);
     html.push_str("</script>\n");
 
+    // Shared renderer helpers (CX.svgCanvas, CX.tooltip, graph renderer, etc.).
+    // common_js is defensive about missing cxpak-data/cxpak-meta tags.
+    html.push_str("  <script>");
+    html.push_str(render::common_js());
+    // SPA provides its own header; suppress the one common_js offers.
+    html.push_str("\nCX.header = function() {};\n");
+    html.push_str("</script>\n");
+
+    // SPA controller (router, palette, inspector, theme, keyboard, freshness).
+    // Runs AFTER common_js so `var CX = window.CX || {}` inherits layout/meta/app
+    // helpers defined by common_js.
     html.push_str("  <script>");
     html.push_str(SPA_CONTROLLER);
     html.push_str("</script>\n");
+
+    // Per-view renderers, each wrapped in a deferred CX.init.{view} function so it
+    // only runs when the router navigates to that view. Before running, CX.app is
+    // repointed to the view's section so the renderer's appendChild calls land in
+    // the correct container. Idempotency is ensured by CX._initialized[view].
+    html.push_str("  <script>\n");
+    html.push_str("CX.init = CX.init || {};\n");
+    html.push_str("CX._initialized = {};\n");
+    html.push_str("function _cxpakRunView(viewName, rendererCode) {\n");
+    html.push_str("  if (CX._initialized[viewName]) return;\n");
+    html.push_str("  CX._initialized[viewName] = true;\n");
+    html.push_str("  var section = document.getElementById('view-' + viewName);\n");
+    html.push_str("  if (!section) return;\n");
+    html.push_str("  CX.app = section;\n");
+    html.push_str("  try { rendererCode(); } catch (e) { console.error('view ' + viewName + ' render failed', e); }\n");
+    html.push_str("}\n");
+    html.push_str("</script>\n");
+
+    for (key, js) in [
+        ("dashboard", render::dashboard_js()),
+        ("architecture", render::architecture_js()),
+        ("risk", render::risk_js()),
+        ("flow", render::flow_js()),
+        ("timeline", render::timeline_js()),
+        ("diff", render::diff_js()),
+    ] {
+        html.push_str(&format!(
+            "  <script>\nCX.init['{key}'] = function() {{ _cxpakRunView('{key}', function() {{\n"
+        ));
+        html.push_str(js);
+        html.push_str("\n}); };\n</script>\n");
+    }
 
     html.push_str("</body>\n");
     html.push_str("</html>\n");

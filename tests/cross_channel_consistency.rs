@@ -116,7 +116,7 @@ async fn health_consistency_spa_v1_mcp_lsp() {
 
     // SPA — dashboard JSON embeds the full HealthQuadrant.
     let spa_html = cxpak::visual::spa::render_spa(&idx, &fixture_metadata()).unwrap();
-    let spa_dashboard = extract_json_tag(&spa_html, "cxpak-dashboard-data");
+    let spa_dashboard = extract_json_tag(&spa_html, "cxpak-dashboard");
     let spa_composite = spa_dashboard["health"]["composite"].as_f64().unwrap();
     assert_eq!(
         spa_composite.to_bits(),
@@ -157,7 +157,7 @@ async fn risk_consistency_spa_v1_mcp() {
 
     // SPA top_risks is first-5 of expected
     let spa_html = cxpak::visual::spa::render_spa(&idx, &fixture_metadata()).unwrap();
-    let spa_dashboard = extract_json_tag(&spa_html, "cxpak-dashboard-data");
+    let spa_dashboard = extract_json_tag(&spa_html, "cxpak-dashboard");
     let spa_top = spa_dashboard["risks"]["top_risks"].as_array().unwrap();
     for (i, entry) in spa_top.iter().enumerate() {
         let real = &expected[i];
@@ -192,7 +192,7 @@ async fn architecture_consistency_spa_v1() {
     let expected = cxpak::intelligence::architecture::build_architecture_map(&idx, 2);
 
     let spa_html = cxpak::visual::spa::render_spa(&idx, &fixture_metadata()).unwrap();
-    let spa_arch = extract_json_tag(&spa_html, "cxpak-architecture-data");
+    let spa_arch = extract_json_tag(&spa_html, "cxpak-explorer");
     let spa_nodes = spa_arch["level1"]["nodes"].as_array().unwrap();
     let spa_prefixes: std::collections::BTreeSet<&str> =
         spa_nodes.iter().filter_map(|n| n["id"].as_str()).collect();

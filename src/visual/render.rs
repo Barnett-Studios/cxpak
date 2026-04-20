@@ -47,9 +47,9 @@ fn visual_type_name(vt: &super::VisualType) -> &'static str {
 /// Returned as a string that is prepended to each view-specific controller.
 pub(crate) fn common_js() -> &'static str {
     r#"
-var CX = {};
-CX.layout = JSON.parse(document.getElementById('cxpak-data').textContent);
-CX.meta = JSON.parse(document.getElementById('cxpak-meta').textContent);
+var CX = (typeof window !== 'undefined' ? (window.CX = window.CX || {}) : {});
+(function(){ var d = document.getElementById('cxpak-data'); CX.layout = d ? JSON.parse(d.textContent) : null; })();
+(function(){ var d = document.getElementById('cxpak-meta'); CX.meta = d ? JSON.parse(d.textContent) : {}; })();
 CX.app = document.getElementById('cxpak-app');
 
 CX.esc = function(s) { var d = document.createElement('span'); d.textContent = s; return d.innerHTML; };
@@ -251,7 +251,7 @@ pub(crate) fn view_controller_js(visual_type: &super::VisualType) -> String {
 
 /// Dashboard view: 4-quadrant grid with health gauge, risk table,
 /// architecture mini-map, and alerts list.
-fn dashboard_js() -> &'static str {
+pub(crate) fn dashboard_js() -> &'static str {
     r#"
 CX.header();
 var dash = JSON.parse(document.getElementById('cxpak-dashboard').textContent);
@@ -389,7 +389,7 @@ grid.appendChild(q4);
 }
 
 /// Architecture Explorer: 3-level click-to-zoom with breadcrumb navigation.
-fn architecture_js() -> &'static str {
+pub(crate) fn architecture_js() -> &'static str {
     r#"
 CX.header();
 var exp = JSON.parse(document.getElementById('cxpak-explorer').textContent);
@@ -485,7 +485,7 @@ wrap.appendChild(leg);
 }
 
 /// Risk Heatmap: D3 treemap with risk-score coloring and tooltips.
-fn risk_js() -> &'static str {
+pub(crate) fn risk_js() -> &'static str {
     r#"
 CX.header();
 var hm = JSON.parse(document.getElementById('cxpak-heatmap').textContent);
@@ -560,7 +560,7 @@ wrap.appendChild(leg);
 
 /// Flow Diagram: horizontal graph with cross-language dividers and
 /// confidence badge.
-fn flow_js() -> &'static str {
+pub(crate) fn flow_js() -> &'static str {
     r#"
 CX.header();
 var fl = JSON.parse(document.getElementById('cxpak-flow').textContent);
@@ -627,7 +627,7 @@ wrap.appendChild(flowLeg);
 }
 
 /// Timeline view: health sparkline, commit dots, and per-step graph.
-fn timeline_js() -> &'static str {
+pub(crate) fn timeline_js() -> &'static str {
     r#"
 CX.header();
 var tl = JSON.parse(document.getElementById('cxpak-timeline').textContent);
@@ -1014,7 +1014,7 @@ updatePlayButton();
 }
 
 /// Diff view: side-by-side before/after with highlighted changes.
-fn diff_js() -> &'static str {
+pub(crate) fn diff_js() -> &'static str {
     r#"
 CX.header();
 var df = JSON.parse(document.getElementById('cxpak-diff').textContent);

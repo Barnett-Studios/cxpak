@@ -76,7 +76,7 @@ fn health_gauge_renders_zero_composite() {
     let data = cxpak::visual::render::build_dashboard_data(&idx);
     assert!(data.health.composite.is_finite());
     let spa_html = cxpak::visual::spa::render_spa(&idx, &fixture_metadata()).unwrap();
-    let tag = r#"id="cxpak-dashboard-data" type="application/json">"#;
+    let tag = r#"id="cxpak-dashboard" type="application/json">"#;
     let start = spa_html.find(tag).unwrap() + tag.len();
     let end = spa_html[start..].find("</script>").unwrap() + start;
     let json: serde_json::Value = serde_json::from_str(&spa_html[start..end]).unwrap();

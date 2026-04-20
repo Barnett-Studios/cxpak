@@ -7,7 +7,7 @@
   // =============================================================================
   // 1) BOOTSTRAP
   // =============================================================================
-  var CX = window.CX = {};
+  var CX = window.CX = window.CX || {};
   CX.state = {
     view: 'dashboard',
     focus: null, module: null, file: null, symbol: null, files: null,
@@ -22,13 +22,26 @@
   try { localStorage.getItem('cxpak-theme'); } catch (e) { CX.state.localStorageAvailable = false; }
 
   CX.data = {};
-  ['dashboard','architecture','risk','timeline','flow','diff','meta','search-index'].forEach(function(name) {
-    var el = document.getElementById('cxpak-' + name + '-data');
-    if (!el) { throw new Error('missing data tag: cxpak-' + name + '-data'); }
+  // Data tags use per-renderer legacy names (cxpak-dashboard, cxpak-explorer, etc.)
+  // so the shared view renderers from src/visual/render.rs work unchanged in SPA mode.
+  var TAG_MAP = {
+    dashboard: 'cxpak-dashboard',
+    architecture: 'cxpak-explorer',
+    risk: 'cxpak-heatmap',
+    timeline: 'cxpak-timeline',
+    flow: 'cxpak-flow',
+    diff: 'cxpak-diff',
+    meta: 'cxpak-meta',
+    'search-index': 'cxpak-search-index',
+  };
+  Object.keys(TAG_MAP).forEach(function(name) {
+    var tagId = TAG_MAP[name];
+    var el = document.getElementById(tagId);
+    if (!el) { throw new Error('missing data tag: ' + tagId); }
     try {
       CX.data[name] = JSON.parse(el.textContent);
     } catch (e) {
-      console.error('failed to parse cxpak-' + name + '-data', e);
+      console.error('failed to parse ' + tagId, e);
       CX.data[name] = null;
     }
   });
@@ -313,6 +326,31 @@
     applyTheme(next);
     writeTheme(next);
   };
+
+  // Wire the theme-toggle button click. Runs at script load since the button
+  // lives in the header which is rendered before this script executes.
+  (function() {
+    var btn = document.querySelector('.cxpak-theme-toggle');
+    if (btn) btn.addEventListener('click', CX.toggleTheme);
+  })();
+
+  // Wire the inspector close button (first one — the actual inspector aside).
+  (function() {
+    var btn = document.querySelector('#cxpak-inspector .cxpak-inspector-close');
+    if (btn) btn.addEventListener('click', closeInspector);
+  })();
+
+  // Wire the help-overlay close button. Clicking on the backdrop also closes it.
+  (function() {
+    var closeHelp = function() {
+      var ho = document.getElementById('cxpak-help-overlay');
+      if (ho) { ho.setAttribute('hidden', ''); CX.state.helpOverlayOpen = false; }
+    };
+    var btn = document.querySelector('#cxpak-help-overlay .cxpak-inspector-close');
+    if (btn) btn.addEventListener('click', closeHelp);
+    var overlay = document.getElementById('cxpak-help-overlay');
+    if (overlay) overlay.addEventListener('click', function(ev) { if (ev.target === overlay) closeHelp(); });
+  })();
 
   // =============================================================================
   // 6) KEYBOARD + A11Y + FRESHNESS
