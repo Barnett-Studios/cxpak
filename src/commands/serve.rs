@@ -480,6 +480,19 @@ pub fn normalize_symbol_param(value: &str) -> Result<String, (StatusCode, Json<V
     Ok(value.to_string())
 }
 
+pub fn validate_visual_type_slug(s: &str) -> Result<&'static str, String> {
+    match s {
+        "dashboard" => Ok("dashboard"),
+        "architecture" => Ok("architecture"),
+        "risk" => Ok("risk"),
+        "flow" => Ok("flow"),
+        "timeline" => Ok("timeline"),
+        "diff" => Ok("diff"),
+        "all" => Ok("all"),
+        _ => Err(format!("invalid_type: {s}")),
+    }
+}
+
 async fn v1_health_handler(State(index): State<SharedIndex>) -> Result<Json<Value>, StatusCode> {
     let idx = index
         .read()
@@ -3337,15 +3350,30 @@ fn handle_tool_call(
 
                 const MCP_INLINE_LIMIT: usize = 1_048_576; // 1 MB
                 if format == "html" && content.len() > MCP_INLINE_LIMIT {
+                    let validated_slug = match validate_visual_type_slug(visual_type) {
+                        Ok(s) => s,
+                        Err(e) => return mcp_tool_result(id, &format!("Error: {e}")),
+                    };
                     let visual_dir = repo_path.join(".cxpak/visual");
-                    let _ = std::fs::create_dir_all(&visual_dir);
-                    let output_path = visual_dir.join(format!("cxpak-{visual_type}.html"));
-                    match std::fs::write(&output_path, &content) {
+                    std::fs::create_dir_all(&visual_dir).ok();
+                    let filepath = visual_dir.join(format!("cxpak-{validated_slug}.html"));
+                    let canon_dir = match visual_dir.canonicalize() {
+                        Ok(d) => d,
+                        Err(e) => return mcp_tool_result(id, &format!("canonicalize failed: {e}")),
+                    };
+                    let canon_file = match filepath.parent().unwrap().canonicalize() {
+                        Ok(p) => p,
+                        Err(e) => return mcp_tool_result(id, &format!("canonicalize failed: {e}")),
+                    };
+                    if !canon_file.starts_with(&canon_dir) {
+                        return mcp_tool_result(id, "Error: path escape detected");
+                    }
+                    match std::fs::write(&filepath, &content) {
                         Ok(()) => mcp_tool_result(
                             id,
                             &format!(
                                 "Output written to {} ({} bytes)",
-                                output_path.display(),
+                                filepath.display(),
                                 content.len()
                             ),
                         ),
