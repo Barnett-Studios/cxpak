@@ -936,6 +936,21 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
 }
 .cxpak-theme-toggle:hover { background: var(--bg-card-hover); color: var(--text-primary); }
 
+/* ── Empty State (SPA views that require CLI parameters) ───────── */
+.cxpak-empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 50vh;
+  padding: 40px;
+  font-size: 14px;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', 'Menlo', monospace;
+  text-align: center;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
 /* ── Data Freshness Badge ──────────────────────────────────────── */
 .cxpak-freshness { font-size: 11px; padding: 2px 8px; border-radius: 8px; font-weight: 500; }
 .cxpak-freshness.fresh { color: var(--text-dim); }

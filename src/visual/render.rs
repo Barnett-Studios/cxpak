@@ -181,7 +181,10 @@ CX.renderGraph = function(root, data, opts) {
 
   var ng = root.append('g').attr('class','cxpak-nodes').selectAll('g').data(nodes).join('g')
     .attr('class', opts.nodeClass || CX.nodeClass)
-    .attr('transform', function(d) { return 'translate(' + d.position.x + ',' + d.position.y + ')'; });
+    .attr('transform', function(d) { return 'translate(' + d.position.x + ',' + d.position.y + ')'; })
+    .attr('tabindex', 0)
+    .attr('role', 'button')
+    .attr('aria-label', function(d) { return d.aria_label || d.label || d.id || ''; });
 
   ng.append('rect')
     .attr('width', function(d) { return d.width; })
@@ -527,6 +530,30 @@ groups.filter(function(d) { return d.children && d.depth === 1; }).append('text'
   .text(function(d) { return d.data.label; });
 
 groups.filter(function(d) { return !d.children; })
+  .attr('tabindex', 0)
+  .attr('role', 'button')
+  .attr('aria-label', function(d) { var t = d.data.tooltip || {}; return (t.path || d.data.label || '') + ', risk ' + (d.data.severity || 'unknown') + ', score ' + d.data.risk_score.toFixed(2); })
+  .on('click', function(ev, d) {
+    if (typeof window.CX !== 'undefined' && typeof window.CX.openInspector === 'function') {
+      var t = d.data.tooltip || {};
+      window.CX.openInspector({
+        id: d.data.id,
+        label: t.path || d.data.label,
+        metadata: { risk_score: d.data.risk_score, token_count: 0, pagerank: null }
+      });
+    }
+  })
+  .on('keydown', function(ev, d) {
+    if ((ev.key === 'Enter' || ev.key === ' ') && typeof window.CX !== 'undefined' && typeof window.CX.openInspector === 'function') {
+      ev.preventDefault();
+      var t = d.data.tooltip || {};
+      window.CX.openInspector({
+        id: d.data.id,
+        label: t.path || d.data.label,
+        metadata: { risk_score: d.data.risk_score, token_count: 0, pagerank: null }
+      });
+    }
+  })
   .on('mouseover', function(ev, d) {
     var t = d.data.tooltip || {};
     var sev = d.data.severity || 'low';

@@ -334,6 +334,45 @@
     if (btn) btn.addEventListener('click', CX.toggleTheme);
   })();
 
+  // Delegated node-click handler: opens the inspector for any `g.cxpak-node`
+  // click inside a view section. Coexists with view-specific click handlers
+  // (architecture drill-down, etc.) — this listener runs at the document
+  // level in the bubble phase after view handlers. Node datum is pulled from
+  // D3's `__data__` property bound via .data().
+  document.addEventListener('click', function(ev) {
+    var t = ev.target;
+    // Walk up to find a g.cxpak-node ancestor (clicks often land on child rect/text).
+    while (t && t !== document.body) {
+      if (t.tagName === 'g' && t.classList && t.classList.contains('cxpak-node')) {
+        var datum = t.__data__;
+        if (datum && typeof datum === 'object' && (datum.id || datum.label)) {
+          CX.openInspector(datum);
+        }
+        return;
+      }
+      t = t.parentNode;
+    }
+  });
+
+  // Delegated keyboard activation for node focus: Enter/Space opens the
+  // inspector without a mouse (matches spec § 1.9 a11y requirement).
+  document.addEventListener('keydown', function(ev) {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    var t = document.activeElement;
+    if (!t) return;
+    while (t && t !== document.body) {
+      if (t.tagName === 'g' && t.classList && t.classList.contains('cxpak-node')) {
+        var datum = t.__data__;
+        if (datum && typeof datum === 'object') {
+          ev.preventDefault();
+          CX.openInspector(datum);
+        }
+        return;
+      }
+      t = t.parentNode;
+    }
+  });
+
   // Wire the inspector close button (first one — the actual inspector aside).
   (function() {
     var btn = document.querySelector('#cxpak-inspector .cxpak-inspector-close');

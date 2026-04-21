@@ -136,7 +136,7 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
         "        <a class=\"cxpak-nav-link\" data-view=\"diff\" href=\"#diff\">Diff</a>\n",
     );
     html.push_str("      </nav>\n");
-    html.push_str("      <button class=\"cxpak-theme-toggle\" aria-label=\"Switch to light mode\">\u{263a}</button>\n");
+    html.push_str("      <button class=\"cxpak-theme-toggle\" aria-label=\"Switch to light mode\">\u{2600}</button>\n");
     html.push_str("      <span class=\"cxpak-freshness\"></span>\n");
     html.push_str("    </header>\n");
     html.push_str("    <main id=\"cxpak-main\">\n");
@@ -253,6 +253,23 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("  var section = document.getElementById('view-' + viewName);\n");
     html.push_str("  if (!section) return;\n");
     html.push_str("  CX.app = section;\n");
+    // Views whose primary data blob is null require CLI parameters; show an
+    // explanatory empty state rather than silently failing in the renderer.
+    html.push_str(
+        "  var DATA_KEY = { flow: 'flow', timeline: 'timeline', diff: 'diff' }[viewName];\n",
+    );
+    html.push_str("  var HINT = {\n");
+    html.push_str("    flow: 'Flow view requires a symbol. Run: cxpak visual --visual-type flow --symbol <name>',\n");
+    html.push_str("    timeline: 'Timeline view requires cached git snapshots. Run: cxpak visual --visual-type timeline',\n");
+    html.push_str("    diff: 'Diff view requires two git refs. Run: cxpak visual --visual-type diff --files <files>',\n");
+    html.push_str("  }[viewName];\n");
+    html.push_str("  if (DATA_KEY && CX.data[DATA_KEY] === null) {\n");
+    html.push_str("    var msg = document.createElement('div');\n");
+    html.push_str("    msg.className = 'cxpak-empty-state';\n");
+    html.push_str("    msg.textContent = HINT;\n");
+    html.push_str("    section.appendChild(msg);\n");
+    html.push_str("    return;\n");
+    html.push_str("  }\n");
     html.push_str("  try { rendererCode(); } catch (e) { console.error('view ' + viewName + ' render failed', e); }\n");
     html.push_str("}\n");
     html.push_str("</script>\n");
