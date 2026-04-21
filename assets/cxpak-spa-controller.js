@@ -334,6 +334,22 @@
     if (btn) btn.addEventListener('click', CX.toggleTheme);
   })();
 
+  // Catch renderer-generated links to standalone view files (e.g. cxpak-architecture.html)
+  // and redirect them through the SPA router. Defense-in-depth — Fix 1 handles the main
+  // path (dashboard_js:navTo), this catches anything we missed.
+  document.addEventListener('click', function(ev) {
+    var a = ev.target;
+    while (a && a.tagName !== 'A' && a !== document.body) a = a.parentElement;
+    if (!a || a.tagName !== 'A') return;
+    var href = a.getAttribute('href') || '';
+    var m = href.match(/(?:^|\/)[^\/]*?-(dashboard|architecture|risk|flow|timeline|diff)\.html?(?:$|[#?])/);
+    if (m) {
+      ev.preventDefault();
+      CX.pushHash('#' + m[1]);
+      CX.navigate();
+    }
+  });
+
   // Delegated node-click handler: opens the inspector for any `g.cxpak-node`
   // click inside a view section. Coexists with view-specific click handlers
   // (architecture drill-down, etc.) — this listener runs at the document

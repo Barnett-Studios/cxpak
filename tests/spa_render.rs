@@ -153,6 +153,26 @@ fn injection_safe_for_malicious_filename() {
 }
 
 #[test]
+fn spa_inlines_empty_favicon_to_suppress_404() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    assert!(
+        html.contains(r#"<link rel="icon" href="data:,">"#),
+        "SPA must inline empty favicon to suppress console 404"
+    );
+}
+
+#[test]
+fn spa_dashboard_nav_is_spa_aware() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    // The navTo function must detect SPA mode before falling back to filename-based nav.
+    // Grep the inlined dashboard_js for the SPA-mode guard.
+    assert!(
+        html.contains("CX.pushHash") && html.contains("window.CX.navigate"),
+        "dashboard_js navTo must check for CX.pushHash/CX.navigate before using filename navigation"
+    );
+}
+
+#[test]
 fn repo_name_is_html_escaped_in_title_and_span() {
     let counter = TokenCounter::new();
     let files = vec![ScannedFile {

@@ -108,6 +108,7 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("<html lang=\"en\" data-theme=\"dark\">\n");
     html.push_str("<head>\n");
     html.push_str("  <meta charset=\"utf-8\">\n");
+    html.push_str("  <link rel=\"icon\" href=\"data:,\">\n");
     html.push_str("  <title>cxpak \u{2014} ");
     html.push_str(&repo);
     html.push_str("</title>\n");

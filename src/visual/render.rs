@@ -263,6 +263,13 @@ var dash = JSON.parse(document.getElementById('cxpak-dashboard').textContent);
    links work regardless of the hosting filename convention (cxpak-dashboard.html,
    dashboard.html, etc.). */
 function navTo(view) {
+  // SPA mode: use the in-page router.
+  if (window.CX && typeof window.CX.pushHash === 'function' && typeof window.CX.navigate === 'function') {
+    window.CX.pushHash('#' + view);
+    window.CX.navigate();
+    return;
+  }
+  // Standalone mode: navigate to a sibling HTML file, preserving the filename prefix.
   var curPath = window.location.pathname.split('/').pop() || '';
   var m = curPath.match(/^(.+?)(dashboard|architecture|risk|diff|flow|timeline)(\.html?)$/i);
   var prefix = m ? m[1] : 'cxpak-';
