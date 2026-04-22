@@ -492,50 +492,61 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
                         // does not resolve dynamic / generic dispatch, so without this
                         // check every `impl Trait for X` method would be flagged dead.
                         true
-                    } else if let Some(ty) = inherent_type {
-                        // Inherent impl method: search other files for `Type::method`.
-                        // This catches function-pointer references like
-                        // `CxpakLspBackend::custom_health` that the call graph misses
-                        // because the symbol is passed as a value, not invoked.
-                        let pat = format!("{ty}::{}", symbol.name);
-                        index.files.iter().any(|f| {
-                            f.relative_path != file.relative_path && f.content.contains(&pat)
-                        })
                     } else {
-                        let has_callers = index
-                            .call_graph
-                            .has_callers(&file.relative_path, &symbol.name);
-                        if has_callers {
+                        // Inherent-impl Type::method cross-file reference is ADDITIVE
+                        // evidence of liveness. If absent, fall through to call graph
+                        // and same-file/qualified-ref fallbacks (the method may still
+                        // be alive via `Self::method` calls in the same file or via a
+                        // call-graph-tracked invocation).
+                        let inherent_type_ref = inherent_type
+                            .as_ref()
+                            .map(|ty| {
+                                let pat = format!("{ty}::{}", symbol.name);
+                                index.files.iter().any(|f| {
+                                    f.relative_path != file.relative_path
+                                        && f.content.contains(&pat)
+                                })
+                            })
+                            .unwrap_or(false);
+                        if inherent_type_ref {
                             true
                         } else {
-                            let is_public = symbol.visibility == Visibility::Public;
-                            let is_ep = is_entry_point(
-                                &file.relative_path,
-                                &symbol.name,
-                                &symbol.signature,
-                                is_public,
-                                &route_cache,
-                            );
-                            let is_test_ref = {
-                                let key = (file.relative_path.clone(), symbol.name.clone());
-                                test_referenced.contains(&key)
-                            };
-                            // Fallback 1: the call graph tracks cross-file edges but may miss
-                            // intra-file calls (private helpers called from within the same
-                            // file). Check whether the name appears more than once in the
-                            // file's content using word-boundary matching. If so, the symbol
-                            // is referenced locally and is alive.
-                            let is_same_file_ref =
-                                same_file_string_reference(&symbol.name, &file.content);
-                            // Fallback 2: qualified-name match across other files. Catches
-                            // calls like `commands::overview::run(args)` that the call graph
-                            // didn't resolve to the concrete symbol.
-                            let is_qualified_ref = has_qualified_reference(
-                                &file.relative_path,
-                                &symbol.name,
-                                &index.files,
-                            );
-                            is_ep || is_test_ref || is_same_file_ref || is_qualified_ref
+                            let has_callers = index
+                                .call_graph
+                                .has_callers(&file.relative_path, &symbol.name);
+                            if has_callers {
+                                true
+                            } else {
+                                let is_public = symbol.visibility == Visibility::Public;
+                                let is_ep = is_entry_point(
+                                    &file.relative_path,
+                                    &symbol.name,
+                                    &symbol.signature,
+                                    is_public,
+                                    &route_cache,
+                                );
+                                let is_test_ref = {
+                                    let key = (file.relative_path.clone(), symbol.name.clone());
+                                    test_referenced.contains(&key)
+                                };
+                                // Fallback 1: the call graph tracks cross-file edges but may
+                                // miss intra-file calls (private helpers called from within
+                                // the same file, or `Self::method` calls in inherent impls).
+                                // Check whether the name appears more than once in the file's
+                                // content using word-boundary matching. If so, the symbol is
+                                // referenced locally and is alive.
+                                let is_same_file_ref =
+                                    same_file_string_reference(&symbol.name, &file.content);
+                                // Fallback 2: qualified-name match across other files. Catches
+                                // calls like `commands::overview::run(args)` that the call
+                                // graph didn't resolve to the concrete symbol.
+                                let is_qualified_ref = has_qualified_reference(
+                                    &file.relative_path,
+                                    &symbol.name,
+                                    &index.files,
+                                );
+                                is_ep || is_test_ref || is_same_file_ref || is_qualified_ref
+                            }
                         }
                     }
                 }
