@@ -13,10 +13,13 @@ pub struct RiskEntry {
 
 /// Compute standing risk per file, sorted descending by risk_score.
 ///
-/// Formula: risk = max(norm_churn, 0.01) × max(norm_blast, 0.01) × max(1.0 - test_coverage, 0.01)
+/// Formula: risk = max(norm_churn, 0.01) × norm_blast × max(1.0 - test_coverage, 0.01)
 ///
 /// - norm_churn: percentile rank across all files (robust against outliers)
-/// - norm_blast: blast_radius_count / total_files
+/// - norm_blast: blast_radius_count / total_files (NO floor — files with no
+///   dependents are architecturally isolated and contribute 0 risk from the
+///   blast dimension; this keeps README / Cargo.toml / CSS / etc. out of
+///   top_risks when they have no reverse-edges).
 /// - test_coverage: 1.0 if has_test, 0.0 otherwise (binary in v1.2.0)
 ///
 /// # Distinction from `blast_radius::compute_blast_impact`
@@ -96,7 +99,7 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
             let test_coverage = if has_test { 1.0 } else { 0.0 };
 
             let nc = norm_churn[i].max(0.01_f64);
-            let nb = norm_blast.max(0.01_f64);
+            let nb = norm_blast;
             let tc_term = (1.0_f64 - test_coverage).max(0.01_f64);
 
             let risk_score = nc * nb * tc_term;
@@ -129,24 +132,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_risk_floor_prevents_zero() {
-        // A file with 0 churn, 0 blast, no test -> floor kicks in: 0.01^3 = 0.000001
-        // A file with 0 churn, 0 blast, HAS test -> floor on nc and nb, (1-1.0) uses floor:
-        // 0.01 * 0.01 * 0.01 = 0.000001
-        let floor_val: f64 = 0.01_f64 * 0.01 * 0.01;
-        // Verify the floor formula produces a positive minimum
-        assert!(floor_val > 0.0);
-        assert!((floor_val - 0.000001).abs() < 1e-15);
+    fn test_files_with_zero_blast_have_zero_risk() {
+        // A file with 0 dependents is architecturally isolated and contributes
+        // 0 risk from the blast dimension. The churn and test-coverage floors
+        // ensure other dimensions stay positive, but the product collapses to 0
+        // whenever blast is 0.
+        let churn_only: f64 = 1.0_f64.max(0.01) * 0.0_f64 * 1.0_f64.max(0.01);
+        assert_eq!(churn_only, 0.0);
     }
 
     #[test]
     fn test_risk_range_is_valid() {
         // max possible: 1.0 * 1.0 * 1.0 = 1.0 (no test, max churn percentile, all files depend)
-        // min possible: 0.01^3 = 0.000001
-        let max: f64 = 1.0_f64.max(0.01) * 1.0_f64.max(0.01) * 1.0_f64.max(0.01);
-        let min: f64 = 0.01_f64.max(0.01) * 0.01_f64.max(0.01) * 0.01_f64.max(0.01);
+        // min possible: 0.01 * 0.0 * 0.01 = 0.0 (isolated file, any churn, any coverage)
+        let max: f64 = 1.0_f64.max(0.01) * 1.0_f64 * 1.0_f64.max(0.01);
+        let min: f64 = 0.01_f64.max(0.01) * 0.0_f64 * 0.01_f64.max(0.01);
         assert!((max - 1.0).abs() < 1e-9);
-        assert!((min - 0.000001).abs() < 1e-12);
+        assert_eq!(min, 0.0);
     }
 
     #[test]

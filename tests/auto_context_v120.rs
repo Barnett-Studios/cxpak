@@ -64,9 +64,12 @@ fn test_v120_auto_context_result_has_all_fields() {
     // Risks: capped at 10
     assert!(result.risks.len() <= 10);
     for risk in &result.risks {
+        // v2.1.0: files with 0 dependents (no architectural reach) score 0
+        // — the blast floor was removed so README/CSS/Cargo.toml-style files
+        // don't pollute top_risks. So 0.0 is now a valid score.
         assert!(
-            risk.risk_score > 0.0,
-            "risk score must be positive for {}",
+            risk.risk_score >= 0.0,
+            "risk score must be non-negative for {}",
             risk.path
         );
         assert!(
