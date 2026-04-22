@@ -988,7 +988,7 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
       <section id="view-timeline" class="cxpak-view" hidden></section>
       <section id="view-diff" class="cxpak-view" hidden></section>
     </main>
-    <aside id="cxpak-inspector" class="cxpak-inspector" hidden>
+    <aside id="cxpak-inspector" class="cxpak-inspector" role="complementary" aria-label="Node details inspector" aria-live="polite" hidden>
       <div class="cxpak-inspector-header">
         <span class="cxpak-inspector-title">Details</span>
         <button class="cxpak-inspector-close" aria-label="Close inspector">×</button>
@@ -997,7 +997,7 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
     </aside>
     <div id="cxpak-live" role="status" aria-live="polite" style="position:absolute;left:-9999px;"></div>
   </div>
-  <div id="cxpak-palette-overlay" class="cxpak-palette-overlay" hidden>
+  <div id="cxpak-palette-overlay" class="cxpak-palette-overlay" role="dialog" aria-modal="true" aria-label="Command palette" hidden>
     <div class="cxpak-palette">
       <input id="cxpak-palette-input" class="cxpak-palette-input" type="text" placeholder="Search files, symbols, views…" autocomplete="off" />
       <div id="cxpak-palette-results" class="cxpak-palette-results" role="listbox"></div>
@@ -1008,7 +1008,7 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
       </div>
     </div>
   </div>
-  <div id="cxpak-help-overlay" class="cxpak-palette-overlay" hidden>
+  <div id="cxpak-help-overlay" class="cxpak-palette-overlay" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" hidden>
     <div class="cxpak-palette">
       <div class="cxpak-inspector-header">
         <span class="cxpak-inspector-title">Keyboard shortcuts</span>
@@ -1234,6 +1234,7 @@ CX.header = function() {};
     view: 'dashboard',
     focus: null, module: null, file: null, symbol: null, files: null,
     inspector: null,
+    inspectorTrigger: null,
     prePaletteFocus: null,
     paletteOpen: false,
     helpOverlayOpen: false,
@@ -1312,6 +1313,12 @@ CX.header = function() {};
       el.setAttribute('hidden', '');
       el.classList.remove('open');
     }
+    // Return focus to the element that triggered the inspector, if still in DOM.
+    var trigger = CX.state.inspectorTrigger;
+    if (trigger && document.body.contains(trigger)) {
+      try { trigger.focus(); } catch (e) { /* ignore */ }
+    }
+    CX.state.inspectorTrigger = null;
   }
 
   function interruptView(name) {
@@ -1356,7 +1363,17 @@ CX.header = function() {};
 
     // Announce to screen readers
     var live = document.getElementById('cxpak-live');
-    if (live) live.textContent = 'Switched to ' + newView;
+    if (live) {
+      var hint = {
+        dashboard: 'Dashboard view with health, risks, and alerts',
+        architecture: 'Architecture view with module graph',
+        risk: 'Risk heatmap view',
+        flow: 'Flow diagram view',
+        timeline: 'Timeline view',
+        diff: 'Diff view',
+      }[newView] || newView;
+      live.textContent = 'Navigated to ' + hint;
+    }
 
     // Update active nav tab
     document.querySelectorAll('.cxpak-nav-link').forEach(function(a) {
@@ -1489,6 +1506,7 @@ CX.header = function() {};
   // =============================================================================
   function openInspector(node) {
     CX.state.inspector = node;
+    CX.state.inspectorTrigger = document.activeElement;
     var el = document.getElementById('cxpak-inspector');
     if (!el) return;
     el.removeAttribute('hidden');
@@ -1627,6 +1645,15 @@ CX.header = function() {};
     if (btn) btn.addEventListener('click', closeHelp);
     var overlay = document.getElementById('cxpak-help-overlay');
     if (overlay) overlay.addEventListener('click', function(ev) { if (ev.target === overlay) closeHelp(); });
+  })();
+
+  // Palette: clicking the backdrop (not the palette body) closes it.
+  (function() {
+    var overlay = document.getElementById('cxpak-palette-overlay');
+    if (!overlay) return;
+    overlay.addEventListener('click', function(ev) {
+      if (ev.target === overlay) closePalette();
+    });
   })();
 
   // =============================================================================

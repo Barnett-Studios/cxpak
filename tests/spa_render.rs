@@ -173,6 +173,38 @@ fn spa_dashboard_nav_is_spa_aware() {
 }
 
 #[test]
+fn spa_inspector_has_aria_attributes() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    assert!(
+        html.contains(r#"role="complementary""#),
+        "inspector must have role=complementary"
+    );
+    assert!(
+        html.contains(r#"aria-label="Node details inspector""#),
+        "inspector must have aria-label"
+    );
+}
+
+#[test]
+fn spa_palette_has_dialog_aria() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    // Palette and help overlay both are modal dialogs.
+    assert_eq!(
+        html.matches(r#"role="dialog""#).count(),
+        2,
+        "expected 2 role=dialog elements (palette + help)"
+    );
+    assert!(
+        html.contains(r#"aria-label="Command palette""#),
+        "palette must have aria-label"
+    );
+    assert!(
+        html.contains(r#"aria-label="Keyboard shortcuts""#),
+        "help overlay must have aria-label"
+    );
+}
+
+#[test]
 fn repo_name_is_html_escaped_in_title_and_span() {
     let counter = TokenCounter::new();
     let files = vec![ScannedFile {

@@ -12,6 +12,7 @@
     view: 'dashboard',
     focus: null, module: null, file: null, symbol: null, files: null,
     inspector: null,
+    inspectorTrigger: null,
     prePaletteFocus: null,
     paletteOpen: false,
     helpOverlayOpen: false,
@@ -90,6 +91,12 @@
       el.setAttribute('hidden', '');
       el.classList.remove('open');
     }
+    // Return focus to the element that triggered the inspector, if still in DOM.
+    var trigger = CX.state.inspectorTrigger;
+    if (trigger && document.body.contains(trigger)) {
+      try { trigger.focus(); } catch (e) { /* ignore */ }
+    }
+    CX.state.inspectorTrigger = null;
   }
 
   function interruptView(name) {
@@ -134,7 +141,17 @@
 
     // Announce to screen readers
     var live = document.getElementById('cxpak-live');
-    if (live) live.textContent = 'Switched to ' + newView;
+    if (live) {
+      var hint = {
+        dashboard: 'Dashboard view with health, risks, and alerts',
+        architecture: 'Architecture view with module graph',
+        risk: 'Risk heatmap view',
+        flow: 'Flow diagram view',
+        timeline: 'Timeline view',
+        diff: 'Diff view',
+      }[newView] || newView;
+      live.textContent = 'Navigated to ' + hint;
+    }
 
     // Update active nav tab
     document.querySelectorAll('.cxpak-nav-link').forEach(function(a) {
@@ -267,6 +284,7 @@
   // =============================================================================
   function openInspector(node) {
     CX.state.inspector = node;
+    CX.state.inspectorTrigger = document.activeElement;
     var el = document.getElementById('cxpak-inspector');
     if (!el) return;
     el.removeAttribute('hidden');
@@ -405,6 +423,15 @@
     if (btn) btn.addEventListener('click', closeHelp);
     var overlay = document.getElementById('cxpak-help-overlay');
     if (overlay) overlay.addEventListener('click', function(ev) { if (ev.target === overlay) closeHelp(); });
+  })();
+
+  // Palette: clicking the backdrop (not the palette body) closes it.
+  (function() {
+    var overlay = document.getElementById('cxpak-palette-overlay');
+    if (!overlay) return;
+    overlay.addEventListener('click', function(ev) {
+      if (ev.target === overlay) closePalette();
+    });
   })();
 
   // =============================================================================

@@ -3,3 +3,19 @@ coverage/
 .cxpak/
 references/
 tarpaulin-report.*
+
+# cxpak generated artifacts during local dev
+/cxpak-all.html
+/.playwright-mcp/
+*-e2e.png
+arch-*.png
+dashboard-*.png
+diff-*.png
+flow-*.png
+risk-*.png
+strict-*.png
+timeline-*.png
+inspector-*.png
+help-*.png
+palette-*.png
+dark-*.png

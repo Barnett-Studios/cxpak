@@ -150,7 +150,7 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("      <section id=\"view-timeline\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("      <section id=\"view-diff\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("    </main>\n");
-    html.push_str("    <aside id=\"cxpak-inspector\" class=\"cxpak-inspector\" hidden>\n");
+    html.push_str("    <aside id=\"cxpak-inspector\" class=\"cxpak-inspector\" role=\"complementary\" aria-label=\"Node details inspector\" aria-live=\"polite\" hidden>\n");
     html.push_str("      <div class=\"cxpak-inspector-header\">\n");
     html.push_str("        <span class=\"cxpak-inspector-title\">Details</span>\n");
     html.push_str("        <button class=\"cxpak-inspector-close\" aria-label=\"Close inspector\">\u{d7}</button>\n");
@@ -159,7 +159,7 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("    </aside>\n");
     html.push_str("    <div id=\"cxpak-live\" role=\"status\" aria-live=\"polite\" style=\"position:absolute;left:-9999px;\"></div>\n");
     html.push_str("  </div>\n");
-    html.push_str("  <div id=\"cxpak-palette-overlay\" class=\"cxpak-palette-overlay\" hidden>\n");
+    html.push_str("  <div id=\"cxpak-palette-overlay\" class=\"cxpak-palette-overlay\" role=\"dialog\" aria-modal=\"true\" aria-label=\"Command palette\" hidden>\n");
     html.push_str("    <div class=\"cxpak-palette\">\n");
     html.push_str("      <input id=\"cxpak-palette-input\" class=\"cxpak-palette-input\" type=\"text\" placeholder=\"Search files, symbols, views\u{2026}\" autocomplete=\"off\" />\n");
     html.push_str("      <div id=\"cxpak-palette-results\" class=\"cxpak-palette-results\" role=\"listbox\"></div>\n");
@@ -170,7 +170,7 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("      </div>\n");
     html.push_str("    </div>\n");
     html.push_str("  </div>\n");
-    html.push_str("  <div id=\"cxpak-help-overlay\" class=\"cxpak-palette-overlay\" hidden>\n");
+    html.push_str("  <div id=\"cxpak-help-overlay\" class=\"cxpak-palette-overlay\" role=\"dialog\" aria-modal=\"true\" aria-label=\"Keyboard shortcuts\" hidden>\n");
     html.push_str("    <div class=\"cxpak-palette\">\n");
     html.push_str("      <div class=\"cxpak-inspector-header\">\n");
     html.push_str("        <span class=\"cxpak-inspector-title\">Keyboard shortcuts</span>\n");
