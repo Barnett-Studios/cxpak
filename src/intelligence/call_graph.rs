@@ -68,11 +68,30 @@ impl CallGraph {
             .collect()
     }
 
-    /// Returns true if a symbol has at least one caller.
+    /// Returns true if a symbol has at least one caller — ANY confidence.
     pub fn has_callers(&self, file: &str, symbol: &str) -> bool {
         self.edges
             .iter()
             .any(|e| e.callee_file == file && e.callee_symbol == symbol)
+    }
+
+    /// Returns true only if the symbol has at least one EXACT caller — an
+    /// edge whose resolution is confirmed (either intra-file or imported
+    /// from this file via the dependency graph).
+    ///
+    /// `Approximate` edges are emitted when a call's name matches a public
+    /// symbol elsewhere but the caller does not explicitly import from the
+    /// definer. These are common-name ambiguity artifacts: a call to
+    /// `run()` in module A binds approximately to whoever exports `run`
+    /// even if A never imports that module. Dead-code detection must not
+    /// treat these as real callers, or every function named `run` / `new`
+    /// / `build` gets falsely marked alive.
+    pub fn has_exact_callers(&self, file: &str, symbol: &str) -> bool {
+        self.edges.iter().any(|e| {
+            e.callee_file == file
+                && e.callee_symbol == symbol
+                && e.confidence == CallConfidence::Exact
+        })
     }
 }
 

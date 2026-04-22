@@ -112,15 +112,77 @@ fn has_string_references(
     false
 }
 
-/// Returns true when a module-qualified reference to the symbol appears in any
-/// file other than its defining file. For `src/commands/overview.rs::run`, this
-/// searches for `overview::run` and `commands::overview::run` across all files.
+/// Returns true when the symbol is referenced via receiver syntax
+/// (`variable.method_name(`) in another file. Captures the common Rust
+/// idiom that the name-based call-graph extractor cannot resolve without
+/// type tracking.
 ///
-/// Qualification disambiguates common function names (like `run`, `new`,
-/// `build`) which would produce too many false negatives under a plain name
-/// search. The call graph should ideally catch these references via path
-/// resolution, but it misses some macro-expanded / dispatched calls; this
-/// check is the last-resort fallback before declaring a callable dead.
+/// Requires (a) the preceding char is `.` (receiver separator), (b) the
+/// following char is `(` (call), and (c) the char before `.` is a word
+/// character (so we don't match e.g. `..name(` which is range syntax).
+/// This trio together is specific enough to avoid matching namespace
+/// paths (`a::name(`), field assignments (`.name =`), or string content.
+///
+/// Short names (<3 chars) are assumed alive to avoid rampant false
+/// positives — `.as(`, `.on(` etc. are ubiquitous.
+fn has_receiver_method_reference(
+    file_path: &str,
+    symbol_name: &str,
+    all_files: &[IndexedFile],
+) -> bool {
+    if symbol_name.len() < 3 {
+        return true;
+    }
+    // The exact pattern we search for: `.{symbol_name}(`
+    let needle = format!(".{symbol_name}(");
+    let needle_bytes = needle.as_bytes();
+    let nlen = needle_bytes.len();
+    for file in all_files {
+        if file.relative_path == file_path {
+            continue;
+        }
+        let bytes = file.content.as_bytes();
+        if bytes.len() < nlen {
+            continue;
+        }
+        let mut i = 0;
+        while i + nlen <= bytes.len() {
+            if &bytes[i..i + nlen] == needle_bytes {
+                // Only exclude the range-operator form `..method(` (two dots
+                // in a row). Every other preceder — word char (`obj.method`),
+                // closing bracket (`arr[0].method`, `foo().method`), whitespace
+                // (multi-line method chain `    .method`) — is a legitimate
+                // receiver call.
+                let prev = if i > 0 { bytes[i - 1] } else { b'\n' };
+                if prev != b'.' {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Returns true when a module-qualified reference to the symbol appears in
+/// any file other than its defining file. For `src/commands/overview.rs::run`,
+/// this searches for the qualified substrings `overview::run` and
+/// `commands::overview::run` — terminated by a trailing non-identifier
+/// character so `foo::run` does NOT match `foo::run_other`.
+///
+/// Qualification with a word-boundary suffix is the minimal honest check.
+/// It catches direct call sites (`commands::overview::run(...)`), `use`
+/// imports (`use crate::commands::overview::run;`), and `pub use`
+/// re-exports (`pub use crate::commands::overview::run as boot;`) because
+/// each of those contains `overview::run` as a substring with a
+/// non-identifier character immediately after.
+///
+/// Historic note: a previous implementation added a catch-all fallback that
+/// fired on `use ` + any `::{symbol_name}` substring to "also catch re-exports".
+/// That fallback was redundant (re-exports already contain `{stem}::{name}`)
+/// AND dangerously over-broad — any file that imported anything and
+/// happened to contain `some_other_module::run` would rubber-stamp every
+/// function named `run` in the tree as alive. Removed.
 fn has_qualified_reference(file_path: &str, symbol_name: &str, all_files: &[IndexedFile]) -> bool {
     let path = std::path::Path::new(file_path);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -141,32 +203,47 @@ fn has_qualified_reference(file_path: &str, symbol_name: &str, all_files: &[Inde
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
         .unwrap_or("");
+
+    // Helper: true when `needle` appears in `content` followed immediately by
+    // a non-identifier character (end of string, punctuation, whitespace).
+    // This prevents `foo::run` from matching inside `foo::run_other`.
+    let has_bounded = |content: &str, needle: &str| -> bool {
+        let bytes = content.as_bytes();
+        let needle_bytes = needle.as_bytes();
+        let nlen = needle_bytes.len();
+        if nlen == 0 || bytes.len() < nlen {
+            return false;
+        }
+        let mut i = 0;
+        while i + nlen <= bytes.len() {
+            if &bytes[i..i + nlen] == needle_bytes {
+                let next = bytes.get(i + nlen).copied().unwrap_or(b' ');
+                // Identifier continuation chars: [A-Za-z0-9_]
+                let is_ident_char = next.is_ascii_alphanumeric() || next == b'_';
+                if !is_ident_char {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    };
+
     let one = format!("{effective_stem}::{symbol_name}");
     let two = if !parent.is_empty() && parent != effective_stem {
         format!("{parent}::{effective_stem}::{symbol_name}")
     } else {
         String::new()
     };
-    let use_pattern = "use ".to_string();
-    let re_export = format!("::{symbol_name};");
-    let bare_qualified = format!("::{symbol_name}");
     for file in all_files {
         if file.relative_path == file_path {
             continue;
         }
         let content = &file.content;
-        if content.contains(&one) {
+        if has_bounded(content, &one) {
             return true;
         }
-        if !two.is_empty() && content.contains(&two) {
-            return true;
-        }
-        // Handle re-exports / direct imports: look for `use ...::{name};` or
-        // `pub use ...::{name};` patterns. We require both `use ` AND `::{name};`
-        // to appear, on the assumption a re-export uses one of those forms.
-        if content.contains(&use_pattern)
-            && (content.contains(&re_export) || content.contains(&bare_qualified))
-        {
+        if !two.is_empty() && has_bounded(content, &two) {
             return true;
         }
     }
@@ -511,9 +588,14 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
                         if inherent_type_ref {
                             true
                         } else {
+                            // Dead-code must use Exact-only callers. Approximate
+                            // edges arise when a bare call name (e.g. `run()`)
+                            // ambiguously matches an exporter that the caller
+                            // never imports; treating those as liveness evidence
+                            // rubber-stamps every common-name function alive.
                             let has_callers = index
                                 .call_graph
-                                .has_callers(&file.relative_path, &symbol.name);
+                                .has_exact_callers(&file.relative_path, &symbol.name);
                             if has_callers {
                                 true
                             } else {
@@ -529,23 +611,30 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
                                     let key = (file.relative_path.clone(), symbol.name.clone());
                                     test_referenced.contains(&key)
                                 };
-                                // Fallback 1: the call graph tracks cross-file edges but may
-                                // miss intra-file calls (private helpers called from within
-                                // the same file, or `Self::method` calls in inherent impls).
-                                // Check whether the name appears more than once in the file's
-                                // content using word-boundary matching. If so, the symbol is
-                                // referenced locally and is alive.
                                 let is_same_file_ref =
                                     same_file_string_reference(&symbol.name, &file.content);
-                                // Fallback 2: qualified-name match across other files. Catches
-                                // calls like `commands::overview::run(args)` that the call
-                                // graph didn't resolve to the concrete symbol.
                                 let is_qualified_ref = has_qualified_reference(
                                     &file.relative_path,
                                     &symbol.name,
                                     &index.files,
                                 );
-                                is_ep || is_test_ref || is_same_file_ref || is_qualified_ref
+                                // Fallback 3: receiver-syntax method call
+                                // `x.method_name(...)`. Captures idiomatic Rust /
+                                // Python / JS method calls that the name-based
+                                // call-graph extractor cannot resolve without
+                                // type tracking. Only meaningful for Method
+                                // symbols — free functions don't have receivers.
+                                let is_receiver_ref = symbol.kind == SymbolKind::Method
+                                    && has_receiver_method_reference(
+                                        &file.relative_path,
+                                        &symbol.name,
+                                        &index.files,
+                                    );
+                                is_ep
+                                    || is_test_ref
+                                    || is_same_file_ref
+                                    || is_qualified_ref
+                                    || is_receiver_ref
                             }
                         }
                     }
