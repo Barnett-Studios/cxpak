@@ -150,7 +150,7 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("      <section id=\"view-timeline\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("      <section id=\"view-diff\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("    </main>\n");
-    html.push_str("    <aside id=\"cxpak-inspector\" class=\"cxpak-inspector\" role=\"complementary\" aria-label=\"Node details inspector\" aria-live=\"polite\" hidden>\n");
+    html.push_str("    <aside id=\"cxpak-inspector\" class=\"cxpak-inspector\" role=\"complementary\" aria-label=\"Node details inspector\" hidden>\n");
     html.push_str("      <div class=\"cxpak-inspector-header\">\n");
     html.push_str("        <span class=\"cxpak-inspector-title\">Details</span>\n");
     html.push_str("        <button class=\"cxpak-inspector-close\" aria-label=\"Close inspector\">\u{d7}</button>\n");

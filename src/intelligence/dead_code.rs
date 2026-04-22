@@ -147,11 +147,26 @@ fn has_qualified_reference(file_path: &str, symbol_name: &str, all_files: &[Inde
     } else {
         String::new()
     };
+    let use_pattern = "use ".to_string();
+    let re_export = format!("::{symbol_name};");
+    let bare_qualified = format!("::{symbol_name}");
     for file in all_files {
         if file.relative_path == file_path {
             continue;
         }
-        if file.content.contains(&one) || (!two.is_empty() && file.content.contains(&two)) {
+        let content = &file.content;
+        if content.contains(&one) {
+            return true;
+        }
+        if !two.is_empty() && content.contains(&two) {
+            return true;
+        }
+        // Handle re-exports / direct imports: look for `use ...::{name};` or
+        // `pub use ...::{name};` patterns. We require both `use ` AND `::{name};`
+        // to appear, on the assumption a re-export uses one of those forms.
+        if content.contains(&use_pattern)
+            && (content.contains(&re_export) || content.contains(&bare_qualified))
+        {
             return true;
         }
     }
@@ -213,14 +228,63 @@ fn has_serde_derive_above(content: &str, start_line: usize) -> bool {
     let lines: Vec<&str> = content.lines().collect();
     let end = start_line.saturating_sub(1);
     let start = end.saturating_sub(10);
+    // Walk forward through the window, accumulating lines that belong to a
+    // derive block (single-line or multi-line). Multi-line derives are common
+    // after rustfmt formats long attribute lists across multiple lines.
+    let mut in_derive = false;
+    let mut accumulator = String::new();
     for i in start..end {
         let Some(line) = lines.get(i) else { continue };
         let l = line.trim();
-        if l.starts_with("#[derive") && (l.contains("Deserialize") || l.contains("Serialize")) {
-            return true;
+        if l.starts_with("#[derive") {
+            in_derive = true;
+            accumulator.push_str(l);
+            accumulator.push(' ');
+            // Single-line derive that closes on same line:
+            if l.contains(")]") {
+                in_derive = false;
+            }
+        } else if in_derive {
+            accumulator.push_str(l);
+            accumulator.push(' ');
+            if l.contains(")]") {
+                in_derive = false;
+            }
         }
     }
-    false
+    accumulator.contains("Deserialize") || accumulator.contains("Serialize")
+}
+
+/// Removes content inside double-quoted strings and after `//` line comments.
+/// Preserves brace characters that appear in code so that brace-depth counting
+/// is not corrupted by literals like `"{ {{ "` or comments like `// {`.
+///
+/// Single-pass: tracks whether we are inside a string and whether we have
+/// already seen `//` on this line. Does not handle raw strings (`r#"..."#`)
+/// perfectly — those are rare in impl headers and the worst case is a
+/// false negative (returning None instead of the correct impl context).
+fn strip_strings_and_comments(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_string = false;
+    let mut prev = '\0';
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if !in_string && ch == '/' && chars.peek() == Some(&'/') {
+            // Rest of line is a comment.
+            break;
+        }
+        if ch == '"' && prev != '\\' {
+            in_string = !in_string;
+            // Don't push the quote either way; it's not a brace.
+            prev = ch;
+            continue;
+        }
+        if !in_string {
+            out.push(ch);
+        }
+        prev = ch;
+    }
+    out
 }
 
 /// Inspects the immediate-enclosing block opener for a symbol and classifies
@@ -233,6 +297,9 @@ fn has_serde_derive_above(content: &str, start_line: usize) -> bool {
 /// `{` that drops depth below zero opens the parent scope, so we inspect that
 /// line. Multi-line impl headers (e.g. with `where` clauses) are handled by
 /// only looking at the line that contains the unmatched `{`.
+///
+/// Braces inside string literals and `//` line comments are ignored via
+/// `strip_strings_and_comments` to avoid false depth counts.
 fn enclosing_impl(content: &str, start_line: usize) -> Option<(bool, Option<String>)> {
     if start_line == 0 {
         return None;
@@ -241,7 +308,8 @@ fn enclosing_impl(content: &str, start_line: usize) -> Option<(bool, Option<Stri
     let mut depth: i32 = 0;
     for i in (0..start_line.saturating_sub(1)).rev() {
         let Some(line) = lines.get(i) else { continue };
-        for ch in line.chars().rev() {
+        let cleaned = strip_strings_and_comments(line);
+        for ch in cleaned.chars().rev() {
             if ch == '}' {
                 depth += 1;
             } else if ch == '{' {
@@ -403,66 +471,72 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
                 // them alive before consulting the graph.
                 if has_test_attribute_above(&file.content, symbol.start_line) {
                     true
-                } else if symbol.kind == SymbolKind::Method
-                    && enclosing_impl(&file.content, symbol.start_line)
-                        .map(|(is_trait, _)| is_trait)
-                        .unwrap_or(false)
-                {
-                    // Trait-impl methods are dispatched at runtime; the call graph
-                    // does not resolve dynamic / generic dispatch, so without this
-                    // check every `impl Trait for X` method would be flagged dead.
-                    true
-                } else if symbol.kind == SymbolKind::Method
-                    && enclosing_impl(&file.content, symbol.start_line)
-                        .and_then(|(_, ty)| ty)
-                        .map(|ty| {
-                            // Inherent impl method: search other files for `Type::method`.
-                            // This catches function-pointer references like
-                            // `CxpakLspBackend::custom_health` that the call graph misses
-                            // because the symbol is passed as a value, not invoked.
-                            let pat = format!("{ty}::{}", symbol.name);
-                            index.files.iter().any(|f| {
-                                f.relative_path != file.relative_path && f.content.contains(&pat)
-                            })
-                        })
-                        .unwrap_or(false)
-                {
-                    true
                 } else {
-                    let has_callers = index
-                        .call_graph
-                        .has_callers(&file.relative_path, &symbol.name);
-                    if has_callers {
-                        true
+                    // Compute enclosing impl context once for Method symbols.
+                    let impl_ctx = if symbol.kind == SymbolKind::Method {
+                        enclosing_impl(&file.content, symbol.start_line)
                     } else {
-                        let is_public = symbol.visibility == Visibility::Public;
-                        let is_ep = is_entry_point(
-                            &file.relative_path,
-                            &symbol.name,
-                            &symbol.signature,
-                            is_public,
-                            &route_cache,
-                        );
-                        let is_test_ref = {
-                            let key = (file.relative_path.clone(), symbol.name.clone());
-                            test_referenced.contains(&key)
-                        };
-                        // Fallback 1: the call graph tracks cross-file edges but may miss
-                        // intra-file calls (private helpers called from within the same
-                        // file). Check whether the name appears more than once in the
-                        // file's content using word-boundary matching. If so, the symbol
-                        // is referenced locally and is alive.
-                        let is_same_file_ref =
-                            same_file_string_reference(&symbol.name, &file.content);
-                        // Fallback 2: qualified-name match across other files. Catches
-                        // calls like `commands::overview::run(args)` that the call graph
-                        // didn't resolve to the concrete symbol.
-                        let is_qualified_ref = has_qualified_reference(
-                            &file.relative_path,
-                            &symbol.name,
-                            &index.files,
-                        );
-                        is_ep || is_test_ref || is_same_file_ref || is_qualified_ref
+                        None
+                    };
+                    let is_trait_method = impl_ctx
+                        .as_ref()
+                        .map(|(is_trait, _)| *is_trait)
+                        .unwrap_or(false);
+                    let inherent_type =
+                        impl_ctx
+                            .as_ref()
+                            .and_then(|(is_trait, ty)| if !is_trait { ty.clone() } else { None });
+
+                    if is_trait_method {
+                        // Trait-impl methods are dispatched at runtime; the call graph
+                        // does not resolve dynamic / generic dispatch, so without this
+                        // check every `impl Trait for X` method would be flagged dead.
+                        true
+                    } else if let Some(ty) = inherent_type {
+                        // Inherent impl method: search other files for `Type::method`.
+                        // This catches function-pointer references like
+                        // `CxpakLspBackend::custom_health` that the call graph misses
+                        // because the symbol is passed as a value, not invoked.
+                        let pat = format!("{ty}::{}", symbol.name);
+                        index.files.iter().any(|f| {
+                            f.relative_path != file.relative_path && f.content.contains(&pat)
+                        })
+                    } else {
+                        let has_callers = index
+                            .call_graph
+                            .has_callers(&file.relative_path, &symbol.name);
+                        if has_callers {
+                            true
+                        } else {
+                            let is_public = symbol.visibility == Visibility::Public;
+                            let is_ep = is_entry_point(
+                                &file.relative_path,
+                                &symbol.name,
+                                &symbol.signature,
+                                is_public,
+                                &route_cache,
+                            );
+                            let is_test_ref = {
+                                let key = (file.relative_path.clone(), symbol.name.clone());
+                                test_referenced.contains(&key)
+                            };
+                            // Fallback 1: the call graph tracks cross-file edges but may miss
+                            // intra-file calls (private helpers called from within the same
+                            // file). Check whether the name appears more than once in the
+                            // file's content using word-boundary matching. If so, the symbol
+                            // is referenced locally and is alive.
+                            let is_same_file_ref =
+                                same_file_string_reference(&symbol.name, &file.content);
+                            // Fallback 2: qualified-name match across other files. Catches
+                            // calls like `commands::overview::run(args)` that the call graph
+                            // didn't resolve to the concrete symbol.
+                            let is_qualified_ref = has_qualified_reference(
+                                &file.relative_path,
+                                &symbol.name,
+                                &index.files,
+                            );
+                            is_ep || is_test_ref || is_same_file_ref || is_qualified_ref
+                        }
                     }
                 }
             } else {
@@ -1042,6 +1116,25 @@ mod tests {
             dead.iter().any(|d| d.symbol == "orphan"),
             "orphan with no callers or references must be flagged as dead"
         );
+    }
+
+    #[test]
+    fn enclosing_impl_ignores_braces_in_strings() {
+        let content =
+            "impl Foo {\n    fn with_string() {\n        let s = \"{nested}\";\n    }\n}\n";
+        // fn with_string is on line 2
+        assert_eq!(
+            enclosing_impl(content, 2),
+            Some((false, Some("Foo".to_string())))
+        );
+    }
+
+    #[test]
+    fn has_serde_derive_above_handles_multiline() {
+        let content =
+            "#[derive(\n    Debug,\n    Clone,\n    Deserialize,\n)]\npub struct Req {}\n";
+        // pub struct Req is on line 6
+        assert!(has_serde_derive_above(content, 6));
     }
 
     #[test]

@@ -96,6 +96,8 @@
     if (trigger && document.body.contains(trigger)) {
       try { trigger.focus(); } catch (e) { /* ignore */ }
     }
+    var live = document.getElementById('cxpak-live');
+    if (live) live.textContent = 'Inspector closed';
     CX.state.inspectorTrigger = null;
   }
 
@@ -309,6 +311,18 @@
         body.appendChild(row);
       });
     }
+    // Announce to screen readers via the dedicated live region.
+    var live = document.getElementById('cxpak-live');
+    if (live) {
+      var label = node.label || node.id || 'details';
+      var pr = node.metadata && node.metadata.pagerank != null
+        ? ', PageRank ' + CX.format.score(node.metadata.pagerank * 100)
+        : '';
+      var rs = node.metadata && node.metadata.risk_score != null
+        ? ', risk score ' + CX.format.score(node.metadata.risk_score * 100)
+        : '';
+      live.textContent = 'Inspector open: ' + label + pr + rs;
+    }
   }
   CX.openInspector = openInspector;
   CX.closeInspector = closeInspector;
@@ -434,6 +448,30 @@
     });
   })();
 
+  // Focus trap for modal dialogs (palette + help overlay).
+  // Tab/Shift-Tab cycles within the dialog when one is open.
+  function trapFocus(ev) {
+    if (ev.key !== 'Tab') return;
+    var modal = null;
+    if (CX.state.paletteOpen) modal = document.getElementById('cxpak-palette-overlay');
+    else if (CX.state.helpOverlayOpen) modal = document.getElementById('cxpak-help-overlay');
+    if (!modal || modal.hasAttribute('hidden')) return;
+    var focusables = modal.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    if (focusables.length === 0) return;
+    var first = focusables[0];
+    var last = focusables[focusables.length - 1];
+    if (ev.shiftKey && document.activeElement === first) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && document.activeElement === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  }
+  document.addEventListener('keydown', trapFocus);
+
   // =============================================================================
   // 6) KEYBOARD + A11Y + FRESHNESS
   // =============================================================================
@@ -453,7 +491,12 @@
     if (ev.key === 't' && !CX.state.paletteOpen) { CX.toggleTheme(); }
     if (ev.key === '?' && !CX.state.paletteOpen) {
       var ho = document.getElementById('cxpak-help-overlay');
-      if (ho) { ho.removeAttribute('hidden'); CX.state.helpOverlayOpen = true; }
+      if (ho) {
+        ho.removeAttribute('hidden');
+        CX.state.helpOverlayOpen = true;
+        var closeBtn = ho.querySelector('.cxpak-inspector-close');
+        if (closeBtn) closeBtn.focus();
+      }
     }
   });
 

@@ -205,6 +205,22 @@ fn spa_palette_has_dialog_aria() {
 }
 
 #[test]
+fn spa_inspector_aside_no_aria_live() {
+    // Per ARIA spec (and Fix I4 in the v2.1.0 quality review), aria-live
+    // belongs on a dedicated #cxpak-live region, not the inspector aside.
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    let aside_idx = html
+        .find(r#"<aside id="cxpak-inspector""#)
+        .expect("aside present");
+    let aside_end = html[aside_idx..].find('>').unwrap() + aside_idx;
+    let aside_open = &html[aside_idx..=aside_end];
+    assert!(
+        !aside_open.contains("aria-live"),
+        "inspector aside should not have aria-live (use #cxpak-live region instead)"
+    );
+}
+
+#[test]
 fn repo_name_is_html_escaped_in_title_and_span() {
     let counter = TokenCounter::new();
     let files = vec![ScannedFile {
