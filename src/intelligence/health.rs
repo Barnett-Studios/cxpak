@@ -102,15 +102,22 @@ fn score_conventions(index: &CodebaseIndex) -> f64 {
 /// Returns true when a source file contains inline tests based on language-specific markers.
 ///
 /// Detects:
-/// - Rust: `#[cfg(test)]` or `#[test]`
+/// - Rust: `#[cfg(test)]`, `#[test]`, `#[tokio::test`, `#[async_std::test`, `#[rstest`, `#[actix_rt::test`
 /// - Python: `def test_` (function-level) or `class Test`
-/// - TypeScript/JavaScript: `describe(`, ` it(`, or `\ntest(`  (non-word prefix)
+/// - TypeScript/JavaScript: `describe(`, ` it(`, or `\ntest(` (non-word prefix)
 /// - Go: `func Test`
 pub(crate) fn has_inline_tests(file: &crate::index::IndexedFile) -> bool {
     let lang = file.language.as_deref().unwrap_or("");
     let content = &file.content;
     match lang {
-        "rust" => content.contains("#[cfg(test)]") || content.contains("#[test]"),
+        "rust" => {
+            content.contains("#[cfg(test)]")
+                || content.contains("#[test]")
+                || content.contains("#[tokio::test")
+                || content.contains("#[async_std::test")
+                || content.contains("#[rstest")
+                || content.contains("#[actix_rt::test")
+        }
         "python" => content.contains("def test_") || content.contains("class Test"),
         "typescript" | "javascript" | "tsx" | "jsx" => {
             content.contains("describe(")

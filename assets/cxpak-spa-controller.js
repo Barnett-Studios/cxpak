@@ -64,6 +64,7 @@
   // =============================================================================
   var VIEWS = ['dashboard','architecture','risk','flow','timeline','diff'];
   var initialized = {};
+  CX._initialized = initialized; // expose for toggleTheme re-render
 
   function parseHash() {
     var raw = window.location.hash.replace(/^#/, '') || 'dashboard';
@@ -370,6 +371,17 @@
     var next = curr === 'dark' ? 'light' : 'dark';
     applyTheme(next);
     writeTheme(next);
+    // Re-render the active view so D3 elements with hardcoded hex fills
+    // pick up the new theme's color palette.
+    var current = CX.state.view;
+    var section = document.getElementById('view-' + current);
+    if (section) {
+      section.textContent = ''; // clear DOM
+      if (CX._initialized) CX._initialized[current] = false;
+      if (typeof CX.init[current] === 'function') {
+        CX.init[current]();
+      }
+    }
   };
 
   // Wire the theme-toggle button click. Runs at script load since the button

@@ -24,7 +24,7 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     .custom_method("cxpak/diff", CxpakLspBackend::custom_stub)
     .custom_method("cxpak/search", CxpakLspBackend::custom_stub)
     .custom_method("cxpak/apiSurface", CxpakLspBackend::custom_stub)
-    .custom_method("cxpak/deadCode", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/deadCode", CxpakLspBackend::custom_dead_code)
     .custom_method("cxpak/callGraph", CxpakLspBackend::custom_stub)
     .custom_method("cxpak/predict", CxpakLspBackend::custom_stub)
     .custom_method("cxpak/drift", CxpakLspBackend::custom_stub)

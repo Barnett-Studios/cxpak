@@ -59,3 +59,29 @@ fn all_14_lsp_methods_return_non_stub() {
         assert!(!is_stub(&body), "{m} returned stub: {body}");
     }
 }
+
+// ── Fix 8: cxpak/deadCode returns real dead-code data, not a stub ────────────
+
+#[test]
+fn lsp_dead_code_returns_real_data_not_stub() {
+    let counter = cxpak::budget::counter::TokenCounter::new();
+    let idx = cxpak::index::CodebaseIndex::build_with_content(
+        vec![],
+        std::collections::HashMap::new(),
+        &counter,
+        std::collections::HashMap::new(),
+    );
+    let result =
+        cxpak::lsp::methods::handle_custom_method("cxpak/deadCode", serde_json::Value::Null, &idx)
+            .unwrap()
+            .unwrap();
+    let status = result.get("status").and_then(|s| s.as_str());
+    assert!(
+        status != Some("available") && status != Some("not_implemented"),
+        "cxpak/deadCode must return real dead-code data, not a stub status: {result}"
+    );
+    assert!(
+        result.get("dead_symbols").is_some(),
+        "cxpak/deadCode must include dead_symbols field"
+    );
+}

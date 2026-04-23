@@ -133,6 +133,22 @@ fn localStorage_is_guarded_with_try() {
     }
 }
 
+// ── Fix 2: theme toggle re-renders active view ───────────────────────────────
+
+#[test]
+fn theme_toggle_re_renders_active_view() {
+    // toggleTheme must invalidate CX._initialized for the active view AND
+    // clear the section DOM so D3-rendered SVG elements with inline hex fills
+    // are recreated under the new theme.
+    assert!(
+        CONTROLLER.contains("CX._initialized")
+            && CONTROLLER.contains("section.textContent = ''")
+            && CONTROLLER.contains("CX.init[current]"),
+        "toggleTheme must invalidate the active view and re-init it; \
+         otherwise D3 SVG elements with hardcoded hex fills don't theme-swap."
+    );
+}
+
 #[test]
 fn clipboard_is_feature_detected() {
     assert!(

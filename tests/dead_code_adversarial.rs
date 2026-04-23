@@ -207,3 +207,72 @@ fn prefix_match_does_not_keep_symbol_alive() {
          Got dead list: {dead_names:?}"
     );
 }
+
+// ── Fix 12: receiver-heuristic short-name rubber-stamp ───────────────────────
+
+/// A 3-char method `run` defined in src/foo.rs with NO qualified reference
+/// anywhere and ONLY an unrelated `.run(` in another file must be flagged dead.
+/// The receiver-call heuristic must NOT rubber-stamp it alive just because some
+/// unrelated `.run(` exists in the codebase.
+#[test]
+fn short_method_with_no_evidence_is_flagged_dead() {
+    use cxpak::parser::language::Visibility;
+    let foo_content = "pub struct App;\nimpl App {\n    pub fn run(&self) {}\n}\n";
+    let foo_sym = Symbol {
+        name: "run".into(),
+        kind: SymbolKind::Method,
+        visibility: Visibility::Public,
+        signature: "pub fn run(&self)".into(),
+        body: "{}".into(),
+        start_line: 3,
+        end_line: 3,
+    };
+    // bar.rs has `.run(` but for a completely different object — not App.
+    let bar_content = "use crate::other;\nfn caller() { other.run(); }\n";
+
+    let mut files = Vec::new();
+    let mut prs = HashMap::new();
+    let mut contents = HashMap::new();
+
+    let foo_file = ScannedFile {
+        relative_path: "src/foo.rs".into(),
+        absolute_path: "/tmp/src/foo.rs".into(),
+        language: Some("rust".into()),
+        size_bytes: foo_content.len() as u64,
+    };
+    let bar_file = ScannedFile {
+        relative_path: "src/bar.rs".into(),
+        absolute_path: "/tmp/src/bar.rs".into(),
+        language: Some("rust".into()),
+        size_bytes: bar_content.len() as u64,
+    };
+    prs.insert(
+        "src/foo.rs".to_string(),
+        ParseResult {
+            symbols: vec![foo_sym],
+            imports: vec![],
+            exports: vec![],
+        },
+    );
+    prs.insert(
+        "src/bar.rs".to_string(),
+        ParseResult {
+            symbols: vec![fn_symbol("caller", 2, false)],
+            imports: vec![],
+            exports: vec![],
+        },
+    );
+    contents.insert("src/foo.rs".to_string(), foo_content.to_string());
+    contents.insert("src/bar.rs".to_string(), bar_content.to_string());
+    files.push(foo_file);
+    files.push(bar_file);
+
+    let idx = CodebaseIndex::build_with_content(files, prs, &TokenCounter::new(), contents);
+    let dead = detect_dead_code(&idx, None);
+    let names: Vec<&str> = dead.iter().map(|d| d.symbol.as_str()).collect();
+    assert!(
+        names.contains(&"run"),
+        "3-char method `run` with no qualified ref must NOT be alive-stamped by receiver \
+         heuristic just because some unrelated `.run(` exists. Got dead: {names:?}"
+    );
+}

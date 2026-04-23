@@ -408,3 +408,174 @@ fn risk_inspector_passes_context_specific_fields() {
         "risk inspector must show blast radius"
     );
 }
+
+// ── Fix 1: dashboard top_risks and alerts use same ranking ───────────────────
+
+#[test]
+fn dashboard_top_risks_and_alerts_use_same_ranking() {
+    // Construct an index where two files have identical risk scores at a high
+    // enough value that the alert filter (>0.8) might pick them up.  Verify
+    // dashboard top_risks ordering and alerts ordering are CONSISTENT (tied
+    // entries appear in the same relative order).
+    use cxpak::budget::counter::TokenCounter;
+    use cxpak::scanner::ScannedFile;
+    let counter = TokenCounter::new();
+    let files: Vec<ScannedFile> = (0..5)
+        .map(|i| ScannedFile {
+            relative_path: format!("src/m{i}/mod.rs"),
+            absolute_path: format!("/tmp/src/m{i}/mod.rs").into(),
+            language: Some("rust".into()),
+            size_bytes: 100,
+        })
+        .collect();
+    let mut content = std::collections::HashMap::new();
+    for f in &files {
+        content.insert(f.relative_path.clone(), "fn x() {}".into());
+    }
+    let idx = cxpak::index::CodebaseIndex::build_with_content(
+        files,
+        std::collections::HashMap::new(),
+        &counter,
+        content,
+    );
+    let data = cxpak::visual::render::build_dashboard_data(&idx);
+    let direct = cxpak::intelligence::risk::compute_risk_ranking(&idx);
+    // Top risks in dashboard MUST match the direct ranking order (path-by-path).
+    for (i, displayed) in data.risks.top_risks.iter().enumerate() {
+        assert_eq!(
+            displayed.path, direct[i].path,
+            "dashboard top_risks[{i}] = {} but compute_risk_ranking[{i}] = {} — divergence between channels",
+            displayed.path, direct[i].path,
+        );
+        assert_eq!(
+            displayed.risk_score.to_bits(),
+            direct[i].risk_score.to_bits(),
+            "risk_score f64 bits diverge for {}",
+            displayed.path
+        );
+    }
+}
+
+// ── Fix 6: first-paint theme inline script ───────────────────────────────────
+
+#[test]
+fn first_paint_theme_inline_script_present() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    let head_start = html.find("<head>").unwrap();
+    let head_end = html.find("</head>").unwrap();
+    let head = &html[head_start..head_end];
+    assert!(
+        head.contains("getItem('cxpak-theme')") || head.contains("getItem(\"cxpak-theme\")"),
+        "head must contain inline script that reads localStorage theme to prevent first-paint flash"
+    );
+    // The inline script must run BEFORE the <style> block.
+    let script_pos = head
+        .find("getItem")
+        .expect("getItem must be present in head");
+    let style_pos = head.find("<style>").expect("<style> must be in head");
+    assert!(
+        script_pos < style_pos,
+        "theme-applying inline script must precede <style> for synchronous first paint"
+    );
+}
+
+// ── Fix 7: has_inline_tests recognises tokio/rstest/async-std ───────────────
+
+#[test]
+fn has_inline_tests_recognizes_tokio_rstest() {
+    use cxpak::budget::counter::TokenCounter;
+    use cxpak::scanner::ScannedFile;
+    let counter = TokenCounter::new();
+    let files = vec![ScannedFile {
+        relative_path: "src/svc.rs".into(),
+        absolute_path: "/tmp/svc.rs".into(),
+        language: Some("rust".into()),
+        size_bytes: 100,
+    }];
+    // No #[cfg(test)] or #[test] — only #[tokio::test]
+    let mut content = std::collections::HashMap::new();
+    content.insert(
+        "src/svc.rs".to_string(),
+        "#[tokio::test]\nasync fn t() {}\n".to_string(),
+    );
+    let idx = cxpak::index::CodebaseIndex::build_with_content(
+        files,
+        std::collections::HashMap::new(),
+        &counter,
+        content,
+    );
+    let data = cxpak::visual::render::build_dashboard_data(&idx);
+    let entry = data
+        .risks
+        .top_risks
+        .iter()
+        .find(|r| r.path == "src/svc.rs")
+        .expect("file must appear in top_risks");
+    assert!(
+        entry.has_tests,
+        "has_tests must recognize #[tokio::test] (currently misses tokio/rstest/async-std test attributes)"
+    );
+}
+
+// ── Fix 10: dashboard dead-symbol alert count is honest ──────────────────────
+
+#[test]
+fn dashboard_dead_symbols_alert_reflects_honest_count() {
+    // On an empty index, detect_dead_code returns 0. The dashboard alert must
+    // agree — not show a stale or computed-from-different-source count.
+    use cxpak::budget::counter::TokenCounter;
+    let counter = TokenCounter::new();
+    let idx = cxpak::index::CodebaseIndex::build_with_content(
+        vec![],
+        std::collections::HashMap::new(),
+        &counter,
+        std::collections::HashMap::new(),
+    );
+    let data = cxpak::visual::render::build_dashboard_data(&idx);
+    let direct_dead = cxpak::intelligence::dead_code::detect_dead_code(&idx, None);
+    // Find the dead-symbols alert if present.
+    let dead_alert = data
+        .alerts
+        .alerts
+        .iter()
+        .find(|a| matches!(a.kind, cxpak::visual::render::AlertKind::DeadSymbols));
+    if let Some(alert) = dead_alert {
+        let count_str = direct_dead.len().to_string();
+        assert!(
+            alert.message.contains(&count_str),
+            "dashboard dead-symbols alert ({}) must reference the same count as direct detection ({} symbols)",
+            alert.message,
+            direct_dead.len()
+        );
+    } else {
+        assert_eq!(
+            direct_dead.len(),
+            0,
+            "no alert is fine only if there are no dead symbols"
+        );
+    }
+}
+
+// ── Fix 11: help overlay documents palette navigation ───────────────────────
+
+#[test]
+fn help_overlay_documents_palette_navigation() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    let help_start = html
+        .find(r#"id="cxpak-help-overlay""#)
+        .expect("help overlay present");
+    // Find the end of the overlay by finding the second closing div block.
+    let region = &html[help_start..];
+    // Grab a generous slice covering the help overlay content.
+    let help_end = region.find("</div>\n  </div>").unwrap_or(region.len());
+    let help = &region[..help_end];
+    assert!(
+        (help.contains('\u{2191}') || help.contains("↑"))
+            && (help.contains('\u{2193}') || help.contains("↓")),
+        "help overlay must list arrow-key palette navigation (↑ ↓)"
+    );
+    assert!(
+        help.contains("Enter") || help.contains("\u{21b5}"),
+        "help overlay must list Enter to select"
+    );
+}

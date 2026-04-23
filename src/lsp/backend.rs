@@ -84,6 +84,16 @@ impl CxpakLspBackend {
         }
     }
 
+    pub async fn custom_dead_code(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        let idx = self.index.read().map_err(Self::lock_err)?;
+        match super::methods::handle_custom_method("cxpak/deadCode", serde_json::Value::Null, &idx)
+        {
+            Ok(Some(v)) => Ok(v),
+            Ok(None) => Ok(serde_json::Value::Null),
+            Err(e) => Err(Self::method_err(e)),
+        }
+    }
+
     pub async fn custom_stub(
         &self,
         params: serde_json::Value,

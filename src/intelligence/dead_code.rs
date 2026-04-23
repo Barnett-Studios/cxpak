@@ -123,15 +123,20 @@ fn has_string_references(
 /// This trio together is specific enough to avoid matching namespace
 /// paths (`a::name(`), field assignments (`.name =`), or string content.
 ///
-/// Short names (<3 chars) are assumed alive to avoid rampant false
-/// positives — `.as(`, `.on(` etc. are ubiquitous.
+/// Short common method names (<5 chars) produce too many false positives via
+/// bare `.method(` pattern matching — names like `run`, `get`, `set`, `new`,
+/// `add` appear as receiver calls throughout any codebase. For names shorter
+/// than 5 characters we return `false` (no receiver evidence found) and let
+/// other checks (qualified ref, same-file ref, call graph) decide liveness.
+/// This means truly-dead 3-4 char methods CAN be flagged dead, while
+/// legitimate receiver calls with longer names are still detected.
 fn has_receiver_method_reference(
     file_path: &str,
     symbol_name: &str,
     all_files: &[IndexedFile],
 ) -> bool {
-    if symbol_name.len() < 3 {
-        return true;
+    if symbol_name.len() < 5 {
+        return false;
     }
     // The exact pattern we search for: `.{symbol_name}(`
     let needle = format!(".{symbol_name}(");

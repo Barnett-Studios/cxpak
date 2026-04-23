@@ -98,6 +98,17 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("  <title>cxpak \u{2014} ");
     html.push_str(&repo);
     html.push_str("</title>\n");
+    // Inline script to read saved theme before CSS paints — prevents flash of
+    // wrong-theme on first load when user has a stored preference.
+    html.push_str("  <script>\n");
+    html.push_str("    (function(){\n");
+    html.push_str("      try {\n");
+    html.push_str("        var t = localStorage.getItem('cxpak-theme');\n");
+    html.push_str("        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);\n");
+    html.push_str("        else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) document.documentElement.setAttribute('data-theme', 'light');\n");
+    html.push_str("      } catch (e) { /* ignore */ }\n");
+    html.push_str("    })();\n");
+    html.push_str("  </script>\n");
     html.push_str("  <style>");
     html.push_str(VISUAL_CSS);
     html.push_str("</style>\n");
@@ -165,6 +176,8 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("      </div>\n");
     html.push_str("      <div class=\"cxpak-inspector-body\">\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Cmd/Ctrl+K</kbd> or <kbd>/</kbd></span><span class=\"cxpak-inspector-value\">Open command palette</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>\u{2191}</kbd> <kbd>\u{2193}</kbd></span><span class=\"cxpak-inspector-value\">Navigate palette items</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Enter</kbd></span><span class=\"cxpak-inspector-value\">Select palette item</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>1</kbd>\u{2013}<kbd>6</kbd></span><span class=\"cxpak-inspector-value\">Switch to Dashboard / Architecture / Risk / Flow / Timeline / Diff</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>t</kbd></span><span class=\"cxpak-inspector-value\">Toggle dark / light theme</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>?</kbd></span><span class=\"cxpak-inspector-value\">This help overlay</span></div>\n");

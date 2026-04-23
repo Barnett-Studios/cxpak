@@ -1146,21 +1146,17 @@ panels.parentNode.appendChild(dleg);
 "#
 }
 
-/// Sanitize a JSON string for safe embedding inside an HTML `<script>` block.
-///
-/// A `</script>` sequence inside a JSON string value would terminate the
-/// surrounding `<script>` element, allowing XSS injection.  Similarly,
-/// `<!--` can confuse HTML parsers.  Both are neutralised by escaping the
-/// leading `<` with its JSON unicode escape equivalent (`\u003c` is not
-/// used here — we use a simpler backslash form that browsers and JSON
-/// parsers both accept: `<\/script>` and `<\!--`).
 /// Escapes JSON for safe embedding inside an HTML `<script>` block.
 ///
 /// Unicode-escapes `<`, `>`, `&`, and `=` — the same character set as
 /// `spa.rs`'s `spa_escape`. Per-character `<`/`>` escaping makes `</script>`
-/// impossible to form, and `&`/`=` escaping prevents attribute-injection.
-/// Unicode escapes are valid JSON per RFC 8259 §7 and decoded transparently
-/// by all JSON parsers.
+/// impossible to form inside a JSON string value (which would otherwise
+/// terminate the surrounding `<script>` element and allow XSS injection).
+/// `&`/`=` escaping prevents attribute-injection.
+///
+/// Unicode escapes are valid JSON per RFC 8259 §7 and are decoded
+/// transparently by all JSON parsers, so the round-tripped data is identical
+/// to the original.
 pub(crate) fn escape_script_tag(json: &str) -> String {
     let mut out = String::with_capacity(json.len() + (json.len() / 16));
     for ch in json.chars() {
@@ -1349,9 +1345,12 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
     };
 
     // ── Risks quadrant ────────────────────────────────────────────────────────
-    let risk_entries = crate::intelligence::risk::compute_risk_ranking(index);
-    let top_risks: Vec<RiskDisplayEntry> = risk_entries
-        .into_iter()
+    // Compute risk ranking once — reused for both the top_risks display and the
+    // high-risk alerts.  Two independent calls could produce divergent ordering
+    // for tied scores and waste O(n²) percentile work twice.
+    let risk_ranking = crate::intelligence::risk::compute_risk_ranking(index);
+    let top_risks: Vec<RiskDisplayEntry> = risk_ranking
+        .iter()
         .take(5)
         .map(|e| {
             // Mirror the same condition used by compute_risk_ranking for test_coverage:
@@ -1365,7 +1364,7 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
                     .unwrap_or(false);
             let severity = risk_severity(e.risk_score).to_string();
             RiskDisplayEntry {
-                path: e.path,
+                path: e.path.clone(),
                 risk_score: e.risk_score,
                 churn_30d: e.churn_30d,
                 blast_radius: e.blast_radius,
@@ -1416,12 +1415,9 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
         });
     }
 
-    // High-risk file alerts (score > 0.8).
-    for entry in crate::intelligence::risk::compute_risk_ranking(index)
-        .into_iter()
-        .filter(|e| e.risk_score > 0.8)
-        .take(3)
-    {
+    // High-risk file alerts (score > 0.8).  Re-uses the same sorted Vec computed
+    // above for top_risks so both channels reflect the same ranking.
+    for entry in risk_ranking.iter().filter(|e| e.risk_score > 0.8).take(3) {
         alerts.push(Alert {
             kind: AlertKind::HighRiskFile,
             message: format!("High risk: {} (score {:.2})", entry.path, entry.risk_score),
