@@ -329,7 +329,7 @@ if (risks.length === 0) {
 } else {
   var tbl = document.createElement('table');
   tbl.className = 'cxpak-risk-table';
-  tbl.innerHTML = '<thead><tr><th>File</th><th>Risk</th><th>Churn</th><th>Blast</th><th>Tests</th></tr></thead>';
+  tbl.innerHTML = '<thead><tr><th>File</th><th>Risk</th><th title="Number of commits touching this file in the last 30 days">Churn (30d)</th><th title="Number of files that directly import this file — larger values increase blast radius of changes">Blast Radius</th><th>Tests</th></tr></thead>';
   var tb = document.createElement('tbody');
   risks.forEach(function(r) {
     var tr = document.createElement('tr');
@@ -387,9 +387,19 @@ if (alerts.length === 0) {
     item.onclick = (function(target) {
       return function() { navTo(target.toLowerCase()); };
     })(link);
-    item.innerHTML =
-      '<span class="cxpak-alert-icon">' + icon + '</span>' +
-      '<span class="cxpak-alert-msg">' + CX.esc(a.message) + '</span>';
+    var srText = document.createElement('span');
+    srText.className = 'sr-only';
+    srText.textContent = sev + ' severity: ';
+    var iconSpan = document.createElement('span');
+    iconSpan.className = 'cxpak-alert-icon';
+    iconSpan.setAttribute('aria-hidden', 'true');
+    iconSpan.textContent = icon;
+    var msgSpan = document.createElement('span');
+    msgSpan.className = 'cxpak-alert-msg';
+    msgSpan.textContent = a.message;
+    item.appendChild(srText);
+    item.appendChild(iconSpan);
+    item.appendChild(msgSpan);
     al.appendChild(item);
   });
 }
@@ -547,6 +557,15 @@ groups.filter(function(d) { return !d.children; })
         id: d.data.id,
         label: t.path || d.data.label,
         metadata: { risk_score: d.data.risk_score, token_count: 0, pagerank: null }
+      }, {
+        fields: [
+          ['Path', t.path || d.data.label],
+          ['Risk score', CX.format.score(d.data.risk_score * 100)],
+          ['Severity', d.data.severity],
+          ['Churn (30d)', t.churn_30d || 0],
+          ['Blast radius', t.blast_radius || 0],
+          ['Tests', t.test_count || 0],
+        ]
       });
     }
   })
@@ -558,6 +577,15 @@ groups.filter(function(d) { return !d.children; })
         id: d.data.id,
         label: t.path || d.data.label,
         metadata: { risk_score: d.data.risk_score, token_count: 0, pagerank: null }
+      }, {
+        fields: [
+          ['Path', t.path || d.data.label],
+          ['Risk score', CX.format.score(d.data.risk_score * 100)],
+          ['Severity', d.data.severity],
+          ['Churn (30d)', t.churn_30d || 0],
+          ['Blast radius', t.blast_radius || 0],
+          ['Tests', t.test_count || 0],
+        ]
       });
     }
   })
@@ -1126,9 +1154,25 @@ panels.parentNode.appendChild(dleg);
 /// leading `<` with its JSON unicode escape equivalent (`\u003c` is not
 /// used here — we use a simpler backslash form that browsers and JSON
 /// parsers both accept: `<\/script>` and `<\!--`).
+/// Escapes JSON for safe embedding inside an HTML `<script>` block.
+///
+/// Unicode-escapes `<`, `>`, `&`, and `=` — the same character set as
+/// `spa.rs`'s `spa_escape`. Per-character `<`/`>` escaping makes `</script>`
+/// impossible to form, and `&`/`=` escaping prevents attribute-injection.
+/// Unicode escapes are valid JSON per RFC 8259 §7 and decoded transparently
+/// by all JSON parsers.
 pub(crate) fn escape_script_tag(json: &str) -> String {
-    json.replace("</script>", r"<\/script>")
-        .replace("<!--", r"<\!--")
+    let mut out = String::with_capacity(json.len() + (json.len() / 16));
+    for ch in json.chars() {
+        match ch {
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '=' => out.push_str("\\u003d"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Renders a self-contained HTML file.  All JS/CSS is inlined — no CDN dependencies.
@@ -1293,6 +1337,10 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
         ("churn_stability".to_string(), health_score.churn_stability),
         ("coupling".to_string(), health_score.coupling),
         ("cycles".to_string(), health_score.cycles),
+        (
+            "dead_code".to_string(),
+            health_score.dead_code.unwrap_or(0.0),
+        ),
     ];
     let health = HealthQuadrant {
         composite: health_score.composite,
@@ -1306,7 +1354,15 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
         .into_iter()
         .take(5)
         .map(|e| {
-            let has_tests = index.test_map.contains_key(e.path.as_str());
+            // Mirror the same condition used by compute_risk_ranking for test_coverage:
+            // a file has tests if it appears in the test_map OR has inline tests.
+            let has_tests = index.test_map.contains_key(e.path.as_str())
+                || index
+                    .files
+                    .iter()
+                    .find(|f| f.relative_path == e.path)
+                    .map(crate::intelligence::health::has_inline_tests)
+                    .unwrap_or(false);
             let severity = risk_severity(e.risk_score).to_string();
             RiskDisplayEntry {
                 path: e.path,
@@ -1597,7 +1653,11 @@ pub fn build_architecture_explorer_data(
         .iter()
         .map(|(path, &score)| (path.as_str(), score))
         .collect();
-    ranked_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked_files.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
 
     for (file_path, _score) in ranked_files.into_iter().take(20) {
         if let Ok(layout) = super::layout::build_symbol_layout(index, file_path, config) {
@@ -4217,14 +4277,15 @@ mod tests {
     fn test_escape_script_tag_blocks_closing_tag_injection() {
         let malicious = r#"{"a":"</script><script>alert(1)</script>"}"#;
         let escaped = escape_script_tag(malicious);
+        // `<` is unicode-escaped so `</script>` is impossible to form.
         assert!(
             !escaped.contains("</script>"),
             "escaped output must not contain </script>, got: {escaped}"
         );
-        // The escaped form should be present.
+        // `<` must not appear in the output.
         assert!(
-            escaped.contains(r"<\/script>"),
-            "escaped output must contain <\\/script>, got: {escaped}"
+            !escaped.contains('<'),
+            "escaped output must not contain raw `<`, got: {escaped}"
         );
     }
 
@@ -4243,6 +4304,30 @@ mod tests {
         let safe = r#"{"key":"value","num":42}"#;
         let escaped = escape_script_tag(safe);
         assert_eq!(escaped, safe, "safe JSON must pass through unchanged");
+    }
+
+    #[test]
+    fn escape_script_tag_neutralizes_html_tag_chars() {
+        // After v2.1.0 unification: escape_script_tag must handle the same
+        // character set as the SPA's spa_escape — specifically <, >, &, =.
+        let input = r#"<img src=x onerror=alert(1)>"#;
+        let out = escape_script_tag(input);
+        assert!(
+            !out.contains('<'),
+            "escape_script_tag must escape `<`: {out}"
+        );
+        assert!(
+            !out.contains('>'),
+            "escape_script_tag must escape `>`: {out}"
+        );
+        assert!(
+            !out.contains('='),
+            "escape_script_tag must escape `=`: {out}"
+        );
+        assert!(
+            !out.contains("onerror=alert"),
+            "raw onerror payload leaked: {out}"
+        );
     }
 
     #[test]

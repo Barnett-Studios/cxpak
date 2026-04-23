@@ -12,7 +12,7 @@
   --bg-card-hover: #222255;
   --text-primary: #e8e8f0;
   --text-secondary: #8888aa;
-  --text-dim: #55557a;
+  --text-dim: #9090b0;
   --accent-blue: #4cc9f0;
   --accent-green: #06d6a0;
   --accent-yellow: #ffd166;
@@ -824,7 +824,7 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
   --bg-card-hover: #f0f0f8;
   --text-primary: #1a1a2e;
   --text-secondary: #5a5a7a;
-  --text-dim: #8888a0;
+  --text-dim: #666680;
   --accent-blue: #2563eb;
   --accent-green: #059669;
   --accent-yellow: #d97706;
@@ -847,6 +847,20 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
     transition-duration: 0ms !important;
     animation-duration: 0ms !important;
   }
+}
+
+/* ── Accessibility helpers ─────────────────────────────────────── */
+/* Standard screen-reader-only utility: visually hidden but announced. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
 }
 
 /* ── Focus Ring ────────────────────────────────────────────────── */

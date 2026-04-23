@@ -251,6 +251,9 @@
     scored.forEach(function(x, idx) {
       var li = document.createElement('div');
       li.className = 'cxpak-palette-item' + (idx === 0 ? ' active' : '');
+      li.setAttribute('role', 'option');
+      li.id = 'cxpak-palette-item-' + idx;
+      li.setAttribute('aria-selected', idx === 0 ? 'true' : 'false');
       var k = document.createElement('span');
       k.className = 'kind ' + x.e.kind;
       k.textContent = x.e.kind;
@@ -269,6 +272,12 @@
       });
       list.appendChild(li);
     });
+    // Set aria-activedescendant on the input to track the first active item.
+    var paletteInput = document.getElementById('cxpak-palette-input');
+    if (paletteInput) {
+      var firstItem = document.getElementById('cxpak-palette-item-0');
+      paletteInput.setAttribute('aria-activedescendant', firstItem ? 'cxpak-palette-item-0' : '');
+    }
     if (scored.length === 0 && q !== '') {
       var empty = document.createElement('div');
       empty.className = 'cxpak-palette-empty';
@@ -284,7 +293,7 @@
   // =============================================================================
   // 4) INSPECTOR PANEL
   // =============================================================================
-  function openInspector(node) {
+  function openInspector(node, opts) {
     CX.state.inspector = node;
     CX.state.inspectorTrigger = document.activeElement;
     var el = document.getElementById('cxpak-inspector');
@@ -297,16 +306,20 @@
     var body = el.querySelector('.cxpak-inspector-body');
     if (body) {
       body.textContent = '';
-      var rows = [
-        ['PageRank', node.metadata && node.metadata.pagerank != null ? CX.format.score(node.metadata.pagerank * 100) : '--'],
-        ['Risk score', node.metadata && node.metadata.risk_score != null ? CX.format.score(node.metadata.risk_score * 100) : '--'],
-        ['Tokens', String(node.metadata && node.metadata.token_count || 0)],
-      ];
+      // If the caller provides context-specific fields, use those; otherwise
+      // fall back to the three generic metadata rows.
+      var rows = (opts && opts.fields)
+        ? opts.fields
+        : [
+            ['PageRank', node.metadata && node.metadata.pagerank != null ? CX.format.score(node.metadata.pagerank * 100) : '--'],
+            ['Risk score', node.metadata && node.metadata.risk_score != null ? CX.format.score(node.metadata.risk_score * 100) : '--'],
+            ['Tokens', String(node.metadata && node.metadata.token_count || 0)],
+          ];
       rows.forEach(function(r) {
         var row = document.createElement('div');
         row.className = 'cxpak-inspector-row';
         var lab = document.createElement('span'); lab.className = 'cxpak-inspector-label'; lab.textContent = r[0];
-        var val = document.createElement('span'); val.className = 'cxpak-inspector-value'; val.textContent = r[1];
+        var val = document.createElement('span'); val.className = 'cxpak-inspector-value'; val.textContent = String(r[1]);
         row.appendChild(lab); row.appendChild(val);
         body.appendChild(row);
       });
@@ -511,14 +524,22 @@
         var idx = Array.prototype.indexOf.call(items, active);
         if (ev.key === 'ArrowDown') {
           ev.preventDefault();
-          if (active) active.classList.remove('active');
+          if (active) { active.classList.remove('active'); active.setAttribute('aria-selected', 'false'); }
           idx = Math.min(idx + 1, items.length - 1);
-          if (items[idx]) items[idx].classList.add('active');
+          if (items[idx]) {
+            items[idx].classList.add('active');
+            items[idx].setAttribute('aria-selected', 'true');
+            input.setAttribute('aria-activedescendant', items[idx].id || '');
+          }
         } else if (ev.key === 'ArrowUp') {
           ev.preventDefault();
-          if (active) active.classList.remove('active');
+          if (active) { active.classList.remove('active'); active.setAttribute('aria-selected', 'false'); }
           idx = Math.max(idx - 1, 0);
-          if (items[idx]) items[idx].classList.add('active');
+          if (items[idx]) {
+            items[idx].classList.add('active');
+            items[idx].setAttribute('aria-selected', 'true');
+            input.setAttribute('aria-activedescendant', items[idx].id || '');
+          }
         } else if (ev.key === 'Enter') {
           ev.preventDefault();
           if (active) active.click();

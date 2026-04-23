@@ -205,3 +205,32 @@ fn escape_priority_palette_before_inspector() {
         "palette check must precede inspector check in escape handler (pal={pal}, insp={insp})"
     );
 }
+
+#[test]
+fn palette_items_have_role_option_and_stable_ids() {
+    assert!(
+        CONTROLLER.contains("'role', 'option'") || CONTROLLER.contains("\"role\", \"option\""),
+        "palette items must be marked role=option"
+    );
+    assert!(
+        CONTROLLER.contains("aria-activedescendant"),
+        "palette input must track active option via aria-activedescendant"
+    );
+    assert!(
+        CONTROLLER.contains("'aria-selected'") || CONTROLLER.contains("\"aria-selected\""),
+        "palette items must toggle aria-selected"
+    );
+    assert!(
+        CONTROLLER.contains("cxpak-palette-item-"),
+        "palette items must have stable IDs (pattern: cxpak-palette-item-N)"
+    );
+}
+
+#[test]
+fn inspector_accepts_optional_fields_parameter() {
+    assert!(
+        CONTROLLER.contains("function openInspector(node, opts)")
+            || CONTROLLER.contains("function openInspector(node, options)"),
+        "openInspector must accept an optional fields parameter for context-aware display"
+    );
+}

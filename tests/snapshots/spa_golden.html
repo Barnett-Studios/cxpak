@@ -18,7 +18,7 @@
   --bg-card-hover: #222255;
   --text-primary: #e8e8f0;
   --text-secondary: #8888aa;
-  --text-dim: #55557a;
+  --text-dim: #9090b0;
   --accent-blue: #4cc9f0;
   --accent-green: #06d6a0;
   --accent-yellow: #ffd166;
@@ -830,7 +830,7 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
   --bg-card-hover: #f0f0f8;
   --text-primary: #1a1a2e;
   --text-secondary: #5a5a7a;
-  --text-dim: #8888a0;
+  --text-dim: #666680;
   --accent-blue: #2563eb;
   --accent-green: #059669;
   --accent-yellow: #d97706;
@@ -853,6 +853,20 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
     transition-duration: 0ms !important;
     animation-duration: 0ms !important;
   }
+}
+
+/* ── Accessibility helpers ─────────────────────────────────────── */
+/* Standard screen-reader-only utility: visually hidden but announced. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
 }
 
 /* ── Focus Ring ────────────────────────────────────────────────── */
@@ -968,6 +982,7 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
   <div id="cxpak-app">
     <header id="cxpak-header">
       <span class="cxpak-logo">cxpak</span>
+      <span class="cxpak-sep">·</span>
       <span class="cxpak-repo">determinism_repo</span>
       <nav class="cxpak-nav">
         <a class="cxpak-nav-link" data-view="dashboard" href="#dashboard" tabindex="0">Dashboard</a>
@@ -1024,7 +1039,7 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
     </div>
   </div>
 
-  <script id="cxpak-dashboard" type="application/json">{"health":{"composite":6.333333333333334,"dimensions":[["conventions",10.0],["test_coverage",0.0],["churn_stability",0.0],["coupling",10.0],["cycles",10.0]],"trend":[]},"risks":{"top_risks":[{"path":"src/auth/mod.rs","risk_score":0.24489795918367344,"churn_30d":0,"blast_radius":2,"has_tests":false,"severity":"low"},{"path":"src/api/handlers.rs","risk_score":0.0,"churn_30d":0,"blast_radius":0,"has_tests":false,"severity":"low"},{"path":"src/api/mod.rs","risk_score":0.0,"churn_30d":0,"blast_radius":0,"has_tests":false,"severity":"low"},{"path":"src/auth/jwt.rs","risk_score":0.0,"churn_30d":0,"blast_radius":0,"has_tests":false,"severity":"low"},{"path":"src/auth/session.rs","risk_score":0.0,"churn_30d":0,"blast_radius":0,"has_tests":false,"severity":"low"}]},"architecture_preview":{"layout":{"nodes":[{"id":"src","label":"src","layer":0,"position":{"x":0.0,"y":0.0},"width":112.0,"height":43.2,"node_type":"Module","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":0,"health_score":5.0,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src, module"},{"id":"src/api","label":"src/api","layer":0,"position":{"x":187.1351482291908,"y":0.0},"width":142.2702964583816,"height":47.091895258934784,"node_type":"Module","metadata":{"pagerank":0.3703708094691349,"risk_score":0.0,"token_count":0,"health_score":0.0,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/api, module"},{"id":"src/auth","label":"src/auth","layer":1,"position":{"x":187.1351482291908,"y":168.0},"width":224.0,"height":57.599999999999994,"node_type":"Module","metadata":{"pagerank":1.370370809469135,"risk_score":0.0,"token_count":0,"health_score":1.6666666666666665,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/auth, module"},{"id":"src/db","label":"src/db","layer":0,"position":{"x":374.2702964583816,"y":0.0},"width":112.0,"height":43.2,"node_type":"Module","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":0,"health_score":5.0,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/db, module"}],"edges":[{"source":"src/api","target":"src/auth","edge_type":"Import","weight":1.0,"is_cycle":false,"waypoints":[]}],"width":486.2702964583816,"height":220.3459476294674,"layers":[["src","src/api","src/db"],["src/auth"]]},"module_count":4,"circular_dep_count":0},"alerts":{"alerts":[{"kind":"CouplingTrend","message":"High coupling in modules: src/api","severity":"Medium","link_view":"Architecture"},{"kind":"HighRiskFile","message":"test coverage score is critically low: 0.0/10","severity":"High","link_view":"Dashboard"},{"kind":"HighRiskFile","message":"churn stability score is critically low: 0.0/10","severity":"High","link_view":"Dashboard"},{"kind":"DeadSymbols","message":"1 dead symbol detected (defined but never called)","severity":"Low","link_view":"Architecture"}]}}</script>
+  <script id="cxpak-dashboard" type="application/json">{"health":{"composite":6.333333333333334,"dimensions":[["conventions",10.0],["test_coverage",0.0],["churn_stability",0.0],["coupling",10.0],["cycles",10.0],["dead_code",8.333333333333334]],"trend":[]},"risks":{"top_risks":[{"path":"src/auth/mod.rs","risk_score":0.24489795918367344,"churn_30d":0,"blast_radius":2,"has_tests":false,"severity":"low"},{"path":"src/api/handlers.rs","risk_score":0.0,"churn_30d":0,"blast_radius":0,"has_tests":false,"severity":"low"},{"path":"src/api/mod.rs","risk_score":0.0,"churn_30d":0,"blast_radius":0,"has_tests":false,"severity":"low"},{"path":"src/auth/jwt.rs","risk_score":0.0,"churn_30d":0,"blast_radius":0,"has_tests":false,"severity":"low"},{"path":"src/auth/session.rs","risk_score":0.0,"churn_30d":0,"blast_radius":0,"has_tests":false,"severity":"low"}]},"architecture_preview":{"layout":{"nodes":[{"id":"src","label":"src","layer":0,"position":{"x":0.0,"y":0.0},"width":112.0,"height":43.2,"node_type":"Module","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":0,"health_score":5.0,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src, module"},{"id":"src/api","label":"src/api","layer":0,"position":{"x":187.1351482291908,"y":0.0},"width":142.2702964583816,"height":47.091895258934784,"node_type":"Module","metadata":{"pagerank":0.3703708094691349,"risk_score":0.0,"token_count":0,"health_score":0.0,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/api, module"},{"id":"src/auth","label":"src/auth","layer":1,"position":{"x":187.1351482291908,"y":168.0},"width":224.0,"height":57.599999999999994,"node_type":"Module","metadata":{"pagerank":1.370370809469135,"risk_score":0.0,"token_count":0,"health_score":1.6666666666666665,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/auth, module"},{"id":"src/db","label":"src/db","layer":0,"position":{"x":374.2702964583816,"y":0.0},"width":112.0,"height":43.2,"node_type":"Module","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":0,"health_score":5.0,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/db, module"}],"edges":[{"source":"src/api","target":"src/auth","edge_type":"Import","weight":1.0,"is_cycle":false,"waypoints":[]}],"width":486.2702964583816,"height":220.3459476294674,"layers":[["src","src/api","src/db"],["src/auth"]]},"module_count":4,"circular_dep_count":0},"alerts":{"alerts":[{"kind":"CouplingTrend","message":"High coupling in modules: src/api","severity":"Medium","link_view":"Architecture"},{"kind":"HighRiskFile","message":"test coverage score is critically low: 0.0/10","severity":"High","link_view":"Dashboard"},{"kind":"HighRiskFile","message":"churn stability score is critically low: 0.0/10","severity":"High","link_view":"Dashboard"},{"kind":"DeadSymbols","message":"1 dead symbol detected (defined but never called)","severity":"Low","link_view":"Architecture"}]}}</script>
   <script id="cxpak-explorer" type="application/json">{"level1":{"nodes":[{"id":"src","label":"src","layer":0,"position":{"x":0.0,"y":0.0},"width":112.0,"height":43.2,"node_type":"Module","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":0,"health_score":5.0,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src, module"},{"id":"src/api","label":"src/api","layer":0,"position":{"x":187.1351482291908,"y":0.0},"width":142.2702964583816,"height":47.091895258934784,"node_type":"Module","metadata":{"pagerank":0.3703708094691349,"risk_score":0.0,"token_count":0,"health_score":0.0,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/api, module"},{"id":"src/auth","label":"src/auth","layer":1,"position":{"x":187.1351482291908,"y":168.0},"width":224.0,"height":57.599999999999994,"node_type":"Module","metadata":{"pagerank":1.370370809469135,"risk_score":0.0,"token_count":0,"health_score":1.6666666666666665,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/auth, module"},{"id":"src/db","label":"src/db","layer":0,"position":{"x":374.2702964583816,"y":0.0},"width":112.0,"height":43.2,"node_type":"Module","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":0,"health_score":5.0,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/db, module"}],"edges":[{"source":"src/api","target":"src/auth","edge_type":"Import","weight":1.0,"is_cycle":false,"waypoints":[]}],"width":486.2702964583816,"height":220.3459476294674,"layers":[["src","src/api","src/db"],["src/auth"]]},"level2":{"src":{"nodes":[{"id":"src/lib.rs","label":"src/lib.rs","layer":0,"position":{"x":0.0,"y":0.0},"width":224.0,"height":57.599999999999994,"node_type":"File","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":25,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/lib.rs, file, 25 tokens"}],"edges":[],"width":224.0,"height":57.599999999999994,"layers":[["src/lib.rs"]]},"src/api":{"nodes":[{"id":"src/api/handlers.rs","label":"src/api/handlers.rs","layer":0,"position":{"x":0.0,"y":0.0},"width":224.0,"height":57.599999999999994,"node_type":"File","metadata":{"pagerank":0.3703708094691349,"risk_score":0.0,"token_count":18,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/api/handlers.rs, file, 18 tokens"},{"id":"src/api/mod.rs","label":"src/api/mod.rs","layer":0,"position":{"x":258.60974390504254,"y":0.0},"width":173.21948781008507,"height":51.07107700415379,"node_type":"File","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":4,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/api/mod.rs, file, 4 tokens"}],"edges":[],"width":457.21948781008507,"height":57.599999999999994,"layers":[["src/api/handlers.rs","src/api/mod.rs"]]},"src/auth":{"nodes":[{"id":"src/auth/jwt.rs","label":"src/auth/jwt.rs","layer":0,"position":{"x":0.0,"y":0.0},"width":224.0,"height":57.599999999999994,"node_type":"File","metadata":{"pagerank":0.3703708094691349,"risk_score":0.0,"token_count":21,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/auth/jwt.rs, file, 21 tokens"},{"id":"src/auth/mod.rs","label":"src/auth/mod.rs","layer":1,"position":{"x":139.34400459436415,"y":168.0},"width":191.61364373830867,"height":53.43603990921112,"node_type":"File","metadata":{"pagerank":1.0,"risk_score":0.24489795918367344,"token_count":8,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/auth/mod.rs, file, low risk (24%), 8 tokens"},{"id":"src/auth/session.rs","label":"src/auth/session.rs","layer":0,"position":{"x":281.34400459436415,"y":0.0},"width":218.6880091887283,"height":56.9170297528365,"node_type":"File","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":18,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/auth/session.rs, file, 18 tokens"}],"edges":[{"source":"src/auth/jwt.rs","target":"src/auth/mod.rs","edge_type":"Import","weight":1.0,"is_cycle":false,"waypoints":[]}],"width":502.6880091887283,"height":223.51801995460556,"layers":[["src/auth/jwt.rs","src/auth/session.rs"],["src/auth/mod.rs"]]},"src/db":{"nodes":[{"id":"src/db/mod.rs","label":"src/db/mod.rs","layer":0,"position":{"x":0.0,"y":0.0},"width":224.0,"height":57.599999999999994,"node_type":"File","metadata":{"pagerank":0.0,"risk_score":0.0,"token_count":5,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"src/db/mod.rs, file, 5 tokens"}],"edges":[],"width":224.0,"height":57.599999999999994,"layers":[["src/db/mod.rs"]]}},"level3":{"src/api/handlers.rs":{"nodes":[{"id":"src/api/handlers.rs::handle","label":"handle","layer":0,"position":{"x":0.0,"y":0.0},"width":160.0,"height":48.0,"node_type":"Symbol","metadata":{"pagerank":0.3703708094691349,"risk_score":0.0,"token_count":0,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"handle, symbol"}],"edges":[],"width":160.0,"height":48.0,"layers":[["src/api/handlers.rs::handle"]]},"src/auth/jwt.rs":{"nodes":[{"id":"src/auth/jwt.rs::verify","label":"verify","layer":0,"position":{"x":0.0,"y":0.0},"width":160.0,"height":48.0,"node_type":"Symbol","metadata":{"pagerank":0.3703708094691349,"risk_score":0.0,"token_count":0,"health_score":null,"is_god_file":false,"has_dead_code":false,"is_circular":false},"aria_label":"verify, symbol"}],"edges":[],"width":160.0,"height":48.0,"layers":[["src/auth/jwt.rs::verify"]]}},"initial_level":1,"breadcrumbs":[{"label":"Repository","level":1,"target_id":"root"}]}</script>
   <script id="cxpak-heatmap" type="application/json">{"root":{"id":"root","label":"Repository","area_value":8.0,"risk_score":0.0,"severity":"low","children":[{"id":"src/auth","label":"src/auth","area_value":4.0,"risk_score":0.0,"severity":"low","children":[{"id":"src/auth/mod.rs","label":"mod.rs","area_value":2.0,"risk_score":0.24489795918367344,"severity":"low","children":[],"blast_radius_files":["src/auth/mod.rs"],"tooltip":{"path":"src/auth/mod.rs","churn_30d":0,"blast_radius":2,"test_count":0,"coupling":0.0}},{"id":"src/auth/jwt.rs","label":"jwt.rs","area_value":1.0,"risk_score":0.0,"severity":"low","children":[],"blast_radius_files":["src/auth/jwt.rs"],"tooltip":{"path":"src/auth/jwt.rs","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}},{"id":"src/auth/session.rs","label":"session.rs","area_value":1.0,"risk_score":0.0,"severity":"low","children":[],"blast_radius_files":["src/auth/session.rs"],"tooltip":{"path":"src/auth/session.rs","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}}],"blast_radius_files":[],"tooltip":{"path":"","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}},{"id":"src/api","label":"src/api","area_value":2.0,"risk_score":0.0,"severity":"low","children":[{"id":"src/api/handlers.rs","label":"handlers.rs","area_value":1.0,"risk_score":0.0,"severity":"low","children":[],"blast_radius_files":["src/api/handlers.rs"],"tooltip":{"path":"src/api/handlers.rs","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}},{"id":"src/api/mod.rs","label":"mod.rs","area_value":1.0,"risk_score":0.0,"severity":"low","children":[],"blast_radius_files":["src/api/mod.rs"],"tooltip":{"path":"src/api/mod.rs","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}}],"blast_radius_files":[],"tooltip":{"path":"","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}},{"id":"src","label":"src","area_value":1.0,"risk_score":0.0,"severity":"low","children":[{"id":"src/lib.rs","label":"lib.rs","area_value":1.0,"risk_score":0.0,"severity":"low","children":[],"blast_radius_files":["src/lib.rs"],"tooltip":{"path":"src/lib.rs","churn_30d":5,"blast_radius":0,"test_count":0,"coupling":0.0}}],"blast_radius_files":[],"tooltip":{"path":"","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}},{"id":"src/db","label":"src/db","area_value":1.0,"risk_score":0.0,"severity":"low","children":[{"id":"src/db/mod.rs","label":"mod.rs","area_value":1.0,"risk_score":0.0,"severity":"low","children":[],"blast_radius_files":["src/db/mod.rs"],"tooltip":{"path":"src/db/mod.rs","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}}],"blast_radius_files":[],"tooltip":{"path":"","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}}],"blast_radius_files":[],"tooltip":{"path":"","churn_30d":0,"blast_radius":0,"test_count":0,"coupling":0.0}},"total_risk_files":7,"max_risk":0.24489795918367344}</script>
   <script id="cxpak-timeline" type="application/json">null</script>
@@ -1473,6 +1488,9 @@ CX.header = function() {};
     scored.forEach(function(x, idx) {
       var li = document.createElement('div');
       li.className = 'cxpak-palette-item' + (idx === 0 ? ' active' : '');
+      li.setAttribute('role', 'option');
+      li.id = 'cxpak-palette-item-' + idx;
+      li.setAttribute('aria-selected', idx === 0 ? 'true' : 'false');
       var k = document.createElement('span');
       k.className = 'kind ' + x.e.kind;
       k.textContent = x.e.kind;
@@ -1491,6 +1509,12 @@ CX.header = function() {};
       });
       list.appendChild(li);
     });
+    // Set aria-activedescendant on the input to track the first active item.
+    var paletteInput = document.getElementById('cxpak-palette-input');
+    if (paletteInput) {
+      var firstItem = document.getElementById('cxpak-palette-item-0');
+      paletteInput.setAttribute('aria-activedescendant', firstItem ? 'cxpak-palette-item-0' : '');
+    }
     if (scored.length === 0 && q !== '') {
       var empty = document.createElement('div');
       empty.className = 'cxpak-palette-empty';
@@ -1506,7 +1530,7 @@ CX.header = function() {};
   // =============================================================================
   // 4) INSPECTOR PANEL
   // =============================================================================
-  function openInspector(node) {
+  function openInspector(node, opts) {
     CX.state.inspector = node;
     CX.state.inspectorTrigger = document.activeElement;
     var el = document.getElementById('cxpak-inspector');
@@ -1519,16 +1543,20 @@ CX.header = function() {};
     var body = el.querySelector('.cxpak-inspector-body');
     if (body) {
       body.textContent = '';
-      var rows = [
-        ['PageRank', node.metadata && node.metadata.pagerank != null ? CX.format.score(node.metadata.pagerank * 100) : '--'],
-        ['Risk score', node.metadata && node.metadata.risk_score != null ? CX.format.score(node.metadata.risk_score * 100) : '--'],
-        ['Tokens', String(node.metadata && node.metadata.token_count || 0)],
-      ];
+      // If the caller provides context-specific fields, use those; otherwise
+      // fall back to the three generic metadata rows.
+      var rows = (opts && opts.fields)
+        ? opts.fields
+        : [
+            ['PageRank', node.metadata && node.metadata.pagerank != null ? CX.format.score(node.metadata.pagerank * 100) : '--'],
+            ['Risk score', node.metadata && node.metadata.risk_score != null ? CX.format.score(node.metadata.risk_score * 100) : '--'],
+            ['Tokens', String(node.metadata && node.metadata.token_count || 0)],
+          ];
       rows.forEach(function(r) {
         var row = document.createElement('div');
         row.className = 'cxpak-inspector-row';
         var lab = document.createElement('span'); lab.className = 'cxpak-inspector-label'; lab.textContent = r[0];
-        var val = document.createElement('span'); val.className = 'cxpak-inspector-value'; val.textContent = r[1];
+        var val = document.createElement('span'); val.className = 'cxpak-inspector-value'; val.textContent = String(r[1]);
         row.appendChild(lab); row.appendChild(val);
         body.appendChild(row);
       });
@@ -1733,14 +1761,22 @@ CX.header = function() {};
         var idx = Array.prototype.indexOf.call(items, active);
         if (ev.key === 'ArrowDown') {
           ev.preventDefault();
-          if (active) active.classList.remove('active');
+          if (active) { active.classList.remove('active'); active.setAttribute('aria-selected', 'false'); }
           idx = Math.min(idx + 1, items.length - 1);
-          if (items[idx]) items[idx].classList.add('active');
+          if (items[idx]) {
+            items[idx].classList.add('active');
+            items[idx].setAttribute('aria-selected', 'true');
+            input.setAttribute('aria-activedescendant', items[idx].id || '');
+          }
         } else if (ev.key === 'ArrowUp') {
           ev.preventDefault();
-          if (active) active.classList.remove('active');
+          if (active) { active.classList.remove('active'); active.setAttribute('aria-selected', 'false'); }
           idx = Math.max(idx - 1, 0);
-          if (items[idx]) items[idx].classList.add('active');
+          if (items[idx]) {
+            items[idx].classList.add('active');
+            items[idx].setAttribute('aria-selected', 'true');
+            input.setAttribute('aria-activedescendant', items[idx].id || '');
+          }
         } else if (ev.key === 'Enter') {
           ev.preventDefault();
           if (active) active.click();
@@ -1899,7 +1935,7 @@ if (risks.length === 0) {
 } else {
   var tbl = document.createElement('table');
   tbl.className = 'cxpak-risk-table';
-  tbl.innerHTML = '<thead><tr><th>File</th><th>Risk</th><th>Churn</th><th>Blast</th><th>Tests</th></tr></thead>';
+  tbl.innerHTML = '<thead><tr><th>File</th><th>Risk</th><th title="Number of commits touching this file in the last 30 days">Churn (30d)</th><th title="Number of files that directly import this file — larger values increase blast radius of changes">Blast Radius</th><th>Tests</th></tr></thead>';
   var tb = document.createElement('tbody');
   risks.forEach(function(r) {
     var tr = document.createElement('tr');
@@ -1957,9 +1993,19 @@ if (alerts.length === 0) {
     item.onclick = (function(target) {
       return function() { navTo(target.toLowerCase()); };
     })(link);
-    item.innerHTML =
-      '<span class="cxpak-alert-icon">' + icon + '</span>' +
-      '<span class="cxpak-alert-msg">' + CX.esc(a.message) + '</span>';
+    var srText = document.createElement('span');
+    srText.className = 'sr-only';
+    srText.textContent = sev + ' severity: ';
+    var iconSpan = document.createElement('span');
+    iconSpan.className = 'cxpak-alert-icon';
+    iconSpan.setAttribute('aria-hidden', 'true');
+    iconSpan.textContent = icon;
+    var msgSpan = document.createElement('span');
+    msgSpan.className = 'cxpak-alert-msg';
+    msgSpan.textContent = a.message;
+    item.appendChild(srText);
+    item.appendChild(iconSpan);
+    item.appendChild(msgSpan);
     al.appendChild(item);
   });
 }
@@ -2117,6 +2163,15 @@ groups.filter(function(d) { return !d.children; })
         id: d.data.id,
         label: t.path || d.data.label,
         metadata: { risk_score: d.data.risk_score, token_count: 0, pagerank: null }
+      }, {
+        fields: [
+          ['Path', t.path || d.data.label],
+          ['Risk score', CX.format.score(d.data.risk_score * 100)],
+          ['Severity', d.data.severity],
+          ['Churn (30d)', t.churn_30d || 0],
+          ['Blast radius', t.blast_radius || 0],
+          ['Tests', t.test_count || 0],
+        ]
       });
     }
   })
@@ -2128,6 +2183,15 @@ groups.filter(function(d) { return !d.children; })
         id: d.data.id,
         label: t.path || d.data.label,
         metadata: { risk_score: d.data.risk_score, token_count: 0, pagerank: null }
+      }, {
+        fields: [
+          ['Path', t.path || d.data.label],
+          ['Risk score', CX.format.score(d.data.risk_score * 100)],
+          ['Severity', d.data.severity],
+          ['Churn (30d)', t.churn_30d || 0],
+          ['Blast radius', t.blast_radius || 0],
+          ['Tests', t.test_count || 0],
+        ]
       });
     }
   })

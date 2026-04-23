@@ -9,25 +9,11 @@ static D3_BUNDLE: &str = include_str!("../../assets/d3-bundle.min.js");
 static VISUAL_CSS: &str = include_str!("../../assets/cxpak-visual.css");
 static SPA_CONTROLLER: &str = include_str!("../../assets/cxpak-spa-controller.js");
 
-/// Escapes JSON for safe embedding inside an HTML `<script type="application/json">` block.
-///
-/// Replaces every `<`, `>`, `&`, and `=` with the corresponding JSON `\u00XX` Unicode escape.
-/// All five chars (`<`, `>`, `&`, `=`, plus `</script>` substring elimination) are covered:
-/// the per-character `<` and `>` escapes alone make `</script>` impossible to form, so the
-/// `escape_script_tag` substring rewrites are no longer needed. Unicode escapes are valid
-/// JSON per RFC 8259 §7 and decoded transparently by all JSON parsers.
+/// Delegates to `render::escape_script_tag` — the single canonical
+/// implementation — so SPA and standalone renders always produce identical
+/// escaping.
 fn spa_escape(json: &str) -> String {
-    let mut out = String::with_capacity(json.len() + (json.len() / 16));
-    for ch in json.chars() {
-        match ch {
-            '<' => out.push_str(r"\u003c"),
-            '>' => out.push_str(r"\u003e"),
-            '&' => out.push_str(r"\u0026"),
-            '=' => out.push_str(r"\u003d"),
-            other => out.push(other),
-        }
-    }
-    out
+    render::escape_script_tag(json)
 }
 
 /// Escapes a string for safe inclusion in HTML element text content.
@@ -120,6 +106,7 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("  <div id=\"cxpak-app\">\n");
     html.push_str("    <header id=\"cxpak-header\">\n");
     html.push_str("      <span class=\"cxpak-logo\">cxpak</span>\n");
+    html.push_str("      <span class=\"cxpak-sep\">\u{b7}</span>\n");
     html.push_str("      <span class=\"cxpak-repo\">");
     html.push_str(&repo);
     html.push_str("</span>\n");

@@ -248,3 +248,163 @@ fn repo_name_is_html_escaped_in_title_and_span() {
         "escaped repo_name not present in HTML output"
     );
 }
+
+#[test]
+fn dashboard_dimensions_reproduce_composite_via_formula() {
+    // Contract: the health composite displayed on the dashboard MUST equal
+    // sum(dimension × weight) where weights are (conventions=0.20,
+    // test_coverage=0.20, churn_stability=0.15, coupling=0.20, cycles=0.15,
+    // dead_code=0.10). If any dimension is missing from the display, the
+    // formula cannot be reproduced by the user from the visible bars.
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    // Extract dashboard JSON
+    let marker = r#"<script id="cxpak-dashboard" type="application/json">"#;
+    let start = html.find(marker).unwrap() + marker.len();
+    let end = html[start..].find("</script>").unwrap() + start;
+    let json_escaped = &html[start..end];
+    // spa_escape uses \u00XX unicode escapes which serde_json parses natively
+    // inside JSON string values, so no pre-processing is needed.
+    let v: serde_json::Value = serde_json::from_str(json_escaped).unwrap();
+    let dims = v["health"]["dimensions"].as_array().unwrap();
+    let composite = v["health"]["composite"].as_f64().unwrap();
+    let weights: std::collections::HashMap<&str, f64> = [
+        ("conventions", 0.20),
+        ("test_coverage", 0.20),
+        ("churn_stability", 0.15),
+        ("coupling", 0.20),
+        ("cycles", 0.15),
+        ("dead_code", 0.10),
+    ]
+    .iter()
+    .cloned()
+    .collect();
+    let mut reproduced = 0.0_f64;
+    let mut seen_names = std::collections::HashSet::new();
+    for d in dims {
+        let name = d[0].as_str().unwrap();
+        let value = d[1].as_f64().unwrap();
+        seen_names.insert(name.to_string());
+        if let Some(w) = weights.get(name) {
+            reproduced += w * value;
+        }
+    }
+    for expected in [
+        "conventions",
+        "test_coverage",
+        "churn_stability",
+        "coupling",
+        "cycles",
+        "dead_code",
+    ] {
+        assert!(
+            seen_names.contains(expected),
+            "dashboard dimensions missing `{expected}`"
+        );
+    }
+    assert!(
+        (reproduced - composite).abs() < 0.01,
+        "dashboard dimensions × weights = {reproduced}, but composite shown = {composite}. \
+         A user cannot reproduce the composite from the visible bars."
+    );
+}
+
+#[test]
+fn dashboard_has_tests_matches_risk_formula_inline_tests() {
+    // A file with inline `#[cfg(test)] mod tests` and NO entry in test_map
+    // must display `has_tests = true` in the dashboard table, matching the
+    // same condition used by compute_risk_ranking for test_coverage.
+    let counter = cxpak::budget::counter::TokenCounter::new();
+    let files = vec![cxpak::scanner::ScannedFile {
+        relative_path: "src/lib_with_inline.rs".into(),
+        absolute_path: "/tmp/src/lib_with_inline.rs".into(),
+        language: Some("rust".into()),
+        size_bytes: 100,
+    }];
+    let mut content = HashMap::new();
+    content.insert(
+        "src/lib_with_inline.rs".to_string(),
+        "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n".to_string(),
+    );
+    let idx =
+        cxpak::index::CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content);
+    let data = cxpak::visual::render::build_dashboard_data(&idx);
+    let entry = data
+        .risks
+        .top_risks
+        .iter()
+        .find(|r| r.path == "src/lib_with_inline.rs")
+        .expect("file must appear in top_risks (any score)");
+    assert!(
+        entry.has_tests,
+        "dashboard must report has_tests=true for a file with inline tests \
+         (matches risk formula's test_coverage detection)"
+    );
+}
+
+#[test]
+fn header_has_separator_between_brand_and_repo() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    // After the fix, either a visible separator glyph (·) or a CSS border
+    // rule should distinguish the two header labels.
+    let has_separator_glyph = html.contains(r#"class="cxpak-sep""#);
+    let has_css_border = html.contains(".cxpak-logo")
+        && html[html.find(".cxpak-logo").unwrap()..]
+            .find("border-right")
+            .is_some();
+    assert!(
+        has_separator_glyph || has_css_border,
+        "header must have a visual separator between brand and repo (either HTML .cxpak-sep span or CSS border-right on .cxpak-logo)"
+    );
+}
+
+#[test]
+fn top_risks_table_uses_unit_labels_and_tooltips() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    assert!(
+        html.contains("Blast Radius"),
+        "column must be named 'Blast Radius', not 'Blast'"
+    );
+    assert!(
+        html.contains("Churn (30d)"),
+        "column must include unit: 'Churn (30d)'"
+    );
+    // And the `title` attribute explaining blast radius:
+    assert!(
+        html.contains("title=\"Number of files that directly import this file"),
+        "Blast Radius header must have a `title` tooltip explaining the metric"
+    );
+}
+
+#[test]
+fn alert_icons_have_sr_only_text_and_aria_hidden() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    // The dashboard_js emits alert items. The icon span must be aria-hidden,
+    // and a preceding sr-only label must describe the severity.
+    assert!(
+        html.contains("setAttribute('aria-hidden', 'true')")
+            || html.contains("aria-hidden=\"true\""),
+        "alert icon must be aria-hidden"
+    );
+    assert!(
+        html.contains("'sr-only'") || html.contains("\"sr-only\""),
+        "alert must have sr-only text for screen readers"
+    );
+    // CSS class `.sr-only` must be defined
+    let css = std::fs::read_to_string("assets/cxpak-visual.css").unwrap();
+    assert!(css.contains(".sr-only"), "CSS must define .sr-only class");
+}
+
+#[test]
+fn risk_inspector_passes_context_specific_fields() {
+    let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    // risk_js should pass Churn / Blast / Tests labels when opening inspector
+    // from a risk treemap cell. Grep the embedded risk_js for these strings.
+    assert!(
+        html.contains("'Churn (30d)'") || html.contains("\"Churn (30d)\""),
+        "risk inspector must show churn"
+    );
+    assert!(
+        html.contains("'Blast radius'") || html.contains("\"Blast radius\""),
+        "risk inspector must show blast radius"
+    );
+}
