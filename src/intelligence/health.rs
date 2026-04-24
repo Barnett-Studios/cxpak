@@ -831,6 +831,7 @@ mod tests {
             .map(|i| ChurnEntry {
                 path: format!("src{i}.rs"),
                 modifications: 15, // > 10 → hot
+                last_commit_epoch: None,
             })
             .collect();
         index.conventions = profile;

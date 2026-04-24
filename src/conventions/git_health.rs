@@ -19,6 +19,11 @@ pub struct GitHealthProfile {
 pub struct ChurnEntry {
     pub path: String,
     pub modifications: usize,
+    /// UNIX epoch seconds of this file's most recent commit inside the window.
+    /// `#[serde(default)]` keeps deserialization of v2.1.0-and-earlier
+    /// conventions.json (which lacks this field) working — missing -> None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit_epoch: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +61,9 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
 
     let mut churn_30d: HashMap<String, usize> = HashMap::new();
     let mut churn_180d: HashMap<String, usize> = HashMap::new();
+    // Track the most recent commit epoch per file for real recency signals.
+    let mut last_commit_30d: HashMap<String, i64> = HashMap::new();
+    let mut last_commit_180d: HashMap<String, i64> = HashMap::new();
     let mut bugfix_commits: HashMap<String, usize> = HashMap::new();
     let mut dir_commits: HashMap<String, usize> = HashMap::new();
     let mut reverts: Vec<RevertEntry> = Vec::new();
@@ -127,10 +135,18 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
         for path in &changed_files {
             // 180d churn
             *churn_180d.entry(path.clone()).or_insert(0) += 1;
+            last_commit_180d
+                .entry(path.clone())
+                .and_modify(|t| *t = (*t).max(commit_time))
+                .or_insert(commit_time);
 
             // 30d churn
             if commit_time >= thirty_days_ago {
                 *churn_30d.entry(path.clone()).or_insert(0) += 1;
+                last_commit_30d
+                    .entry(path.clone())
+                    .and_modify(|t| *t = (*t).max(commit_time))
+                    .or_insert(commit_time);
             }
 
             // Bug-fix density per directory
@@ -166,18 +182,26 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
     // Sort churn entries by modification count (descending)
     let mut churn_30d_vec: Vec<ChurnEntry> = churn_30d
         .into_iter()
-        .map(|(path, modifications)| ChurnEntry {
-            path,
-            modifications,
+        .map(|(path, modifications)| {
+            let last_commit_epoch = last_commit_30d.get(&path).copied();
+            ChurnEntry {
+                path,
+                modifications,
+                last_commit_epoch,
+            }
         })
         .collect();
     churn_30d_vec.sort_by(|a, b| b.modifications.cmp(&a.modifications));
 
     let mut churn_180d_vec: Vec<ChurnEntry> = churn_180d
         .into_iter()
-        .map(|(path, modifications)| ChurnEntry {
-            path,
-            modifications,
+        .map(|(path, modifications)| {
+            let last_commit_epoch = last_commit_180d.get(&path).copied();
+            ChurnEntry {
+                path,
+                modifications,
+                last_commit_epoch,
+            }
         })
         .collect();
     churn_180d_vec.sort_by(|a, b| b.modifications.cmp(&a.modifications));

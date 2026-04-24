@@ -512,10 +512,12 @@ mod tests {
                 churn_30d: vec![ChurnEntry {
                     path: "src/hot_file.rs".to_string(),
                     modifications: 42,
+                    last_commit_epoch: None,
                 }],
                 churn_180d: vec![ChurnEntry {
                     path: "src/hot_file.rs".to_string(),
                     modifications: 120,
+                    last_commit_epoch: None,
                 }],
                 reverts: vec![RevertEntry {
                     commit_message: "Revert bad change".to_string(),
@@ -546,6 +548,7 @@ mod tests {
                 churn_30d: vec![ChurnEntry {
                     path: "src/lib.rs".to_string(),
                     modifications: 10,
+                    last_commit_epoch: None,
                 }],
                 churn_180d: vec![],
                 reverts: vec![RevertEntry {
@@ -634,10 +637,12 @@ mod tests {
             churn_30d: vec![ChurnEntry {
                 path: "src/main.rs".to_string(),
                 modifications: 42,
+                last_commit_epoch: None,
             }],
             churn_180d: vec![ChurnEntry {
                 path: "src/main.rs".to_string(),
                 modifications: 15,
+                last_commit_epoch: None,
             }],
             churn_trend: {
                 let mut m = std::collections::HashMap::new();

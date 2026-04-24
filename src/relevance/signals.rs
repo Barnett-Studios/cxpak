@@ -1026,6 +1026,7 @@ mod tests {
         index.conventions.git_health.churn_30d.push(ChurnEntry {
             path: "src/hot.rs".to_string(),
             modifications: 5,
+            last_commit_epoch: None,
         });
         let result = recency_boost_signal("src/hot.rs", &index);
         assert_eq!(result.name, "recency_boost");
@@ -1041,6 +1042,7 @@ mod tests {
         index.conventions.git_health.churn_180d.push(ChurnEntry {
             path: "src/cold.rs".to_string(),
             modifications: 2,
+            last_commit_epoch: None,
         });
         let result = recency_boost_signal("src/cold.rs", &index);
         assert_eq!(result.name, "recency_boost");
