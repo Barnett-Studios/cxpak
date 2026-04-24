@@ -342,9 +342,9 @@ pub fn handle_custom_method(
         "cxpak/apiSurface" => {
             let surface =
                 crate::intelligence::api_surface::extract_api_surface(index, None, "all", 5000);
-            Ok(Some(
-                serde_json::to_value(surface).unwrap_or_else(|_| serde_json::json!({})),
-            ))
+            Ok(Some(serde_json::to_value(surface).map_err(|e| {
+                LspMethodError::Internal(format!("serialization failed: {e}"))
+            })?))
         }
         "cxpak/deadCode" => {
             let dead = crate::intelligence::dead_code::detect_dead_code(index, None);
@@ -378,9 +378,9 @@ pub fn handle_custom_method(
                 &index.test_map,
                 3,
             );
-            Ok(Some(
-                serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
-            ))
+            Ok(Some(serde_json::to_value(result).map_err(|e| {
+                LspMethodError::Internal(format!("serialization failed: {e}"))
+            })?))
         }
         "cxpak/drift" => {
             let save_baseline = params
@@ -399,9 +399,9 @@ pub fn handle_custom_method(
                 crate::intelligence::security::DEFAULT_AUTH_PATTERNS,
                 None,
             );
-            Ok(Some(
-                serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
-            ))
+            Ok(Some(serde_json::to_value(result).map_err(|e| {
+                LspMethodError::Internal(format!("serialization failed: {e}"))
+            })?))
         }
         "cxpak/dataFlow" => {
             let sym = params
