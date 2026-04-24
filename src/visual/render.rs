@@ -1240,9 +1240,6 @@ pub struct HealthQuadrant {
     pub composite: f64,
     /// (dimension_name, score) pairs, e.g. [("conventions", 9.0), ...]
     pub dimensions: Vec<(String, f64)>,
-    /// Placeholder trend series — populated as `(label, value)` pairs when
-    /// historical data is available; empty otherwise.
-    pub trend: Vec<(String, f64)>,
 }
 
 /// Top-right quadrant: top-5 riskiest files.
@@ -1341,7 +1338,6 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
     let health = HealthQuadrant {
         composite: health_score.composite,
         dimensions,
-        trend: vec![],
     };
 
     // ── Risks quadrant ────────────────────────────────────────────────────────
