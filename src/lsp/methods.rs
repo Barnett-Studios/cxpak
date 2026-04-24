@@ -122,23 +122,57 @@ pub fn diagnostics_for_file(
     index: &crate::index::CodebaseIndex,
     repo_root: &Path,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+
     let url = Url::parse(uri_path).ok();
     let rel_opt = url.as_ref().and_then(|u| uri_to_rel_path(u, repo_root));
 
-    // Only produce diagnostics for files we know about
-    let file = index.files.iter().find(|f| {
+    let Some(file) = index.files.iter().find(|f| {
         rel_opt.as_deref().is_some_and(|r| f.relative_path == r)
             || uri_path.ends_with(&f.relative_path)
-    });
-
-    let Some(_f) = file else {
+    }) else {
         return Vec::new();
     };
 
-    // Convention verification requires git state which isn't available in the LSP
-    // context without a repo path. Return empty for now — real diagnostics will
-    // be wired when verify::check_file is added.
-    Vec::new()
+    // Emit a Warning diagnostic for every symbol the dead-code detector flags
+    // in this file. `detect_dead_code` uses our strict heuristics, so
+    // diagnostics inherit the same zero-false-positive contract locked by
+    // `tests/dead_code_adversarial.rs`.  `DeadSymbol` doesn't carry line
+    // numbers, so look them up from the file's parse result.
+    let Some(pr) = &file.parse_result else {
+        return Vec::new();
+    };
+    let dead = crate::intelligence::dead_code::detect_dead_code(index, None);
+    dead.into_iter()
+        .filter(|d| d.file == file.relative_path)
+        .filter_map(|d| {
+            let sym = pr
+                .symbols
+                .iter()
+                .find(|s| s.name == d.symbol && s.kind == d.kind)?;
+            let line = sym.start_line.saturating_sub(1) as u32;
+            let end_line = sym.end_line.saturating_sub(1) as u32;
+            Some(Diagnostic {
+                range: Range {
+                    start: Position { line, character: 0 },
+                    end: Position {
+                        line: end_line,
+                        character: 0,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::WARNING),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "cxpak.dead_code".into(),
+                )),
+                code_description: None,
+                source: Some("cxpak".into()),
+                message: format!("dead code: {} ({})", d.symbol, d.reason),
+                related_information: None,
+                tags: Some(vec![tower_lsp::lsp_types::DiagnosticTag::UNNECESSARY]),
+                data: None,
+            })
+        })
+        .collect()
 }
 
 pub fn workspace_symbols(
@@ -565,11 +599,71 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_empty_for_known_file() {
+    fn diagnostics_empty_for_known_file_without_dead_code() {
+        // With no dead symbols the diagnostics list is empty.
         let index = make_test_index();
         let root = std::path::Path::new("/tmp");
         let result = diagnostics_for_file("src/main.rs", &index, root);
-        assert!(result.is_empty());
+        assert!(
+            result.is_empty(),
+            "no dead symbols -> no diagnostics, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_include_dead_code_warnings() {
+        // A private function with zero callers, no test attribute, no
+        // qualified reference is dead. diagnostics_for_file must surface it
+        // as a WARNING-severity diagnostic with source=cxpak and
+        // tags=[UNNECESSARY] so the editor can grey it out.
+        let counter = TokenCounter::new();
+        let file = ScannedFile {
+            relative_path: "src/main.rs".to_string(),
+            absolute_path: std::path::PathBuf::from("/tmp/src/main.rs"),
+            language: Some("rust".to_string()),
+            size_bytes: 100,
+        };
+        let mut parses = HashMap::new();
+        parses.insert(
+            "src/main.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "unused_helper".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "fn unused_helper()".to_string(),
+                    body: "fn unused_helper() { 1 + 1; }".to_string(),
+                    start_line: 7,
+                    end_line: 9,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content = HashMap::new();
+        content.insert(
+            "src/main.rs".to_string(),
+            "\n\n\n\n\n\nfn unused_helper() {}\n".to_string(),
+        );
+        let index = CodebaseIndex::build_with_content(vec![file], parses, &counter, content);
+        let root = std::path::Path::new("/tmp");
+        let diags = diagnostics_for_file("src/main.rs", &index, root);
+        assert!(
+            diags.iter().any(|d| d.source.as_deref() == Some("cxpak")
+                && d.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+                && d.message.contains("dead code")
+                && d.message.contains("unused_helper")),
+            "expected at least one cxpak dead-code warning for unused_helper, got {diags:?}"
+        );
+        // Range must point at the symbol's declaration line (1-indexed -> 0-indexed).
+        let d = diags
+            .iter()
+            .find(|d| d.message.contains("unused_helper"))
+            .unwrap();
+        assert_eq!(
+            d.range.start.line, 6,
+            "start line must be 0-indexed start_line-1"
+        );
     }
 
     fn make_multi_symbol_index() -> CodebaseIndex {
