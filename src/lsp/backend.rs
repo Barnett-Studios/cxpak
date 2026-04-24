@@ -50,59 +50,111 @@ impl CxpakLspBackend {
     }
 
     pub async fn custom_health(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let idx = self.index.read().map_err(Self::lock_err)?;
-        match super::methods::handle_custom_method("cxpak/health", serde_json::Value::Null, &idx) {
-            Ok(Some(v)) => Ok(v),
-            Ok(None) => Ok(serde_json::Value::Null),
-            Err(e) => Err(Self::method_err(e)),
-        }
+        self.dispatch("cxpak/health", serde_json::Value::Null).await
     }
 
     pub async fn custom_conventions(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let idx = self.index.read().map_err(Self::lock_err)?;
-        match super::methods::handle_custom_method(
-            "cxpak/conventions",
-            serde_json::Value::Null,
-            &idx,
-        ) {
-            Ok(Some(v)) => Ok(v),
-            Ok(None) => Ok(serde_json::Value::Null),
-            Err(e) => Err(Self::method_err(e)),
-        }
+        self.dispatch("cxpak/conventions", serde_json::Value::Null)
+            .await
     }
 
-    pub async fn custom_blast_radius(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let idx = self.index.read().map_err(Self::lock_err)?;
-        match super::methods::handle_custom_method(
-            "cxpak/blastRadius",
-            serde_json::Value::Null,
-            &idx,
-        ) {
-            Ok(Some(v)) => Ok(v),
-            Ok(None) => Ok(serde_json::Value::Null),
-            Err(e) => Err(Self::method_err(e)),
-        }
-    }
-
-    pub async fn custom_dead_code(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let idx = self.index.read().map_err(Self::lock_err)?;
-        match super::methods::handle_custom_method("cxpak/deadCode", serde_json::Value::Null, &idx)
-        {
-            Ok(Some(v)) => Ok(v),
-            Ok(None) => Ok(serde_json::Value::Null),
-            Err(e) => Err(Self::method_err(e)),
-        }
-    }
-
-    pub async fn custom_stub(
+    pub async fn custom_blast_radius(
         &self,
         params: serde_json::Value,
     ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let method = params
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        Ok(serde_json::json!({"status": "available", "method": method}))
+        self.dispatch("cxpak/blastRadius", params).await
+    }
+
+    pub async fn custom_dead_code(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/deadCode", serde_json::Value::Null)
+            .await
+    }
+
+    /// Shared dispatcher that forwards a named method + params to
+    /// `methods::handle_custom_method`. Each `custom_*` wrapper calls this
+    /// with a constant method name so the registration surface stays clean
+    /// while every method ends up at the real implementation.
+    async fn dispatch(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        let idx = self.index.read().map_err(Self::lock_err)?;
+        match super::methods::handle_custom_method(method, params, &idx, self.path.as_path()) {
+            Ok(Some(v)) => Ok(v),
+            Ok(None) => Ok(serde_json::Value::Null),
+            Err(e) => Err(Self::method_err(e)),
+        }
+    }
+
+    pub async fn custom_overview(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/overview", params).await
+    }
+
+    pub async fn custom_trace(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/trace", params).await
+    }
+
+    pub async fn custom_diff(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/diff", params).await
+    }
+
+    pub async fn custom_search(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/search", params).await
+    }
+
+    pub async fn custom_api_surface(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/apiSurface", params).await
+    }
+
+    pub async fn custom_call_graph(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/callGraph", params).await
+    }
+
+    pub async fn custom_predict(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/predict", params).await
+    }
+
+    pub async fn custom_drift(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/drift", params).await
+    }
+
+    pub async fn custom_security_surface(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/securitySurface", params).await
+    }
+
+    pub async fn custom_data_flow(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/dataFlow", params).await
     }
 }
 

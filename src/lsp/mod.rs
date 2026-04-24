@@ -19,17 +19,20 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     .custom_method("cxpak/health", CxpakLspBackend::custom_health)
     .custom_method("cxpak/conventions", CxpakLspBackend::custom_conventions)
     .custom_method("cxpak/blastRadius", CxpakLspBackend::custom_blast_radius)
-    .custom_method("cxpak/overview", CxpakLspBackend::custom_stub)
-    .custom_method("cxpak/trace", CxpakLspBackend::custom_stub)
-    .custom_method("cxpak/diff", CxpakLspBackend::custom_stub)
-    .custom_method("cxpak/search", CxpakLspBackend::custom_stub)
-    .custom_method("cxpak/apiSurface", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/overview", CxpakLspBackend::custom_overview)
+    .custom_method("cxpak/trace", CxpakLspBackend::custom_trace)
+    .custom_method("cxpak/diff", CxpakLspBackend::custom_diff)
+    .custom_method("cxpak/search", CxpakLspBackend::custom_search)
+    .custom_method("cxpak/apiSurface", CxpakLspBackend::custom_api_surface)
     .custom_method("cxpak/deadCode", CxpakLspBackend::custom_dead_code)
-    .custom_method("cxpak/callGraph", CxpakLspBackend::custom_stub)
-    .custom_method("cxpak/predict", CxpakLspBackend::custom_stub)
-    .custom_method("cxpak/drift", CxpakLspBackend::custom_stub)
-    .custom_method("cxpak/securitySurface", CxpakLspBackend::custom_stub)
-    .custom_method("cxpak/dataFlow", CxpakLspBackend::custom_stub)
+    .custom_method("cxpak/callGraph", CxpakLspBackend::custom_call_graph)
+    .custom_method("cxpak/predict", CxpakLspBackend::custom_predict)
+    .custom_method("cxpak/drift", CxpakLspBackend::custom_drift)
+    .custom_method(
+        "cxpak/securitySurface",
+        CxpakLspBackend::custom_security_surface,
+    )
+    .custom_method("cxpak/dataFlow", CxpakLspBackend::custom_data_flow)
     .finish();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {

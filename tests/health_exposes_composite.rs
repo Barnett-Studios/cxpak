@@ -46,10 +46,14 @@ fn lsp_health_exposes_composite_field() {
         &counter,
         std::collections::HashMap::new(),
     );
-    let result =
-        cxpak::lsp::methods::handle_custom_method("cxpak/health", serde_json::Value::Null, &idx)
-            .unwrap()
-            .unwrap();
+    let result = cxpak::lsp::methods::handle_custom_method(
+        "cxpak/health",
+        serde_json::Value::Null,
+        &idx,
+        std::path::Path::new("/tmp"),
+    )
+    .unwrap()
+    .unwrap();
     assert!(
         result.get("composite").is_some(),
         "LSP cxpak/health must expose composite: {result}"

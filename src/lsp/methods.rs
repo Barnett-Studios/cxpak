@@ -205,6 +205,7 @@ pub fn handle_custom_method(
     method: &str,
     params: serde_json::Value,
     index: &crate::index::CodebaseIndex,
+    repo_root: &Path,
 ) -> Result<Option<serde_json::Value>, LspMethodError> {
     match method {
         "cxpak/health" => {
@@ -226,9 +227,46 @@ pub fn handle_custom_method(
         "cxpak/conventions" => serde_json::to_value(&index.conventions)
             .map(Some)
             .map_err(|e| LspMethodError::Internal(format!("serialization failed: {e}"))),
-        "cxpak/blastRadius" => Ok(Some(serde_json::json!({
-            "note": "use cxpak/health for file counts; blast radius requires file param"
-        }))),
+        "cxpak/blastRadius" => {
+            let files: Vec<String> = params
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .or_else(|| {
+                    params
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .map(|s| vec![s.to_string()])
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                return Err(LspMethodError::Internal(
+                    "cxpak/blastRadius requires 'file' (string) or 'files' (array) param".into(),
+                ));
+            }
+            let depth = params
+                .get("depth")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3)
+                .min(8) as usize;
+            let focus = params.get("focus").and_then(|v| v.as_str());
+            let refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+            let result = crate::intelligence::blast_radius::compute_blast_radius(
+                &refs,
+                &index.graph,
+                &index.pagerank,
+                &index.test_map,
+                depth,
+                focus,
+            );
+            Ok(Some(serde_json::to_value(result).map_err(|e| {
+                LspMethodError::Internal(format!("serialization failed: {e}"))
+            })?))
+        }
         "cxpak/overview" => Ok(Some(serde_json::json!({
             "total_files": index.total_files,
             "total_tokens": index.total_tokens,
@@ -259,9 +297,28 @@ pub fn handle_custom_method(
                 )),
             }
         }
-        "cxpak/diff" => Ok(Some(
-            serde_json::json!({"note": "diff requires git ref; use cxpak diff CLI"}),
-        )),
+        "cxpak/diff" => {
+            let git_ref = params.get("ref").and_then(|v| v.as_str());
+            match crate::commands::diff::extract_changes(repo_root, git_ref) {
+                Ok(changes) => {
+                    let entries: Vec<_> = changes
+                        .iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "path": c.path,
+                                "diff_bytes": c.diff_text.len(),
+                            })
+                        })
+                        .collect();
+                    Ok(Some(serde_json::json!({
+                        "ref": git_ref.unwrap_or("uncommitted"),
+                        "count": entries.len(),
+                        "changes": entries,
+                    })))
+                }
+                Err(e) => Err(LspMethodError::Internal(format!("git diff failed: {e}"))),
+            }
+        }
         "cxpak/search" => {
             let query = params
                 .get("query")
@@ -323,9 +380,17 @@ pub fn handle_custom_method(
                 serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
             ))
         }
-        "cxpak/drift" => Ok(Some(
-            serde_json::json!({"note": "drift requires repo path; use cxpak drift CLI"}),
-        )),
+        "cxpak/drift" => {
+            let save_baseline = params
+                .get("save_baseline")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let report =
+                crate::intelligence::drift::build_drift_report(index, repo_root, save_baseline);
+            Ok(Some(serde_json::to_value(report).map_err(|e| {
+                LspMethodError::Internal(format!("serialization failed: {e}"))
+            })?))
+        }
         "cxpak/securitySurface" => {
             let result = crate::intelligence::security::build_security_surface(
                 index,
@@ -599,10 +664,39 @@ mod tests {
         );
     }
 
+    /// Create a throwaway directory with `git init` so drift/diff can run.
+    fn make_git_tempdir() -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _ = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(temp.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(temp.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(temp.path())
+            .output();
+        std::fs::write(temp.path().join("README.md"), "init\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(temp.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(temp.path())
+            .output();
+        temp
+    }
+
     #[test]
     fn custom_method_health_returns_json() {
         let index = make_test_index();
-        let result = handle_custom_method("cxpak/health", serde_json::Value::Null, &index);
+        let root = std::path::Path::new("/tmp");
+        let result = handle_custom_method("cxpak/health", serde_json::Value::Null, &index, root);
         assert!(result.is_ok());
         let val = result.unwrap().unwrap();
         assert!(val["total_files"].is_number());
@@ -611,7 +705,9 @@ mod tests {
     #[test]
     fn custom_method_unknown_returns_not_found() {
         let index = make_test_index();
-        let result = handle_custom_method("cxpak/nonexistent", serde_json::Value::Null, &index);
+        let root = std::path::Path::new("/tmp");
+        let result =
+            handle_custom_method("cxpak/nonexistent", serde_json::Value::Null, &index, root);
         assert!(
             matches!(result, Err(LspMethodError::NotFound(_))),
             "unknown method must return LspMethodError::NotFound"
@@ -621,7 +717,9 @@ mod tests {
     #[test]
     fn custom_method_conventions_returns_profile() {
         let index = make_test_index();
-        let result = handle_custom_method("cxpak/conventions", serde_json::Value::Null, &index);
+        let root = std::path::Path::new("/tmp");
+        let result =
+            handle_custom_method("cxpak/conventions", serde_json::Value::Null, &index, root);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
     }
@@ -629,25 +727,36 @@ mod tests {
     #[test]
     fn all_registered_custom_methods_return_ok() {
         let index = make_test_index();
-        let methods = [
-            "cxpak/health",
-            "cxpak/conventions",
-            "cxpak/blastRadius",
-            "cxpak/overview",
-            "cxpak/trace",
-            "cxpak/diff",
-            "cxpak/search",
-            "cxpak/apiSurface",
-            "cxpak/deadCode",
-            "cxpak/callGraph",
-            "cxpak/predict",
-            "cxpak/drift",
-            "cxpak/securitySurface",
-            "cxpak/dataFlow",
+        let temp = make_git_tempdir();
+        let root = temp.path();
+        let param_map: &[(&str, serde_json::Value)] = &[
+            ("cxpak/health", serde_json::Value::Null),
+            ("cxpak/conventions", serde_json::Value::Null),
+            (
+                "cxpak/blastRadius",
+                serde_json::json!({"file": "src/main.rs"}),
+            ),
+            ("cxpak/overview", serde_json::Value::Null),
+            ("cxpak/trace", serde_json::json!({"symbol": "main"})),
+            ("cxpak/diff", serde_json::Value::Null),
+            ("cxpak/search", serde_json::json!({"query": "main"})),
+            ("cxpak/apiSurface", serde_json::Value::Null),
+            ("cxpak/deadCode", serde_json::Value::Null),
+            ("cxpak/callGraph", serde_json::Value::Null),
+            (
+                "cxpak/predict",
+                serde_json::json!({"files": ["src/main.rs"]}),
+            ),
+            ("cxpak/drift", serde_json::Value::Null),
+            ("cxpak/securitySurface", serde_json::Value::Null),
+            ("cxpak/dataFlow", serde_json::json!({"symbol": "main"})),
         ];
-        for m in methods {
-            let result = handle_custom_method(m, serde_json::Value::Null, &index);
-            assert!(result.is_ok(), "method {m} should return Ok");
+        for (m, params) in param_map {
+            let result = handle_custom_method(m, params.clone(), &index, root);
+            assert!(
+                result.is_ok(),
+                "method {m} should return Ok, got {result:?}"
+            );
         }
     }
 

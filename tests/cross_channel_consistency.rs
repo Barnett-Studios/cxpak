@@ -137,9 +137,14 @@ async fn health_consistency_spa_v1_mcp_lsp() {
 
     // LSP cxpak/health (updated in Task 12b).
     let idx2 = make_fixture_index();
-    let lsp = cxpak::lsp::methods::handle_custom_method("cxpak/health", Value::Null, &idx2)
-        .unwrap()
-        .expect("Some");
+    let lsp = cxpak::lsp::methods::handle_custom_method(
+        "cxpak/health",
+        Value::Null,
+        &idx2,
+        std::path::Path::new("/tmp"),
+    )
+    .unwrap()
+    .expect("Some");
     let lsp_composite = lsp["composite"]
         .as_f64()
         .expect("LSP cxpak/health must expose composite (Task 12b)");
@@ -230,9 +235,14 @@ async fn dead_code_consistency_v1_lsp() {
         .unwrap_or(0);
     assert_eq!(v1_count, expected.len());
     let idx2 = make_fixture_index();
-    let lsp = cxpak::lsp::methods::handle_custom_method("cxpak/deadCode", Value::Null, &idx2)
-        .unwrap()
-        .expect("Some");
+    let lsp = cxpak::lsp::methods::handle_custom_method(
+        "cxpak/deadCode",
+        Value::Null,
+        &idx2,
+        std::path::Path::new("/tmp"),
+    )
+    .unwrap()
+    .expect("Some");
     let lsp_count = lsp
         .as_array()
         .map(|a| a.len())
