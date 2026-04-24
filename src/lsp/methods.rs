@@ -273,29 +273,27 @@ pub fn handle_custom_method(
             "languages": index.language_stats.len(),
         }))),
         "cxpak/trace" => {
-            let symbol = params.get("symbol").and_then(|v| v.as_str());
-            match symbol {
-                Some(sym) => {
-                    let matches = index.find_symbol(sym);
-                    let locations: Vec<_> = matches
-                        .into_iter()
-                        .map(|(file, s)| {
-                            serde_json::json!({
-                                "file": file,
-                                "start_line": s.start_line,
-                                "end_line": s.end_line,
-                                "kind": format!("{:?}", s.kind),
-                            })
-                        })
-                        .collect();
-                    Ok(Some(
-                        serde_json::json!({"count": locations.len(), "locations": locations}),
-                    ))
-                }
-                None => Ok(Some(
-                    serde_json::json!({"count": 0, "locations": [], "note": "provide symbol parameter"}),
-                )),
-            }
+            let sym = params
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    LspMethodError::Internal("cxpak/trace requires 'symbol' (string) param".into())
+                })?;
+            let matches = index.find_symbol(sym);
+            let locations: Vec<_> = matches
+                .into_iter()
+                .map(|(file, s)| {
+                    serde_json::json!({
+                        "file": file,
+                        "start_line": s.start_line,
+                        "end_line": s.end_line,
+                        "kind": format!("{:?}", s.kind),
+                    })
+                })
+                .collect();
+            Ok(Some(
+                serde_json::json!({"count": locations.len(), "locations": locations}),
+            ))
         }
         "cxpak/diff" => {
             let git_ref = params.get("ref").and_then(|v| v.as_str());
@@ -323,11 +321,13 @@ pub fn handle_custom_method(
             let query = params
                 .get("query")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .ok_or_else(|| {
+                    LspMethodError::Internal("cxpak/search requires 'query' (string) param".into())
+                })?
                 .to_lowercase();
             if query.is_empty() {
-                return Ok(Some(
-                    serde_json::json!({"matches": [], "note": "provide query parameter"}),
+                return Err(LspMethodError::Internal(
+                    "cxpak/search 'query' must be non-empty".into(),
                 ));
             }
             let matches: Vec<_> = index
@@ -365,7 +365,9 @@ pub fn handle_custom_method(
                 })
                 .unwrap_or_default();
             if files.is_empty() {
-                return Ok(Some(serde_json::json!({"note": "provide files parameter"})));
+                return Err(LspMethodError::Internal(
+                    "cxpak/predict requires 'files' (array of strings) param".into(),
+                ));
             }
             let refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
             let result = crate::intelligence::predict::predict(
@@ -402,19 +404,18 @@ pub fn handle_custom_method(
             ))
         }
         "cxpak/dataFlow" => {
-            let symbol = params.get("symbol").and_then(|v| v.as_str());
-            match symbol {
-                Some(sym) => {
-                    let result =
-                        crate::intelligence::data_flow::trace_data_flow(sym, None, 6, index);
-                    Ok(Some(
-                        serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
-                    ))
-                }
-                None => Ok(Some(
-                    serde_json::json!({"note": "provide symbol parameter"}),
-                )),
-            }
+            let sym = params
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    LspMethodError::Internal(
+                        "cxpak/dataFlow requires 'symbol' (string) param".into(),
+                    )
+                })?;
+            let result = crate::intelligence::data_flow::trace_data_flow(sym, None, 6, index);
+            Ok(Some(serde_json::to_value(result).map_err(|e| {
+                LspMethodError::Internal(format!("serialization failed: {e}"))
+            })?))
         }
         _ => Err(LspMethodError::NotFound(method.to_string())),
     }
@@ -756,6 +757,31 @@ mod tests {
             assert!(
                 result.is_ok(),
                 "method {m} should return Ok, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn methods_with_missing_required_params_return_internal_error() {
+        let index = make_test_index();
+        let root = std::path::Path::new("/tmp");
+        // These methods MUST return an Internal error rather than a soft-failure
+        // {"note": "provide X"} payload, which would let a caller mistake a
+        // missing-input for a valid empty response.
+        let cases = [
+            ("cxpak/trace", serde_json::Value::Null),
+            ("cxpak/search", serde_json::Value::Null),
+            ("cxpak/search", serde_json::json!({"query": ""})),
+            ("cxpak/predict", serde_json::Value::Null),
+            ("cxpak/predict", serde_json::json!({"files": []})),
+            ("cxpak/dataFlow", serde_json::Value::Null),
+            ("cxpak/blastRadius", serde_json::Value::Null),
+        ];
+        for (m, p) in cases {
+            let r = handle_custom_method(m, p, &index, root);
+            assert!(
+                matches!(r, Err(LspMethodError::Internal(_))),
+                "method {m} with missing params must Err(Internal), got {r:?}"
             );
         }
     }
