@@ -4,6 +4,16 @@ coverage/
 references/
 tarpaulin-report.*
 
+# LLM-collaboration artifacts kept locally only
+.claude/
+docs/plans/
+docs/release/
+docs/LANDSCAPE_RESEARCH_2026.md
+docs/MARKET_ANALYSIS_SUMMARY.md
+docs/ROADMAP_RECOMMENDATIONS.md
+docs/RESEARCH_INDEX.md
+cxpak-architecture.mmd
+
 # cxpak generated artifacts during local dev
 /cxpak-all.html
 /.playwright-mcp/
