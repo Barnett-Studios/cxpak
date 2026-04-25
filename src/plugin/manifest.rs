@@ -214,6 +214,7 @@ mod tests {
             cross_lang_edges: vec![],
             #[cfg(feature = "embeddings")]
             embedding_index: None,
+            dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {
@@ -302,6 +303,7 @@ mod tests {
             cross_lang_edges: vec![],
             #[cfg(feature = "embeddings")]
             embedding_index: None,
+            dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {
@@ -350,6 +352,7 @@ mod tests {
             cross_lang_edges: vec![],
             #[cfg(feature = "embeddings")]
             embedding_index: None,
+            dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {
@@ -423,6 +426,7 @@ mod tests {
             cross_lang_edges: vec![],
             #[cfg(feature = "embeddings")]
             embedding_index: None,
+            dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {
@@ -485,6 +489,7 @@ mod tests {
             cross_lang_edges: vec![],
             #[cfg(feature = "embeddings")]
             embedding_index: None,
+            dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {

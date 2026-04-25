@@ -7,11 +7,13 @@ use crate::context_quality::expansion::Domain;
 use crate::conventions::ConventionProfile;
 use crate::index::graph::DependencyGraph;
 use crate::intelligence::call_graph::CallGraph;
+use crate::intelligence::dead_code::DeadSymbol;
 use crate::intelligence::test_map::TestFileRef;
 use crate::parser::language::{Import, ParseResult, Symbol, Visibility};
 use crate::scanner::ScannedFile;
 use crate::schema::SchemaIndex;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone)]
 pub struct CodebaseIndex {
@@ -37,6 +39,29 @@ pub struct CodebaseIndex {
     pub cross_lang_edges: Vec<crate::intelligence::cross_lang::CrossLangEdge>,
     #[cfg(feature = "embeddings")]
     pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
+    /// Memoized `detect_dead_code(self, None)` result. Populated lazily on
+    /// first call to [`Self::dead_code_cached`]. Shared across clones via
+    /// `Arc`, so any clone that triggers computation benefits all clones.
+    /// Invalidation is by index rebuild — the watcher replaces the whole
+    /// `CodebaseIndex` in the `Arc<RwLock<_>>`, dropping the old cache.
+    #[doc(hidden)]
+    pub dead_code_cache: Arc<OnceLock<Vec<DeadSymbol>>>,
+}
+
+impl CodebaseIndex {
+    /// Return the global dead-code analysis for this index, computing it
+    /// lazily on first call and reusing the memoized result thereafter.
+    ///
+    /// This is the hot path for LSP `diagnostics_for_file` and the SPA
+    /// dashboard. A full scan is O(F·S·C) where F = files, S = symbols,
+    /// C = cross-file content scans; at index-build scale (300 files ×
+    /// 50 symbols × 300 files) running it per diagnostic request froze
+    /// editors on any non-toy repo. The cache reduces each subsequent
+    /// access to pointer deref + bounds check.
+    pub fn dead_code_cached(&self) -> &[DeadSymbol] {
+        self.dead_code_cache
+            .get_or_init(|| crate::intelligence::dead_code::detect_dead_code(self, None))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +193,7 @@ impl CodebaseIndex {
             cross_lang_edges: Vec::new(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
+            dead_code_cache: Arc::new(OnceLock::new()),
         };
         index.schema = crate::schema::detect::build_schema_index(&index);
         index.graph =
@@ -344,6 +370,7 @@ impl CodebaseIndex {
             cross_lang_edges: Vec::new(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
+            dead_code_cache: Arc::new(OnceLock::new()),
         };
         index.schema = crate::schema::detect::build_schema_index(&index);
         index.graph =
@@ -585,6 +612,7 @@ impl CodebaseIndex {
             cross_lang_edges: Vec::new(),
             #[cfg(feature = "embeddings")]
             embedding_index: None,
+            dead_code_cache: Arc::new(OnceLock::new()),
         }
     }
 

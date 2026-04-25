@@ -91,8 +91,15 @@ fn is_type_kind(kind: &SymbolKind) -> bool {
     )
 }
 
-/// Returns true when the symbol name appears as a substring in any file other than
-/// `defining_file`. Short names (<3 chars) are assumed alive to avoid false positives.
+/// Returns true when the symbol name appears as a word-bounded token in any
+/// file other than `defining_file`. Short names (<3 chars) are assumed alive
+/// to avoid false positives.
+///
+/// Uses `\b{name}\b` regex so a 3-char name like `run` does NOT match
+/// substrings inside `runtime`, `return`, or `truncate`. This closes an
+/// asymmetry with `same_file_string_reference` which already used word
+/// boundaries — under the old `contains`, `run` appeared alive in virtually
+/// every file regardless of whether a real caller existed.
 fn has_string_references(
     symbol_name: &str,
     defining_file: &str,
@@ -101,11 +108,18 @@ fn has_string_references(
     if symbol_name.len() < 3 {
         return true; // too short to search reliably — assume alive
     }
+    let re = match regex::Regex::new(&format!(r"\b{}\b", regex::escape(symbol_name))) {
+        Ok(r) => r,
+        // Should be unreachable for a valid identifier. On the unlikely
+        // failure path, assume alive so we never regress into a false
+        // positive.
+        Err(_) => return true,
+    };
     for file in all_files {
         if file.relative_path == defining_file {
             continue;
         }
-        if file.content.contains(symbol_name) {
+        if re.is_match(&file.content) {
             return true;
         }
     }

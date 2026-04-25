@@ -267,15 +267,10 @@ impl LanguageServer for CxpakLspBackend {
 
         let index = self.index.read().map_err(Self::lock_err)?;
 
-        // Try to locate the file in the index using a repo-relative path.
-        let file = {
-            let rel_opt = super::methods::uri_to_rel_path(uri, &self.path);
-            let uri_str = uri.as_str();
-            index.files.iter().find(|f| {
-                rel_opt.as_deref().is_some_and(|r| f.relative_path == r)
-                    || uri_str.ends_with(&f.relative_path)
-            })
-        };
+        // Locate the file via the shared path-bounded resolver so a URI like
+        // `file:///.../my_src/main.rs` does NOT falsely match an indexed
+        // `src/main.rs` from a different crate in the same workspace.
+        let file = super::methods::find_indexed_file(uri.as_str(), &index, &self.path);
 
         // Prefer the in-memory document (most recent editor state) over the indexed
         // content, falling back to disk when the URI is not open in the editor.

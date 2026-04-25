@@ -1067,6 +1067,7 @@ mod tests {
             files,
             #[cfg(feature = "embeddings")]
             embedding_index: None,
+            dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 

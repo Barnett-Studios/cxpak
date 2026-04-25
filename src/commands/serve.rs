@@ -3064,12 +3064,16 @@ fn handle_tool_call(
             // workspace acts as a focus prefix when focus is not set
             let effective_focus = focus.or(workspace);
             let dead = crate::intelligence::dead_code::detect_dead_code(index, effective_focus);
-            let total_count = dead.len();
+            let total = dead.len();
             let limited: Vec<_> = dead.into_iter().take(limit).collect();
             let showing = limited.len();
+            // Cross-channel parity: v1/dead_code, LSP cxpak/deadCode, and MCP
+            // cxpak_dead_code all expose `total` and `dead_symbols`.  MCP
+            // additionally reports `showing` so a client that passed `limit`
+            // can detect truncation; v1/LSP are non-paginated.
             let result = json!({
                 "dead_symbols": limited,
-                "total_count": total_count,
+                "total": total,
                 "showing": showing,
             });
             mcp_tool_result(

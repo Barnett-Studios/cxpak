@@ -324,12 +324,25 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
 
 .cxpak-risk-table tr:hover td { background: var(--bg-card); }
 
+/* Severity badge: small pill with a one-letter code (H/M/L) overlaid on the
+ * colored background.  Color-blind users (deuteranopia, etc.) cannot
+ * distinguish an 8x8px red vs green circle reliably; the letter provides a
+ * non-color signal.  Screen readers read the title attribute set in HTML. */
 .cxpak-severity-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
   margin-right: 6px;
+  color: #0f0f23;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: inherit;
+  line-height: 1;
+  letter-spacing: 0;
+  vertical-align: middle;
 }
 
 .cxpak-severity-dot.high { background: var(--accent-red); box-shadow: 0 0 4px var(--accent-red); }

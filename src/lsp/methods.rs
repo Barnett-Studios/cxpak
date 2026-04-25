@@ -1,5 +1,14 @@
+use crate::parser::language::Visibility;
 use std::path::Path;
 use tower_lsp::lsp_types::{CodeLens, Command, Position, Range, Url};
+
+/// One-word visibility label for dead-code diagnostic messages.
+fn visibility_label(v: &Visibility) -> &'static str {
+    match v {
+        Visibility::Public => "public",
+        Visibility::Private => "private",
+    }
+}
 
 /// Error type returned by [`handle_custom_method`].
 #[derive(Debug)]
@@ -52,18 +61,42 @@ pub fn extract_word_at(content: &str, line_idx: usize, char_idx: usize) -> Strin
     chars[start..end].iter().collect()
 }
 
+/// Resolve a URI or uri-ish string to an indexed file.
+///
+/// Primary strategy: parse as file:// URL, strip `repo_root`, exact-match on
+/// `IndexedFile.relative_path`.  Fallback: path-bounded suffix match — the
+/// URI must end with `/<relative_path>` or be exactly `<relative_path>`.
+/// A plain `ends_with(relative_path)` without the separator bound would
+/// falsely match `src/main.rs` against URIs in unrelated crates whose paths
+/// happen to end in `main.rs` (e.g., `my_src/main.rs`).
+pub fn find_indexed_file<'a>(
+    uri_path: &str,
+    index: &'a crate::index::CodebaseIndex,
+    repo_root: &Path,
+) -> Option<&'a crate::index::IndexedFile> {
+    let url = Url::parse(uri_path).ok();
+    let rel_opt = url.as_ref().and_then(|u| uri_to_rel_path(u, repo_root));
+    index.files.iter().find(|f| {
+        if rel_opt.as_deref().is_some_and(|r| f.relative_path == r) {
+            return true;
+        }
+        // Path-bounded suffix match: require a leading `/` or exact equality
+        // so the match aligns to a directory boundary. `src/main.rs` MUST NOT
+        // match `my_src/main.rs`.
+        let rel = &f.relative_path;
+        uri_path == rel
+            || (uri_path.len() > rel.len()
+                && uri_path.ends_with(rel)
+                && uri_path.as_bytes()[uri_path.len() - rel.len() - 1] == b'/')
+    })
+}
+
 pub fn code_lens_for_file(
     uri_path: &str,
     index: &crate::index::CodebaseIndex,
     repo_root: &Path,
 ) -> Vec<CodeLens> {
-    let url = Url::parse(uri_path).ok();
-    let rel_opt = url.as_ref().and_then(|u| uri_to_rel_path(u, repo_root));
-
-    let file = index.files.iter().find(|f| {
-        rel_opt.as_deref().is_some_and(|r| f.relative_path == r)
-            || uri_path.ends_with(&f.relative_path)
-    });
+    let file = find_indexed_file(uri_path, index, repo_root);
 
     match file {
         None => Vec::new(),
@@ -124,13 +157,7 @@ pub fn diagnostics_for_file(
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-    let url = Url::parse(uri_path).ok();
-    let rel_opt = url.as_ref().and_then(|u| uri_to_rel_path(u, repo_root));
-
-    let Some(file) = index.files.iter().find(|f| {
-        rel_opt.as_deref().is_some_and(|r| f.relative_path == r)
-            || uri_path.ends_with(&f.relative_path)
-    }) else {
+    let Some(file) = find_indexed_file(uri_path, index, repo_root) else {
         return Vec::new();
     };
 
@@ -139,11 +166,17 @@ pub fn diagnostics_for_file(
     // diagnostics inherit the same zero-false-positive contract locked by
     // `tests/dead_code_adversarial.rs`.  `DeadSymbol` doesn't carry line
     // numbers, so look them up from the file's parse result.
+    //
+    // Using the cached dead-code analysis on the index — an LSP client
+    // requests diagnostics per file open/save/focus, so the naive per-call
+    // recomputation was O(F·S·C) per request, freezing editors on any
+    // non-toy repo. The cache pays off on the second call onwards.
     let Some(pr) = &file.parse_result else {
         return Vec::new();
     };
-    let dead = crate::intelligence::dead_code::detect_dead_code(index, None);
-    dead.into_iter()
+    index
+        .dead_code_cached()
+        .iter()
         .filter(|d| d.file == file.relative_path)
         .filter_map(|d| {
             let sym = pr
@@ -166,7 +199,21 @@ pub fn diagnostics_for_file(
                 )),
                 code_description: None,
                 source: Some("cxpak".into()),
-                message: format!("dead code: {} ({})", d.symbol, d.reason),
+                // Include kind and visibility so the IDE message is
+                // actionable at a glance.  `d.reason` is the detector's
+                // single fixed string ("zero callers, not entry point,
+                // no test reference") — useful but repetitive across
+                // every diagnostic; prefixing with kind+visibility tells
+                // the user whether they can safely delete a private
+                // function vs. whether a pub symbol requires review of
+                // external callers.
+                message: format!(
+                    "dead code: {} {:?} `{}` — {}",
+                    visibility_label(&sym.visibility),
+                    d.kind,
+                    d.symbol,
+                    d.reason,
+                ),
                 related_information: None,
                 tags: Some(vec![tower_lsp::lsp_types::DiagnosticTag::UNNECESSARY]),
                 data: None,
@@ -282,6 +329,31 @@ pub fn handle_custom_method(
                     "cxpak/blastRadius requires 'file' (string) or 'files' (array) param".into(),
                 ));
             }
+            // Validate every input path against the index.  Silent empty
+            // results for typo'd paths make a caller's "zero dependents"
+            // response indistinguishable from "unknown file" — signal the
+            // actual problem instead.
+            let indexed: std::collections::HashSet<&str> = index
+                .files
+                .iter()
+                .map(|f| f.relative_path.as_str())
+                .collect();
+            let unknown: Vec<&String> = files
+                .iter()
+                .filter(|f| !indexed.contains(f.as_str()))
+                .collect();
+            if !unknown.is_empty() {
+                return Err(LspMethodError::Internal(format!(
+                    "cxpak/blastRadius: {} file(s) not in index: {}",
+                    unknown.len(),
+                    unknown
+                        .iter()
+                        .take(5)
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
             let depth = params
                 .get("depth")
                 .and_then(|v| v.as_u64())
@@ -333,11 +405,16 @@ pub fn handle_custom_method(
             let git_ref = params.get("ref").and_then(|v| v.as_str());
             match crate::commands::diff::extract_changes(repo_root, git_ref) {
                 Ok(changes) => {
+                    // Return the real diff content, not just a byte count.
+                    // An LSP client asking for diff data needs the patch text
+                    // to render in a side panel or feed to another tool;
+                    // returning length() alone is a shallow integration.
                     let entries: Vec<_> = changes
                         .iter()
                         .map(|c| {
                             serde_json::json!({
                                 "path": c.path,
+                                "diff_text": c.diff_text,
                                 "diff_bytes": c.diff_text.len(),
                             })
                         })
@@ -381,8 +458,11 @@ pub fn handle_custom_method(
             })?))
         }
         "cxpak/deadCode" => {
-            let dead = crate::intelligence::dead_code::detect_dead_code(index, None);
-            Ok(Some(serde_json::json!({"dead_symbols": dead})))
+            let dead = index.dead_code_cached();
+            Ok(Some(serde_json::json!({
+                "dead_symbols": dead,
+                "total": dead.len(),
+            })))
         }
         "cxpak/callGraph" => Ok(Some(serde_json::json!({
             "edges": index.call_graph.edges,

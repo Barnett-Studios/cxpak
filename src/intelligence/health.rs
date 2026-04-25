@@ -41,7 +41,9 @@ pub fn compute_health(index: &CodebaseIndex) -> HealthScore {
         .filter_map(|f| f.parse_result.as_ref())
         .map(|pr| pr.symbols.len())
         .sum();
-    let dead_symbols = crate::intelligence::dead_code::detect_dead_code(index, None);
+    // Cached so the dashboard, health score, LSP diagnostics, and all three
+    // output channels (v1, MCP, LSP) reuse a single full-index scan per build.
+    let dead_symbols = index.dead_code_cached();
     let dead_code = Some(compute_dead_code_dimension(
         total_symbols,
         dead_symbols.len(),

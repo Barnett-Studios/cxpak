@@ -287,6 +287,19 @@
       empty.appendChild(document.createTextNode('"'));
       list.appendChild(empty);
     }
+    // Announce result count to screen readers via the live region.
+    // Sighted users see the listbox grow; SR users get no cue without this.
+    var live = document.getElementById('cxpak-live');
+    if (live) {
+      var n = scored.length;
+      if (n === 0) {
+        live.textContent = q ? ('No results for "' + q + '"') : 'No results';
+      } else if (n === 1) {
+        live.textContent = '1 result';
+      } else {
+        live.textContent = n + ' results';
+      }
+    }
   }
   CX.openPalette = openPalette;
   CX.closePalette = closePalette;
@@ -453,11 +466,21 @@
   })();
 
   // Wire the help-overlay close button. Clicking on the backdrop also closes it.
+  // Focus returns to whatever had focus before `?` opened the overlay.
+  function closeHelp() {
+    var ho = document.getElementById('cxpak-help-overlay');
+    if (ho) { ho.setAttribute('hidden', ''); CX.state.helpOverlayOpen = false; }
+    // Restore focus to the pre-help element (typically a nav link or
+    // whichever control the user was interacting with). Without this the
+    // keyboard user lands on body after Esc, losing their place.
+    var back = CX.state.preHelpFocus;
+    CX.state.preHelpFocus = null;
+    if (back && typeof back.focus === 'function') {
+      try { back.focus(); } catch (_) { /* element may have been removed */ }
+    }
+  }
+  CX.closeHelp = closeHelp;
   (function() {
-    var closeHelp = function() {
-      var ho = document.getElementById('cxpak-help-overlay');
-      if (ho) { ho.setAttribute('hidden', ''); CX.state.helpOverlayOpen = false; }
-    };
     var btn = document.querySelector('#cxpak-help-overlay .cxpak-inspector-close');
     if (btn) btn.addEventListener('click', closeHelp);
     var overlay = document.getElementById('cxpak-help-overlay');
@@ -507,7 +530,7 @@
     if (ev.key === 'Escape') {
       if (CX.state.paletteOpen) { closePalette(); return; }
       if (CX.state.inspector) { closeInspector(); return; }
-      if (CX.state.helpOverlayOpen) { CX.state.helpOverlayOpen = false; var ho = document.getElementById('cxpak-help-overlay'); if (ho) ho.setAttribute('hidden', ''); return; }
+      if (CX.state.helpOverlayOpen) { closeHelp(); return; }
     }
     if (['1','2','3','4','5','6'].indexOf(ev.key) >= 0 && !CX.state.paletteOpen) {
       var v = VIEWS[parseInt(ev.key) - 1];
@@ -517,6 +540,10 @@
     if (ev.key === '?' && !CX.state.paletteOpen) {
       var ho = document.getElementById('cxpak-help-overlay');
       if (ho) {
+        // Save the element that had focus before the overlay opened so
+        // closeHelp() can restore it. Without this, keyboard users lose
+        // their place after Esc.
+        CX.state.preHelpFocus = document.activeElement;
         ho.removeAttribute('hidden');
         CX.state.helpOverlayOpen = true;
         var closeBtn = ho.querySelector('.cxpak-inspector-close');

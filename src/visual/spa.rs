@@ -138,6 +138,13 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("      <button class=\"cxpak-theme-toggle\" aria-label=\"Switch to light mode\">\u{2600}</button>\n");
     html.push_str("      <span class=\"cxpak-freshness\"></span>\n");
     html.push_str("    </header>\n");
+    html.push_str("    <noscript>\n");
+    html.push_str("      <div style=\"padding:24px 32px;border:1px solid var(--accent-yellow);border-radius:8px;margin:16px;color:var(--text-primary);background:var(--bg-card)\">\n");
+    html.push_str("        <strong>JavaScript required.</strong> The cxpak dashboard is a single-page app that renders six interactive views (Dashboard, Architecture, Risk, Flow, Timeline, Diff) entirely in the browser. Without JavaScript the views below remain empty.\n");
+    html.push_str("        <br><br>\n");
+    html.push_str("        For a JS-free overview of this codebase, run <code>cxpak overview</code> on the command line, which produces a token-budgeted text/markdown report with the same intelligence (PageRank, blast radius, dead code, conventions) backing this dashboard.\n");
+    html.push_str("      </div>\n");
+    html.push_str("    </noscript>\n");
     html.push_str("    <main id=\"cxpak-main\">\n");
     html.push_str("      <section id=\"view-dashboard\" class=\"cxpak-view\"></section>\n");
     html.push_str(
@@ -148,7 +155,7 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("      <section id=\"view-timeline\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("      <section id=\"view-diff\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("    </main>\n");
-    html.push_str("    <aside id=\"cxpak-inspector\" class=\"cxpak-inspector\" role=\"complementary\" aria-label=\"Node details inspector\" hidden>\n");
+    html.push_str("    <aside id=\"cxpak-inspector\" class=\"cxpak-inspector\" role=\"dialog\" aria-modal=\"false\" aria-label=\"Node details inspector\" hidden>\n");
     html.push_str("      <div class=\"cxpak-inspector-header\">\n");
     html.push_str("        <span class=\"cxpak-inspector-title\">Details</span>\n");
     html.push_str("        <button class=\"cxpak-inspector-close\" aria-label=\"Close inspector\">\u{d7}</button>\n");
@@ -159,8 +166,8 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("  </div>\n");
     html.push_str("  <div id=\"cxpak-palette-overlay\" class=\"cxpak-palette-overlay\" role=\"dialog\" aria-modal=\"true\" aria-label=\"Command palette\" hidden>\n");
     html.push_str("    <div class=\"cxpak-palette\">\n");
-    html.push_str("      <input id=\"cxpak-palette-input\" class=\"cxpak-palette-input\" type=\"text\" placeholder=\"Search files, symbols, views\u{2026}\" autocomplete=\"off\" />\n");
-    html.push_str("      <div id=\"cxpak-palette-results\" class=\"cxpak-palette-results\" role=\"listbox\"></div>\n");
+    html.push_str("      <input id=\"cxpak-palette-input\" class=\"cxpak-palette-input\" type=\"text\" placeholder=\"Search files, symbols, views\u{2026}\" autocomplete=\"off\" role=\"combobox\" aria-autocomplete=\"list\" aria-expanded=\"true\" aria-controls=\"cxpak-palette-results\" aria-label=\"Search files, symbols, and views\" />\n");
+    html.push_str("      <div id=\"cxpak-palette-results\" class=\"cxpak-palette-results\" role=\"listbox\" aria-label=\"Palette results\"></div>\n");
     html.push_str("      <div class=\"cxpak-palette-hint\">\n");
     html.push_str("        <span><kbd>\u{2191}\u{2193}</kbd> navigate</span>\n");
     html.push_str("        <span><kbd>\u{21b5}</kbd> select</span>\n");

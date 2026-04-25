@@ -175,12 +175,20 @@ fn spa_dashboard_nav_is_spa_aware() {
 #[test]
 fn spa_inspector_has_aria_attributes() {
     let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
+    // Inspector switched from role=complementary to role=dialog in v2.1.1
+    // so the focus trap can recognize it as a modal-like region.
+    // aria-modal=false signals the dialog is non-blocking — main view is
+    // still accessible (vs the palette/help which are aria-modal=true).
+    let aside_line = html
+        .lines()
+        .find(|l| l.contains(r#"id="cxpak-inspector""#))
+        .expect("inspector aside line");
     assert!(
-        html.contains(r#"role="complementary""#),
-        "inspector must have role=complementary"
+        aside_line.contains(r#"role="dialog""#),
+        "inspector must have role=dialog (was complementary pre-v2.1.1); got: {aside_line}"
     );
     assert!(
-        html.contains(r#"aria-label="Node details inspector""#),
+        aside_line.contains(r#"aria-label="Node details inspector""#),
         "inspector must have aria-label"
     );
 }
@@ -188,11 +196,13 @@ fn spa_inspector_has_aria_attributes() {
 #[test]
 fn spa_palette_has_dialog_aria() {
     let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
-    // Palette and help overlay both are modal dialogs.
+    // Palette + help overlay + inspector are all role=dialog after v2.1.1
+    // moved the inspector from role=complementary so the focus trap can
+    // include it.
     assert_eq!(
         html.matches(r#"role="dialog""#).count(),
-        2,
-        "expected 2 role=dialog elements (palette + help)"
+        3,
+        "expected 3 role=dialog elements (palette + help + inspector)"
     );
     assert!(
         html.contains(r#"aria-label="Command palette""#),

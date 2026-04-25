@@ -339,12 +339,25 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
 
 .cxpak-risk-table tr:hover td { background: var(--bg-card); }
 
+/* Severity badge: small pill with a one-letter code (H/M/L) overlaid on the
+ * colored background.  Color-blind users (deuteranopia, etc.) cannot
+ * distinguish an 8x8px red vs green circle reliably; the letter provides a
+ * non-color signal.  Screen readers read the title attribute set in HTML. */
 .cxpak-severity-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
   margin-right: 6px;
+  color: #0f0f23;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: inherit;
+  line-height: 1;
+  letter-spacing: 0;
+  vertical-align: middle;
 }
 
 .cxpak-severity-dot.high { background: var(--accent-red); box-shadow: 0 0 4px var(--accent-red); }
@@ -1011,6 +1024,13 @@ input:focus-visible {
       <button class="cxpak-theme-toggle" aria-label="Switch to light mode">☀</button>
       <span class="cxpak-freshness"></span>
     </header>
+    <noscript>
+      <div style="padding:24px 32px;border:1px solid var(--accent-yellow);border-radius:8px;margin:16px;color:var(--text-primary);background:var(--bg-card)">
+        <strong>JavaScript required.</strong> The cxpak dashboard is a single-page app that renders six interactive views (Dashboard, Architecture, Risk, Flow, Timeline, Diff) entirely in the browser. Without JavaScript the views below remain empty.
+        <br><br>
+        For a JS-free overview of this codebase, run <code>cxpak overview</code> on the command line, which produces a token-budgeted text/markdown report with the same intelligence (PageRank, blast radius, dead code, conventions) backing this dashboard.
+      </div>
+    </noscript>
     <main id="cxpak-main">
       <section id="view-dashboard" class="cxpak-view"></section>
       <section id="view-architecture" class="cxpak-view" hidden></section>
@@ -1019,7 +1039,7 @@ input:focus-visible {
       <section id="view-timeline" class="cxpak-view" hidden></section>
       <section id="view-diff" class="cxpak-view" hidden></section>
     </main>
-    <aside id="cxpak-inspector" class="cxpak-inspector" role="complementary" aria-label="Node details inspector" hidden>
+    <aside id="cxpak-inspector" class="cxpak-inspector" role="dialog" aria-modal="false" aria-label="Node details inspector" hidden>
       <div class="cxpak-inspector-header">
         <span class="cxpak-inspector-title">Details</span>
         <button class="cxpak-inspector-close" aria-label="Close inspector">×</button>
@@ -1030,8 +1050,8 @@ input:focus-visible {
   </div>
   <div id="cxpak-palette-overlay" class="cxpak-palette-overlay" role="dialog" aria-modal="true" aria-label="Command palette" hidden>
     <div class="cxpak-palette">
-      <input id="cxpak-palette-input" class="cxpak-palette-input" type="text" placeholder="Search files, symbols, views…" autocomplete="off" />
-      <div id="cxpak-palette-results" class="cxpak-palette-results" role="listbox"></div>
+      <input id="cxpak-palette-input" class="cxpak-palette-input" type="text" placeholder="Search files, symbols, views…" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="cxpak-palette-results" aria-label="Search files, symbols, and views" />
+      <div id="cxpak-palette-results" class="cxpak-palette-results" role="listbox" aria-label="Palette results"></div>
       <div class="cxpak-palette-hint">
         <span><kbd>↑↓</kbd> navigate</span>
         <span><kbd>↵</kbd> select</span>
@@ -1542,6 +1562,19 @@ CX.header = function() {};
       empty.appendChild(document.createTextNode('"'));
       list.appendChild(empty);
     }
+    // Announce result count to screen readers via the live region.
+    // Sighted users see the listbox grow; SR users get no cue without this.
+    var live = document.getElementById('cxpak-live');
+    if (live) {
+      var n = scored.length;
+      if (n === 0) {
+        live.textContent = q ? ('No results for "' + q + '"') : 'No results';
+      } else if (n === 1) {
+        live.textContent = '1 result';
+      } else {
+        live.textContent = n + ' results';
+      }
+    }
   }
   CX.openPalette = openPalette;
   CX.closePalette = closePalette;
@@ -1708,11 +1741,21 @@ CX.header = function() {};
   })();
 
   // Wire the help-overlay close button. Clicking on the backdrop also closes it.
+  // Focus returns to whatever had focus before `?` opened the overlay.
+  function closeHelp() {
+    var ho = document.getElementById('cxpak-help-overlay');
+    if (ho) { ho.setAttribute('hidden', ''); CX.state.helpOverlayOpen = false; }
+    // Restore focus to the pre-help element (typically a nav link or
+    // whichever control the user was interacting with). Without this the
+    // keyboard user lands on body after Esc, losing their place.
+    var back = CX.state.preHelpFocus;
+    CX.state.preHelpFocus = null;
+    if (back && typeof back.focus === 'function') {
+      try { back.focus(); } catch (_) { /* element may have been removed */ }
+    }
+  }
+  CX.closeHelp = closeHelp;
   (function() {
-    var closeHelp = function() {
-      var ho = document.getElementById('cxpak-help-overlay');
-      if (ho) { ho.setAttribute('hidden', ''); CX.state.helpOverlayOpen = false; }
-    };
     var btn = document.querySelector('#cxpak-help-overlay .cxpak-inspector-close');
     if (btn) btn.addEventListener('click', closeHelp);
     var overlay = document.getElementById('cxpak-help-overlay');
@@ -1762,7 +1805,7 @@ CX.header = function() {};
     if (ev.key === 'Escape') {
       if (CX.state.paletteOpen) { closePalette(); return; }
       if (CX.state.inspector) { closeInspector(); return; }
-      if (CX.state.helpOverlayOpen) { CX.state.helpOverlayOpen = false; var ho = document.getElementById('cxpak-help-overlay'); if (ho) ho.setAttribute('hidden', ''); return; }
+      if (CX.state.helpOverlayOpen) { closeHelp(); return; }
     }
     if (['1','2','3','4','5','6'].indexOf(ev.key) >= 0 && !CX.state.paletteOpen) {
       var v = VIEWS[parseInt(ev.key) - 1];
@@ -1772,6 +1815,10 @@ CX.header = function() {};
     if (ev.key === '?' && !CX.state.paletteOpen) {
       var ho = document.getElementById('cxpak-help-overlay');
       if (ho) {
+        // Save the element that had focus before the overlay opened so
+        // closeHelp() can restore it. Without this, keyboard users lose
+        // their place after Esc.
+        CX.state.preHelpFocus = document.activeElement;
         ho.removeAttribute('hidden');
         CX.state.helpOverlayOpen = true;
         var closeBtn = ho.querySelector('.cxpak-inspector-close');
@@ -1972,11 +2019,17 @@ if (risks.length === 0) {
     tr.className = 'cxpak-clickable';
     tr.title = 'View risk heatmap';
     tr.onclick = function() { navTo('risk'); };
+    // Severity badge: one-letter code (H/M/L) + colored background.
+    // The letter is the non-color discriminator color-blind users rely on;
+    // aria-label is what screen readers announce.
+    var sevLetter = r.severity === 'high' ? 'H' : r.severity === 'medium' ? 'M' : 'L';
+    var sevLabel = r.severity === 'high' ? 'High risk' : r.severity === 'medium' ? 'Medium risk' : 'Low risk';
+    var testsLabel = r.has_tests ? 'has tests' : 'no tests';
     tr.innerHTML =
-      '<td><span class="cxpak-severity-dot ' + r.severity + '"></span>' + CX.esc(r.path) + '</td>' +
+      '<td><span class="cxpak-severity-dot ' + r.severity + '" role="img" aria-label="' + sevLabel + '" title="' + sevLabel + '">' + sevLetter + '</span>' + CX.esc(r.path) + '</td>' +
       '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
       '<td>' + r.churn_30d + '</td><td>' + r.blast_radius + '</td>' +
-      '<td style="color:' + (r.has_tests ? '#06d6a0' : '#8888aa') + '">' + (r.has_tests ? '\u2713' : '\u2014') + '</td>';
+      '<td style="color:' + (r.has_tests ? '#06d6a0' : '#8888aa') + '"><span aria-label="' + testsLabel + '" title="' + testsLabel + '">' + (r.has_tests ? '\u2713' : '\u2014') + '</span></td>';
     tb.appendChild(tr);
   });
   tbl.appendChild(tb);
@@ -2763,7 +2816,9 @@ if (df.new_risks && df.new_risks.length > 0) {
   rl.innerHTML = '<div class="cxpak-diff-risks-title">Affected Files</div>';
   var tbl = '<table class="cxpak-risk-table"><thead><tr><th>File</th><th>Risk</th><th>Blast</th></tr></thead><tbody>';
   df.new_risks.slice(0, 10).forEach(function(r) {
-    tbl += '<tr><td><span class="cxpak-severity-dot ' + r.severity + '"></span>' + CX.esc(r.path) + '</td>' +
+    var sevLetter = r.severity === 'high' ? 'H' : r.severity === 'medium' ? 'M' : 'L';
+    var sevLabel = r.severity === 'high' ? 'High risk' : r.severity === 'medium' ? 'Medium risk' : 'Low risk';
+    tbl += '<tr><td><span class="cxpak-severity-dot ' + r.severity + '" role="img" aria-label="' + sevLabel + '" title="' + sevLabel + '">' + sevLetter + '</span>' + CX.esc(r.path) + '</td>' +
       '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
       '<td>' + r.blast_radius + '</td></tr>';
   });

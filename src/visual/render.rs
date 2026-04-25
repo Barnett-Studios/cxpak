@@ -336,11 +336,17 @@ if (risks.length === 0) {
     tr.className = 'cxpak-clickable';
     tr.title = 'View risk heatmap';
     tr.onclick = function() { navTo('risk'); };
+    // Severity badge: one-letter code (H/M/L) + colored background.
+    // The letter is the non-color discriminator color-blind users rely on;
+    // aria-label is what screen readers announce.
+    var sevLetter = r.severity === 'high' ? 'H' : r.severity === 'medium' ? 'M' : 'L';
+    var sevLabel = r.severity === 'high' ? 'High risk' : r.severity === 'medium' ? 'Medium risk' : 'Low risk';
+    var testsLabel = r.has_tests ? 'has tests' : 'no tests';
     tr.innerHTML =
-      '<td><span class="cxpak-severity-dot ' + r.severity + '"></span>' + CX.esc(r.path) + '</td>' +
+      '<td><span class="cxpak-severity-dot ' + r.severity + '" role="img" aria-label="' + sevLabel + '" title="' + sevLabel + '">' + sevLetter + '</span>' + CX.esc(r.path) + '</td>' +
       '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
       '<td>' + r.churn_30d + '</td><td>' + r.blast_radius + '</td>' +
-      '<td style="color:' + (r.has_tests ? '#06d6a0' : '#8888aa') + '">' + (r.has_tests ? '\u2713' : '\u2014') + '</td>';
+      '<td style="color:' + (r.has_tests ? '#06d6a0' : '#8888aa') + '"><span aria-label="' + testsLabel + '" title="' + testsLabel + '">' + (r.has_tests ? '\u2713' : '\u2014') + '</span></td>';
     tb.appendChild(tr);
   });
   tbl.appendChild(tb);
@@ -1128,7 +1134,9 @@ if (df.new_risks && df.new_risks.length > 0) {
   rl.innerHTML = '<div class="cxpak-diff-risks-title">Affected Files</div>';
   var tbl = '<table class="cxpak-risk-table"><thead><tr><th>File</th><th>Risk</th><th>Blast</th></tr></thead><tbody>';
   df.new_risks.slice(0, 10).forEach(function(r) {
-    tbl += '<tr><td><span class="cxpak-severity-dot ' + r.severity + '"></span>' + CX.esc(r.path) + '</td>' +
+    var sevLetter = r.severity === 'high' ? 'H' : r.severity === 'medium' ? 'M' : 'L';
+    var sevLabel = r.severity === 'high' ? 'High risk' : r.severity === 'medium' ? 'Medium risk' : 'Low risk';
+    tbl += '<tr><td><span class="cxpak-severity-dot ' + r.severity + '" role="img" aria-label="' + sevLabel + '" title="' + sevLabel + '">' + sevLetter + '</span>' + CX.esc(r.path) + '</td>' +
       '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
       '<td>' + r.blast_radius + '</td></tr>';
   });
@@ -1457,7 +1465,9 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
     }
 
     // Dead-symbol alert — defined but never called from anywhere indexed.
-    let dead_symbols = crate::intelligence::dead_code::detect_dead_code(index, None);
+    // Use the cached analysis on the index so the dashboard, health score,
+    // and LSP diagnostics all share a single computation per index build.
+    let dead_symbols = index.dead_code_cached();
     if !dead_symbols.is_empty() {
         let count = dead_symbols.len();
         alerts.push(Alert {
