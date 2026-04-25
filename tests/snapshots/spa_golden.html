@@ -869,6 +869,17 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
   --shadow: rgba(0, 0, 0, 0.1);
 }
 
+/* ── Severity badge contrast: light-mode override ─────────────────
+ * Dark text (#0f0f23) on light-mode --accent-red (#dc2626) is 3.25:1 —
+ * fails WCAG AA (4.5:1).  Same problem on light-mode --accent-yellow
+ * (#d97706: 4.25:1).  Switch the H/M letter to white in light mode so
+ * the badge text passes AA on every severity color.  Dark mode is
+ * unchanged: dark-on-saturated-pastel passes there.
+ */
+:root[data-theme="light"] .cxpak-severity-dot {
+  color: #ffffff;
+}
+
 /* ── Reduced Motion ────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -1050,7 +1061,7 @@ input:focus-visible {
   </div>
   <div id="cxpak-palette-overlay" class="cxpak-palette-overlay" role="dialog" aria-modal="true" aria-label="Command palette" hidden>
     <div class="cxpak-palette">
-      <input id="cxpak-palette-input" class="cxpak-palette-input" type="text" placeholder="Search files, symbols, views…" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="cxpak-palette-results" aria-label="Search files, symbols, and views" />
+      <input id="cxpak-palette-input" class="cxpak-palette-input" type="text" placeholder="Search files, symbols, views…" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="cxpak-palette-results" aria-label="Search files, symbols, and views" />
       <div id="cxpak-palette-results" class="cxpak-palette-results" role="listbox" aria-label="Palette results"></div>
       <div class="cxpak-palette-hint">
         <span><kbd>↑↓</kbd> navigate</span>
@@ -1472,6 +1483,10 @@ CX.header = function() {};
     overlay.removeAttribute('hidden');
     var input = document.getElementById('cxpak-palette-input');
     input.value = '';
+    // ARIA combobox spec: aria-expanded must reflect popup visibility.
+    // Hardcoded "true" lied while the palette was hidden — flip it here
+    // and in closePalette() so screen readers announce the state honestly.
+    input.setAttribute('aria-expanded', 'true');
     input.focus();
     renderPaletteResults('');
   }
@@ -1479,6 +1494,8 @@ CX.header = function() {};
     if (!CX.state.paletteOpen) return;
     CX.state.paletteOpen = false;
     document.getElementById('cxpak-palette-overlay').setAttribute('hidden', '');
+    var input = document.getElementById('cxpak-palette-input');
+    if (input) input.setAttribute('aria-expanded', 'false');
     try { CX.state.prePaletteFocus && CX.state.prePaletteFocus.focus(); }
     catch (e) { document.querySelector('.cxpak-nav-link').focus(); }
   }
@@ -1771,13 +1788,16 @@ CX.header = function() {};
     });
   })();
 
-  // Focus trap for modal dialogs (palette + help overlay).
-  // Tab/Shift-Tab cycles within the dialog when one is open.
+  // Focus trap for modal dialogs (palette + help overlay + inspector).
+  // Tab/Shift-Tab cycles within the dialog when one is open.  Inspector is
+  // role=dialog aria-modal=false: non-blocking but still focus-bounded so
+  // keyboard users do not Tab out into the background SVG by surprise.
   function trapFocus(ev) {
     if (ev.key !== 'Tab') return;
     var modal = null;
     if (CX.state.paletteOpen) modal = document.getElementById('cxpak-palette-overlay');
     else if (CX.state.helpOverlayOpen) modal = document.getElementById('cxpak-help-overlay');
+    else if (CX.state.inspector) modal = document.getElementById('cxpak-inspector');
     if (!modal || modal.hasAttribute('hidden')) return;
     var focusables = modal.querySelectorAll(
       'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
@@ -1801,7 +1821,19 @@ CX.header = function() {};
   document.addEventListener('keydown', function(ev) {
     var mod = ev.metaKey || ev.ctrlKey;
     if (mod && ev.key === 'k') { ev.preventDefault(); openPalette(); return; }
-    if (ev.key === '/') { ev.preventDefault(); openPalette(); return; }
+    if (ev.key === '/') {
+      // Skip when palette is already open (avoid duplicate trigger and
+      // not stealing the `/` keystroke from the palette input itself) and
+      // when the user is typing into any other input/textarea/editable
+      // surface — pressing `/` in a search field should produce a `/`,
+      // not open a new palette.
+      if (CX.state.paletteOpen) return;
+      var t = ev.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      ev.preventDefault();
+      openPalette();
+      return;
+    }
     if (ev.key === 'Escape') {
       if (CX.state.paletteOpen) { closePalette(); return; }
       if (CX.state.inspector) { closeInspector(); return; }

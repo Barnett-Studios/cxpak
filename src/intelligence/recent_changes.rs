@@ -7,16 +7,12 @@ pub struct RecentChange {
     pub path: String,
     /// Days since the file's most recent commit in the 30-day churn window.
     /// Computed from the per-file last-commit epoch added on `ChurnEntry`
-    /// in v2.1.1.  For pre-v2.1.1 cached data the field is `None`,
-    /// serialized as `null`, and `unknown_days_ago` is `true` so a client
-    /// can distinguish "unknown" from a real `0` (today). Sort order
-    /// places unknown entries LAST — never claiming "this file changed
-    /// today" when we don't actually know.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// in v2.1.1.  Always serialized — `null` when the underlying
+    /// `ChurnEntry.last_commit_epoch` is missing (pre-v2.1.1 cached data).
+    /// A `null` here means "unknown", NOT "today" — sort order places
+    /// `null` entries last so the SPA / clients never present a
+    /// stale-cache file as the freshest.
     pub days_ago: Option<u32>,
-    /// Convenience flag — true when `days_ago` is `None`. Mirrors the
-    /// presence/absence of the field for clients that don't introspect.
-    pub unknown_days_ago: bool,
     pub modifications_30d: u32,
 }
 
@@ -56,7 +52,6 @@ pub fn compute_recent_changes(index: &CodebaseIndex) -> Vec<RecentChange> {
             RecentChange {
                 path: e.path.clone(),
                 days_ago,
-                unknown_days_ago: days_ago.is_none(),
                 modifications_30d: e.modifications.min(u32::MAX as usize) as u32,
             }
         })
@@ -289,10 +284,6 @@ mod tests {
             Some(0),
             "fresh commit's days_ago must be Some(0) (real value), not a placeholder"
         );
-        assert!(
-            !changes[0].unknown_days_ago,
-            "fresh commit days_ago is known"
-        );
         assert_eq!(
             changes[1].days_ago,
             Some(20),
@@ -340,8 +331,10 @@ mod tests {
             "the entry with a real epoch must sort first; old code put unknown first by virtue of days_ago=0 placeholder. Got: {changes:?}"
         );
         assert_eq!(changes[1].path, "legacy_unknown.rs");
-        assert!(changes[1].unknown_days_ago);
-        assert_eq!(changes[1].days_ago, None);
+        assert_eq!(
+            changes[1].days_ago, None,
+            "unknown-epoch entry must serialise days_ago as None (null in JSON)"
+        );
     }
 
     #[test]

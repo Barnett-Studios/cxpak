@@ -42,8 +42,14 @@ pub struct CodebaseIndex {
     /// Memoized `detect_dead_code(self, None)` result. Populated lazily on
     /// first call to [`Self::dead_code_cached`]. Shared across clones via
     /// `Arc`, so any clone that triggers computation benefits all clones.
-    /// Invalidation is by index rebuild — the watcher replaces the whole
-    /// `CodebaseIndex` in the `Arc<RwLock<_>>`, dropping the old cache.
+    ///
+    /// Invalidation contract: callers that mutate the index in-place (e.g.,
+    /// `commands::serve::process_watcher_changes` after
+    /// `apply_incremental_update`) MUST reset this with
+    /// `idx.dead_code_cache = Arc::new(OnceLock::new())` so the next read
+    /// recomputes against the new state. Constructors (`build`,
+    /// `build_with_content`, `empty`) initialise it fresh, so a full
+    /// replace via `*shared.write() = new_index` is also correct.
     #[doc(hidden)]
     pub dead_code_cache: Arc<OnceLock<Vec<DeadSymbol>>>,
 }

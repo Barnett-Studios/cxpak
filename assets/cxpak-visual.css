@@ -854,6 +854,17 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
   --shadow: rgba(0, 0, 0, 0.1);
 }
 
+/* ── Severity badge contrast: light-mode override ─────────────────
+ * Dark text (#0f0f23) on light-mode --accent-red (#dc2626) is 3.25:1 —
+ * fails WCAG AA (4.5:1).  Same problem on light-mode --accent-yellow
+ * (#d97706: 4.25:1).  Switch the H/M letter to white in light mode so
+ * the badge text passes AA on every severity color.  Dark mode is
+ * unchanged: dark-on-saturated-pastel passes there.
+ */
+:root[data-theme="light"] .cxpak-severity-dot {
+  color: #ffffff;
+}
+
 /* ── Reduced Motion ────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

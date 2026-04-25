@@ -166,7 +166,7 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("  </div>\n");
     html.push_str("  <div id=\"cxpak-palette-overlay\" class=\"cxpak-palette-overlay\" role=\"dialog\" aria-modal=\"true\" aria-label=\"Command palette\" hidden>\n");
     html.push_str("    <div class=\"cxpak-palette\">\n");
-    html.push_str("      <input id=\"cxpak-palette-input\" class=\"cxpak-palette-input\" type=\"text\" placeholder=\"Search files, symbols, views\u{2026}\" autocomplete=\"off\" role=\"combobox\" aria-autocomplete=\"list\" aria-expanded=\"true\" aria-controls=\"cxpak-palette-results\" aria-label=\"Search files, symbols, and views\" />\n");
+    html.push_str("      <input id=\"cxpak-palette-input\" class=\"cxpak-palette-input\" type=\"text\" placeholder=\"Search files, symbols, views\u{2026}\" autocomplete=\"off\" role=\"combobox\" aria-autocomplete=\"list\" aria-expanded=\"false\" aria-controls=\"cxpak-palette-results\" aria-label=\"Search files, symbols, and views\" />\n");
     html.push_str("      <div id=\"cxpak-palette-results\" class=\"cxpak-palette-results\" role=\"listbox\" aria-label=\"Palette results\"></div>\n");
     html.push_str("      <div class=\"cxpak-palette-hint\">\n");
     html.push_str("        <span><kbd>\u{2191}\u{2193}</kbd> navigate</span>\n");

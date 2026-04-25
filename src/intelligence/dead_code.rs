@@ -91,15 +91,78 @@ fn is_type_kind(kind: &SymbolKind) -> bool {
     )
 }
 
+/// Strip line and block comments + string literals from `src` before scanning
+/// for word-bounded references.  Without this step a function named `encode`
+/// is falsely marked alive whenever the word "encode" appears in a `// encode
+/// the payload` doc comment or a `"encode"` string literal anywhere in the
+/// codebase.  We use a deliberately conservative C-family stripper: it
+/// recognises `// ... \n`, `/* ... */`, and double-quoted strings (with
+/// backslash-escape).  This covers Rust, JS, TS, Java, Go, C, C++, C#,
+/// Swift, Kotlin, Scala, and Dart — everything we parse for dead-code with
+/// the `is_supported_kind` filter.
+///
+/// Languages outside that set (Python `# ...`, Ruby, etc.) get the
+/// conservative original behaviour: comments are NOT stripped, so the
+/// false-alive bias is the same as before this change.  This keeps Python
+/// dead-code unchanged.
+fn strip_code_noise(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Line comment `// ...` to end of line.
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment `/* ... */`.
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        // Double-quoted string `"..."` with backslash-escape.
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Push only ASCII bytes verbatim; for non-ASCII multibyte the
+        // straightforward push of the code unit is safe because the regex
+        // we run against the result also matches against UTF-8 bytes —
+        // identifiers are ASCII, so non-ASCII bytes can never be part of
+        // a word-boundary match for an identifier.
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
 /// Returns true when the symbol name appears as a word-bounded token in any
-/// file other than `defining_file`. Short names (<3 chars) are assumed alive
-/// to avoid false positives.
+/// file other than `defining_file`, **outside of comments and string literals**.
+/// Short names (<3 chars) are assumed alive to avoid false positives.
 ///
 /// Uses `\b{name}\b` regex so a 3-char name like `run` does NOT match
-/// substrings inside `runtime`, `return`, or `truncate`. This closes an
-/// asymmetry with `same_file_string_reference` which already used word
-/// boundaries — under the old `contains`, `run` appeared alive in virtually
-/// every file regardless of whether a real caller existed.
+/// substrings inside `runtime`, `return`, or `truncate`.  Code-noise
+/// stripping (`strip_code_noise`) removes `// ...`, `/* ... */`, and
+/// `"..."` so a name appearing only in a doc comment or string literal
+/// is NOT taken as a real reference.
 fn has_string_references(
     symbol_name: &str,
     defining_file: &str,
@@ -119,7 +182,8 @@ fn has_string_references(
         if file.relative_path == defining_file {
             continue;
         }
-        if re.is_match(&file.content) {
+        let stripped = strip_code_noise(&file.content);
+        if re.is_match(&stripped) {
             return true;
         }
     }

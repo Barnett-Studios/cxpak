@@ -197,6 +197,10 @@
     overlay.removeAttribute('hidden');
     var input = document.getElementById('cxpak-palette-input');
     input.value = '';
+    // ARIA combobox spec: aria-expanded must reflect popup visibility.
+    // Hardcoded "true" lied while the palette was hidden — flip it here
+    // and in closePalette() so screen readers announce the state honestly.
+    input.setAttribute('aria-expanded', 'true');
     input.focus();
     renderPaletteResults('');
   }
@@ -204,6 +208,8 @@
     if (!CX.state.paletteOpen) return;
     CX.state.paletteOpen = false;
     document.getElementById('cxpak-palette-overlay').setAttribute('hidden', '');
+    var input = document.getElementById('cxpak-palette-input');
+    if (input) input.setAttribute('aria-expanded', 'false');
     try { CX.state.prePaletteFocus && CX.state.prePaletteFocus.focus(); }
     catch (e) { document.querySelector('.cxpak-nav-link').focus(); }
   }
@@ -496,13 +502,16 @@
     });
   })();
 
-  // Focus trap for modal dialogs (palette + help overlay).
-  // Tab/Shift-Tab cycles within the dialog when one is open.
+  // Focus trap for modal dialogs (palette + help overlay + inspector).
+  // Tab/Shift-Tab cycles within the dialog when one is open.  Inspector is
+  // role=dialog aria-modal=false: non-blocking but still focus-bounded so
+  // keyboard users do not Tab out into the background SVG by surprise.
   function trapFocus(ev) {
     if (ev.key !== 'Tab') return;
     var modal = null;
     if (CX.state.paletteOpen) modal = document.getElementById('cxpak-palette-overlay');
     else if (CX.state.helpOverlayOpen) modal = document.getElementById('cxpak-help-overlay');
+    else if (CX.state.inspector) modal = document.getElementById('cxpak-inspector');
     if (!modal || modal.hasAttribute('hidden')) return;
     var focusables = modal.querySelectorAll(
       'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
@@ -526,7 +535,19 @@
   document.addEventListener('keydown', function(ev) {
     var mod = ev.metaKey || ev.ctrlKey;
     if (mod && ev.key === 'k') { ev.preventDefault(); openPalette(); return; }
-    if (ev.key === '/') { ev.preventDefault(); openPalette(); return; }
+    if (ev.key === '/') {
+      // Skip when palette is already open (avoid duplicate trigger and
+      // not stealing the `/` keystroke from the palette input itself) and
+      // when the user is typing into any other input/textarea/editable
+      // surface — pressing `/` in a search field should produce a `/`,
+      // not open a new palette.
+      if (CX.state.paletteOpen) return;
+      var t = ev.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      ev.preventDefault();
+      openPalette();
+      return;
+    }
     if (ev.key === 'Escape') {
       if (CX.state.paletteOpen) { closePalette(); return; }
       if (CX.state.inspector) { closeInspector(); return; }

@@ -10,6 +10,56 @@ fn visibility_label(v: &Visibility) -> &'static str {
     }
 }
 
+/// Restrictive allowlist for git rev-spec strings supplied by LSP clients.
+///
+/// `git2::Repository::revparse_single` accepts the full rev-spec grammar
+/// including `HEAD^{/regex}` and `@{u}` patterns that can trigger expensive
+/// regex scans over commit history.  We only need the simple cases —
+/// abbreviated/full SHA, branch/tag name, `HEAD`, `HEAD~N`, `HEAD^N`,
+/// `<ref>~N`, `<ref>^N`.  Anything outside this grammar is rejected with
+/// `Internal(...)` so the user gets a clear error instead of a denial-of-
+/// service vector.
+fn validate_git_ref(raw: Option<&str>) -> Result<Option<&str>, LspMethodError> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if s.len() > 200 {
+        return Err(LspMethodError::Internal(
+            "git ref too long (max 200 chars)".into(),
+        ));
+    }
+    // Reject any character outside the safe set for branch/tag/SHA names
+    // plus the small ref-spec syntax (`~`, `^`, digits) we actually support.
+    // Notably excludes `{`, `}`, `:`, `/regex/`, `@`, backtick, semicolons,
+    // and whitespace — the vectors that drive expensive parses.
+    let ok = s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | '^'));
+    if !ok {
+        return Err(LspMethodError::Internal(format!(
+            "git ref `{s}` contains disallowed characters; allowed: A-Z a-z 0-9 _ - . / ~ ^"
+        )));
+    }
+    // No leading dot, no `..` (parent ref, ambiguous), no consecutive `//`,
+    // no trailing `.lock` (git ref-name rule).
+    if s.starts_with('.')
+        || s.starts_with('/')
+        || s.contains("..")
+        || s.contains("//")
+        || s.ends_with(".lock")
+        || s.ends_with('/')
+        || s.ends_with('.')
+    {
+        return Err(LspMethodError::Internal(format!(
+            "git ref `{s}` violates git ref-name rules"
+        )));
+    }
+    Ok(Some(s))
+}
+
 /// Error type returned by [`handle_custom_method`].
 #[derive(Debug)]
 pub enum LspMethodError {
@@ -402,26 +452,50 @@ pub fn handle_custom_method(
             ))
         }
         "cxpak/diff" => {
-            let git_ref = params.get("ref").and_then(|v| v.as_str());
+            // Optional caps so a 50-file refactor does not produce a multi-MB
+            // JSON-RPC response that blocks LSP clients.  Defaults: 50 files,
+            // 32 KiB per file's diff_text.  Caller can override (e.g.,
+            // `{"max_files": 10, "max_bytes_per_file": 4096}`).
+            let max_files = params
+                .get("max_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .min(500) as usize;
+            let max_bytes_per_file = params
+                .get("max_bytes_per_file")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(32 * 1024)
+                .min(1_048_576) as usize;
+            let git_ref = validate_git_ref(params.get("ref").and_then(|v| v.as_str()))?;
             match crate::commands::diff::extract_changes(repo_root, git_ref) {
                 Ok(changes) => {
-                    // Return the real diff content, not just a byte count.
-                    // An LSP client asking for diff data needs the patch text
-                    // to render in a side panel or feed to another tool;
-                    // returning length() alone is a shallow integration.
-                    let entries: Vec<_> = changes
-                        .iter()
-                        .map(|c| {
-                            serde_json::json!({
-                                "path": c.path,
-                                "diff_text": c.diff_text,
-                                "diff_bytes": c.diff_text.len(),
-                            })
-                        })
-                        .collect();
+                    let total_changed = changes.len();
+                    let truncated_files = total_changed > max_files;
+                    let mut entries: Vec<serde_json::Value> = Vec::new();
+                    for c in changes.iter().take(max_files) {
+                        let full_bytes = c.diff_text.len();
+                        let (text, truncated_text) = if full_bytes > max_bytes_per_file {
+                            // Slice on a UTF-8 char boundary <= max_bytes_per_file.
+                            let mut end = max_bytes_per_file;
+                            while end > 0 && !c.diff_text.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            (&c.diff_text[..end], true)
+                        } else {
+                            (c.diff_text.as_str(), false)
+                        };
+                        entries.push(serde_json::json!({
+                            "path": c.path,
+                            "diff_text": text,
+                            "diff_bytes": full_bytes,
+                            "truncated": truncated_text,
+                        }));
+                    }
                     Ok(Some(serde_json::json!({
                         "ref": git_ref.unwrap_or("uncommitted"),
-                        "count": entries.len(),
+                        "count": total_changed,
+                        "showing": entries.len(),
+                        "files_truncated": truncated_files,
                         "changes": entries,
                     })))
                 }

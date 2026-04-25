@@ -54,9 +54,14 @@ fn palette_input_implements_aria_combobox_pattern() {
         input_attrs.contains(r#"aria-autocomplete="list""#),
         "palette input must declare aria-autocomplete=list; got: {input_attrs}"
     );
+    // Static aria-expanded MUST be "false" — palette is hidden at page
+    // load.  The controller toggles to "true" in openPalette() and back
+    // to "false" in closePalette().  A hardcoded "true" lies to screen
+    // readers about popup visibility (locked by round3_hardening test
+    // palette_aria_expanded_defaults_false_in_static_html).
     assert!(
-        input_attrs.contains(r#"aria-expanded="true""#),
-        "palette input must declare aria-expanded=true (results visible while open); got: {input_attrs}"
+        input_attrs.contains(r#"aria-expanded="false""#),
+        "palette input must declare aria-expanded=false at page load; got: {input_attrs}"
     );
 }
 

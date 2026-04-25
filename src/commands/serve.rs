@@ -1068,7 +1068,7 @@ async fn diff_handler(
     Query(params): Query<DiffParams>,
 ) -> Result<Json<Value>, StatusCode> {
     let git_ref = params.git_ref.as_deref();
-    let _token_budget = params
+    let token_budget = params
         .tokens
         .as_deref()
         .and_then(|t| crate::cli::parse_token_count(t).ok())
@@ -1077,19 +1077,34 @@ async fn diff_handler(
     let changes = crate::commands::diff::extract_changes(&repo_path, git_ref)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let files: Vec<Value> = changes
-        .iter()
-        .map(|c| {
-            json!({
-                "path": c.path,
-                "diff": c.diff_text,
-            })
-        })
-        .collect();
+    // Approximate 1 token ≈ 4 chars (English text avg).  Pack files until
+    // the budget is reached, then signal truncation in the response so the
+    // caller can decide to retry with a larger budget or paginate.
+    let counter = crate::budget::counter::TokenCounter::new();
+    let total_changed = changes.len();
+    let mut files: Vec<Value> = Vec::new();
+    let mut tokens_used = 0usize;
+    let mut truncated = false;
+    for c in &changes {
+        let tokens = counter.count(&c.diff_text);
+        if tokens_used + tokens > token_budget && !files.is_empty() {
+            truncated = true;
+            break;
+        }
+        tokens_used = tokens_used.saturating_add(tokens);
+        files.push(json!({
+            "path": c.path,
+            "diff": c.diff_text,
+        }));
+    }
 
     Ok(Json(json!({
         "git_ref": git_ref.unwrap_or("working tree"),
-        "changed_files": changes.len(),
+        "changed_files": total_changed,
+        "showing": files.len(),
+        "truncated": truncated,
+        "tokens_used": tokens_used,
+        "token_budget": token_budget,
         "files": files,
     })))
 }
@@ -3063,7 +3078,15 @@ fn handle_tool_call(
             let workspace = args.get("workspace").and_then(|w| w.as_str());
             // workspace acts as a focus prefix when focus is not set
             let effective_focus = focus.or(workspace);
-            let dead = crate::intelligence::dead_code::detect_dead_code(index, effective_focus);
+            // Use the shared cache when no focus is requested — matches the
+            // LSP / dashboard / health-score paths and saves the full
+            // O(F·S·C) re-scan that an unfocused MCP poll would otherwise
+            // pay on every call.  When focus IS set, fall through to a
+            // direct call so the focus filter is honoured.
+            let dead: Vec<_> = match effective_focus {
+                None => index.dead_code_cached().to_vec(),
+                Some(f) => crate::intelligence::dead_code::detect_dead_code(index, Some(f)),
+            };
             let total = dead.len();
             let limited: Vec<_> = dead.into_iter().take(limit).collect();
             let showing = limited.len();
@@ -3445,7 +3468,12 @@ fn mcp_tool_result(id: Option<Value>, text: &str) -> Value {
 }
 
 /// Process a batch of watcher changes, updating the shared index.
-pub(crate) fn process_watcher_changes(
+///
+/// Public so integration tests can drive the watcher invalidation contract
+/// without owning a real `notify` watcher process.  Hidden from the rendered
+/// docs because it's not part of the stable public API surface.
+#[doc(hidden)]
+pub fn process_watcher_changes(
     changes: &[crate::daemon::watcher::FileChange],
     base_path: &Path,
     shared: &SharedIndex,
@@ -3473,6 +3501,14 @@ pub(crate) fn process_watcher_changes(
                 );
                 idx.conventions = conventions;
             }
+            // Invalidate the dead-code cache.  apply_incremental_update
+            // mutates the index in place — it does NOT replace the whole
+            // CodebaseIndex — so the OnceLock cache from the pre-edit state
+            // would silently lie to LSP diagnostics, the dashboard, and the
+            // health score until process restart.  Replacing the Arc with
+            // a fresh OnceLock drops the old cached vector; the next caller
+            // re-computes against the now-current index.
+            idx.dead_code_cache = std::sync::Arc::new(std::sync::OnceLock::new());
             eprintln!(
                 "cxpak: updated {} file(s), {} files / {} tokens total",
                 update_count, idx.total_files, idx.total_tokens
