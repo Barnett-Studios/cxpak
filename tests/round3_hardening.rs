@@ -71,7 +71,7 @@ fn process_watcher_changes_invalidates_dead_code_cache() {
         .output();
 
     let idx = cxpak::commands::serve::build_index(dir.path()).expect("build_index");
-    let shared = std::sync::Arc::new(std::sync::RwLock::new(idx));
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(idx)));
     // Prime the cache.
     {
         let g = shared.read().unwrap();

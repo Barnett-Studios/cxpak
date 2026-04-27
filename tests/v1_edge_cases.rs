@@ -6,7 +6,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 fn build_app(idx: cxpak::index::CodebaseIndex) -> axum::Router {
-    let shared = std::sync::Arc::new(std::sync::RwLock::new(idx));
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(idx)));
     let path = std::sync::Arc::new(std::path::PathBuf::from("."));
     cxpak::commands::serve::build_router_for_test(shared, path)
 }

@@ -24,8 +24,21 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
-type SharedIndex = Arc<RwLock<CodebaseIndex>>;
-type SharedSnapshot = Arc<RwLock<Option<crate::auto_context::diff::ContextSnapshot>>>;
+/// Shared, atomically-swappable handle to the active CodebaseIndex.
+///
+/// The double-Arc pattern (`Arc<RwLock<Arc<CodebaseIndex>>>`) lets readers
+/// take a snapshot of the inner `Arc<CodebaseIndex>` in O(1) (a single
+/// atomic refcount bump), drop the read lock, and then run arbitrarily
+/// long handlers against the snapshot.  Writers (the watcher) build a
+/// new `CodebaseIndex` off a clone of the previous snapshot, then swap
+/// the inner Arc atomically — readers in flight continue to see the
+/// pre-swap snapshot, never blocked, never returning torn state.
+///
+/// Without the inner Arc, the existing `RwLock<CodebaseIndex>` forced
+/// long-running LSP handlers (predict, drift, securitySurface) to hold
+/// the read guard for seconds, starving every concurrent watcher write.
+pub type SharedIndex = Arc<RwLock<Arc<CodebaseIndex>>>;
+pub type SharedSnapshot = Arc<RwLock<Option<crate::auto_context::diff::ContextSnapshot>>>;
 
 /// Maximum allowed regex pattern length in the search endpoint.
 /// Patterns beyond this limit risk catastrophic backtracking (ReDoS).
@@ -278,6 +291,44 @@ pub fn build_router_for_test_with_token(
 }
 
 /// Build the axum Router for the HTTP server.
+/// Inject defense-in-depth security headers on every response.
+///
+/// `cxpak serve` returns only JSON; no inline scripts, no third-party
+/// resources, no framing.  A strict CSP costs nothing here and gives
+/// browsers a clear signal that any unexpected script execution is
+/// disallowed if a response is ever mis-typed as HTML.
+async fn security_headers_layer(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    // No script, no styles, no images, no frames, nothing.  cxpak/serve
+    // emits JSON exclusively; tightening to `'none'` makes a wrong-MIME
+    // response inert in a browser.
+    headers.insert(
+        "Content-Security-Policy",
+        axum::http::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    headers.insert(
+        "X-Content-Type-Options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "Referrer-Policy",
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        "X-Frame-Options",
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        "Cross-Origin-Resource-Policy",
+        axum::http::HeaderValue::from_static("same-origin"),
+    );
+    response
+}
+
 fn build_router(shared: SharedIndex, repo_path: SharedPath, token: Option<String>) -> Router {
     let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
     let state = AppState {
@@ -311,8 +362,13 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath, token: Option<String
         )
         .route("/data_flow", axum::routing::post(data_flow_handler))
         .route("/cross_lang", get(cross_lang_handler))
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .merge(build_v1_router(state.clone()))
+        // Security layer applied LAST so it wraps both legacy + v1 routes.
+        // Tower layers wrap outside-in: layers added later sit at the
+        // outermost edge and run for every request that reaches a child
+        // route, including everything pulled in via `.merge`.
+        .layer(axum::middleware::from_fn(security_headers_layer))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -497,7 +553,9 @@ async fn v1_health_handler(State(index): State<SharedIndex>) -> Result<Json<Valu
     let idx = index
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let health = crate::intelligence::health::compute_health(&idx);
+    // Cached so polling /v1/health doesn't re-run the 5 scoring passes
+    // every request.  Cache is invalidated by process_watcher_changes.
+    let health = idx.health_cached();
     Ok(Json(serde_json::json!({
         "total_files": idx.total_files,
         "total_tokens": idx.total_tokens,
@@ -886,6 +944,32 @@ async fn v1_cross_lang_handler(
     Ok(axum::Json(serde_json::json!({"edges": edges})))
 }
 
+/// Reject startup configurations that would expose the API to other
+/// hosts without authentication.
+///
+/// `cxpak serve` returns full source-bearing intelligence responses;
+/// without this guard, `cxpak serve --bind 0.0.0.0` exposes the entire
+/// codebase content to any host that can reach the port.  Loopback
+/// (127.0.0.1, ::1) is permitted token-less because it already requires
+/// local OS access.
+///
+/// Public for adversarial testing — the rule is too important to leave
+/// untestable inside `run()` (which would otherwise have to bind a
+/// real socket to be exercised).
+pub fn validate_bind_security(
+    addr: &std::net::SocketAddr,
+    token: Option<&str>,
+) -> Result<(), String> {
+    if !addr.ip().is_loopback() && token.is_none() {
+        return Err(format!(
+            "refusing to bind {addr} without --token: a non-loopback listener \
+             is reachable by other hosts and MUST be authenticated. \
+             Either set --token <secret> or bind to 127.0.0.1 / ::1."
+        ));
+    }
+    Ok(())
+}
+
 pub fn run(
     path: &Path,
     port: u16,
@@ -898,6 +982,8 @@ pub fn run(
         .parse()
         .map_err(|e| format!("invalid bind address '{bind}:{port}': {e}"))?;
 
+    validate_bind_security(&addr, token)?;
+
     let index = build_index(path)?;
 
     eprintln!(
@@ -907,7 +993,10 @@ pub fn run(
         index.total_tokens,
     );
 
-    let shared = Arc::new(RwLock::new(index));
+    // Wrap in inner Arc so the lock guards a cheap-to-clone handle, not
+    // the full CodebaseIndex.  Readers snapshot in O(1); writers swap
+    // atomically (see SharedIndex docs).
+    let shared = Arc::new(RwLock::new(Arc::new(index)));
     let shared_path = Arc::new(path.to_path_buf());
 
     // Background watcher thread
@@ -2146,7 +2235,12 @@ fn mcp_stdio_loop_with_io(
     Ok(())
 }
 
-fn handle_tool_call(
+/// MCP `tools/call` dispatch.  Public-with-doc-hidden so integration
+/// tests in `tests/cross_channel_consistency.rs` can drive the MCP
+/// channel directly and assert byte-identical parity with v1 / LSP /
+/// SPA.  Not part of the stable public API surface.
+#[doc(hidden)]
+pub fn handle_tool_call(
     id: Option<Value>,
     tool_name: &str,
     args: &Value,
@@ -3480,41 +3574,54 @@ pub fn process_watcher_changes(
 ) {
     let (modified_paths, removed_paths) = classify_changes(changes, base_path);
 
-    if let Ok(mut idx) = shared.write() {
-        let update_count =
-            apply_incremental_update(&mut idx, base_path, &modified_paths, &removed_paths);
-        if update_count > 0 {
-            idx.rebuild_graph();
-            idx.pagerank = crate::intelligence::pagerank::compute_pagerank(&idx.graph, 0.85, 100);
-            let paths: std::collections::HashSet<String> =
-                idx.files.iter().map(|f| f.relative_path.clone()).collect();
-            idx.test_map = crate::intelligence::test_map::build_test_map(&idx.files, &paths);
-            {
-                let mod_vec: Vec<String> = modified_paths.iter().cloned().collect();
-                let rem_vec: Vec<String> = removed_paths.iter().cloned().collect();
-                let mut conventions = std::mem::take(&mut idx.conventions);
-                crate::conventions::update_conventions_incremental(
-                    &mut conventions,
-                    &mod_vec,
-                    &rem_vec,
-                    &idx,
-                );
-                idx.conventions = conventions;
-            }
-            // Invalidate the dead-code cache.  apply_incremental_update
-            // mutates the index in place — it does NOT replace the whole
-            // CodebaseIndex — so the OnceLock cache from the pre-edit state
-            // would silently lie to LSP diagnostics, the dashboard, and the
-            // health score until process restart.  Replacing the Arc with
-            // a fresh OnceLock drops the old cached vector; the next caller
-            // re-computes against the now-current index.
-            idx.dead_code_cache = std::sync::Arc::new(std::sync::OnceLock::new());
-            eprintln!(
-                "cxpak: updated {} file(s), {} files / {} tokens total",
-                update_count, idx.total_files, idx.total_tokens
-            );
-        }
+    // Snapshot-then-swap: clone the inner Arc under the read lock (O(1)),
+    // drop the lock, build the new index off a deep clone of the snapshot,
+    // then take the write lock briefly to swap in the new Arc.  Long-running
+    // readers in flight continue to see the pre-swap snapshot — never
+    // blocked, never returning torn state.
+    let snapshot: Arc<CodebaseIndex> = match shared.read() {
+        Ok(g) => Arc::clone(&*g),
+        Err(_) => return, // poisoned lock — nothing to do
+    };
+    let mut next: CodebaseIndex = (*snapshot).clone();
+    drop(snapshot);
+
+    let update_count =
+        apply_incremental_update(&mut next, base_path, &modified_paths, &removed_paths);
+    if update_count == 0 {
+        return;
     }
+    next.rebuild_graph();
+    next.pagerank = crate::intelligence::pagerank::compute_pagerank(&next.graph, 0.85, 100);
+    let paths: std::collections::HashSet<String> =
+        next.files.iter().map(|f| f.relative_path.clone()).collect();
+    next.test_map = crate::intelligence::test_map::build_test_map(&next.files, &paths);
+    {
+        let mod_vec: Vec<String> = modified_paths.iter().cloned().collect();
+        let rem_vec: Vec<String> = removed_paths.iter().cloned().collect();
+        let mut conventions = std::mem::take(&mut next.conventions);
+        crate::conventions::update_conventions_incremental(
+            &mut conventions,
+            &mod_vec,
+            &rem_vec,
+            &next,
+        );
+        next.conventions = conventions;
+    }
+    // Fresh OnceLocks — we built a new CodebaseIndex; the prior caches
+    // are bound to the prior state and would lie if carried forward.
+    next.dead_code_cache = std::sync::Arc::new(std::sync::OnceLock::new());
+    next.health_cache = std::sync::Arc::new(std::sync::OnceLock::new());
+
+    let total_files = next.total_files;
+    let total_tokens = next.total_tokens;
+    let new_arc = Arc::new(next);
+    if let Ok(mut g) = shared.write() {
+        *g = new_arc;
+    }
+    eprintln!(
+        "cxpak: updated {update_count} file(s), {total_files} files / {total_tokens} tokens total"
+    );
 }
 
 fn mcp_error_response(id: Option<Value>, code: i32, message: &str) -> Value {
@@ -3581,7 +3688,7 @@ mod tests {
     }
 
     fn make_shared_index() -> SharedIndex {
-        Arc::new(RwLock::new(make_test_index()))
+        Arc::new(RwLock::new(Arc::new(make_test_index())))
     }
 
     fn make_shared_snapshot() -> SharedSnapshot {

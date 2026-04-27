@@ -70,7 +70,7 @@ fn fixture_metadata() -> cxpak::visual::render::RenderMetadata {
 }
 
 fn build_router_with_index(idx: cxpak::index::CodebaseIndex) -> axum::Router {
-    let shared = std::sync::Arc::new(std::sync::RwLock::new(idx));
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(idx)));
     let path = std::sync::Arc::new(std::path::PathBuf::from("."));
     cxpak::commands::serve::build_router_for_test(shared, path)
 }
@@ -107,6 +107,31 @@ async fn get_v1(app: axum::Router, path: &str) -> Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Drive the MCP `tools/call` channel and parse the embedded JSON result.
+///
+/// MCP responses are JSON-RPC envelopes with the actual tool payload
+/// pretty-printed inside `result.content[0].text` (per MCP spec).  This
+/// helper extracts and re-parses that string so tests can assert
+/// byte-identical parity against the SPA / v1 / LSP channels.
+fn call_mcp(idx: &cxpak::index::CodebaseIndex, tool: &str, args: Value) -> Value {
+    let snapshot: cxpak::commands::serve::SharedSnapshot =
+        std::sync::Arc::new(std::sync::RwLock::new(None));
+    let envelope = cxpak::commands::serve::handle_tool_call(
+        Some(Value::Number(1.into())),
+        tool,
+        &args,
+        idx,
+        std::path::Path::new("/tmp"),
+        &snapshot,
+    );
+    let text = envelope["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("MCP {tool} envelope missing result.content[0].text: {envelope}"))
+        .to_string();
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("MCP {tool} content text not JSON ({e}): {text}"))
 }
 
 #[tokio::test]
@@ -153,6 +178,20 @@ async fn health_consistency_spa_v1_mcp_lsp() {
         expected.composite.to_bits(),
         "LSP health drift"
     );
+
+    // MCP cxpak_health — function name has had `_mcp_` in it for two
+    // releases but the body never invoked the MCP channel.  Closes that
+    // coverage gap with a real MCP dispatch + bit-identical assertion.
+    let idx3 = make_fixture_index();
+    let mcp = call_mcp(&idx3, "cxpak_health", serde_json::json!({}));
+    let mcp_composite = mcp["composite"]
+        .as_f64()
+        .expect("MCP cxpak_health must expose composite");
+    assert_eq!(
+        mcp_composite.to_bits(),
+        expected.composite.to_bits(),
+        "MCP health drift"
+    );
 }
 
 #[tokio::test]
@@ -189,10 +228,41 @@ async fn risk_consistency_spa_v1_mcp() {
             expected[i].risk_score.to_bits()
         );
     }
+
+    // MCP cxpak_risks — function name promised _mcp coverage but the
+    // body never invoked the channel.  MCP returns a top-level array
+    // (no `risks` envelope), unlike v1 which wraps in `{"risks":[…]}`.
+    // The schema divergence between channels is itself a finding worth
+    // flagging — but for now this test asserts byte-identical risk
+    // scores against the same reference.
+    let idx_mcp = make_fixture_index();
+    let mcp = call_mcp(&idx_mcp, "cxpak_risks", serde_json::json!({}));
+    let mcp_risks = mcp.as_array().unwrap_or_else(|| {
+        panic!("MCP cxpak_risks must return a top-level JSON array, got: {mcp}")
+    });
+    assert!(
+        !mcp_risks.is_empty(),
+        "MCP cxpak_risks must return at least one entry on a non-empty index"
+    );
+    for (i, entry) in mcp_risks.iter().enumerate() {
+        if i >= expected.len() {
+            break;
+        }
+        assert_eq!(
+            entry["path"].as_str().unwrap(),
+            expected[i].path,
+            "MCP risk path drift at index {i}"
+        );
+        assert_eq!(
+            entry["risk_score"].as_f64().unwrap().to_bits(),
+            expected[i].risk_score.to_bits(),
+            "MCP risk_score drift at index {i}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn architecture_consistency_spa_v1() {
+async fn architecture_consistency_spa_v1_mcp() {
     let idx = make_fixture_index();
     let expected = cxpak::intelligence::architecture::build_architecture_map(&idx, 2);
 
@@ -217,10 +287,29 @@ async fn architecture_consistency_spa_v1() {
         .filter_map(|m| m["prefix"].as_str())
         .collect();
     assert_eq!(v1_prefixes, expected_prefixes);
+
+    // MCP cxpak_architecture — coverage gap previously masked by the
+    // `_spa_v1` function name not promising MCP coverage.  Now both
+    // promise and assertion are present.
+    let idx_mcp = make_fixture_index();
+    let mcp = call_mcp(&idx_mcp, "cxpak_architecture", serde_json::json!({}));
+    let mcp_modules = mcp["modules"]
+        .as_array()
+        .expect("MCP cxpak_architecture must return `modules` array");
+    let mcp_prefixes: std::collections::BTreeSet<String> = mcp_modules
+        .iter()
+        .filter_map(|m| m["prefix"].as_str().map(String::from))
+        .collect();
+    let mcp_refs: std::collections::BTreeSet<&str> =
+        mcp_prefixes.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        mcp_refs, expected_prefixes,
+        "MCP architecture prefix-set drift"
+    );
 }
 
 #[tokio::test]
-async fn dead_code_consistency_v1_lsp() {
+async fn dead_code_consistency_v1_lsp_mcp() {
     let idx = make_fixture_index();
     let expected = cxpak::intelligence::dead_code::detect_dead_code(&idx, None);
     let v1_body = post_v1(
@@ -249,6 +338,20 @@ async fn dead_code_consistency_v1_lsp() {
         .or_else(|| lsp["dead_symbols"].as_array().map(|a| a.len()))
         .unwrap_or(0);
     assert_eq!(lsp_count, expected.len());
+
+    // MCP cxpak_dead_code — was not in any cross-channel test, despite
+    // being a fully-wired dispatcher.  v1, LSP, and now MCP MUST all
+    // report the same `total` (cardinality of the dead-symbol set).
+    let idx3 = make_fixture_index();
+    let mcp = call_mcp(&idx3, "cxpak_dead_code", serde_json::json!({}));
+    let mcp_total = mcp["total"]
+        .as_u64()
+        .expect("MCP cxpak_dead_code must expose `total`") as usize;
+    assert_eq!(
+        mcp_total,
+        expected.len(),
+        "MCP dead_code total drift vs reference"
+    );
 }
 
 #[tokio::test]

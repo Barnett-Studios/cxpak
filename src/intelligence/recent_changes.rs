@@ -50,7 +50,10 @@ pub fn compute_recent_changes(index: &CodebaseIndex) -> Vec<RecentChange> {
         .map(|e| {
             let days_ago = e.last_commit_epoch.map(|ep| days_between(now, ep));
             RecentChange {
-                path: e.path.clone(),
+                // Bidi-sanitise so a malicious commit that renames a file
+                // to embed U+202E cannot flip the visual rendering of
+                // recent-change paths in the SPA / v1 / MCP outputs.
+                path: crate::util::sanitize_bidi(&e.path),
                 days_ago,
                 modifications_30d: e.modifications.min(u32::MAX as usize) as u32,
             }

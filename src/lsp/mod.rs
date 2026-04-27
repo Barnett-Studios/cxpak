@@ -7,7 +7,10 @@ pub use backend::CxpakLspBackend;
 pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     use tower_lsp::{LspService, Server};
     let index = crate::commands::serve::build_index(path)?;
-    let shared = std::sync::Arc::new(std::sync::RwLock::new(index));
+    // Inner Arc so the LSP dispatch can take an O(1) snapshot and run
+    // long-running custom methods without holding the lock — see
+    // SharedIndex docs in commands::serve.
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(index)));
     let shared_path = std::sync::Arc::new(path.to_path_buf());
     let (service, socket) = LspService::build(|client| {
         CxpakLspBackend::new(

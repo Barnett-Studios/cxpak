@@ -12,7 +12,7 @@ fn empty_app() -> axum::Router {
         &counter,
         std::collections::HashMap::new(),
     );
-    let shared = std::sync::Arc::new(std::sync::RwLock::new(idx));
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(idx)));
     let path = std::sync::Arc::new(std::path::PathBuf::from("."));
     cxpak::commands::serve::build_router_for_test(shared, path)
 }

@@ -256,12 +256,14 @@ pub fn diagnostics_for_file(
                 // every diagnostic; prefixing with kind+visibility tells
                 // the user whether they can safely delete a private
                 // function vs. whether a pub symbol requires review of
-                // external callers.
+                // external callers.  Bidi-sanitised so a symbol named
+                // with U+202E cannot flip the visual order of the
+                // diagnostic message.
                 message: format!(
                     "dead code: {} {:?} `{}` — {}",
                     visibility_label(&sym.visibility),
                     d.kind,
-                    d.symbol,
+                    crate::util::sanitize_bidi(&d.symbol),
                     d.reason,
                 ),
                 related_information: None,

@@ -4,7 +4,13 @@ use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{async_trait, Client, LanguageServer};
 
-type SharedIndex = Arc<RwLock<crate::index::CodebaseIndex>>;
+// Re-use the canonical SharedIndex alias from `commands::serve` so the
+// LSP backend and the watcher's `process_watcher_changes` agree on the
+// type at the call boundary.  The double-Arc lets long-running custom
+// methods (predict, drift, securitySurface) take an O(1) snapshot, drop
+// the read guard, and run against the snapshot — never blocking a
+// concurrent watcher write.
+type SharedIndex = crate::commands::serve::SharedIndex;
 type SharedPath = Arc<std::path::PathBuf>;
 type SharedDocuments = Arc<RwLock<HashMap<Url, String>>>;
 
@@ -74,13 +80,24 @@ impl CxpakLspBackend {
     /// `methods::handle_custom_method`. Each `custom_*` wrapper calls this
     /// with a constant method name so the registration surface stays clean
     /// while every method ends up at the real implementation.
+    ///
+    /// Snapshot-then-release pattern: take the read lock just long enough
+    /// to clone the inner `Arc<CodebaseIndex>`, drop the guard, then run
+    /// the (potentially seconds-long) handler against the snapshot.  A
+    /// concurrent watcher write swap-installs a new Arc; readers in flight
+    /// finish against the pre-swap snapshot.  Without this, custom methods
+    /// like `predict` / `drift` / `securitySurface` held the read guard
+    /// for their full duration, starving every concurrent watcher write.
     async fn dispatch(
         &self,
         method: &'static str,
         params: serde_json::Value,
     ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let idx = self.index.read().map_err(Self::lock_err)?;
-        match super::methods::handle_custom_method(method, params, &idx, self.path.as_path()) {
+        let snapshot: Arc<crate::index::CodebaseIndex> = {
+            let g = self.index.read().map_err(Self::lock_err)?;
+            Arc::clone(&*g)
+        }; // read guard released here — handler runs lock-free
+        match super::methods::handle_custom_method(method, params, &snapshot, self.path.as_path()) {
             Ok(Some(v)) => Ok(v),
             Ok(None) => Ok(serde_json::Value::Null),
             Err(e) => Err(Self::method_err(e)),

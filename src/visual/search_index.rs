@@ -1,6 +1,7 @@
 //! Pre-computes a fuzzy search index from a CodebaseIndex.
 
 use crate::index::CodebaseIndex;
+use crate::util::sanitize_bidi;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,22 +40,25 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
 
     // 2. Files (all — including parse-failed). Skip paths with NUL bytes; they
     // are invalid on all target platforms and would corrupt JSON output.
+    // Sanitise bidi/zero-width control chars from labels and routing targets
+    // so a malicious repo cannot spoof rendered identifiers (Trojan-source).
     for file in &index.files {
         if file.relative_path.contains('\0') {
             continue;
         }
         let language = file.language.clone().unwrap_or_else(|| "unknown".into());
+        let safe_path = sanitize_bidi(&file.relative_path);
         let detail = if file.parse_result.is_none() {
             format!("{language} · parse error")
         } else {
             format!("{language} · {} tokens", file.token_count)
         };
         entries.push(SearchEntry {
-            label: file.relative_path.clone(),
+            label: safe_path.clone(),
             kind: "file".to_string(),
             context: language.clone(),
             detail,
-            target: format!("#architecture?file={}", file.relative_path),
+            target: format!("#architecture?file={safe_path}"),
         });
     }
 
@@ -67,12 +71,14 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
             if !matches!(sym.visibility, Visibility::Public) {
                 continue;
             }
+            let safe_name = sanitize_bidi(&sym.name);
+            let safe_path = sanitize_bidi(&file.relative_path);
             entries.push(SearchEntry {
-                label: sym.name.clone(),
+                label: safe_name,
                 kind: "symbol".to_string(),
-                context: file.relative_path.clone(),
-                detail: format!("{:?} in {}", sym.kind, file.relative_path),
-                target: format!("#architecture?file={}", file.relative_path),
+                context: safe_path.clone(),
+                detail: format!("{:?} in {safe_path}", sym.kind),
+                target: format!("#architecture?file={safe_path}"),
             });
         }
     }
@@ -95,12 +101,13 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
             .iter()
             .filter(|f| f.relative_path == *m || f.relative_path.starts_with(&format!("{m}/")))
             .count();
+        let safe_m = sanitize_bidi(m);
         entries.push(SearchEntry {
-            label: m.clone(),
+            label: safe_m.clone(),
             kind: "module".to_string(),
             context: String::new(),
             detail: format!("{count} files"),
-            target: format!("#architecture?module={m}"),
+            target: format!("#architecture?module={safe_m}"),
         });
     }
 

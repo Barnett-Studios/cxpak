@@ -215,6 +215,7 @@ mod tests {
             #[cfg(feature = "embeddings")]
             embedding_index: None,
             dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+            health_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {
@@ -304,6 +305,7 @@ mod tests {
             #[cfg(feature = "embeddings")]
             embedding_index: None,
             dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+            health_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {
@@ -353,6 +355,7 @@ mod tests {
             #[cfg(feature = "embeddings")]
             embedding_index: None,
             dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+            health_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {
@@ -427,6 +430,7 @@ mod tests {
             #[cfg(feature = "embeddings")]
             embedding_index: None,
             dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+            health_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {
@@ -490,6 +494,7 @@ mod tests {
             #[cfg(feature = "embeddings")]
             embedding_index: None,
             dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+            health_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = PluginEntry {

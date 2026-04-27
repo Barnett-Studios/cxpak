@@ -8,6 +8,7 @@ use crate::conventions::ConventionProfile;
 use crate::index::graph::DependencyGraph;
 use crate::intelligence::call_graph::CallGraph;
 use crate::intelligence::dead_code::DeadSymbol;
+use crate::intelligence::health::HealthScore;
 use crate::intelligence::test_map::TestFileRef;
 use crate::parser::language::{Import, ParseResult, Symbol, Visibility};
 use crate::scanner::ScannedFile;
@@ -52,9 +53,25 @@ pub struct CodebaseIndex {
     /// replace via `*shared.write() = new_index` is also correct.
     #[doc(hidden)]
     pub dead_code_cache: Arc<OnceLock<Vec<DeadSymbol>>>,
+    /// Memoized full HealthScore.  Same lazy-fill / Arc-shared / reset-on-
+    /// watcher-update contract as `dead_code_cache`.  Without this, every
+    /// `GET /v1/health` poll redoes O(F) convention/coupling/cycles work.
+    #[doc(hidden)]
+    pub health_cache: Arc<OnceLock<HealthScore>>,
 }
 
 impl CodebaseIndex {
+    /// Return the cached HealthScore, computing it lazily on first call.
+    ///
+    /// `compute_health` runs five O(F) scoring passes; without this cache
+    /// every `GET /v1/health` poll repeated the work.  Shared across
+    /// clones via Arc; invalidated alongside `dead_code_cache` on every
+    /// `process_watcher_changes` tick.
+    pub fn health_cached(&self) -> &HealthScore {
+        self.health_cache
+            .get_or_init(|| crate::intelligence::health::compute_health(self))
+    }
+
     /// Return the global dead-code analysis for this index, computing it
     /// lazily on first call and reusing the memoized result thereafter.
     ///
@@ -200,6 +217,7 @@ impl CodebaseIndex {
             #[cfg(feature = "embeddings")]
             embedding_index: None,
             dead_code_cache: Arc::new(OnceLock::new()),
+            health_cache: Arc::new(OnceLock::new()),
         };
         index.schema = crate::schema::detect::build_schema_index(&index);
         index.graph =
@@ -377,6 +395,7 @@ impl CodebaseIndex {
             #[cfg(feature = "embeddings")]
             embedding_index: None,
             dead_code_cache: Arc::new(OnceLock::new()),
+            health_cache: Arc::new(OnceLock::new()),
         };
         index.schema = crate::schema::detect::build_schema_index(&index);
         index.graph =
@@ -619,6 +638,7 @@ impl CodebaseIndex {
             #[cfg(feature = "embeddings")]
             embedding_index: None,
             dead_code_cache: Arc::new(OnceLock::new()),
+            health_cache: Arc::new(OnceLock::new()),
         }
     }
 

@@ -11,7 +11,7 @@ mod api_v1 {
         std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
         let index = cxpak::commands::serve::build_index(dir.path())
             .unwrap_or_else(|_| cxpak::index::CodebaseIndex::empty());
-        let shared = std::sync::Arc::new(std::sync::RwLock::new(index));
+        let shared = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(index)));
         let path = std::sync::Arc::new(dir.path().to_path_buf());
         let router = cxpak::commands::serve::build_router_for_test(shared, path);
         (router, dir)
@@ -22,7 +22,7 @@ mod api_v1 {
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let index = cxpak::index::CodebaseIndex::empty();
-        let shared = std::sync::Arc::new(std::sync::RwLock::new(index));
+        let shared = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(index)));
         let path = std::sync::Arc::new(dir.path().to_path_buf());
         let router = cxpak::commands::serve::build_router_for_test_with_token(
             shared,

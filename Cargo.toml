@@ -103,7 +103,13 @@ default = [
     "embeddings",
     "lsp",
     "visual",
-    "plugins",
+    # `plugins` (WASM plugin loader) intentionally excluded from default.
+    # PluginLoader::load() currently always errors with "guest function
+    # binding not yet implemented" — shipping that as a default feature
+    # made `cxpak plugin add` look functional while the loader was a
+    # known stub.  Build with `--features plugins` once the WIT bridge
+    # is wired up.  Existing plugin-management commands (`list`, `add`,
+    # `verify` of `.cxpak/plugins.json`) move under the same gate.
 ]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-typescript = ["dep:tree-sitter-typescript"]
