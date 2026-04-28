@@ -156,9 +156,18 @@
       live.textContent = 'Navigated to ' + hint;
     }
 
-    // Update active nav tab
+    // Update active nav tab + roving-tabindex state.  Per WAI-ARIA APG
+    // tablist pattern: the active tab gets tabindex="0" and
+    // aria-selected="true"; all others get tabindex="-1" and
+    // aria-selected="false".  Combined with the ArrowKey handler below,
+    // this makes Tab+Arrow-keys reach any view; previously only
+    // dashboard was a tab stop and keyboard users needed Tab through
+    // the entire page to reach Architecture/Risk/Flow/Timeline/Diff.
     document.querySelectorAll('.cxpak-nav-link').forEach(function(a) {
-      a.classList.toggle('active', a.getAttribute('data-view') === newView);
+      var match = a.getAttribute('data-view') === newView;
+      a.classList.toggle('active', match);
+      a.setAttribute('tabindex', match ? '0' : '-1');
+      a.setAttribute('aria-selected', match ? 'true' : 'false');
     });
   }
 
@@ -168,10 +177,41 @@
     navigate();
   });
   window.addEventListener('DOMContentLoaded', function() {
-    // Initial focus on first nav tab.
+    // Initial focus on first nav tab.  navigate() below also sets the
+    // tabindex/aria-selected pair correctly via the roving update.
     var firstNav = document.querySelector('.cxpak-nav-link[data-view="dashboard"]');
     if (firstNav) firstNav.setAttribute('tabindex', '0');
     navigate();
+
+    // Roving-tabindex arrow-key handler.  ArrowLeft/ArrowRight cycle
+    // through the nav tabs (with wraparound); Home/End jump to first/
+    // last.  The tabindex update happens via navigate() once the new
+    // view is selected so a single source of truth (the active view)
+    // drives both visual state and focus order.
+    var navEl = document.querySelector('.cxpak-nav[role="tablist"]');
+    if (!navEl) return;
+    navEl.addEventListener('keydown', function(ev) {
+      if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight'
+          && ev.key !== 'Home' && ev.key !== 'End') return;
+      var tabs = Array.prototype.slice.call(
+        document.querySelectorAll('.cxpak-nav-link[role="tab"]')
+      );
+      if (tabs.length === 0) return;
+      var current = tabs.indexOf(document.activeElement);
+      if (current < 0) current = 0;
+      var next;
+      if (ev.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+      else if (ev.key === 'ArrowRight') next = (current + 1) % tabs.length;
+      else if (ev.key === 'Home') next = 0;
+      else next = tabs.length - 1;
+      ev.preventDefault();
+      var target = tabs[next];
+      // Move focus AND navigate (auto-activation on focus is the
+      // simpler ARIA tab pattern; works well for view switching).
+      CX.pushHash(target.getAttribute('href'));
+      navigate();
+      target.focus();
+    });
   });
 
   // Programmatic hash updates use pushState (no re-entrant hashchange).

@@ -59,6 +59,9 @@ CX.header = function() {
   h.id = 'cxpak-header';
   var hs = CX.meta.health_score;
   var hc = hs == null ? '' : (hs >= 7 ? 'good' : hs >= 4 ? 'warn' : 'bad');
+  // SAFETY: repo_name + visual_type_display interpolated via CX.esc;
+  // hc is one of '' / 'good' / 'warn' / 'bad' chosen above; hs is a
+  // number (.toFixed). No attacker-controlled markup possible.
   h.innerHTML =
     '<span class="cxpak-logo">cxpak</span>' +
     '<span class="cxpak-repo">' + CX.esc(CX.meta.repo_name) + '</span>' +
@@ -290,6 +293,8 @@ q1.innerHTML = '<div class="cxpak-quadrant-title">Health Score</div>';
 var gw = document.createElement('div'); gw.className = 'cxpak-gauge-wrap';
 var sc = dash.health.composite;
 var gc = sc >= 7 ? 'good' : sc >= 4 ? 'warn' : 'bad';
+// SAFETY: gc is one of three string literals chosen above; sc is a number
+// formatted to one decimal. No attacker-controlled markup possible.
 gw.innerHTML = '<div class="cxpak-gauge-score ' + gc + '">' + sc.toFixed(1) + '</div>';
 
 var gSvg = d3.select(gw).append('svg').attr('width', 160).attr('height', 160)
@@ -310,6 +315,9 @@ var bars = document.createElement('div'); bars.className = 'cxpak-dim-bars';
   var name = dim[0], val = dim[1];
   var row = document.createElement('div');
   row.className = 'cxpak-dim-row';
+  // SAFETY: name goes through CX.esc; val is numeric (.toFixed, *10);
+  // CX.dimColor returns a fixed-set hex string from a small enum-like
+  // table.  No attacker-controlled markup or attribute possible.
   row.innerHTML =
     '<span class="cxpak-dim-label">' + CX.esc(name.replace(/_/g, ' ')) + '</span>' +
     '<div class="cxpak-dim-bar"><div class="cxpak-dim-fill" style="width:' + (val*10) + '%;background:' + CX.dimColor(val) + '"></div></div>' +
@@ -342,6 +350,11 @@ if (risks.length === 0) {
     var sevLetter = r.severity === 'high' ? 'H' : r.severity === 'medium' ? 'M' : 'L';
     var sevLabel = r.severity === 'high' ? 'High risk' : r.severity === 'medium' ? 'Medium risk' : 'Low risk';
     var testsLabel = r.has_tests ? 'has tests' : 'no tests';
+    // SAFETY: r.severity is a server enum (high/medium/low); sevLetter,
+    // sevLabel, testsLabel are chosen from a literal set above; r.path
+    // goes through CX.esc; numeric fields (.toFixed, churn_30d,
+    // blast_radius) cannot inject markup.  Color hex strings are also
+    // chosen from literals.
     tr.innerHTML =
       '<td><span class="cxpak-severity-dot ' + r.severity + '" role="img" aria-label="' + sevLabel + '" title="' + sevLabel + '">' + sevLetter + '</span>' + CX.esc(r.path) + '</td>' +
       '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
@@ -359,6 +372,8 @@ var q3 = document.createElement('div');
 q3.className = 'cxpak-quadrant cxpak-clickable';
 q3.title = 'Open architecture explorer';
 q3.onclick = function() { navTo('architecture'); };
+// SAFETY: only numeric values (module_count, circular_dep_count) are
+// interpolated, both fall through `|| 0` so non-numeric inputs become 0.
 q3.innerHTML = '<div class="cxpak-quadrant-title">Architecture (' +
   (dash.architecture_preview.module_count || 0) + ' modules, ' +
   (dash.architecture_preview.circular_dep_count || 0) + ' cycles)</div>';
@@ -500,6 +515,10 @@ navigate(1, 'root');
 
 /* legend */
 var leg = document.createElement('div'); leg.className = 'cxpak-legend';
+// SAFETY: 100% static literal HTML, zero dynamic interpolation.  The
+// `+` is the JS string-concatenation operator joining literal strings,
+// not interpolating any value.
+// SAFETY: 100% static literal HTML, zero dynamic interpolation.
 leg.innerHTML =
   '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#06d6a0"></span>Healthy module (Level 1) / Low risk (Level 2)</div>' +
   '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ffd166"></span>Mid range</div>' +
@@ -618,6 +637,7 @@ window.addEventListener('resize', function() {
 
 /* legend */
 var leg = document.createElement('div'); leg.className = 'cxpak-legend';
+// SAFETY: 100% static literal HTML, zero dynamic interpolation.
 leg.innerHTML =
   '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#06d6a0"></span>Low risk (&lt;0.4)</div>' +
   '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ffd166"></span>Medium (0.4\u20130.7)</div>' +
@@ -634,6 +654,10 @@ CX.header();
 var fl = JSON.parse(document.getElementById('cxpak-flow').textContent);
 
 var badge = document.createElement('div'); badge.className = 'cxpak-flow-badge';
+// SAFETY: fl.symbol and fl.confidence go through CX.esc.  The bare
+// `fl.confidence.toLowerCase()` interpolation lands inside a class= attr
+// — confidence is always one of "high"/"medium"/"low" (server-side enum
+// in FlowConfidence), so .toLowerCase() yields safe ASCII.
 badge.innerHTML = '<span class="cxpak-flow-symbol">' + CX.esc(fl.symbol) + '</span>' +
   '<span class="cxpak-confidence ' + fl.confidence.toLowerCase() + '">' + CX.esc(fl.confidence) + '</span>' +
   (fl.truncated ? '<span class="cxpak-flow-truncated">Truncated</span>' : '');
@@ -685,6 +709,7 @@ CX.renderGraph(cv.g, data, {
 
 /* flow legend (bottom-right) */
 var flowLeg = document.createElement('div'); flowLeg.className = 'cxpak-legend';
+// SAFETY: 100% static literal HTML, zero dynamic interpolation.
 flowLeg.innerHTML =
   '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#4cc9f0"></span>Source</div>' +
   '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ffd166"></span>Transform</div>' +
@@ -820,6 +845,7 @@ if (steps.length === 0) {
   emptyMsg.style.margin = 'auto';
   emptyMsg.style.padding = '32px';
   emptyMsg.style.textAlign = 'center';
+  // SAFETY: 100% static literal text, zero dynamic interpolation.
   emptyMsg.innerHTML = '<strong>No timeline snapshots available</strong><br>' +
     'Insufficient git history for timeline. Run cxpak in a repository with more commits, ' +
     'or generate snapshots with <code>cxpak visual --visual-type timeline</code> after committing changes.';
@@ -972,6 +998,7 @@ function flashKeyEvent(idx) {
   var e = evts[0];
   var flash = document.createElement('div');
   flash.className = 'cxpak-event-flash';
+  // SAFETY: both interpolations go through CX.esc.
   flash.innerHTML = '<strong>' + CX.esc(e.kind) + '</strong><br>' + CX.esc(e.message);
   wrap.appendChild(flash);
   d3.select(flash)
@@ -1093,6 +1120,8 @@ CX.app.appendChild(dw);
 /* impact header */
 var dh = document.createElement('div'); dh.className = 'cxpak-diff-header';
 var impSev = df.impact_score >= 0.5 ? 'high' : df.impact_score >= 0.15 ? 'medium' : 'low';
+// SAFETY: only numeric values (.length, .toFixed) and the impSev enum
+// (chosen above from three string literals) are interpolated.
 dh.innerHTML = '<span>Changed: <b>' + df.changed_files.length + '</b> files</span>' +
   '<span>Blast radius: <b>' + df.blast_radius_files.length + '</b> files</span>' +
   '<span class="cxpak-impact-badge ' + impSev + '">Impact ' + (df.impact_score * 100).toFixed(0) + '%</span>';
@@ -1147,6 +1176,7 @@ if (df.new_risks && df.new_risks.length > 0) {
 
 /* legend */
 var dleg = document.createElement('div'); dleg.className = 'cxpak-legend';
+// SAFETY: 100% static literal HTML, zero dynamic interpolation.
 dleg.innerHTML =
   '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(255,209,102,0.2);border:2px solid #ffd166"></span>Changed file</div>' +
   '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(255,159,67,0.15);border:1.5px solid #ff9f43"></span>Blast radius</div>';

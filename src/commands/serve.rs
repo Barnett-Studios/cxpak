@@ -1028,7 +1028,17 @@ pub fn run(
         }
     });
 
-    let app = build_router(shared, shared_path, token.map(|s| s.to_string()));
+    // Treat empty-string token consistently with `validate_bind_security`:
+    // if the operator typed `--token ""` (loopback bind path that survived
+    // the security guard), the token must NOT be installed — otherwise the
+    // bearer middleware would silently accept clients sending an empty
+    // `Authorization: Bearer` header, contradicting the validate_bind
+    // semantics that empty == not configured.
+    let app = build_router(
+        shared,
+        shared_path,
+        token.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+    );
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -1863,7 +1873,14 @@ fn mcp_stdio_loop(
     mcp_stdio_loop_with_io(repo_path, index, snapshot, stdin.lock(), &mut stdout.lock())
 }
 
-fn mcp_stdio_loop_with_io(
+/// Run the MCP JSON-RPC loop reading newline-delimited requests from
+/// `reader` and writing newline-delimited responses to `writer`.
+///
+/// Public-with-`#[doc(hidden)]` so integration tests can drive the real
+/// stdio framing path without spawning a subprocess.  Closes the gap the
+/// prior round catalogued (in-process MCP tests bypass framing entirely).
+#[doc(hidden)]
+pub fn mcp_stdio_loop_with_io(
     repo_path: &Path,
     index: &CodebaseIndex,
     snapshot: &SharedSnapshot,
@@ -3462,7 +3479,12 @@ pub fn handle_tool_call(
                     generated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                     health_score: None,
                     node_count: index.files.len(),
-                    edge_count: index.graph.edges.values().map(|v| v.len()).sum::<usize>(),
+                    // Shared helper — Contract 8 single-source-of-truth.
+                    // commands/visual.rs::make_metadata, the cross-channel
+                    // parity test, AND this MCP cxpak_visual handler all
+                    // route through `.edge_count()`; if a future edge type
+                    // changes the counting rule, all three pick it up.
+                    edge_count: index.graph.edge_count(),
                     cxpak_version: env!("CARGO_PKG_VERSION").to_string(),
                 };
                 let config = LayoutConfig::default();

@@ -139,14 +139,33 @@ async fn health_consistency_spa_v1_mcp_lsp() {
     let idx = make_fixture_index();
     let expected = cxpak::intelligence::health::compute_health(&idx);
 
-    // SPA — dashboard JSON embeds the full HealthQuadrant.
+    // P4 hardening: bilateral comparison.  Previously this compared the
+    // raw Rust f64 against the JSON-extracted f64 — works in practice
+    // because serde_json's Ryu serialiser is bit-stable for normal f64,
+    // but the rationale was wrong.  Now we round-trip the EXPECTED
+    // value through the same serialiser the SPA uses, then compare bit
+    // patterns of the two JSON-derived values.  If anyone enables
+    // `arbitrary_precision` or otherwise breaks Ryu bit-stability, both
+    // sides would shift identically — the SHARED-CHANNEL invariant
+    // ("both renderers serialise the same way") holds.
+    let expected_json = serde_json::to_value(expected.composite).unwrap();
+    let expected_roundtripped = expected_json.as_f64().unwrap();
     let spa_html = cxpak::visual::spa::render_spa(&idx, &fixture_metadata()).unwrap();
     let spa_dashboard = extract_json_tag(&spa_html, "cxpak-dashboard");
     let spa_composite = spa_dashboard["health"]["composite"].as_f64().unwrap();
     assert_eq!(
         spa_composite.to_bits(),
+        expected_roundtripped.to_bits(),
+        "SPA health composite drift after JSON round-trip — bilateral check"
+    );
+    // Also assert the round-trip itself didn't lose precision.  This
+    // catches a future arbitrary_precision-style change that would
+    // otherwise silently let both sides drift in lockstep.
+    assert_eq!(
+        expected_roundtripped.to_bits(),
         expected.composite.to_bits(),
-        "SPA health composite drift"
+        "JSON round-trip of composite f64 dropped precision — \
+         serializer is no longer bit-stable for HealthScore values"
     );
 
     // v1/health is GET, not POST.
@@ -269,8 +288,24 @@ async fn architecture_consistency_spa_v1_mcp() {
     let spa_html = cxpak::visual::spa::render_spa(&idx, &fixture_metadata()).unwrap();
     let spa_arch = extract_json_tag(&spa_html, "cxpak-explorer");
     let spa_nodes = spa_arch["level1"]["nodes"].as_array().unwrap();
+    // P2 hardening: assert explicit cardinality BEFORE BTreeSet
+    // construction so a future bug that emits duplicate nodes (e.g.,
+    // same module appearing twice as separate node objects) is caught.
+    // BTreeSet equality alone silently dedupes and would let this slip.
+    assert_eq!(
+        spa_nodes.len(),
+        expected.modules.len(),
+        "SPA level1 node array length must equal architecture module count — \
+         duplicates would dedupe through BTreeSet and silently pass otherwise"
+    );
     let spa_prefixes: std::collections::BTreeSet<&str> =
         spa_nodes.iter().filter_map(|n| n["id"].as_str()).collect();
+    assert_eq!(
+        spa_prefixes.len(),
+        spa_nodes.len(),
+        "no duplicate module IDs in SPA level1 nodes — architecture must \
+         emit each module exactly once"
+    );
     let expected_prefixes: std::collections::BTreeSet<&str> =
         expected.modules.iter().map(|m| m.prefix.as_str()).collect();
     assert_eq!(spa_prefixes, expected_prefixes);

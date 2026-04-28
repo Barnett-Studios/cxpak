@@ -121,19 +121,20 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("      <span class=\"cxpak-repo\">");
     html.push_str(&repo);
     html.push_str("</span>\n");
-    html.push_str("      <nav class=\"cxpak-nav\">\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"dashboard\" href=\"#dashboard\" tabindex=\"0\">Dashboard</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"architecture\" href=\"#architecture\">Architecture</a>\n");
-    html.push_str(
-        "        <a class=\"cxpak-nav-link\" data-view=\"risk\" href=\"#risk\">Risk</a>\n",
-    );
-    html.push_str(
-        "        <a class=\"cxpak-nav-link\" data-view=\"flow\" href=\"#flow\">Flow</a>\n",
-    );
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"timeline\" href=\"#timeline\">Timeline</a>\n");
-    html.push_str(
-        "        <a class=\"cxpak-nav-link\" data-view=\"diff\" href=\"#diff\">Diff</a>\n",
-    );
+    // Roving-tabindex pattern (WAI-ARIA APG): role=tablist on the
+    // container, role=tab on each link.  ONE link has tabindex=0, the
+    // rest tabindex=-1.  Arrow keys cycle focus between them — the
+    // controller handles ArrowLeft/ArrowRight + Home/End and updates
+    // tabindex/aria-selected as focus moves.  Without this, keyboard
+    // users had to Tab through every preceding focusable element to
+    // reach a non-dashboard view.
+    html.push_str("      <nav class=\"cxpak-nav\" role=\"tablist\" aria-label=\"Views\">\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"dashboard\" href=\"#dashboard\" role=\"tab\" aria-selected=\"true\" tabindex=\"0\">Dashboard</a>\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"architecture\" href=\"#architecture\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Architecture</a>\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"risk\" href=\"#risk\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Risk</a>\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"flow\" href=\"#flow\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Flow</a>\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"timeline\" href=\"#timeline\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Timeline</a>\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"diff\" href=\"#diff\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Diff</a>\n");
     html.push_str("      </nav>\n");
     html.push_str("      <button class=\"cxpak-theme-toggle\" aria-label=\"Switch to light mode\">\u{2600}</button>\n");
     html.push_str("      <span class=\"cxpak-freshness\"></span>\n");
