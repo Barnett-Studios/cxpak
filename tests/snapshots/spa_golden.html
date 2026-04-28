@@ -1108,20 +1108,78 @@ CX.app = document.getElementById('cxpak-app');
 
 CX.esc = function(s) { var d = document.createElement('span'); d.textContent = s; return d.innerHTML; };
 
+/* CX.h(tag, attrs, children) — safe-by-construction DOM builder.
+ * Replaces innerHTML+concat patterns: every attribute goes through
+ * setAttribute, every text child through textContent, every element
+ * child through appendChild.  No interpolation path can produce
+ * attacker-controlled markup, regardless of what the caller passes.
+ *
+ * Children may be: a string (textContent), an Element (appendChild),
+ * a number (coerced to string via String(n)), or null/undefined (skipped).
+ * Nested arrays are flattened one level so callers can spread groups.
+ *
+ * Usage:
+ *   var el = CX.h('div', {class: 'cxpak-foo', role: 'tab'}, [
+ *     CX.h('span', {class: 'cxpak-label'}, [user.name]),
+ *     ' - ',
+ *     CX.h('span', null, [count]),
+ *   ]);
+ *
+ * Replaces the entire risk surface of the prior CX.esc-everywhere
+ * pattern: a developer who forgets to escape can no longer introduce
+ * XSS, because there is no escape-needing path through this API.
+ */
+CX.h = function(tag, attrs, children) {
+  var el = document.createElement(tag);
+  if (attrs) {
+    for (var k in attrs) {
+      if (!Object.prototype.hasOwnProperty.call(attrs, k)) continue;
+      var v = attrs[k];
+      if (v == null) continue;
+      // Allow short alias `class` for className.
+      var attr = (k === 'class') ? 'class' : k;
+      el.setAttribute(attr, String(v));
+    }
+  }
+  if (children) {
+    for (var i = 0; i < children.length; i++) {
+      var c = children[i];
+      if (c == null || c === false) continue;
+      if (Array.isArray(c)) {
+        for (var j = 0; j < c.length; j++) {
+          var cj = c[j];
+          if (cj == null || cj === false) continue;
+          if (typeof cj === 'string' || typeof cj === 'number') {
+            el.appendChild(document.createTextNode(String(cj)));
+          } else {
+            el.appendChild(cj);
+          }
+        }
+      } else if (typeof c === 'string' || typeof c === 'number') {
+        el.appendChild(document.createTextNode(String(c)));
+      } else {
+        el.appendChild(c);
+      }
+    }
+  }
+  return el;
+};
+
 CX.header = function() {
   var h = document.createElement('div');
   h.id = 'cxpak-header';
   var hs = CX.meta.health_score;
   var hc = hs == null ? '' : (hs >= 7 ? 'good' : hs >= 4 ? 'warn' : 'bad');
-  // SAFETY: repo_name + visual_type_display interpolated via CX.esc;
-  // hc is one of '' / 'good' / 'warn' / 'bad' chosen above; hs is a
-  // number (.toFixed). No attacker-controlled markup possible.
-  h.innerHTML =
-    '<span class="cxpak-logo">cxpak</span>' +
-    '<span class="cxpak-repo">' + CX.esc(CX.meta.repo_name) + '</span>' +
-    '<span class="cxpak-type">' + CX.esc(CX.meta.visual_type_display) + '</span>' +
-    (hs != null ? '<span class="cxpak-health ' + hc + '">' + hs.toFixed(1) + '/10</span>' : '') +
-    '<span class="cxpak-timestamp">' + CX.esc(CX.meta.generated_at) + '</span>';
+  // Safe DOM construction via CX.h — every value goes through
+  // textContent, every attribute through setAttribute. No interpolation
+  // path that could produce markup.
+  h.appendChild(CX.h('span', {class: 'cxpak-logo'}, ['cxpak']));
+  h.appendChild(CX.h('span', {class: 'cxpak-repo'}, [CX.meta.repo_name || '']));
+  h.appendChild(CX.h('span', {class: 'cxpak-type'}, [CX.meta.visual_type_display || '']));
+  if (hs != null) {
+    h.appendChild(CX.h('span', {class: 'cxpak-health ' + hc}, [hs.toFixed(1) + '/10']));
+  }
+  h.appendChild(CX.h('span', {class: 'cxpak-timestamp'}, [CX.meta.generated_at || '']));
   CX.app.appendChild(h);
   /* navigation links */
   var typeMap = { 'Dashboard': 'dashboard', 'Architecture Explorer': 'architecture', 'Risk Heatmap': 'risk', 'Diff View': 'diff', 'Flow Diagram': 'flow', 'Time Machine': 'timeline' };
@@ -2060,9 +2118,7 @@ q1.innerHTML = '<div class="cxpak-quadrant-title">Health Score</div>';
 var gw = document.createElement('div'); gw.className = 'cxpak-gauge-wrap';
 var sc = dash.health.composite;
 var gc = sc >= 7 ? 'good' : sc >= 4 ? 'warn' : 'bad';
-// SAFETY: gc is one of three string literals chosen above; sc is a number
-// formatted to one decimal. No attacker-controlled markup possible.
-gw.innerHTML = '<div class="cxpak-gauge-score ' + gc + '">' + sc.toFixed(1) + '</div>';
+gw.appendChild(CX.h('div', {class: 'cxpak-gauge-score ' + gc}, [sc.toFixed(1)]));
 
 var gSvg = d3.select(gw).append('svg').attr('width', 160).attr('height', 160)
   .append('g').attr('transform','translate(80,80)');
@@ -2082,13 +2138,18 @@ var bars = document.createElement('div'); bars.className = 'cxpak-dim-bars';
   var name = dim[0], val = dim[1];
   var row = document.createElement('div');
   row.className = 'cxpak-dim-row';
-  // SAFETY: name goes through CX.esc; val is numeric (.toFixed, *10);
-  // CX.dimColor returns a fixed-set hex string from a small enum-like
-  // table.  No attacker-controlled markup or attribute possible.
-  row.innerHTML =
-    '<span class="cxpak-dim-label">' + CX.esc(name.replace(/_/g, ' ')) + '</span>' +
-    '<div class="cxpak-dim-bar"><div class="cxpak-dim-fill" style="width:' + (val*10) + '%;background:' + CX.dimColor(val) + '"></div></div>' +
-    '<span class="cxpak-dim-val" style="color:' + CX.dimColor(val) + '">' + val.toFixed(1) + '</span>';
+  row.appendChild(CX.h('span', {class: 'cxpak-dim-label'}, [name.replace(/_/g, ' ')]));
+  var bar = CX.h('div', {class: 'cxpak-dim-bar'}, [
+    CX.h('div', {
+      class: 'cxpak-dim-fill',
+      style: 'width:' + (val * 10) + '%;background:' + CX.dimColor(val),
+    }, []),
+  ]);
+  row.appendChild(bar);
+  row.appendChild(CX.h('span', {
+    class: 'cxpak-dim-val',
+    style: 'color:' + CX.dimColor(val),
+  }, [val.toFixed(1)]));
   bars.appendChild(row);
 });
 gw.appendChild(bars);
@@ -2117,16 +2178,25 @@ if (risks.length === 0) {
     var sevLetter = r.severity === 'high' ? 'H' : r.severity === 'medium' ? 'M' : 'L';
     var sevLabel = r.severity === 'high' ? 'High risk' : r.severity === 'medium' ? 'Medium risk' : 'Low risk';
     var testsLabel = r.has_tests ? 'has tests' : 'no tests';
-    // SAFETY: r.severity is a server enum (high/medium/low); sevLetter,
-    // sevLabel, testsLabel are chosen from a literal set above; r.path
-    // goes through CX.esc; numeric fields (.toFixed, churn_30d,
-    // blast_radius) cannot inject markup.  Color hex strings are also
-    // chosen from literals.
-    tr.innerHTML =
-      '<td><span class="cxpak-severity-dot ' + r.severity + '" role="img" aria-label="' + sevLabel + '" title="' + sevLabel + '">' + sevLetter + '</span>' + CX.esc(r.path) + '</td>' +
-      '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
-      '<td>' + r.churn_30d + '</td><td>' + r.blast_radius + '</td>' +
-      '<td style="color:' + (r.has_tests ? '#06d6a0' : '#8888aa') + '"><span aria-label="' + testsLabel + '" title="' + testsLabel + '">' + (r.has_tests ? '\u2713' : '\u2014') + '</span></td>';
+    var riskColor = r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0';
+    var testsColor = r.has_tests ? '#06d6a0' : '#8888aa';
+    tr.appendChild(CX.h('td', null, [
+      CX.h('span', {
+        class: 'cxpak-severity-dot ' + r.severity,
+        role: 'img',
+        'aria-label': sevLabel,
+        title: sevLabel,
+      }, [sevLetter]),
+      r.path || '',
+    ]));
+    tr.appendChild(CX.h('td', {style: 'color:' + riskColor}, [r.risk_score.toFixed(2)]));
+    tr.appendChild(CX.h('td', null, [String(r.churn_30d)]));
+    tr.appendChild(CX.h('td', null, [String(r.blast_radius)]));
+    tr.appendChild(CX.h('td', {style: 'color:' + testsColor}, [
+      CX.h('span', {'aria-label': testsLabel, title: testsLabel}, [
+        r.has_tests ? '\u2713' : '\u2014',
+      ]),
+    ]));
     tb.appendChild(tr);
   });
   tbl.appendChild(tb);
@@ -2139,11 +2209,13 @@ var q3 = document.createElement('div');
 q3.className = 'cxpak-quadrant cxpak-clickable';
 q3.title = 'Open architecture explorer';
 q3.onclick = function() { navTo('architecture'); };
-// SAFETY: only numeric values (module_count, circular_dep_count) are
-// interpolated, both fall through `|| 0` so non-numeric inputs become 0.
-q3.innerHTML = '<div class="cxpak-quadrant-title">Architecture (' +
-  (dash.architecture_preview.module_count || 0) + ' modules, ' +
-  (dash.architecture_preview.circular_dep_count || 0) + ' cycles)</div>';
+q3.appendChild(CX.h('div', {class: 'cxpak-quadrant-title'}, [
+  'Architecture (',
+  String(dash.architecture_preview.module_count || 0),
+  ' modules, ',
+  String(dash.architecture_preview.circular_dep_count || 0),
+  ' cycles)',
+]));
 var mm = document.createElement('div'); mm.className = 'cxpak-minimap';
 q3.appendChild(mm);
 grid.appendChild(q3);
@@ -2282,16 +2354,18 @@ navigate(1, 'root');
 
 /* legend */
 var leg = document.createElement('div'); leg.className = 'cxpak-legend';
-// SAFETY: 100% static literal HTML, zero dynamic interpolation.  The
-// `+` is the JS string-concatenation operator joining literal strings,
-// not interpolating any value.
-// SAFETY: 100% static literal HTML, zero dynamic interpolation.
-leg.innerHTML =
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#06d6a0"></span>Healthy module (Level 1) / Low risk (Level 2)</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ffd166"></span>Mid range</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ef476f"></span>Unhealthy module / High risk</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(239,71,111,0.25);border:1px solid #ef476f"></span>God file (stroke overlay)</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#2a2a50;border:1px solid #7b68ee;border-style:dashed"></span>Circular dependency</div>';
+function legendItem(bg, label, extraStyle) {
+  var style = 'background:' + bg + (extraStyle ? ';' + extraStyle : '');
+  return CX.h('div', {class: 'cxpak-legend-item'}, [
+    CX.h('span', {class: 'cxpak-legend-swatch', style: style}, []),
+    label,
+  ]);
+}
+leg.appendChild(legendItem('#06d6a0', 'Healthy module (Level 1) / Low risk (Level 2)', null));
+leg.appendChild(legendItem('#ffd166', 'Mid range', null));
+leg.appendChild(legendItem('#ef476f', 'Unhealthy module / High risk', null));
+leg.appendChild(legendItem('rgba(239,71,111,0.25)', 'God file (stroke overlay)', 'border:1px solid #ef476f'));
+leg.appendChild(legendItem('#2a2a50', 'Circular dependency', 'border:1px solid #7b68ee;border-style:dashed'));
 wrap.appendChild(leg);
 
 }); };
@@ -2404,11 +2478,15 @@ window.addEventListener('resize', function() {
 
 /* legend */
 var leg = document.createElement('div'); leg.className = 'cxpak-legend';
-// SAFETY: 100% static literal HTML, zero dynamic interpolation.
-leg.innerHTML =
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#06d6a0"></span>Low risk (&lt;0.4)</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ffd166"></span>Medium (0.4\u20130.7)</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ef476f"></span>High risk (&gt;0.7)</div>';
+function riskLegItem(bg, label) {
+  return CX.h('div', {class: 'cxpak-legend-item'}, [
+    CX.h('span', {class: 'cxpak-legend-swatch', style: 'background:' + bg}, []),
+    label,
+  ]);
+}
+leg.appendChild(riskLegItem('#06d6a0', 'Low risk (<0.4)'));
+leg.appendChild(riskLegItem('#ffd166', 'Medium (0.4\u20130.7)'));
+leg.appendChild(riskLegItem('#ef476f', 'High risk (>0.7)'));
 wrap.appendChild(leg);
 
 }); };
@@ -2420,13 +2498,11 @@ CX.header();
 var fl = JSON.parse(document.getElementById('cxpak-flow').textContent);
 
 var badge = document.createElement('div'); badge.className = 'cxpak-flow-badge';
-// SAFETY: fl.symbol and fl.confidence go through CX.esc.  The bare
-// `fl.confidence.toLowerCase()` interpolation lands inside a class= attr
-// — confidence is always one of "high"/"medium"/"low" (server-side enum
-// in FlowConfidence), so .toLowerCase() yields safe ASCII.
-badge.innerHTML = '<span class="cxpak-flow-symbol">' + CX.esc(fl.symbol) + '</span>' +
-  '<span class="cxpak-confidence ' + fl.confidence.toLowerCase() + '">' + CX.esc(fl.confidence) + '</span>' +
-  (fl.truncated ? '<span class="cxpak-flow-truncated">Truncated</span>' : '');
+badge.appendChild(CX.h('span', {class: 'cxpak-flow-symbol'}, [fl.symbol || '']));
+badge.appendChild(CX.h('span', {class: 'cxpak-confidence ' + (fl.confidence || '').toLowerCase()}, [fl.confidence || '']));
+if (fl.truncated) {
+  badge.appendChild(CX.h('span', {class: 'cxpak-flow-truncated'}, ['Truncated']));
+}
 CX.app.appendChild(badge);
 
 var wrap = document.createElement('div'); wrap.className = 'cxpak-canvas';
@@ -2475,12 +2551,16 @@ CX.renderGraph(cv.g, data, {
 
 /* flow legend (bottom-right) */
 var flowLeg = document.createElement('div'); flowLeg.className = 'cxpak-legend';
-// SAFETY: 100% static literal HTML, zero dynamic interpolation.
-flowLeg.innerHTML =
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#4cc9f0"></span>Source</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ffd166"></span>Transform</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#ef476f"></span>Sink</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:#8888aa"></span>Passthrough</div>';
+function flowLegItem(bg, label) {
+  return CX.h('div', {class: 'cxpak-legend-item'}, [
+    CX.h('span', {class: 'cxpak-legend-swatch', style: 'background:' + bg}, []),
+    label,
+  ]);
+}
+flowLeg.appendChild(flowLegItem('#4cc9f0', 'Source'));
+flowLeg.appendChild(flowLegItem('#ffd166', 'Transform'));
+flowLeg.appendChild(flowLegItem('#ef476f', 'Sink'));
+flowLeg.appendChild(flowLegItem('#8888aa', 'Passthrough'));
 wrap.appendChild(flowLeg);
 
 }); };
@@ -2611,10 +2691,13 @@ if (steps.length === 0) {
   emptyMsg.style.margin = 'auto';
   emptyMsg.style.padding = '32px';
   emptyMsg.style.textAlign = 'center';
-  // SAFETY: 100% static literal text, zero dynamic interpolation.
-  emptyMsg.innerHTML = '<strong>No timeline snapshots available</strong><br>' +
-    'Insufficient git history for timeline. Run cxpak in a repository with more commits, ' +
-    'or generate snapshots with <code>cxpak visual --visual-type timeline</code> after committing changes.';
+  emptyMsg.appendChild(CX.h('strong', null, ['No timeline snapshots available']));
+  emptyMsg.appendChild(document.createElement('br'));
+  emptyMsg.appendChild(document.createTextNode(
+    'Insufficient git history for timeline. Run cxpak in a repository with more commits, or generate snapshots with '
+  ));
+  emptyMsg.appendChild(CX.h('code', null, ['cxpak visual --visual-type timeline']));
+  emptyMsg.appendChild(document.createTextNode(' after committing changes.'));
   graphArea.appendChild(emptyMsg);
   return;
 }
@@ -2764,8 +2847,9 @@ function flashKeyEvent(idx) {
   var e = evts[0];
   var flash = document.createElement('div');
   flash.className = 'cxpak-event-flash';
-  // SAFETY: both interpolations go through CX.esc.
-  flash.innerHTML = '<strong>' + CX.esc(e.kind) + '</strong><br>' + CX.esc(e.message);
+  flash.appendChild(CX.h('strong', null, [e.kind || '']));
+  flash.appendChild(document.createElement('br'));
+  flash.appendChild(document.createTextNode(e.message || ''));
   wrap.appendChild(flash);
   d3.select(flash)
     .transition().duration(1500)
@@ -2886,11 +2970,19 @@ CX.app.appendChild(dw);
 /* impact header */
 var dh = document.createElement('div'); dh.className = 'cxpak-diff-header';
 var impSev = df.impact_score >= 0.5 ? 'high' : df.impact_score >= 0.15 ? 'medium' : 'low';
-// SAFETY: only numeric values (.length, .toFixed) and the impSev enum
-// (chosen above from three string literals) are interpolated.
-dh.innerHTML = '<span>Changed: <b>' + df.changed_files.length + '</b> files</span>' +
-  '<span>Blast radius: <b>' + df.blast_radius_files.length + '</b> files</span>' +
-  '<span class="cxpak-impact-badge ' + impSev + '">Impact ' + (df.impact_score * 100).toFixed(0) + '%</span>';
+dh.appendChild(CX.h('span', null, [
+  'Changed: ',
+  CX.h('b', null, [String(df.changed_files.length)]),
+  ' files',
+]));
+dh.appendChild(CX.h('span', null, [
+  'Blast radius: ',
+  CX.h('b', null, [String(df.blast_radius_files.length)]),
+  ' files',
+]));
+dh.appendChild(CX.h('span', {class: 'cxpak-impact-badge ' + impSev}, [
+  'Impact ' + (df.impact_score * 100).toFixed(0) + '%',
+]));
 dw.appendChild(dh);
 
 /* panels */
@@ -2926,26 +3018,51 @@ CX.renderGraph(cv2.g, a, { nodeClass: diffNodeClass });
 /* risk list */
 if (df.new_risks && df.new_risks.length > 0) {
   var rl = document.createElement('div'); rl.className = 'cxpak-diff-risks';
-  rl.innerHTML = '<div class="cxpak-diff-risks-title">Affected Files</div>';
-  var tbl = '<table class="cxpak-risk-table"><thead><tr><th>File</th><th>Risk</th><th>Blast</th></tr></thead><tbody>';
+  rl.appendChild(CX.h('div', {class: 'cxpak-diff-risks-title'}, ['Affected Files']));
+  var thead = CX.h('thead', null, [
+    CX.h('tr', null, [
+      CX.h('th', null, ['File']),
+      CX.h('th', null, ['Risk']),
+      CX.h('th', null, ['Blast']),
+    ]),
+  ]);
+  var tbody = document.createElement('tbody');
   df.new_risks.slice(0, 10).forEach(function(r) {
     var sevLetter = r.severity === 'high' ? 'H' : r.severity === 'medium' ? 'M' : 'L';
     var sevLabel = r.severity === 'high' ? 'High risk' : r.severity === 'medium' ? 'Medium risk' : 'Low risk';
-    tbl += '<tr><td><span class="cxpak-severity-dot ' + r.severity + '" role="img" aria-label="' + sevLabel + '" title="' + sevLabel + '">' + sevLetter + '</span>' + CX.esc(r.path) + '</td>' +
-      '<td style="color:' + (r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0') + '">' + r.risk_score.toFixed(2) + '</td>' +
-      '<td>' + r.blast_radius + '</td></tr>';
+    var riskColor = r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0';
+    var trEl = CX.h('tr', null, [
+      CX.h('td', null, [
+        CX.h('span', {
+          class: 'cxpak-severity-dot ' + r.severity,
+          role: 'img',
+          'aria-label': sevLabel,
+          title: sevLabel,
+        }, [sevLetter]),
+        r.path || '',
+      ]),
+      CX.h('td', {style: 'color:' + riskColor}, [r.risk_score.toFixed(2)]),
+      CX.h('td', null, [String(r.blast_radius)]),
+    ]);
+    tbody.appendChild(trEl);
   });
-  tbl += '</tbody></table>';
-  rl.innerHTML += tbl;
+  rl.appendChild(CX.h('table', {class: 'cxpak-risk-table'}, [thead, tbody]));
   dw.appendChild(rl);
 }
 
 /* legend */
 var dleg = document.createElement('div'); dleg.className = 'cxpak-legend';
-// SAFETY: 100% static literal HTML, zero dynamic interpolation.
-dleg.innerHTML =
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(255,209,102,0.2);border:2px solid #ffd166"></span>Changed file</div>' +
-  '<div class="cxpak-legend-item"><span class="cxpak-legend-swatch" style="background:rgba(255,159,67,0.15);border:1.5px solid #ff9f43"></span>Blast radius</div>';
+function diffLegItem(bg, border, label) {
+  return CX.h('div', {class: 'cxpak-legend-item'}, [
+    CX.h('span', {
+      class: 'cxpak-legend-swatch',
+      style: 'background:' + bg + ';border:' + border,
+    }, []),
+    label,
+  ]);
+}
+dleg.appendChild(diffLegItem('rgba(255,209,102,0.2)', '2px solid #ffd166', 'Changed file'));
+dleg.appendChild(diffLegItem('rgba(255,159,67,0.15)', '1.5px solid #ff9f43', 'Blast radius'));
 panels.parentNode.appendChild(dleg);
 
 }); };

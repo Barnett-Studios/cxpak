@@ -241,17 +241,19 @@ fn no_inline_edge_count_lambda_anywhere_in_src() {
 
 // ── P3: structural innerHTML invariant ─────────────────────────────────────
 
-/// Every `innerHTML = ... + ... + ...` site in render.rs MUST carry a
-/// preceding `// SAFETY:` comment so reviewers and graders can audit the
-/// XSS-safety reasoning without re-deriving it.  Closes the
-/// "render.rs depends on every developer remembering CX.esc forever"
-/// fragility flagged in v2.1.3 final validation.
+/// `innerHTML = ... + ... + ...` is FORBIDDEN in render.rs as of v2.1.3.
+/// All dynamic-data sites have been migrated to `CX.h(tag, attrs, children)`
+/// — a safe-by-construction DOM builder where every attribute goes
+/// through setAttribute and every text child through textContent.  No
+/// developer-discipline-forever requirement; the structural property
+/// is now mechanically enforceable by this test.
 ///
-/// Static-text innerHTMLs (no `+`) and clearing assignments
-/// (`innerHTML = ''`) are exempt — neither can interpolate
-/// attacker-controlled data.
+/// Static-literal innerHTMLs and clearing assignments (`innerHTML = ''`)
+/// remain permitted — neither can interpolate attacker-controlled data.
+/// Variable RHS (`innerHTML = msg`) is permitted with the assignment of
+/// `msg` audited at its own site.
 #[test]
-fn render_innerhtml_concat_sites_carry_safety_annotation() {
+fn render_innerhtml_concat_sites_are_forbidden() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/visual/render.rs"))
         .expect("read render.rs");
     let lines: Vec<&str> = src.lines().collect();
@@ -318,25 +320,17 @@ fn render_innerhtml_concat_sites_carry_safety_annotation() {
         if !has_concat {
             continue;
         }
-        // Concat site — require SAFETY: in the preceding 6 lines so a
-        // multi-line SAFETY comment block is fully captured.
-        let lookback = 6.min(i);
-        let preceding = lines
-            .iter()
-            .skip(i.saturating_sub(lookback))
-            .take(lookback)
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !preceding.contains("SAFETY:") {
-            violations.push(format!("render.rs:{}: {}", i + 1, line.trim()));
-        }
+        // Concat site — forbidden, period.  Migrate to
+        // CX.h(tag, attrs, children) instead.  Static-only innerHTML
+        // (no `+`) is fine; concat is the structural defect.
+        violations.push(format!("render.rs:{}: {}", i + 1, line.trim()));
     }
     assert!(
         violations.is_empty(),
-        "Spec § 1.5 / Contract 13 violation — innerHTML+concat without preceding SAFETY: comment.\n\
-         Either (a) document the safety reasoning with a `// SAFETY: …` comment immediately above\n\
-         the assignment, or (b) refactor to createElement + textContent.\n\n\
+        "Spec § 1.5 / Contract 13 violation — innerHTML+concat is FORBIDDEN in render.rs.\n\
+         Migrate the offending site to `CX.h(tag, attrs, children)` — the safe-by-construction\n\
+         DOM builder.  setAttribute handles attributes; textContent handles strings; appendChild\n\
+         handles element children.  No interpolation path can produce attacker-controlled markup.\n\n\
          Offenders ({}):\n{}",
         violations.len(),
         violations.join("\n")
