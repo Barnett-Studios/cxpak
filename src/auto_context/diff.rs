@@ -15,6 +15,12 @@ pub struct ContextSnapshot {
     /// Per-file token counts at snapshot time, used to compute true deltas.
     #[serde(default)]
     pub token_counts: HashMap<String, usize>,
+    /// RFC-3339 UTC timestamp at which this snapshot was created.
+    /// Lets `/context_diff?since=<ISO>` reject baselines older than the
+    /// caller-supplied threshold so a stale snapshot can't masquerade as
+    /// fresh data.
+    #[serde(default)]
+    pub generated_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,11 +100,63 @@ pub fn create_snapshot(index: &CodebaseIndex) -> ContextSnapshot {
         }
     }
 
+    let generated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| {
+            // Format as RFC-3339-ish UTC: 2026-04-27T13:45:00Z.  Avoid
+            // adding chrono just for this — manual format is sufficient
+            // since we only need lexicographic-monotonic strings.
+            let secs = d.as_secs() as i64;
+            let days_from_epoch = secs / 86_400;
+            let sec_in_day = secs % 86_400;
+            // 1970-01-01 + days_from_epoch — correct for the next ~30k years.
+            let mut y = 1970i64;
+            let mut d = days_from_epoch;
+            loop {
+                let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+                let year_days = if leap { 366 } else { 365 };
+                if d < year_days {
+                    break;
+                }
+                d -= year_days;
+                y += 1;
+            }
+            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let days_in_month = [
+                31,
+                if leap { 29 } else { 28 },
+                31,
+                30,
+                31,
+                30,
+                31,
+                31,
+                30,
+                31,
+                30,
+                31,
+            ];
+            let mut m = 0usize;
+            while m < 12 && d >= days_in_month[m] {
+                d -= days_in_month[m];
+                m += 1;
+            }
+            let day = d + 1;
+            let month = (m as i64) + 1;
+            let h = sec_in_day / 3600;
+            let mi = (sec_in_day % 3600) / 60;
+            let s = sec_in_day % 60;
+            format!("{y:04}-{month:02}-{day:02}T{h:02}:{mi:02}:{s:02}Z")
+        })
+        .unwrap_or_default();
+
     ContextSnapshot {
         file_hashes,
         symbol_set,
         edge_set,
         token_counts,
+        generated_at,
     }
 }
 

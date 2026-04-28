@@ -1915,7 +1915,19 @@ CX.header = function() {};
         var btn = document.createElement('button');
         btn.textContent = 'copy refresh command';
         btn.addEventListener('click', function() {
-          navigator.clipboard.writeText('cxpak visual').then(function() { btn.textContent = 'Copied!'; setTimeout(function() { updateFreshness(); }, 2000); });
+          // .catch is REQUIRED — clipboard.writeText rejects on insecure
+          // contexts (file://, non-HTTPS), permissions denied, or focus
+          // loss.  Without the catch the user gets stuck on "copy
+          // refresh command" with no feedback.
+          navigator.clipboard.writeText('cxpak visual')
+            .then(function() {
+              btn.textContent = 'Copied!';
+              setTimeout(function() { updateFreshness(); }, 2000);
+            })
+            .catch(function() {
+              btn.textContent = 'copy failed — run: cxpak visual';
+              setTimeout(function() { updateFreshness(); }, 4000);
+            });
         });
         el.appendChild(btn);
       } else {

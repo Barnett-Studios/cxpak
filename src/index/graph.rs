@@ -52,6 +52,18 @@ impl DependencyGraph {
         Self::default()
     }
 
+    /// Total directed-edge count: sum of every adjacency-list length.
+    ///
+    /// Single source of truth so `commands::visual::make_metadata`,
+    /// `tests/cross_channel_consistency.rs`, and any future renderer
+    /// agree on the value.  Spec § Contract 8 requires both sides of
+    /// the SPA-vs-MCP edge_count comparison to derive from the same
+    /// helper; without this method they were inlined as identical
+    /// lambdas in two files and could drift independently.
+    pub fn edge_count(&self) -> usize {
+        self.edges.values().map(|v| v.len()).sum()
+    }
+
     pub fn add_edge(&mut self, from: &str, to: &str, edge_type: EdgeType) {
         self.edges
             .entry(from.to_string())

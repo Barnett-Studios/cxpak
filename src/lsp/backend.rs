@@ -76,6 +76,17 @@ impl CxpakLspBackend {
             .await
     }
 
+    /// Take an O(1) snapshot of the index and immediately drop the read
+    /// guard so the standard LSP handlers (code_lens / hover / diagnostic /
+    /// symbol) and the custom-method dispatch below run lock-free against
+    /// a stable snapshot.  Without this, e.g. `diagnostic` (which runs the
+    /// full dead-code detector on first call per index) held the read
+    /// guard for seconds and starved every concurrent watcher write.
+    fn snapshot(&self) -> tower_lsp::jsonrpc::Result<Arc<crate::index::CodebaseIndex>> {
+        let g = self.index.read().map_err(Self::lock_err)?;
+        Ok(Arc::clone(&*g))
+    }
+
     /// Shared dispatcher that forwards a named method + params to
     /// `methods::handle_custom_method`. Each `custom_*` wrapper calls this
     /// with a constant method name so the registration surface stays clean
@@ -93,10 +104,7 @@ impl CxpakLspBackend {
         method: &'static str,
         params: serde_json::Value,
     ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
-        let snapshot: Arc<crate::index::CodebaseIndex> = {
-            let g = self.index.read().map_err(Self::lock_err)?;
-            Arc::clone(&*g)
-        }; // read guard released here — handler runs lock-free
+        let snapshot = self.snapshot()?;
         match super::methods::handle_custom_method(method, params, &snapshot, self.path.as_path()) {
             Ok(Some(v)) => Ok(v),
             Ok(None) => Ok(serde_json::Value::Null),
@@ -267,7 +275,7 @@ impl LanguageServer for CxpakLspBackend {
 
     async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
         let uri = params.text_document.uri.to_string();
-        let idx = self.index.read().map_err(Self::lock_err)?;
+        let idx = self.snapshot()?;
         let lenses = super::methods::code_lens_for_file(&uri, &idx, &self.path);
         Ok(if lenses.is_empty() {
             None
@@ -282,7 +290,7 @@ impl LanguageServer for CxpakLspBackend {
         let line_idx = position.line as usize;
         let char_idx = position.character as usize;
 
-        let index = self.index.read().map_err(Self::lock_err)?;
+        let index = self.snapshot()?;
 
         // Locate the file via the shared path-bounded resolver so a URI like
         // `file:///.../my_src/main.rs` does NOT falsely match an indexed
@@ -327,7 +335,7 @@ impl LanguageServer for CxpakLspBackend {
         params: DocumentDiagnosticParams,
     ) -> LspResult<DocumentDiagnosticReportResult> {
         let uri = params.text_document.uri.to_string();
-        let idx = self.index.read().map_err(Self::lock_err)?;
+        let idx = self.snapshot()?;
         let diags = super::methods::diagnostics_for_file(&uri, &idx, &self.path);
         Ok(DocumentDiagnosticReportResult::Report(
             DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
@@ -345,7 +353,7 @@ impl LanguageServer for CxpakLspBackend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
-        let idx = self.index.read().map_err(Self::lock_err)?;
+        let idx = self.snapshot()?;
         let symbols = super::methods::workspace_symbols(&params.query, &idx, &self.path);
         Ok(if symbols.is_empty() {
             None

@@ -960,11 +960,18 @@ pub fn validate_bind_security(
     addr: &std::net::SocketAddr,
     token: Option<&str>,
 ) -> Result<(), String> {
-    if !addr.ip().is_loopback() && token.is_none() {
+    // Treat the empty string as no-token at startup (fail-fast) rather
+    // than relying on the per-request bearer middleware to reject it
+    // later.  An operator who launches `cxpak serve --bind 0.0.0.0
+    // --token ""` is almost certainly mistaken about what they typed; a
+    // startup error tells them at the moment they can fix it.
+    let effective_token = token.filter(|t| !t.is_empty());
+    if !addr.ip().is_loopback() && effective_token.is_none() {
         return Err(format!(
             "refusing to bind {addr} without --token: a non-loopback listener \
-             is reachable by other hosts and MUST be authenticated. \
-             Either set --token <secret> or bind to 127.0.0.1 / ::1."
+             is reachable by other hosts and MUST be authenticated with a \
+             non-empty bearer token. Either set --token <secret> or bind to \
+             127.0.0.1 / ::1."
         ));
     }
     Ok(())
@@ -1419,14 +1426,18 @@ async fn auto_context_handler(
 
 #[derive(Deserialize)]
 struct ContextDiffParams {
-    #[allow(dead_code)]
+    /// `since` is an ISO-8601-ish timestamp threshold.  When set, the
+    /// stored snapshot is rejected if its `generated_at` is older than
+    /// the threshold and the response says "snapshot too old; refresh
+    /// auto_context to capture a new baseline".  Lets clients ignore
+    /// stale baselines without first probing.
     since: Option<String>,
 }
 
 async fn context_diff_handler(
     State(index): State<SharedIndex>,
     State(snapshot): State<SharedSnapshot>,
-    Query(_params): Query<ContextDiffParams>,
+    Query(params): Query<ContextDiffParams>,
 ) -> Result<Json<Value>, StatusCode> {
     let idx = index
         .read()
@@ -1436,7 +1447,27 @@ async fn context_diff_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let delta = match snap_guard.as_ref() {
         None => crate::auto_context::diff::no_snapshot_recommendation(),
-        Some(snap) => crate::auto_context::diff::compute_diff(snap, &idx),
+        Some(snap) => {
+            // Honour `since`: lexicographic comparison works for
+            // ISO-8601-ish timestamps (the snapshot.generated_at field
+            // uses RFC-3339 strings which sort the same way as their
+            // wall-clock order).
+            if let Some(threshold) = params.since.as_deref() {
+                if snap.generated_at.as_str() < threshold {
+                    let mut rec = crate::auto_context::diff::no_snapshot_recommendation();
+                    rec.recommendation = format!(
+                        "snapshot generated_at {} predates `since` threshold {}; \
+                         call /auto_context to refresh the baseline before diffing",
+                        snap.generated_at, threshold
+                    );
+                    return Ok(Json(
+                        serde_json::to_value(&rec)
+                            .unwrap_or_else(|_| json!({"error": "serialisation failed"})),
+                    ));
+                }
+            }
+            crate::auto_context::diff::compute_diff(snap, &idx)
+        }
     };
     Ok(Json(serde_json::to_value(&delta).unwrap_or_else(
         |_| json!({"error": "serialisation failed"}),
@@ -1479,10 +1510,15 @@ async fn risks_handler(
 #[derive(Deserialize)]
 struct CallGraphParams {
     target: Option<String>,
-    #[allow(dead_code)]
+    /// Maximum hops from `target` to include in the response. Default
+    /// 3, capped at 8.  Without this filter a full-codebase query
+    /// returns the entire call_graph (megabytes on real repos).
     depth: Option<usize>,
     focus: Option<String>,
-    #[allow(dead_code)]
+    /// MCP-style alias for `focus` — the cxpak_call_graph MCP tool
+    /// accepts `workspace` as a workspace-prefix filter; the v1 path
+    /// now honours the same name so clients can use one parameter
+    /// shape across both transports.
     workspace: Option<String>,
 }
 
@@ -1494,30 +1530,52 @@ async fn call_graph_handler(
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let cg = &idx.call_graph;
+    let depth_cap = params.depth.unwrap_or(3).min(8);
+    // Workspace acts as a focus prefix when focus is not set (matches MCP).
+    let effective_focus = params.focus.as_deref().or(params.workspace.as_deref());
 
     let filtered_edges: Vec<&crate::intelligence::call_graph::CallEdge> =
-        if let Some(ref target) = params.target {
+        if let Some(target) = params.target.as_deref() {
+            // Initial set: edges that mention the target.
+            let mut frontier: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for e in cg.edges.iter().filter(|e| {
+                e.caller_file.contains(target)
+                    || e.callee_file.contains(target)
+                    || e.caller_symbol.contains(target)
+                    || e.callee_symbol.contains(target)
+            }) {
+                frontier.insert(e.caller_file.clone());
+                frontier.insert(e.callee_file.clone());
+            }
+            // BFS up to depth_cap hops away from the frontier files.
+            for _ in 0..depth_cap {
+                let mut next = frontier.clone();
+                for e in cg.edges.iter() {
+                    if frontier.contains(&e.caller_file) {
+                        next.insert(e.callee_file.clone());
+                    }
+                    if frontier.contains(&e.callee_file) {
+                        next.insert(e.caller_file.clone());
+                    }
+                }
+                if next.len() == frontier.len() {
+                    break;
+                }
+                frontier = next;
+            }
             cg.edges
                 .iter()
-                .filter(|e| {
-                    e.caller_file.contains(target.as_str())
-                        || e.callee_file.contains(target.as_str())
-                        || e.caller_symbol.contains(target.as_str())
-                        || e.callee_symbol.contains(target.as_str())
-                })
+                .filter(|e| frontier.contains(&e.caller_file) || frontier.contains(&e.callee_file))
                 .collect()
         } else {
             cg.edges.iter().collect()
         };
 
     let edges: Vec<&crate::intelligence::call_graph::CallEdge> =
-        if let Some(ref focus) = params.focus {
+        if let Some(focus) = effective_focus {
             filtered_edges
                 .into_iter()
-                .filter(|e| {
-                    e.caller_file.starts_with(focus.as_str())
-                        || e.callee_file.starts_with(focus.as_str())
-                })
+                .filter(|e| e.caller_file.starts_with(focus) || e.callee_file.starts_with(focus))
                 .collect()
         } else {
             filtered_edges
@@ -1534,7 +1592,9 @@ async fn call_graph_handler(
 struct DeadCodeParams {
     focus: Option<String>,
     limit: Option<usize>,
-    #[allow(dead_code)]
+    /// MCP-style workspace alias for `focus`.  Cross-transport parity:
+    /// `cxpak_dead_code` MCP tool accepts `workspace` as a workspace
+    /// prefix; v1 honours the same name.
     workspace: Option<String>,
 }
 
@@ -1546,7 +1606,7 @@ async fn dead_code_handler(
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let limit = params.limit.unwrap_or(50);
-    let focus = params.focus.as_deref();
+    let focus = params.focus.as_deref().or(params.workspace.as_deref());
 
     let dead = crate::intelligence::dead_code::detect_dead_code(&idx, focus);
     let total_count = dead.len();
@@ -1563,7 +1623,7 @@ async fn dead_code_handler(
 #[derive(Deserialize)]
 struct ArchitectureParams {
     focus: Option<String>,
-    #[allow(dead_code)]
+    /// MCP-style workspace alias for `focus`.
     workspace: Option<String>,
 }
 
@@ -1575,11 +1635,12 @@ async fn architecture_handler(
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let map = crate::intelligence::architecture::build_architecture_map(&idx, 2);
+    let effective_focus = params.focus.as_deref().or(params.workspace.as_deref());
 
-    let modules = if let Some(ref focus) = params.focus {
+    let modules = if let Some(focus) = effective_focus {
         map.modules
             .into_iter()
-            .filter(|m| m.prefix.starts_with(focus.as_str()))
+            .filter(|m| m.prefix.starts_with(focus))
             .collect::<Vec<_>>()
     } else {
         map.modules
@@ -1596,7 +1657,9 @@ async fn architecture_handler(
 #[derive(Deserialize)]
 struct PredictParams {
     files: Option<Vec<String>>,
-    #[allow(dead_code)]
+    /// Restrict predictions to test files whose path starts with this
+    /// prefix.  Lets a CI integration ask "which tests in `tests/auth/`
+    /// should I run for these changes" without parsing the full output.
     focus: Option<String>,
     depth: Option<usize>,
 }
@@ -1618,7 +1681,7 @@ async fn predict_handler(
     let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
     let depth = params.depth.unwrap_or(3);
 
-    let result = crate::intelligence::predict::predict(
+    let mut result = crate::intelligence::predict::predict(
         &file_refs,
         &idx.graph,
         &idx.pagerank,
@@ -1626,6 +1689,11 @@ async fn predict_handler(
         &idx.test_map,
         depth,
     );
+    if let Some(prefix) = params.focus.as_deref() {
+        result
+            .test_impact
+            .retain(|t| t.test_file.starts_with(prefix));
+    }
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_else(
         |_| json!({"error": "serialization failed"}),
@@ -1635,7 +1703,8 @@ async fn predict_handler(
 #[derive(Deserialize)]
 struct DriftParams {
     save_baseline: Option<bool>,
-    #[allow(dead_code)]
+    /// Restrict the drift report's `hotspots` to module prefixes
+    /// matching this filter.  Useful for per-team drift dashboards.
     focus: Option<String>,
 }
 
@@ -1648,7 +1717,11 @@ async fn drift_handler(
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let save_baseline = params.save_baseline.unwrap_or(false);
-    let report = crate::intelligence::drift::build_drift_report(&idx, &repo_path, save_baseline);
+    let mut report =
+        crate::intelligence::drift::build_drift_report(&idx, &repo_path, save_baseline);
+    if let Some(prefix) = params.focus.as_deref() {
+        report.hotspots.retain(|h| h.module.starts_with(prefix));
+    }
     Ok(Json(serde_json::to_value(&report).unwrap_or_else(
         |_| json!({"error": "serialization failed"}),
     )))
@@ -1683,7 +1756,9 @@ struct DataFlowParams {
     symbol: Option<String>,
     sink: Option<String>,
     depth: Option<usize>,
-    #[allow(dead_code)]
+    /// Restrict result paths to those whose origin or sink file starts
+    /// with this prefix. Lets per-area data-flow audits skip irrelevant
+    /// paths in the response without re-tracing.
     focus: Option<String>,
 }
 
@@ -1701,12 +1776,20 @@ async fn data_flow_handler(
         .depth
         .unwrap_or(crate::intelligence::data_flow::MAX_DEPTH)
         .min(crate::intelligence::data_flow::MAX_DEPTH);
-    let result = crate::intelligence::data_flow::trace_data_flow(
+    let mut result = crate::intelligence::data_flow::trace_data_flow(
         &symbol,
         params.sink.as_deref(),
         depth,
         &idx,
     );
+    if let Some(prefix) = params.focus.as_deref() {
+        // Keep only paths whose source OR sink file lives under the focus
+        // prefix.  An empty result is meaningful — the caller asked for
+        // a specific area and got nothing.
+        result
+            .paths
+            .retain(|p| p.nodes.iter().any(|n| n.file.starts_with(prefix)));
+    }
     Ok(Json(serde_json::to_value(&result).unwrap_or_else(
         |_| json!({"error": "serialization failed"}),
     )))

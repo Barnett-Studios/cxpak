@@ -365,8 +365,13 @@ async fn metadata_node_count_matches_total_files() {
 
 #[tokio::test]
 async fn metadata_edge_count_matches_graph_sum() {
+    // Both sides MUST go through `DependencyGraph::edge_count()` — the
+    // shared helper added in v2.1.3.  Without it the renderer and the
+    // test inlined identical lambdas in two files; if the inline logic
+    // ever drifted (e.g., to skip a new edge type), the test would
+    // continue to pass while the dashboard underreported.
     let idx = make_fixture_index();
-    let expected: usize = idx.graph.edges.values().map(|v| v.len()).sum();
+    let expected: usize = idx.graph.edge_count();
     let spa_html = cxpak::visual::spa::render_spa(&idx, &fixture_metadata()).unwrap();
     let meta = extract_json_tag(&spa_html, "cxpak-meta");
     assert_eq!(meta["edge_count"].as_u64().unwrap() as usize, expected);

@@ -88,23 +88,35 @@ fn validate_allows_non_loopback_with_token() {
 }
 
 #[test]
-fn validate_treats_empty_string_token_as_present() {
-    // The CLI parses --token "" as Some("") — debatable whether that
-    // should be treated as "no token", but the security guard accepts
-    // it as a token (the bearer-check elsewhere is the actual gate
-    // against an empty token authenticating).  This test pins the
-    // current contract so a future refactor doesn't silently weaken it.
+fn validate_rejects_empty_string_token_at_startup() {
+    // `--token ""` was previously accepted by validate_bind_security and
+    // only rejected per-request by the bearer middleware.  An operator
+    // mistake belongs at startup where they can see and fix it, not on
+    // every subsequent 401.  Tightened in v2.1.3.
     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-    let result = cxpak::commands::serve::validate_bind_security(&addr, Some(""));
-    // Document the actual behaviour: validate_bind_security only checks
-    // is_some(), not non-empty.  The bearer check rejects empty tokens
-    // separately.  If this assertion changes, it's an intentional
-    // hardening — update both callers and document.
+    let err = cxpak::commands::serve::validate_bind_security(&addr, Some(""))
+        .expect_err("--token \"\" must Err at startup, not pass through");
     assert!(
-        result.is_ok(),
-        "current contract: --token \"\" passes validate_bind_security; \
-         the bearer check rejects empty tokens. If you change this, \
-         update both check_auth and validate_bind_security together."
+        err.contains("non-empty"),
+        "error must explain the non-empty requirement; got: {err}"
+    );
+}
+
+#[test]
+fn validate_rejects_ipv4_mapped_ipv6_loopback_without_token() {
+    // ::ffff:127.0.0.1 is the IPv4-mapped form of 127.0.0.1.  Per current
+    // Rust stdlib (1.94), `Ipv6Addr::is_loopback()` only matches `::1`
+    // exactly — IPv4-mapped does NOT count as loopback, so our guard
+    // correctly REJECTS this address without a token.  Pinning so a
+    // future stdlib extension that flips is_loopback() for the mapped
+    // form (which would silently weaken our defense) breaks this test
+    // and forces an explicit decision.
+    let addr: SocketAddr = "[::ffff:127.0.0.1]:8080".parse().unwrap();
+    assert!(
+        cxpak::commands::serve::validate_bind_security(&addr, None).is_err(),
+        "::ffff:127.0.0.1 (IPv4-mapped IPv6) MUST be treated as non-loopback \
+         and require a token — pin this so a future stdlib change cannot \
+         silently weaken the guard"
     );
 }
 

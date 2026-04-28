@@ -193,14 +193,21 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
                     .map(|s| s.to_string())
                     .collect();
 
+                // Bidi-sanitise the rendered identifiers (module prefix
+                // and god-file paths derive directly from indexed file
+                // paths — a malicious repo could embed U+202E to spoof
+                // them in the dashboard / v1 / MCP architecture views).
                 ModuleInfo {
-                    prefix: prefix.clone(),
+                    prefix: crate::util::sanitize_bidi(prefix.as_str()),
                     file_count: files.len(),
                     aggregate_pagerank,
                     coupling,
                     cohesion,
                     boundary_violations,
-                    god_files,
+                    god_files: god_files
+                        .into_iter()
+                        .map(|p| crate::util::sanitize_bidi(&p))
+                        .collect(),
                 }
             })
             .collect();

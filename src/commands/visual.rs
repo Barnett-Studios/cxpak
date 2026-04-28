@@ -19,7 +19,9 @@ fn make_metadata(index: &CodebaseIndex, path: &Path) -> RenderMetadata {
     let generated_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let node_count = index.files.len();
-    let edge_count = index.graph.edges.values().map(|v| v.len()).sum::<usize>();
+    // Use the shared helper — Contract 8 (SPA + cross-channel parity)
+    // requires both renderers to derive edge_count from one source.
+    let edge_count = index.graph.edge_count();
 
     RenderMetadata {
         repo_name,
