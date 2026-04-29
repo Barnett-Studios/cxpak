@@ -162,3 +162,30 @@ embeddings = [
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
 e2e-browser = []
 plugins = ["dep:wasmtime"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Disk-usage controls.  cxpak depends on wasmtime + candle + 43 tree-sitter
+# parsers; without these overrides the ~50 integration-test binaries each
+# carry full debug info for every linked dep, and `target/` reaches 100 GB+
+# in a busy session.
+#
+# `[profile.dev]` keeps line-table debug on cxpak's own code (back-traces
+# still resolve to file:line) but strips full debug info — typical 40-50%
+# binary-size reduction.  `[profile.dev.package."*"]` strips ALL debug info
+# from third-party deps, where step-debugging is rarely useful and the
+# weight is dominant.  `[profile.test]` inherits both.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
+# Tests inherit profile.dev settings; explicit declaration here documents the
+# choice and lets future tuning (e.g., `opt-level = 1` for slow test
+# fixtures) attach without surprise.
+[profile.test]
+debug = "line-tables-only"
