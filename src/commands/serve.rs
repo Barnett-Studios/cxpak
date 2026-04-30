@@ -1045,7 +1045,30 @@ pub fn run(
         eprintln!("cxpak: listening on http://{addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let shutdown = async {
-            tokio::signal::ctrl_c().await.ok();
+            // Listen for SIGTERM in addition to Ctrl-C: containerised
+            // environments (kubectl, systemd, docker stop) and most CI process
+            // killers send SIGTERM, not SIGINT.  Without this branch the
+            // process is force-killed by the kernel after the grace period
+            // and any in-flight request is dropped mid-write.
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                match signal(SignalKind::terminate()) {
+                    Ok(mut term) => {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {},
+                            _ = term.recv() => {},
+                        }
+                    }
+                    Err(_) => {
+                        tokio::signal::ctrl_c().await.ok();
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok();
+            }
             eprintln!("cxpak: shutting down gracefully...");
         };
         axum::serve(listener, app)

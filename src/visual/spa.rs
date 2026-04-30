@@ -59,10 +59,16 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     let search = search_index::build_search_index(index);
 
     // Timeline: attempt to load cached snapshots; null when absent.
+    // Each per-view JSON below uses `.expect("...is infallible")` because the
+    // serialised types are plain `#[derive(serde::Serialize)]` data structures
+    // (see render.rs DashboardData / ArchitectureExplorerData / RiskHeatmap and
+    // search_index::SearchIndex).  None contains a custom `Serialize` impl that
+    // could fail.  An infallible-fallback `unwrap_or_else(|_| "null".into())`
+    // would only mask a corrupted build, not handle a real runtime failure.
     let timeline_json =
         match crate::visual::timeline::load_cached_snapshots(std::path::Path::new(".")) {
             Some(snaps) if !snaps.is_empty() => {
-                serde_json::to_string(&snaps).unwrap_or_else(|_| "null".into())
+                serde_json::to_string(&snaps).expect("TimelineSnapshot serialization is infallible")
             }
             _ => "null".into(),
         };
@@ -71,16 +77,22 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     let flow_json = "null".to_string();
     let diff_json = "null".to_string();
 
-    let dashboard_json =
-        spa_escape(&serde_json::to_string(&dashboard_data).unwrap_or_else(|_| "null".into()));
-    let arch_json =
-        spa_escape(&serde_json::to_string(&arch_data).unwrap_or_else(|_| "null".into()));
-    let risk_json =
-        spa_escape(&serde_json::to_string(&risk_data).unwrap_or_else(|_| "null".into()));
+    let dashboard_json = spa_escape(
+        &serde_json::to_string(&dashboard_data).expect("DashboardData serialization is infallible"),
+    );
+    let arch_json = spa_escape(
+        &serde_json::to_string(&arch_data)
+            .expect("ArchitectureExplorerData serialization is infallible"),
+    );
+    let risk_json = spa_escape(
+        &serde_json::to_string(&risk_data).expect("RiskHeatmap serialization is infallible"),
+    );
     let timeline_json = spa_escape(&timeline_json);
     let flow_json = spa_escape(&flow_json);
     let diff_json = spa_escape(&diff_json);
-    let search_json = spa_escape(&serde_json::to_string(&search).unwrap_or_else(|_| "[]".into()));
+    let search_json = spa_escape(
+        &serde_json::to_string(&search).expect("SearchIndex serialization is infallible"),
+    );
     let meta_json = spa_escape(
         &serde_json::to_string(metadata).expect("RenderMetadata serialization is infallible"),
     );
