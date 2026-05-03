@@ -9,7 +9,11 @@ use crate::visual::render::{self, RenderMetadata};
 use std::io::Write;
 use std::path::Path;
 
-fn make_metadata(index: &CodebaseIndex, path: &Path) -> RenderMetadata {
+// `pub` so the cross-channel-parity test in tests/cross_channel_consistency.rs
+// can call this directly and assert the SPA meta's health_score is wired to
+// `index.health_cached().composite` — which keeps the SPA header tile in
+// sync with /v1/health, MCP cxpak_health, and the dashboard health quadrant.
+pub fn make_metadata(index: &CodebaseIndex, path: &Path) -> RenderMetadata {
     let repo_name = path
         .canonicalize()
         .ok()
@@ -23,10 +27,17 @@ fn make_metadata(index: &CodebaseIndex, path: &Path) -> RenderMetadata {
     // requires both renderers to derive edge_count from one source.
     let edge_count = index.graph.edge_count();
 
+    // Derive the SPA's header health badge from the same cached source the
+    // dashboard quadrant + /v1/health + MCP cxpak_health all read.  Without
+    // this the SPA shows "—" in the header even when the dashboard tile next
+    // to it shows the real score; cross-channel parity (Contract 8) demands
+    // both surface the same number.
+    let health_score = Some(index.health_cached().composite);
+
     RenderMetadata {
         repo_name,
         generated_at,
-        health_score: None,
+        health_score,
         node_count,
         edge_count,
         cxpak_version: env!("CARGO_PKG_VERSION").to_string(),

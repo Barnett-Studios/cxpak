@@ -3500,7 +3500,10 @@ pub fn handle_tool_call(
                 let metadata = RenderMetadata {
                     repo_name,
                     generated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                    health_score: None,
+                    // Same cached source the dashboard tile, /v1/health, and
+                    // MCP cxpak_health read.  Contract 8 single-source-of-
+                    // truth applies to health as well as edge_count.
+                    health_score: Some(index.health_cached().composite),
                     node_count: index.files.len(),
                     // Shared helper — Contract 8 single-source-of-truth.
                     // commands/visual.rs::make_metadata, the cross-channel

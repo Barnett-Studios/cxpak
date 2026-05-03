@@ -411,3 +411,43 @@ async fn metadata_edge_count_matches_graph_sum() {
     let meta = extract_json_tag(&spa_html, "cxpak-meta");
     assert_eq!(meta["edge_count"].as_u64().unwrap() as usize, expected);
 }
+
+#[tokio::test]
+async fn metadata_health_score_matches_health_cached() {
+    // Pre-fix bug (caught during v2.1.0 manual QA): commands/visual.rs and
+    // commands/serve.rs both hardcoded `health_score: None` when building the
+    // SPA's RenderMetadata, so the SPA header showed "—" while the dashboard
+    // tile next to it showed the real composite from `compute_health`.  All
+    // other channels (/v1/health, MCP cxpak_health, SPA dashboard data) read
+    // from `index.health_cached()`; this test pins the SPA meta to the same
+    // single source of truth so the four surfaces can never drift again.
+    let idx = make_fixture_index();
+    let expected = idx.health_cached().composite;
+    assert!(
+        expected.is_finite(),
+        "compute_health must produce a finite composite for non-empty index, got {expected}"
+    );
+    // Production path: commands::visual::make_metadata is the canonical
+    // builder. We call it directly here (rather than via subprocess) so a
+    // future refactor that moves the field can't silently re-introduce the
+    // null-default behaviour.
+    let meta = cxpak::commands::visual::make_metadata(&idx, std::path::Path::new("."));
+    assert_eq!(
+        meta.health_score,
+        Some(expected),
+        "make_metadata must surface health_cached().composite bit-for-bit"
+    );
+    // And confirm it survives the SPA serialization round-trip.
+    let spa_html = cxpak::visual::spa::render_spa(&idx, &meta).unwrap();
+    let serialized = extract_json_tag(&spa_html, "cxpak-meta");
+    let actual = serialized["health_score"]
+        .as_f64()
+        .expect("cxpak-meta.health_score must serialize as a JSON number, not null");
+    assert_eq!(
+        actual.to_bits(),
+        expected.to_bits(),
+        "SPA meta health_score must round-trip bit-identically; got {actual} (bits {actual_bits:#x}) vs expected {expected} (bits {expected_bits:#x})",
+        actual_bits = actual.to_bits(),
+        expected_bits = expected.to_bits()
+    );
+}
