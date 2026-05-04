@@ -112,8 +112,16 @@ mod v1_subprocess_tests {
                 )
             })
         };
+        // 30s read timeout: heavy /v1/* handlers (briefing, auto_context-
+        // backed, security_surface) routinely take 1-3s on cold caches,
+        // and Linux CI runners are slower than local macOS.  Original 5s
+        // value caused a sporadic Linux-only failure in
+        // `v1_briefing_with_correct_bearer_and_task_returns_200` —
+        // read_to_end timed out, returned 0 bytes, panicked at the status
+        // parse.  30s is generous enough to never bite a real success
+        // path while still catching genuinely-stuck servers.
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
 
         let mut req = format!(
@@ -144,7 +152,7 @@ mod v1_subprocess_tests {
         // here causes hyper on the server side to see FIN mid-parse and
         // abort the request without responding.
         let mut buf = Vec::new();
-        let _ = (&stream).read_to_end(&mut buf);
+        let read_outcome = (&stream).read_to_end(&mut buf);
         let response = String::from_utf8_lossy(&buf).into_owned();
 
         let status = response
@@ -154,8 +162,12 @@ mod v1_subprocess_tests {
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or_else(|| {
                 panic!(
-                    "could not parse HTTP status from response (read {} bytes): <<<{response}>>>",
-                    buf.len()
+                    "could not parse HTTP status from response. \
+                     read {} bytes; read_to_end outcome: {:?}; \
+                     method={method} path={path}; \
+                     response so far: <<<{response}>>>",
+                    buf.len(),
+                    read_outcome,
                 )
             });
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();

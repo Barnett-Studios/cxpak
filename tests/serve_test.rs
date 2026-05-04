@@ -60,8 +60,11 @@ mod serve_tests {
 
     fn http_get(port: u16, path: &str) -> (u16, String) {
         let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        // 30s rather than 5s so heavy-handler responses (overview on a
+        // freshly-indexed temp repo) survive Linux CI runner load — same
+        // class of fix as in tests/serve_v1_subprocess.rs::http_request.
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .unwrap();
 
         let request =
@@ -404,8 +407,11 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        // Wait for MCP ready message on stderr
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // Wait for MCP ready message on stderr.  5s (was 2s) tolerates
+        // Linux CI runner load — cxpak's index build + tree-sitter init
+        // can exceed 2s on a busy ubuntu-latest runner with several
+        // sibling test processes spawning concurrently.
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         let response = mcp_exchange(
             &mut child,
@@ -448,7 +454,7 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         // Initialize first
         mcp_exchange(
@@ -513,7 +519,7 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         let response = mcp_exchange(
             &mut child,
@@ -556,7 +562,7 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         let response = mcp_exchange(
             &mut child,
@@ -599,7 +605,7 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         let response = mcp_exchange(
             &mut child,
@@ -641,7 +647,7 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         let response = mcp_exchange(
             &mut child,
@@ -682,7 +688,7 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         let response = mcp_exchange(
             &mut child,
@@ -725,7 +731,7 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         let response = mcp_exchange(
             &mut child,
@@ -770,7 +776,7 @@ mod serve_tests {
             .spawn()
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         let response = mcp_exchange(
             &mut child,
@@ -878,7 +884,7 @@ mod serve_tests {
             .unwrap();
 
         // Wait for initial index build
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         // Create a new file to trigger a watch event
         std::fs::write(
@@ -888,7 +894,7 @@ mod serve_tests {
         .unwrap();
 
         // Wait for the watcher to pick up the change
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(5));
 
         child.kill().ok();
         let output = child.wait_with_output().unwrap();

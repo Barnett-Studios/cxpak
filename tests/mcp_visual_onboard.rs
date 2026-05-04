@@ -74,8 +74,12 @@ mod mcp_visual_onboard_tests {
             let reader = BufReader::new(child.stdout.take().unwrap());
             let stdin = child.stdin.take().unwrap();
 
-            // Allow the server to complete its index build before sending requests.
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            // Allow the server to complete its index build before sending
+            // requests.  5s (was 3s) to tolerate Linux CI runner load —
+            // tree-sitter init + scanner + parser passes can exceed 3s on
+            // a busy ubuntu-latest runner with sibling cxpak processes
+            // spawning concurrently.
+            std::thread::sleep(std::time::Duration::from_secs(5));
 
             McpServer {
                 child,
