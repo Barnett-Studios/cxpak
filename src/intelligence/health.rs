@@ -1,7 +1,7 @@
 use crate::index::graph::DependencyGraph;
 use crate::index::CodebaseIndex;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthScore {
@@ -200,7 +200,18 @@ fn score_churn_stability(index: &CodebaseIndex) -> f64 {
 /// When a qualifying module has 0 total edges, coupling = 0.0 (fully isolated → unhealthy signal).
 pub fn score_coupling(index: &CodebaseIndex, module_depth: usize) -> f64 {
     // Group files into modules by taking the first `module_depth` path segments.
-    let mut module_files: HashMap<String, Vec<&str>> = HashMap::new();
+    //
+    // BTreeMap (not HashMap) so iteration order is deterministic.  Without
+    // this, the per-module ratios further down feed into a `.sum::<f64>()`
+    // whose order varies with HashMap's randomised hasher; f64 addition is
+    // not associative, so the same input would jitter in the last bit
+    // across runs (1 ULP).  That divergence then propagated through the
+    // composite into /v1/health, MCP cxpak_health, and the SPA meta —
+    // breaking the "deterministic tool" contract for cross-process
+    // reproducibility.  BTreeMap insert is O(log n) vs HashMap's O(1)
+    // amortised, but n is bounded by the number of top-level modules
+    // (dozens) and the score path runs once per index build.
+    let mut module_files: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for file in &index.files {
         let prefix = module_prefix(&file.relative_path, module_depth);
         module_files

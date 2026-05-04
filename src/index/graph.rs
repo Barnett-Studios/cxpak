@@ -1,10 +1,10 @@
 use super::IndexedFile;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 /// Identifies a cross-language boundary type. Used as the payload of
 /// [`EdgeType::CrossLanguage`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum BridgeType {
     /// HTTP request from one service to another (fetch / axios / reqwest → route handler).
     HttpCall,
@@ -20,7 +20,7 @@ pub enum BridgeType {
     CommandExec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum EdgeType {
     Import,
     ForeignKey,
@@ -35,16 +35,30 @@ pub enum EdgeType {
     CrossLanguage(BridgeType),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TypedEdge {
     pub target: String,
     pub edge_type: EdgeType,
 }
 
+/// Backed by `BTreeMap`/`BTreeSet` rather than the hash equivalents so iteration
+/// order is fully deterministic.  PageRank, coupling, and other downstream
+/// reducers do `iter().filter().map().sum::<f64>()` over these collections;
+/// f64 addition is not associative, and HashMap/HashSet iteration order is
+/// randomised by the std hasher, so the same input graph would produce
+/// 1-ULP-different results across runs.  That divergence then propagated
+/// into `/v1/health`, MCP `cxpak_health`, the SPA dashboard, and api_surface
+/// pagerank fields — breaking the deterministic-tool contract for
+/// cross-process reproducibility (caught during v2.1.0 manual QA).
+///
+/// BTreeMap insert is O(log n) vs HashMap's O(1) amortised, but n is bounded
+/// by the file count (low thousands at most for the sizes cxpak indexes),
+/// log₂(n) ≈ 11–13, and the graph is built once per index build.  No
+/// measurable wall-clock impact.
 #[derive(Debug, Default, Clone)]
 pub struct DependencyGraph {
-    pub edges: HashMap<String, HashSet<TypedEdge>>,
-    pub reverse_edges: HashMap<String, HashSet<TypedEdge>>,
+    pub edges: BTreeMap<String, BTreeSet<TypedEdge>>,
+    pub reverse_edges: BTreeMap<String, BTreeSet<TypedEdge>>,
 }
 
 impl DependencyGraph {
@@ -88,7 +102,7 @@ impl DependencyGraph {
             .unwrap_or_default()
     }
 
-    pub fn dependencies(&self, path: &str) -> Option<&HashSet<TypedEdge>> {
+    pub fn dependencies(&self, path: &str) -> Option<&BTreeSet<TypedEdge>> {
         self.edges.get(path)
     }
 

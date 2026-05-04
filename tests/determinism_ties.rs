@@ -57,3 +57,62 @@ fn pagerank_sort_secondary_key_is_path_lexicographic() {
     assert_eq!(pairs[3].0, "src/m_file.rs");
     assert_eq!(pairs[4].0, "src/z_file.rs");
 }
+
+/// v2.1.0 root-cause: cross-process f64 determinism for PageRank, coupling,
+/// and every other downstream reducer requires the dependency graph to use
+/// BTreeMap/BTreeSet (not HashMap/HashSet).  Without it,
+/// `graph.reverse_edges[node].iter().filter_map(...).sum::<f64>()` in
+/// pagerank's power iteration sees randomised order, and f64 addition is
+/// non-associative — the same input graph produces 1-ULP-different ranks
+/// across runs, then propagates into /v1/health, MCP cxpak_health, the SPA
+/// dashboard, and `cxpak_api_surface.symbols.by_file[*].pagerank`
+/// (4000+ divergent f64 values across 5 processes before the fix; 0 after).
+#[test]
+fn dependency_graph_uses_btreemap_btreeset_for_determinism() {
+    let source = include_str!("../src/index/graph.rs");
+    let edges_decl = source
+        .lines()
+        .find(|l| l.contains("pub edges:"))
+        .expect("pub edges field declaration must exist");
+    assert!(
+        edges_decl.contains("BTreeMap")
+            && edges_decl.contains("BTreeSet")
+            && !edges_decl.contains("HashMap")
+            && !edges_decl.contains("HashSet"),
+        "DependencyGraph.edges MUST be BTreeMap<String, BTreeSet<TypedEdge>>; \
+         HashMap/HashSet iteration is randomised → f64 sums vary 1 ULP across \
+         processes (caught v2.1.0). Got: {edges_decl}"
+    );
+    let rev_decl = source
+        .lines()
+        .find(|l| l.contains("pub reverse_edges:"))
+        .expect("pub reverse_edges field declaration must exist");
+    assert!(
+        rev_decl.contains("BTreeMap")
+            && rev_decl.contains("BTreeSet")
+            && !rev_decl.contains("HashMap")
+            && !rev_decl.contains("HashSet"),
+        "DependencyGraph.reverse_edges MUST be BTreeMap<String, BTreeSet<TypedEdge>>; \
+         the regression is silent — tests still pass, but PageRank/health/risk \
+         outputs jitter across runs. Got: {rev_decl}"
+    );
+}
+
+/// v2.1.0 root-cause: score_coupling builds a per-module groups map and then
+/// `.sum::<f64>()` over the qualifying groups.  HashMap iteration order
+/// scrambles the sum order → 1-ULP jitter in coupling → propagates into the
+/// composite health score across processes.  BTreeMap fixes it at the source.
+#[test]
+fn score_coupling_module_files_uses_btreemap() {
+    let source = include_str!("../src/intelligence/health.rs");
+    let func_start = source
+        .find("pub fn score_coupling")
+        .expect("score_coupling exists");
+    let func_window = &source[func_start..func_start + 800];
+    assert!(
+        func_window.contains("BTreeMap"),
+        "score_coupling MUST declare its module_files map as BTreeMap so the \
+         downstream `.sum::<f64>()` over module ratios sees a deterministic \
+         iteration order.  HashMap regresses cross-process determinism."
+    );
+}
