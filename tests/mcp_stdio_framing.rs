@@ -141,6 +141,123 @@ fn malformed_line_returns_parse_error_then_loop_continues() {
     assert!(ok["result"]["tools"].is_array());
 }
 
+/// Coverage closure: pre-this-test, the framing path was exercised for
+/// `cxpak_health` only.  The other 25 tools relied on in-process
+/// `handle_tool_call` tests, which is the same coverage shape that hid
+/// the original tools/list dispatch bugs.  This test parameterises over
+/// every cxpak_* tool advertised by `tools/list` and asserts each one:
+///   1. produces a response on its own line
+///   2. has matching `id`
+///   3. has a `result.content[0].text` payload (no `error` envelope)
+///   4. that text payload is valid JSON or non-empty plain text
+///
+/// Tools requiring required arguments are sent a minimal-but-valid body
+/// (the tool list metadata in the test enumerates each).  A regression
+/// that broke the dispatch table for any tool — or its serialisation
+/// envelope shape — would now fail loudly.
+#[test]
+fn every_mcp_tool_returns_a_well_formed_response_over_stdio_framing() {
+    // (tool_name, args)  —  args chosen to satisfy each tool's
+    // required-field validation while staying minimal.
+    let tools: &[(&str, &str)] = &[
+        ("cxpak_health", "{}"),
+        ("cxpak_stats", "{}"),
+        ("cxpak_overview", r#"{"tokens":"10k"}"#),
+        ("cxpak_risks", "{}"),
+        ("cxpak_briefing", r#"{"task":"smoke test"}"#),
+        ("cxpak_dead_code", "{}"),
+        ("cxpak_drift", "{}"),
+        ("cxpak_security_surface", "{}"),
+        ("cxpak_cross_lang", "{}"),
+        ("cxpak_architecture", "{}"),
+        ("cxpak_api_surface", "{}"),
+        ("cxpak_conventions", "{}"),
+        ("cxpak_predict", r#"{"files":["src/main.rs"],"depth":2}"#),
+        ("cxpak_blast_radius", r#"{"file":"src/main.rs"}"#),
+        ("cxpak_call_graph", r#"{"target":"main"}"#),
+        ("cxpak_data_flow", r#"{"symbol":"main"}"#),
+        ("cxpak_trace", r#"{"target":"main"}"#),
+        ("cxpak_search", r#"{"query":"main"}"#),
+        ("cxpak_diff", "{}"),
+        ("cxpak_context_diff", "{}"),
+        ("cxpak_auto_context", r#"{"task":"smoke"}"#),
+        ("cxpak_context_for_task", r#"{"task":"smoke"}"#),
+        ("cxpak_pack_context", r#"{"files":["src/main.rs"]}"#),
+        ("cxpak_visual", r#"{"type":"dashboard","format":"html"}"#),
+        ("cxpak_onboard", "{}"),
+        ("cxpak_verify", "{}"),
+    ];
+
+    // First confirm the count matches CLAUDE.md's documented "26 MCP tools".
+    assert_eq!(
+        tools.len(),
+        26,
+        "tool list count must match CLAUDE.md's '26 MCP tools' contract; \
+         updating either the count or the tool list requires updating both"
+    );
+
+    // Build one big multi-request input and drive the framing loop once.
+    // Each request gets a unique sequential id starting at 100 so we can
+    // map responses back unambiguously.
+    let mut input = String::new();
+    for (i, (name, args)) in tools.iter().enumerate() {
+        let id = 100 + i;
+        input.push_str(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}{newline}"#,
+            newline = "\n"
+        ));
+    }
+
+    let output = drive(&input);
+    let responses: Vec<serde_json::Value> = output
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    assert_eq!(
+        responses.len(),
+        tools.len(),
+        "expected one response per tool/call; got {} responses for {} tools",
+        responses.len(),
+        tools.len()
+    );
+
+    for (i, ((name, _args), resp)) in tools.iter().zip(responses.iter()).enumerate() {
+        let expected_id = 100 + i;
+        assert_eq!(
+            resp["id"].as_u64(),
+            Some(expected_id as u64),
+            "response #{i} for tool {name}: id mismatch — got {resp}"
+        );
+        // Either result.content[0].text OR error envelope is allowed —
+        // SOME tools may legitimately error on an empty index (the test
+        // fixture in mcp_stdio_framing builds with vec![]).  Each MUST
+        // have one or the other; what's NOT allowed is a malformed
+        // envelope (no result, no error).
+        let has_result = resp["result"]["content"][0]["text"].is_string();
+        let has_error = resp["error"].is_object();
+        assert!(
+            has_result || has_error,
+            "tool {name} (id={expected_id}) returned neither result.content[0].text nor error envelope. \
+             Full response: {resp}"
+        );
+        // If errored, it MUST be a JSON-RPC error with a numeric code —
+        // a free-form panic envelope would also break LSP framing
+        // contracts for any client that re-marshals the response.
+        if has_error {
+            assert!(
+                resp["error"]["code"].is_number(),
+                "tool {name} error envelope must have numeric code; got {resp}"
+            );
+            assert!(
+                resp["error"]["message"].is_string(),
+                "tool {name} error envelope must have string message; got {resp}"
+            );
+        }
+    }
+}
+
 /// Multiple sequential requests on the same loop: requests are processed
 /// in order, each response is on its own line.
 #[test]

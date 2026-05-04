@@ -451,3 +451,43 @@ async fn metadata_health_score_matches_health_cached() {
         expected_bits = expected.to_bits()
     );
 }
+
+/// Source-pin: the MCP cxpak_visual handler MUST route metadata
+/// construction through `commands::visual::make_metadata`, NOT inline its
+/// own copy.  Pre-fix the handler was a hand-duplicate of make_metadata's
+/// body — exactly the divergence pattern that hid the original
+/// `health_score: null` bug (one branch updated, the other not).
+///
+/// Source-pin (rather than calling the handler in-process) because the
+/// handler signature is closure-captured inside the MCP dispatch
+/// `match tool_name { ... }` arm and is impractical to invoke directly
+/// from tests.  A subprocess-driven MCP test (mcp_stdio_framing.rs)
+/// covers the runtime parity; this test pins the architectural contract.
+#[tokio::test]
+async fn mcp_cxpak_visual_routes_through_make_metadata() {
+    let source = include_str!("../src/commands/serve.rs");
+    let cxpak_visual_marker = "cxpak_visual";
+    // Find the actual dispatch arm `"cxpak_visual" => { ... }` (not the
+    // tools/list schema string).  The dispatch arm uniquely matches the
+    // pattern with `=>` immediately after.
+    let idx = source
+        .find(r#""cxpak_visual" => {"#)
+        .expect("MCP cxpak_visual handler dispatch arm must exist");
+    let window = &source[idx..idx + 4000];
+    assert!(
+        window.contains("commands::visual::make_metadata")
+            || window.contains("crate::commands::visual::make_metadata"),
+        "MCP `{cxpak_visual_marker}` handler MUST call commands::visual::make_metadata \
+         instead of inlining the RenderMetadata construction; pre-this-contract the \
+         inline copy let the SPA meta health_score field drift to null while the CLI \
+         path was correct.  Window starting at the cxpak_visual marker:\n{window}"
+    );
+    // And the inline RenderMetadata { ... } construction must NOT exist
+    // in this window — if it does, someone re-introduced the duplication.
+    let inline_construct = "RenderMetadata {";
+    assert!(
+        !window.contains(inline_construct),
+        "MCP cxpak_visual handler must not inline `RenderMetadata {{ ... }}` — route \
+         through make_metadata.  Found inline construction in the handler window."
+    );
+}
