@@ -354,3 +354,130 @@ fn lsp_sigterm_triggers_graceful_shutdown() {
         }
     }
 }
+
+/// Regression: SIGTERM arriving while an LSP custom method is in-flight
+/// must NOT drop the response.  Pre-fix the LSP shutdown path called
+/// `std::process::exit(0)` immediately when the signal future resolved;
+/// this aborted tower-lsp's dispatch loop AND any in-flight handler
+/// task, so a request whose bytes were in the pipe but whose handler
+/// hadn't finished writing the response simply never reached the
+/// client (`EOF` on the response read).  That defeated the original
+/// motivation for handling SIGTERM at all — "don't drop in-flight
+/// responses" — which is the contract `commands/serve.rs` provides via
+/// `axum::with_graceful_shutdown`.
+///
+/// Empirical race-test (matrix in audit notes): with the bug,
+/// SIGTERM at delays 0–100ms after sending a ~120ms request all
+/// produced EOF.  After the fix (spawn serve as a separate task +
+/// configurable grace before exit), 0–300ms all return the full
+/// response.
+///
+/// This test sends a real custom method known to take >0ms
+/// (`cxpak/dataFlow` on a small fixture; ~tens of ms on a 4-file
+/// repo), SIGTERMs the process immediately afterward, and asserts
+/// the response arrives with `id` matching the request.
+#[cfg(unix)]
+#[test]
+fn lsp_sigterm_drains_in_flight_response() {
+    let repo = make_test_repo();
+    // Add a couple more files so cxpak/dataFlow has something to walk;
+    // the default fixture's single main.rs makes the handler near-
+    // instant and we'd race past the in-flight window before SIGTERM
+    // could find anything to drop.
+    std::fs::write(
+        repo.path().join("src/util.rs"),
+        "pub fn helper() -> i32 { crate::main_helper() }\npub fn main_helper() -> i32 { 7 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub mod util;\npub fn entry() { util::helper(); }\n",
+    )
+    .unwrap();
+
+    let mut child = spawn_lsp(&repo);
+    let stderr = child.stderr.take().expect("stderr pipe");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_buf_drain = std::sync::Arc::clone(&stderr_buf);
+    let _drain_handle = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Ok(mut buf) = stderr_buf_drain.lock() {
+                        buf.push_str(&line);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Wait for ready banner.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !stderr_buf.lock().unwrap().contains("cxpak lsp: ready") {
+        if std::time::Instant::now() > deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!(
+                "cxpak lsp never printed `ready`. stderr so far: {}",
+                stderr_buf.lock().unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+
+    // Initialize.
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": format!("file://{}", repo.path().to_str().unwrap()),
+                "capabilities": {}
+            }
+        })
+        .to_string(),
+    );
+    let _init = read_response_for_id(&mut reader, 1).expect("initialize response");
+
+    // Send the heavy method, then SIGTERM IMMEDIATELY.  The fix's
+    // contract is: handlers complete + write their responses during
+    // the grace window before process::exit fires.
+    write_lsp_message(
+        stdin,
+        r#"{"jsonrpc":"2.0","id":42,"method":"cxpak/dataFlow","params":{"symbol":"main"}}"#,
+    );
+    let pid = child.id();
+    process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("kill -TERM should be invocable");
+
+    // Read with a deadline well past the default 1500ms grace.
+    let resp = read_response_for_id(&mut reader, 42)
+        .expect("in-flight response must arrive — pre-fix this returned EOF");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 42);
+    assert!(
+        resp["result"].is_object() || resp["result"].is_array(),
+        "in-flight cxpak/dataFlow must complete with a real result, not be cut to EOF; got: {resp}"
+    );
+
+    // Process should still exit cleanly after the grace window.
+    let exit_status = child.wait().expect("child to exit");
+    assert!(
+        exit_status.success(),
+        "exit must be clean (status 0) after grace; got: {exit_status:?}"
+    );
+}

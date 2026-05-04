@@ -88,28 +88,57 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
         // this line instead of sleeping a guessed-at duration.
         eprintln!("cxpak lsp: ready");
 
-        let serve_fut = Server::new(stdin, stdout, socket).serve(service);
+        // Spawn the serve loop as its own task so it keeps draining
+        // stdin, dispatching, and writing responses for the duration
+        // of the grace window after a signal.  If we instead awaited
+        // `serve_fut` directly inside `select!`, the signal branch
+        // resolving would drop the serve future — aborting tower-lsp's
+        // dispatch loop entirely — and any request bytes already in
+        // the pipe would never reach a handler.  Empirically that
+        // yielded EOF (no response) for any request whose bytes hadn't
+        // been parsed before the signal.  Spawning lets the dispatch
+        // continue running in parallel; the grace sleep below decides
+        // how long to let it.
+        let serve_handle = tokio::spawn(Server::new(stdin, stdout, socket).serve(service));
         tokio::select! {
-            _ = serve_fut => {
+            res = serve_handle => {
                 // Normal in-protocol exit: client closed stdin.  Returning
                 // from the async block lets `block_on` unwind and the
                 // process exits via `main`'s normal return path.
+                let _ = res;
             }
             _ = shutdown_rx => {
                 // Signal-driven shutdown.  `tokio::io::stdin()` internally
                 // spawns a blocking thread (libc `read()`) that cannot be
                 // cancelled — even after we drop `serve_fut`, that thread
                 // keeps the tokio runtime alive, so `block_on` would never
-                // return and the process would hang forever (verified
-                // empirically: select! resolves and the banner prints, but
-                // the runtime doesn't unwind).  Force-exit via
-                // `std::process::exit` is the right call here: the
-                // graceful banner has already printed and there is no
-                // protocol-level cleanup tower-lsp asks of us.  The
-                // alternative — `axum::with_graceful_shutdown`-style
-                // cooperative drain — isn't available on tower-lsp's
-                // Server::serve.
+                // return.  We must `process::exit` to actually leave; the
+                // question is *when*.
+                //
+                // Empirically (race-test in tests/lsp_subprocess.rs's
+                // `lsp_sigterm_drains_in_flight_response`), the in-flight
+                // tower-lsp handler tasks continue running AFTER `select!`
+                // resolves — they remain on the runtime, finishing their
+                // work and writing JSON-RPC responses to stdout.  Without
+                // a grace period, an immediate `process::exit` cuts the
+                // response mid-write, the client sees EOF, and the
+                // original "don't drop in-flight responses" motivation
+                // for handling SIGTERM at all is defeated.
+                //
+                // Wait `LSP_SHUTDOWN_GRACE_MS` (default 1500ms) for
+                // in-flight handlers to drain.  Methods that take longer
+                // than the grace will still be cut — there is no clean
+                // way to drain unboundedly without protocol-level
+                // cooperation (LSP's `shutdown` request → `exit`
+                // notification cycle, which only the client can drive).
+                // Override via `CXPAK_LSP_SHUTDOWN_GRACE_MS=...` for
+                // operators who need a longer drain window.
                 eprintln!("cxpak lsp: shutting down gracefully...");
+                let grace_ms: u64 = std::env::var("CXPAK_LSP_SHUTDOWN_GRACE_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1500);
+                tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
                 std::process::exit(0);
             }
         }
