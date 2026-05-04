@@ -41,7 +41,41 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     rt.block_on(async {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
-        Server::new(stdin, stdout, socket).serve(service).await;
+        // Race the LSP serve loop against SIGTERM/Ctrl-C so containerised
+        // hosts (kubectl, systemd, docker stop) don't kill us mid-RPC.
+        // tower-lsp's `Server::serve` future returns when the client closes
+        // stdin (the normal termination signal from any LSP client), but a
+        // SIGTERM from outside the LSP protocol stream would otherwise be
+        // ignored — the kernel default disposition would terminate the
+        // process and drop the in-flight JSON-RPC response.  Same shape as
+        // commands::serve.rs's HTTP/MCP shutdown handler.
+        let serve_fut = Server::new(stdin, stdout, socket).serve(service);
+        let shutdown_fut = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                match signal(SignalKind::terminate()) {
+                    Ok(mut term) => {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {},
+                            _ = term.recv() => {},
+                        }
+                    }
+                    Err(_) => {
+                        tokio::signal::ctrl_c().await.ok();
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok();
+            }
+            eprintln!("cxpak lsp: shutting down gracefully...");
+        };
+        tokio::select! {
+            _ = serve_fut => {}
+            _ = shutdown_fut => {}
+        }
     });
     Ok(())
 }

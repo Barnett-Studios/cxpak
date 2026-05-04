@@ -92,7 +92,16 @@ pub fn detect_god_files<'a>(inbound_counts: &[(&'a str, usize)]) -> Vec<&'a str>
 ///
 /// `module_depth` controls how many path segments form a module name (default 2).
 pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> ArchitectureMap {
-    let mut module_files: HashMap<String, Vec<String>> = HashMap::new();
+    // BTreeMap rather than HashMap so the downstream `module_files.iter()` →
+    // `mods: Vec<ModuleInfo>` collection order is deterministic.  Without
+    // this, the final `mods.sort_by(aggregate_pagerank)` (which uses
+    // `unwrap_or(Ordering::Equal)`, no secondary key) preserves the
+    // randomised insertion order whenever two modules share an aggregate
+    // pagerank — propagating to SPA cxpak-explorer, /v1/architecture,
+    // MCP cxpak_architecture, and LSP cxpak/architecture.  Same class as
+    // the v2.1.0 score_coupling/pagerank determinism fix.
+    let mut module_files: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for file in &index.files {
         let prefix = module_prefix(&file.relative_path, module_depth);
         module_files
@@ -101,8 +110,11 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
             .push(file.relative_path.clone());
     }
 
-    // Pre-compute per-file inbound edge counts (for god file detection)
-    let mut inbound_counts: HashMap<String, usize> = HashMap::new();
+    // Pre-compute per-file inbound edge counts (for god file detection).
+    // BTreeMap so any future code that iterates `inbound_counts` (instead
+    // of `.get()`) is deterministic by construction.
+    let mut inbound_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     for edges in index.graph.reverse_edges.values() {
         for edge in edges {
             *inbound_counts.entry(edge.target.clone()).or_default() += 1;
@@ -211,10 +223,19 @@ pub fn build_architecture_map(index: &CodebaseIndex, module_depth: usize) -> Arc
                 }
             })
             .collect();
+        // Secondary key: module prefix — deterministic tiebreak when two
+        // modules share an aggregate_pagerank (common on small or symmetric
+        // repos where many modules score 0.0).  Without this the final
+        // ordering depends on input order, which prior to the BTreeMap above
+        // came from HashMap iteration (randomised).  Even with BTreeMap, an
+        // explicit secondary key is the right contract — it documents the
+        // intended ordering and survives any future refactor of the upstream
+        // collection type.
         mods.sort_by(|a, b| {
             b.aggregate_pagerank
                 .partial_cmp(&a.aggregate_pagerank)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.prefix.cmp(&b.prefix))
         });
         mods
     };

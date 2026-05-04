@@ -3488,31 +3488,19 @@ pub fn handle_tool_call(
             {
                 use crate::visual::export;
                 use crate::visual::layout::{self, LayoutConfig};
-                use crate::visual::render::{self, RenderMetadata};
+                use crate::visual::render::{self};
 
                 let _ = focus; // focus reserved for future scoped rendering
 
-                let repo_name = repo_path
-                    .canonicalize()
-                    .ok()
-                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                    .unwrap_or_else(|| "codebase".to_string());
-                let metadata = RenderMetadata {
-                    repo_name,
-                    generated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                    // Same cached source the dashboard tile, /v1/health, and
-                    // MCP cxpak_health read.  Contract 8 single-source-of-
-                    // truth applies to health as well as edge_count.
-                    health_score: Some(index.health_cached().composite),
-                    node_count: index.files.len(),
-                    // Shared helper — Contract 8 single-source-of-truth.
-                    // commands/visual.rs::make_metadata, the cross-channel
-                    // parity test, AND this MCP cxpak_visual handler all
-                    // route through `.edge_count()`; if a future edge type
-                    // changes the counting rule, all three pick it up.
-                    edge_count: index.graph.edge_count(),
-                    cxpak_version: env!("CARGO_PKG_VERSION").to_string(),
-                };
+                // Single source of truth — call commands::visual::make_metadata
+                // directly so the SPA/standalone renderers and this MCP path
+                // can never drift on any field (repo_name canonicalization,
+                // health_score wiring, edge_count helper, version).  Pre-fix
+                // this site was an inline copy of make_metadata's body, which
+                // is exactly what hid the original `health_score: null` bug
+                // (parity broke when one branch was updated and the other
+                // wasn't).
+                let metadata = crate::commands::visual::make_metadata(index, repo_path);
                 let config = LayoutConfig::default();
 
                 let html_result: Result<String, Box<dyn std::error::Error>> = match visual_type {
