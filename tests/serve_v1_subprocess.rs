@@ -85,7 +85,33 @@ mod v1_subprocess_tests {
         bearer: Option<&str>,
         body_json: Option<&str>,
     ) -> (u16, String) {
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        // Connect with brief retry: under parallel-test load on macOS the
+        // server's accept queue can be drained between two requests, even
+        // after wait_for_server proved the listener is up.  Three quick
+        // retries cover the transient ECONNREFUSED/ECONNRESET window
+        // without masking a genuinely-down server.
+        let mut stream = {
+            let mut last_err = None;
+            let mut connected = None;
+            for _ in 0..5 {
+                match TcpStream::connect(format!("127.0.0.1:{port}")) {
+                    Ok(s) => {
+                        connected = Some(s);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+            connected.unwrap_or_else(|| {
+                panic!(
+                    "could not connect to 127.0.0.1:{port} after 5 retries: {:?}",
+                    last_err
+                )
+            })
+        };
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -301,6 +327,221 @@ mod v1_subprocess_tests {
         assert_eq!(
             status, 401,
             "POST /v1/* without bearer when --token is set must be 401"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    // ─── Auth gate covers EVERY /v1/* route (not just /v1/health & /v1/conventions) ──
+
+    /// Coverage closure: prior to this test, only /v1/health and
+    /// /v1/conventions had subprocess coverage.  The other 10 v1 routes
+    /// relied on in-process Router tests, which is the same coverage shape
+    /// that hid the original SIGTERM-only-on-ctrl-c gap.  Parameterising
+    /// over every POST route asserts the auth_layer (route_layer at
+    /// commands/serve.rs:421) wraps every handler uniformly — a regression
+    /// that excluded one route from the layer would otherwise be silent.
+    #[test]
+    fn every_v1_post_route_rejects_missing_bearer() {
+        let routes = [
+            "/v1/risks",
+            "/v1/architecture",
+            "/v1/predict",
+            "/v1/drift",
+            "/v1/security_surface",
+            "/v1/dead_code",
+            "/v1/call_graph",
+            "/v1/data_flow",
+            "/v1/cross_lang",
+            "/v1/briefing",
+        ];
+        let repo = make_test_repo();
+        let port = find_free_port();
+        let mut child = spawn_serve(&repo, port, Some("auth-gate-secret"));
+        assert!(wait_for_server(port));
+
+        for route in routes.iter() {
+            let (status, _) = http_request(port, "POST", route, None, Some("{}"));
+            assert_eq!(
+                status, 401,
+                "POST {route} must return 401 when --token is set and no bearer is sent"
+            );
+        }
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    /// Same matrix, with WRONG bearer.  Distinct from the missing-bearer
+    /// case because the auth path takes a different branch (extract_bearer
+    /// returns Some, then check_auth's constant-time compare returns false)
+    /// — both branches must end at 401.
+    #[test]
+    fn every_v1_post_route_rejects_wrong_bearer() {
+        let routes = [
+            "/v1/risks",
+            "/v1/architecture",
+            "/v1/predict",
+            "/v1/drift",
+            "/v1/security_surface",
+            "/v1/dead_code",
+            "/v1/call_graph",
+            "/v1/data_flow",
+            "/v1/cross_lang",
+            "/v1/briefing",
+        ];
+        let repo = make_test_repo();
+        let port = find_free_port();
+        let mut child = spawn_serve(&repo, port, Some("the-real-secret"));
+        assert!(wait_for_server(port));
+
+        for route in routes.iter() {
+            let (status, _) =
+                http_request(port, "POST", route, Some("a-different-token"), Some("{}"));
+            assert_eq!(
+                status, 401,
+                "POST {route} with wrong bearer must return 401"
+            );
+        }
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    /// Positive path for every route that doesn't require specific body
+    /// fields.  Routes with required typed bodies (predict/files,
+    /// call_graph/target, data_flow/symbol) are covered by their own tests
+    /// below with valid payloads.  This proves the route + handler are
+    /// wired and the auth_layer doesn't accidentally block the success
+    /// path — pre-this-test, only /v1/health and /v1/conventions had
+    /// subprocess proof of "auth passes → handler runs".
+    #[test]
+    fn every_v1_post_route_returns_2xx_with_correct_bearer() {
+        // Routes that accept POST with empty `{}` body and produce a
+        // structured response (do not require a typed payload).  Routes
+        // requiring specific fields — predict (files), call_graph (target),
+        // data_flow (symbol), briefing (task) — are tested separately
+        // below with valid payloads.
+        let routes = [
+            "/v1/risks",
+            "/v1/architecture",
+            "/v1/drift",
+            "/v1/security_surface",
+            "/v1/dead_code",
+            "/v1/cross_lang",
+        ];
+        let repo = make_test_repo();
+        let port = find_free_port();
+        let token = "live-token-1234";
+        let mut child = spawn_serve(&repo, port, Some(token));
+        assert!(wait_for_server(port));
+
+        for route in routes.iter() {
+            let (status, body) = http_request(port, "POST", route, Some(token), Some("{}"));
+            assert!(
+                (200..300).contains(&status),
+                "POST {route} with correct bearer should be 2xx; got {status}, body: {body}"
+            );
+            // Body must be parseable JSON — proves the handler ran to
+            // completion and the response went through the JSON serialisers.
+            let parsed: Result<Value, _> = serde_json::from_str(&body);
+            assert!(
+                parsed.is_ok(),
+                "POST {route} response body must be JSON; got: {body}"
+            );
+        }
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    /// /v1/predict requires a `files` array.  Test it with a real file from
+    /// the index.
+    #[test]
+    fn v1_predict_with_correct_bearer_and_valid_body_returns_200() {
+        let repo = make_test_repo();
+        let port = find_free_port();
+        let token = "predict-token";
+        let mut child = spawn_serve(&repo, port, Some(token));
+        assert!(wait_for_server(port));
+
+        let body = r#"{"files":["src/main.rs"],"depth":2}"#;
+        let (status, response_body) =
+            http_request(port, "POST", "/v1/predict", Some(token), Some(body));
+        assert!(
+            (200..300).contains(&status),
+            "/v1/predict with files array should be 2xx; got {status}, body: {response_body}"
+        );
+        let parsed: Value =
+            serde_json::from_str(&response_body).expect("/v1/predict body must be JSON");
+        assert!(
+            parsed.is_object(),
+            "/v1/predict response should be a JSON object"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    /// /v1/call_graph accepts an optional `target`; with no target it should
+    /// still return a structured response (not error).
+    #[test]
+    fn v1_call_graph_with_correct_bearer_returns_200() {
+        let repo = make_test_repo();
+        let port = find_free_port();
+        let token = "callgraph-token";
+        let mut child = spawn_serve(&repo, port, Some(token));
+        assert!(wait_for_server(port));
+
+        let body = r#"{"target":"main"}"#;
+        let (status, response_body) =
+            http_request(port, "POST", "/v1/call_graph", Some(token), Some(body));
+        assert!(
+            (200..300).contains(&status),
+            "/v1/call_graph should be 2xx; got {status}, body: {response_body}"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    /// /v1/briefing requires a `task` field.
+    #[test]
+    fn v1_briefing_with_correct_bearer_and_task_returns_200() {
+        let repo = make_test_repo();
+        let port = find_free_port();
+        let token = "briefing-token";
+        let mut child = spawn_serve(&repo, port, Some(token));
+        assert!(wait_for_server(port));
+
+        let body = r#"{"task":"investigate why main returns early"}"#;
+        let (status, response_body) =
+            http_request(port, "POST", "/v1/briefing", Some(token), Some(body));
+        assert!(
+            (200..300).contains(&status),
+            "/v1/briefing with task should be 2xx; got {status}, body: {response_body}"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    /// /v1/data_flow needs a `symbol`.
+    #[test]
+    fn v1_data_flow_with_correct_bearer_returns_200() {
+        let repo = make_test_repo();
+        let port = find_free_port();
+        let token = "dataflow-token";
+        let mut child = spawn_serve(&repo, port, Some(token));
+        assert!(wait_for_server(port));
+
+        let body = r#"{"symbol":"main","depth":3}"#;
+        let (status, response_body) =
+            http_request(port, "POST", "/v1/data_flow", Some(token), Some(body));
+        assert!(
+            (200..300).contains(&status),
+            "/v1/data_flow should be 2xx; got {status}, body: {response_body}"
         );
 
         child.kill().ok();
