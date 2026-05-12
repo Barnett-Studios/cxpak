@@ -70,6 +70,7 @@ fn is_web_code_language(lang: Option<&str>) -> bool {
                 | "csharp"
                 | "swift"
                 | "php"
+                | "clojure"
                 | "elixir"
                 | "scala"
                 | "dart"

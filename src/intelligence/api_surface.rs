@@ -187,6 +187,7 @@ fn language_from_path(path: &str) -> &'static str {
         "rb" => "ruby",
         "java" => "java",
         "kt" | "kts" => "kotlin",
+        "clj" | "cljs" | "cljc" | "edn" => "clojure",
         "ex" | "exs" => "elixir",
         "cs" => "csharp",
         "scala" => "scala",

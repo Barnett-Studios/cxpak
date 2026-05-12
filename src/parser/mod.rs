@@ -76,6 +76,9 @@ impl LanguageRegistry {
         #[cfg(feature = "lang-lua")]
         self.register(Box::new(languages::lua::LuaLanguage));
 
+        #[cfg(feature = "lang-clojure")]
+        self.register(Box::new(languages::clojure::ClojureLanguage));
+
         #[cfg(feature = "lang-elixir")]
         self.register(Box::new(languages::elixir::ElixirLanguage));
 
@@ -184,8 +187,8 @@ mod tests {
         let registry = LanguageRegistry::new();
         let langs = registry.supported_languages();
         assert!(
-            langs.len() >= 42,
-            "expected at least 42 languages, got {}",
+            langs.len() >= 43,
+            "expected at least 43 languages, got {}",
             langs.len()
         );
         assert!(langs.contains(&"rust"));

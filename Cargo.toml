@@ -44,6 +44,7 @@ tree-sitter-hcl = { version = "1.1", optional = true }
 tree-sitter-dart = { version = "0.1", optional = true }
 tree-sitter-scala = { version = "0.25", optional = true }
 tree-sitter-lua = { version = "0.5", optional = true }
+tree-sitter-clojure = { version = "0.1.0", optional = true }
 tree-sitter-elixir = { version = "0.3", optional = true }
 tree-sitter-zig = { version = "1.1", optional = true }
 tree-sitter-haskell = { version = "0.23", optional = true }
@@ -95,7 +96,7 @@ default = [
     "lang-c", "lang-cpp", "lang-ruby", "lang-csharp", "lang-swift", "lang-kotlin",
     "lang-bash", "lang-css", "lang-scss", "lang-php", "lang-markdown",
     "lang-json", "lang-yaml", "lang-toml", "lang-dockerfile", "lang-hcl", "lang-dart",
-    "lang-scala", "lang-lua", "lang-elixir", "lang-zig", "lang-haskell",
+    "lang-scala", "lang-lua", "lang-clojure", "lang-elixir", "lang-zig", "lang-haskell",
     "lang-groovy", "lang-objc", "lang-r", "lang-julia", "lang-ocaml", "lang-matlab",
     "lang-proto", "lang-svelte", "lang-makefile", "lang-html", "lang-graphql", "lang-xml",
     "lang-sql", "lang-prisma",
@@ -136,6 +137,7 @@ lang-hcl = ["dep:tree-sitter-hcl"]
 lang-dart = ["dep:tree-sitter-dart"]
 lang-scala = ["dep:tree-sitter-scala"]
 lang-lua = ["dep:tree-sitter-lua"]
+lang-clojure = ["dep:tree-sitter-clojure"]
 lang-elixir = ["dep:tree-sitter-elixir"]
 lang-zig = ["dep:tree-sitter-zig"]
 lang-haskell = ["dep:tree-sitter-haskell"]

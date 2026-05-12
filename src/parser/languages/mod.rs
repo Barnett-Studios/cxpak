@@ -50,6 +50,9 @@ pub mod scala;
 #[cfg(feature = "lang-lua")]
 pub mod lua;
 
+#[cfg(feature = "lang-clojure")]
+pub mod clojure;
+
 #[cfg(feature = "lang-elixir")]
 pub mod elixir;
 
