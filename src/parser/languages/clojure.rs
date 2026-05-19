@@ -64,8 +64,7 @@ impl ClojureLanguage {
             if c.kind() == "meta_lit" {
                 if let Some(val) = c.child_by_field_name("value") {
                     let text = Self::node_text(&val, source);
-                    text == ":private"
-                        || (val.kind() == "map_lit" && text.contains(":private"))
+                    text == ":private" || (val.kind() == "map_lit" && text.contains(":private"))
                 } else {
                     false
                 }
@@ -108,11 +107,8 @@ impl ClojureLanguage {
                         if let Some(ns_sym) = vec_children.first() {
                             let ns_name = Self::node_text(ns_sym, source).to_string();
                             if !ns_name.is_empty() {
-                                let short = ns_name
-                                    .rsplit('.')
-                                    .next()
-                                    .unwrap_or(&ns_name)
-                                    .to_string();
+                                let short =
+                                    ns_name.rsplit('.').next().unwrap_or(&ns_name).to_string();
                                 imports.push(Import {
                                     source: ns_name,
                                     names: vec![short],
@@ -124,11 +120,7 @@ impl ClojureLanguage {
                         // bare require: clojure.string
                         let ns_name = Self::node_text(require_entry, source).to_string();
                         if !ns_name.is_empty() && !ns_name.starts_with(':') {
-                            let short = ns_name
-                                .rsplit('.')
-                                .next()
-                                .unwrap_or(&ns_name)
-                                .to_string();
+                            let short = ns_name.rsplit('.').next().unwrap_or(&ns_name).to_string();
                             imports.push(Import {
                                 source: ns_name,
                                 names: vec![short],
@@ -424,7 +416,9 @@ impl LanguageSupport for ClojureLanguage {
         let mut ns = String::new();
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
-            if child.kind() == "list_lit" && ClojureLanguage::list_head_text(&child, source_bytes) == "ns" {
+            if child.kind() == "list_lit"
+                && ClojureLanguage::list_head_text(&child, source_bytes) == "ns"
+            {
                 let (ns_name, _) = ClojureLanguage::list_name_text(&child, source_bytes);
                 ns = ns_name;
                 break;
@@ -651,7 +645,11 @@ mod tests {
     fn test_symbol_line_numbers() {
         let src = "(ns my.ns)\n\n(defn foo []\n  :ok)\n";
         let result = parse_and_extract(src);
-        let foo: Vec<_> = result.symbols.iter().filter(|s| s.name == "my.ns/foo").collect();
+        let foo: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.name == "my.ns/foo")
+            .collect();
         assert!(!foo.is_empty(), "expected defn 'foo'");
         assert_eq!(foo[0].start_line, 3, "defn should start at line 3");
     }
@@ -696,10 +694,22 @@ mod tests {
         let result = parse_and_extract(src);
 
         assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Class));
-        assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Constant && s.name == "my.app/version"));
-        assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Function && s.visibility == Visibility::Private));
-        assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "my.app/fetch"));
-        assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Interface));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "my.app/version"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Function && s.visibility == Visibility::Private));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Function && s.name == "my.app/fetch"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Interface));
         assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Struct));
         assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Macro));
         assert!(result.imports.iter().any(|i| i.source == "clojure.string"));
