@@ -6,7 +6,6 @@ tarpaulin-report.*
 
 # LLM-collaboration artifacts kept locally only
 .claude/
-!.claude/CLAUDE.md
 docs/plans/
 docs/release/
 docs/LANDSCAPE_RESEARCH_2026.md
