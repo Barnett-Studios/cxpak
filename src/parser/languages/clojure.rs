@@ -642,6 +642,23 @@ mod tests {
     }
 
     #[test]
+    fn test_private_defn_via_metadata() {
+        let src = "(ns my.ns)\n(defn ^:private hidden [] :ok)\n";
+        let result = parse_and_extract(src);
+        let fns: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.name == "my.ns/hidden")
+            .collect();
+        assert!(!fns.is_empty(), "expected ^:private defn 'hidden'");
+        assert_eq!(fns[0].visibility, Visibility::Private);
+        assert!(
+            !result.exports.iter().any(|e| e.name == "my.ns/hidden"),
+            "^:private defn should not be exported"
+        );
+    }
+
+    #[test]
     fn test_symbol_line_numbers() {
         let src = "(ns my.ns)\n\n(defn foo []\n  :ok)\n";
         let result = parse_and_extract(src);
@@ -693,15 +710,19 @@ mod tests {
 "#;
         let result = parse_and_extract(src);
 
-        assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Class));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Class && s.name == "my.app"));
         assert!(result
             .symbols
             .iter()
             .any(|s| s.kind == SymbolKind::Constant && s.name == "my.app/version"));
-        assert!(result
-            .symbols
-            .iter()
-            .any(|s| s.kind == SymbolKind::Function && s.visibility == Visibility::Private));
+        assert!(result.symbols.iter().any(|s| {
+            s.kind == SymbolKind::Function
+                && s.visibility == Visibility::Private
+                && s.name == "my.app/build-url"
+        }));
         assert!(result
             .symbols
             .iter()
@@ -709,9 +730,15 @@ mod tests {
         assert!(result
             .symbols
             .iter()
-            .any(|s| s.kind == SymbolKind::Interface));
-        assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Struct));
-        assert!(result.symbols.iter().any(|s| s.kind == SymbolKind::Macro));
+            .any(|s| s.kind == SymbolKind::Interface && s.name == "my.app/Repository"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Struct && s.name == "my.app/InMemoryRepo"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Macro && s.name == "my.app/with-retry"));
         assert!(result.imports.iter().any(|i| i.source == "clojure.string"));
     }
 }
