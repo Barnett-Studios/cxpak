@@ -14,6 +14,7 @@ pub fn comment_syntax(language: &str) -> (&'static str, &'static str) {
         | "prisma" => ("// ", ""),
         "python" | "ruby" | "bash" | "perl" | "r" | "julia" | "elixir" | "yaml" | "toml"
         | "makefile" | "dockerfile" | "hcl" => ("# ", ""),
+        "clojure" => (";; ", ""),
         "haskell" | "lua" | "sql" | "ocaml" | "ocaml_interface" => ("-- ", ""),
         "html" | "xml" | "svelte" | "markdown" => ("<!-- ", " -->"),
         "css" | "scss" => ("/* ", " */"),
@@ -180,6 +181,13 @@ mod tests {
             assert_eq!(pre, "# ", "wrong prefix for {lang}");
             assert_eq!(suf, "", "wrong suffix for {lang}");
         }
+    }
+
+    #[test]
+    fn comment_syntax_semicolon_languages() {
+        let (pre, suf) = comment_syntax("clojure");
+        assert_eq!(pre, ";; ", "wrong prefix for clojure");
+        assert_eq!(suf, "", "wrong suffix for clojure");
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 **Spends CPU cycles so you don't spend tokens.**
 
-cxpak indexes your codebase using tree-sitter across 42 languages, builds a typed dependency graph, and produces token-budgeted context bundles that give LLMs a briefing packet instead of a flashlight in a dark room. It understands your code's architecture, conventions, risk profile, and data layer -- then packs exactly what the LLM needs, nothing more.
+cxpak indexes your codebase using tree-sitter across 43 languages, builds a typed dependency graph, and produces token-budgeted context bundles that give LLMs a briefing packet instead of a flashlight in a dark room. It understands your code's architecture, conventions, risk profile, and data layer -- then packs exactly what the LLM needs, nothing more.
 
 ## What it looks like
 
@@ -173,10 +173,10 @@ cxpak onboard .
 
 Generates a dependency-ordered reading guide: files topologically sorted, grouped into phases by module, ordered by PageRank. Each file lists key symbols to focus on and an estimated reading time.
 
-## Language support (42)
+## Language support (43)
 
 **Full extraction** (functions, classes, methods, imports, exports):
-Rust, TypeScript, JavaScript, Python, Java, Go, C, C++, Ruby, C#, Swift, Kotlin, Bash, PHP, Dart, Scala, Lua, Elixir, Zig, Haskell, Groovy, Objective-C, R, Julia, OCaml, MATLAB
+Rust, TypeScript, JavaScript, Python, Java, Go, C, C++, Ruby, C#, Swift, Kotlin, Bash, PHP, Dart, Scala, Lua, Elixir, Zig, Haskell, Groovy, Objective-C, R, Julia, OCaml, MATLAB, Clojure
 
 **Structural extraction** (selectors, keys, blocks):
 CSS, SCSS, Markdown, JSON, YAML, TOML, Dockerfile, HCL/Terraform, Protobuf, Svelte, Makefile, HTML, GraphQL, XML
