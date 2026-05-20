@@ -186,6 +186,8 @@ mod tests {
     fn test_supported_languages_returns_all() {
         let registry = LanguageRegistry::new();
         let langs = registry.supported_languages();
+        // Unconditional floor: fires even under --no-default-features so a
+        // miscounted feature flag cannot silently hollow out the registry.
         assert!(
             langs.len() >= 43,
             "expected at least 43 languages, got {}",

@@ -19,9 +19,7 @@ impl ClojureLanguage {
     /// punctuation nodes (`(`, `)`, `[`, `]`, etc.).
     fn named_children<'a>(node: &tree_sitter::Node<'a>) -> Vec<tree_sitter::Node<'a>> {
         let mut cursor = node.walk();
-        node.children(&mut cursor)
-            .filter(|c| c.is_named())
-            .collect()
+        node.named_children(&mut cursor).collect()
     }
 
     /// Return the text of the first named child of a list_lit.
@@ -76,16 +74,30 @@ impl ClojureLanguage {
         (actual_name, is_private)
     }
 
-    /// Extract `:require` imports from a namespace form's body.
+    /// Qualify `name` with `ns`, producing `ns/name`.  When `ns` is empty
+    /// (file has no `ns` form) the bare `name` is returned unchanged.
+    fn qualify(ns: &str, name: &str) -> String {
+        if ns.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", ns, name)
+        }
+    }
+
+    /// Extract `:require` and `:use` imports from a namespace form's body.
     ///
-    /// Handles the two main require styles:
-    ///   `[clojure.string :as str]`   — vector with optional alias
-    ///   `clojure.string`             — bare symbol
+    /// Handles the common import styles:
+    ///   `[clojure.string :as str]`        — vector with optional alias
+    ///   `[clojure.string :refer [f1 f2]]` — vector with explicit refer list
+    ///   `clojure.string`                  — bare symbol
+    ///
+    /// `:use` clauses are treated identically to `:require` for source-level
+    /// import tracking (the namespace origin is what matters for call-graph edges).
     fn extract_ns_imports(ns_node: &tree_sitter::Node, source: &[u8]) -> Vec<Import> {
         let mut imports = Vec::new();
         let children = Self::named_children(ns_node);
 
-        // Each (:require ...) clause is a list_lit inside the ns form.
+        // Each (:require ...) or (:use ...) clause is a list_lit inside the ns form.
         for child in children.iter().skip(2) {
             if child.kind() != "list_lit" {
                 continue;
@@ -188,11 +200,7 @@ impl ClojureLanguage {
                     } else {
                         Visibility::Public
                     };
-                    let qualified = if ns.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}/{}", ns, name)
-                    };
+                    let qualified = Self::qualify(ns, &name);
                     if visibility == Visibility::Public {
                         exports.push(Export {
                             name: qualified.clone(),
@@ -219,11 +227,7 @@ impl ClojureLanguage {
                     let body = Self::node_text(node, source).to_string();
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
-                    let qualified = if ns.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}/{}", ns, name)
-                    };
+                    let qualified = Self::qualify(ns, &name);
                     symbols.push(Symbol {
                         name: qualified,
                         kind: SymbolKind::Function,
@@ -248,11 +252,7 @@ impl ClojureLanguage {
                     } else {
                         Visibility::Public
                     };
-                    let qualified = if ns.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}/{}", ns, name)
-                    };
+                    let qualified = Self::qualify(ns, &name);
                     if visibility == Visibility::Public {
                         exports.push(Export {
                             name: qualified.clone(),
@@ -283,11 +283,7 @@ impl ClojureLanguage {
                     } else {
                         Visibility::Public
                     };
-                    let qualified = if ns.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}/{}", ns, name)
-                    };
+                    let qualified = Self::qualify(ns, &name);
                     if visibility == Visibility::Public {
                         exports.push(Export {
                             name: qualified.clone(),
@@ -313,11 +309,7 @@ impl ClojureLanguage {
                     let body = Self::node_text(node, source).to_string();
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
-                    let qualified = if ns.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}/{}", ns, name)
-                    };
+                    let qualified = Self::qualify(ns, &name);
                     exports.push(Export {
                         name: qualified.clone(),
                         kind: SymbolKind::Interface,
@@ -341,11 +333,7 @@ impl ClojureLanguage {
                     let body = Self::node_text(node, source).to_string();
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
-                    let qualified = if ns.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}/{}", ns, name)
-                    };
+                    let qualified = Self::qualify(ns, &name);
                     exports.push(Export {
                         name: qualified.clone(),
                         kind: SymbolKind::Struct,
@@ -369,11 +357,7 @@ impl ClojureLanguage {
                     let body = Self::node_text(node, source).to_string();
                     let start_line = node.start_position().row + 1;
                     let end_line = node.end_position().row + 1;
-                    let qualified = if ns.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}/{}", ns, name)
-                    };
+                    let qualified = Self::qualify(ns, &name);
                     exports.push(Export {
                         name: qualified.clone(),
                         kind: SymbolKind::Function,
@@ -579,6 +563,23 @@ mod tests {
     }
 
     #[test]
+    fn test_deftype_extracted_as_struct() {
+        let src = "(ns my.ns)\n(deftype Counter [val])\n";
+        let result = parse_and_extract(src);
+        let types: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Struct && s.name == "my.ns/Counter")
+            .collect();
+        assert!(!types.is_empty(), "expected deftype as Struct");
+        assert_eq!(types[0].visibility, Visibility::Public);
+        assert!(
+            result.exports.iter().any(|e| e.name == "my.ns/Counter"),
+            "deftype should be exported"
+        );
+    }
+
+    #[test]
     fn test_defmulti_extracted() {
         let src = "(ns my.ns)\n(defmulti area :shape)\n";
         let result = parse_and_extract(src);
@@ -611,6 +612,16 @@ mod tests {
         assert!(
             result.imports.iter().any(|i| i.source == "clojure.string"),
             "expected bare require import"
+        );
+    }
+
+    #[test]
+    fn test_refer_import_vector() {
+        let src = "(ns my.ns\n  (:require [clojure.string :refer [join split]]))\n";
+        let result = parse_and_extract(src);
+        assert!(
+            result.imports.iter().any(|i| i.source == "clojure.string"),
+            "expected :refer vector to record namespace"
         );
     }
 
@@ -669,6 +680,7 @@ mod tests {
             .collect();
         assert!(!foo.is_empty(), "expected defn 'foo'");
         assert_eq!(foo[0].start_line, 3, "defn should start at line 3");
+        assert_eq!(foo[0].end_line, 4, "defn should end at line 4");
     }
 
     #[test]
@@ -740,5 +752,48 @@ mod tests {
             .iter()
             .any(|s| s.kind == SymbolKind::Macro && s.name == "my.app/with-retry"));
         assert!(result.imports.iter().any(|i| i.source == "clojure.string"));
+    }
+
+    #[test]
+    fn test_reader_conditional_does_not_panic() {
+        // Reader conditionals are not top-level list_lit forms so defns inside
+        // them won't be extracted — but the parser must not panic and the ns is present.
+        let src = "(ns my.ns)\n#?(:clj (defn jvm-only [] :jvm)\n   :cljs (defn js-only [] :js))\n";
+        let result = parse_and_extract(src);
+        assert!(result
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Class && s.name == "my.ns"));
+    }
+
+    #[test]
+    fn test_multi_arity_defn_extracted() {
+        let src =
+            "(ns my.ns)\n(defn greet\n  ([] (greet \"World\"))\n  ([name] (str \"Hello, \" name)))\n";
+        let result = parse_and_extract(src);
+        let fns: Vec<_> = result
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function && s.name == "my.ns/greet")
+            .collect();
+        assert!(!fns.is_empty(), "expected multi-arity defn to be extracted");
+        assert_eq!(fns[0].visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn test_comment_only_source() {
+        let src = ";; This is a comment\n;; Another comment\n";
+        let result = parse_and_extract(src);
+        assert!(result.symbols.is_empty());
+        assert!(result.imports.is_empty());
+        assert!(result.exports.is_empty());
+    }
+
+    #[test]
+    fn test_malformed_source_does_not_panic() {
+        // tree-sitter parses with error recovery; extraction must complete without panic.
+        let src = "(defn broken [x\n";
+        let result = parse_and_extract(src);
+        let _ = result;
     }
 }

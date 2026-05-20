@@ -331,6 +331,10 @@ fn is_source_code_file(path: &str) -> bool {
             | "h"
             | "hpp"
             | "hxx"
+            | "clj"
+            | "cljs"
+            | "cljc"
+            | "edn"
     )
 }
 
