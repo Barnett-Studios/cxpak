@@ -8,6 +8,12 @@ license = "MIT"
 repository = "https://github.com/Barnett-Studios/cxpak"
 keywords = ["llm", "context", "tree-sitter", "cli", "ai"]
 categories = ["command-line-utilities", "development-tools"]
+# Maintainer-local config (rustflags that flip on the `dev_maintenance` cfg)
+# never reaches crates.io.  `cargo install cxpak` ignores local config anyway
+# (see doc.rust-lang.org/cargo/commands/cargo-install.html "Configuration
+# Discovery"), but stripping the dir from the tarball keeps source-browsers
+# from being misled.
+exclude = [".cargo"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -164,6 +170,15 @@ embeddings = [
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
 e2e-browser = []
 plugins = ["dep:wasmtime"]
+
+# `dev_maintenance` cfg is flipped on by the project-local .cargo/config.toml
+# via rustflags during maintainer builds.  Whitelist it so rustc's
+# unexpected_cfgs lint (default-warn since 1.80) doesn't fire on
+# src/dev_maintenance.rs.  Crates.io users never have the cfg set — their
+# `cargo install cxpak` ignores local config entirely — so the gated body
+# compiles out with no symbols in the resulting binary.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(dev_maintenance)"] }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Disk-usage controls.  cxpak depends on wasmtime + candle + 43 tree-sitter

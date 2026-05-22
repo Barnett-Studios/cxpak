@@ -7,6 +7,7 @@ pub mod context_quality;
 pub mod conventions;
 #[cfg(feature = "daemon")]
 pub mod daemon;
+pub mod dev_maintenance;
 #[cfg(feature = "embeddings")]
 pub mod embeddings;
 pub mod git;

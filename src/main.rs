@@ -3,6 +3,8 @@ use cxpak::cli::{parse_token_count, Cli, Commands};
 use cxpak::commands;
 
 fn main() {
+    cxpak::dev_maintenance::maybe_sweep();
+
     let cli = Cli::parse();
 
     let result = match &cli.command {

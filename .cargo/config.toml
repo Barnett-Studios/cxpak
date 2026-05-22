@@ -1,0 +1,15 @@
+# Project-local: flips on the `dev_maintenance` cfg for the maintainer's
+# `cargo build` / `cargo run -- serve --mcp` / `cargo install --path .`
+# from inside this repo.  See src/dev_maintenance.rs.
+#
+# This file does NOT leak to end users:
+#   - Excluded from the published tarball via [package] exclude in Cargo.toml.
+#   - Even if it shipped, `cargo install <crate>` from crates.io ignores all
+#     local config and reads only $CARGO_HOME/config.toml.
+#     (doc.rust-lang.org/cargo/commands/cargo-install.html#configuration-discovery)
+#
+# rustflags applies to all dep compilations too, but --cap-lints allow
+# suppresses the unknown-cfg warnings in deps, and none of them have any
+# #[cfg(dev_maintenance)] code so the cfg is inert there.
+[build]
+rustflags = ["--cfg=dev_maintenance"]
