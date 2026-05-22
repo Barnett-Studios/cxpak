@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "cxpak"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "assert_cmd",
  "axum",
