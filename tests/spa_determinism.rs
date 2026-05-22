@@ -18,8 +18,20 @@ use std::path::PathBuf;
 fn load_fixture_index() -> cxpak::index::CodebaseIndex {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let fixture_root = PathBuf::from(&manifest).join("tests/fixtures/determinism_repo");
-    // Scanner requires a .git directory; create it if the embedded git was stripped.
-    std::fs::create_dir_all(fixture_root.join(".git")).expect("create fixture .git");
+    // Scanner needs a real, valid git repo here.  An empty `.git/` directory
+    // (the previous setup) passes existence checks but fails validity, and
+    // git's discovery algorithm then walks up the parent chain until it
+    // finds cxpak's own .git — so any churn lookup against a fixture file
+    // whose relative path also exists in cxpak (e.g. `src/lib.rs`) leaks
+    // commits from the outer repo's history and the snapshot drifts every
+    // time we land a commit that touches a mirrored path.  `git init`
+    // creates a hermetic empty repo so discovery stops here, every file
+    // reports churn_30d=0, and the fixture is independent of outer history.
+    let _ = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&fixture_root)
+        .status()
+        .expect("git init fixture");
     cxpak::commands::serve::build_index(&fixture_root).expect("fixture index builds")
 }
 
