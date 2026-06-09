@@ -87,7 +87,7 @@ docker run -d -p 3000:3000 \
   -v cxpak-models:/root/.cxpak \
   cxpak serve --bind 0.0.0.0 --token mysecret .
 
-# MCP (Claude Code / Cursor)
+# MCP — stdio only, one repo per instance (see note below)
 docker run --rm -i -v $(pwd):/repo cxpak serve --mcp .
 ```
 
@@ -105,7 +105,7 @@ docker run -d -p 3000:3000 `
 # Verify (use curl.exe — PowerShell's curl alias does not work here)
 curl.exe http://localhost:3000/health
 
-# MCP (Claude Code / Cursor)
+# MCP — stdio only, one repo per instance (see note below)
 docker run --rm -i -v ${PWD}:/repo cxpak serve --mcp .
 ```
 
@@ -116,6 +116,10 @@ Replace `mysecret` with any non-empty secret of your choice. Authenticated endpo
 curl http://localhost:3000/health                                        # no auth required
 curl -H "Authorization: Bearer mysecret" http://localhost:3000/v1/overview
 ```
+
+> **HTTP vs MCP:** These are two separate transports — you cannot use the HTTP server as an MCP endpoint.
+>
+> **MCP scope:** Each MCP instance indexes exactly one repository — the path passed at startup (`.` in the examples above, which maps to the mounted `/repo`). To serve multiple repos simultaneously, run one container per repo and register each in your MCP client config. The HTTP server has the same single-repo scope.
 
 ## Quick start
 
