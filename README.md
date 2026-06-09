@@ -48,6 +48,49 @@ brew tap Barnett-Studios/tap && brew install cxpak   # macOS/Linux
 cargo install cxpak                                   # or via cargo
 ```
 
+## Docker
+
+Docker is a first-class deployment option — useful anywhere you want a reproducible, isolated install without managing a Rust toolchain: CI pipelines, sandboxed servers, Windows machines, or air-gapped environments.
+
+### Standalone (no source needed)
+
+Copy [`Dockerfile.standalone`](Dockerfile.standalone) anywhere and build:
+
+```bash
+docker build -f Dockerfile.standalone -t cxpak .
+
+# Pin a specific release:
+docker build -f Dockerfile.standalone --build-arg VERSION=2.1.0 -t cxpak:2.1.0 .
+```
+
+Fetches the pre-built Linux binary from GitHub Releases. Supports `amd64` and `arm64`.
+
+### From source
+
+```bash
+docker build -t cxpak .
+```
+
+Builds the full default feature set from your local checkout. First build is slow (candle ML deps); subsequent builds are fast — dependencies are cached in a separate layer.
+
+### Usage
+
+```bash
+# One-shot command
+docker run --rm -v $(pwd):/repo cxpak overview .
+
+# HTTP server
+docker run -d -p 3000:3000 \
+  -v $(pwd):/repo \
+  -v cxpak-models:/root/.cxpak \
+  cxpak serve .
+
+# MCP (Claude Code / Cursor)
+docker run --rm -i -v $(pwd):/repo cxpak serve --mcp .
+```
+
+Mount `/root/.cxpak` as a named volume to persist the embedding model weights (~30 MB, downloaded on first use).
+
 ## Quick start
 
 ```bash
