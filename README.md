@@ -75,21 +75,47 @@ Builds the full default feature set from your local checkout. First build is slo
 
 ### Usage
 
+**macOS / Linux:**
 ```bash
 # One-shot command
 docker run --rm -v $(pwd):/repo cxpak overview .
 
-# HTTP server
+# HTTP server (--bind 0.0.0.0 required to reach the container from the host;
+# --token is mandatory when binding to a non-loopback address)
 docker run -d -p 3000:3000 \
   -v $(pwd):/repo \
   -v cxpak-models:/root/.cxpak \
-  cxpak serve .
+  cxpak serve --bind 0.0.0.0 --token mysecret .
 
 # MCP (Claude Code / Cursor)
 docker run --rm -i -v $(pwd):/repo cxpak serve --mcp .
 ```
 
+**Windows (PowerShell):**
+```powershell
+# One-shot command
+docker run --rm -v ${PWD}:/repo cxpak overview .
+
+# HTTP server
+docker run -d -p 3000:3000 `
+  -v ${PWD}:/repo `
+  -v cxpak-models:/root/.cxpak `
+  cxpak serve --bind 0.0.0.0 --token mysecret .
+
+# Verify (use curl.exe — PowerShell's curl alias does not work here)
+curl.exe http://localhost:3000/health
+
+# MCP (Claude Code / Cursor)
+docker run --rm -i -v ${PWD}:/repo cxpak serve --mcp .
+```
+
 Mount `/root/.cxpak` as a named volume to persist the embedding model weights (~30 MB, downloaded on first use).
+
+Replace `mysecret` with any non-empty secret of your choice. Authenticated endpoints are under `/v1/`:
+```bash
+curl http://localhost:3000/health                                        # no auth required
+curl -H "Authorization: Bearer mysecret" http://localhost:3000/v1/overview
+```
 
 ## Quick start
 
