@@ -13,7 +13,7 @@
 ARG VERSION=2.1.0
 ARG TARGETARCH
 
-FROM debian:bookworm-slim AS downloader
+FROM ubuntu:24.04 AS downloader
 
 ARG VERSION
 ARG TARGETARCH
@@ -32,13 +32,11 @@ RUN case "$TARGETARCH" in \
         "https://github.com/Barnett-Studios/cxpak/releases/download/v${VERSION}/cxpak-${TRIPLE}.tar.gz" \
         | tar -xz -C /usr/local/bin
 
-FROM debian:bookworm-slim
+# Match the upstream release builder (ubuntu-latest = 24.04) to avoid glibc version mismatches.
+FROM ubuntu:24.04
 
-# ca-certificates: HTTPS for embeddings model download on first use.
-# libgcc-s1:       Rust panic unwinding runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=downloader /usr/local/bin/cxpak /usr/local/bin/cxpak
