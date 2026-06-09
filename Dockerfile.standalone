@@ -1,0 +1,53 @@
+# Standalone Dockerfile — no source tree required.
+# Downloads the pre-built Linux binary from the upstream GitHub release.
+#
+# Build:
+#   docker build -f Dockerfile.standalone -t cxpak .
+#   docker build -f Dockerfile.standalone --build-arg VERSION=2.0.0 -t cxpak:2.0.0 .
+#
+# Run:
+#   docker run --rm -v $(pwd):/repo cxpak overview .
+#   docker run -d -p 3000:3000 -v $(pwd):/repo -v cxpak-models:/root/.cxpak cxpak serve .
+#   docker run --rm -i -v $(pwd):/repo cxpak serve --mcp .   # MCP / Claude Code
+
+ARG VERSION=2.1.0
+ARG TARGETARCH
+
+FROM debian:bookworm-slim AS downloader
+
+ARG VERSION
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN case "$TARGETARCH" in \
+        amd64) TRIPLE="x86_64-unknown-linux-gnu" ;; \
+        arm64) TRIPLE="aarch64-unknown-linux-gnu" ;; \
+        *) echo "Unsupported arch: $TARGETARCH" && exit 1 ;; \
+    esac \
+    && curl -fsSL \
+        "https://github.com/Barnett-Studios/cxpak/releases/download/v${VERSION}/cxpak-${TRIPLE}.tar.gz" \
+        | tar -xz -C /usr/local/bin
+
+FROM debian:bookworm-slim
+
+# ca-certificates: HTTPS for embeddings model download on first use.
+# libgcc-s1:       Rust panic unwinding runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=downloader /usr/local/bin/cxpak /usr/local/bin/cxpak
+
+# all-MiniLM-L6-v2 weights are downloaded to ~/.cxpak/models/ on first use.
+# Mount a named volume to persist them across runs.
+VOLUME ["/root/.cxpak"]
+
+WORKDIR /repo
+EXPOSE 3000
+
+ENTRYPOINT ["cxpak"]
