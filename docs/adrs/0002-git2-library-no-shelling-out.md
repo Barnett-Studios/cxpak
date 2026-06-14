@@ -28,11 +28,11 @@ Use the `git2` crate for all git-context operations: revwalk for history, diff-a
 - No dependency on a `git` binary being present on PATH; access is structured and parse-free.
 
 ### Negative
-- Pulls in libgit2/openssl; the shipped `Cargo.toml` enables the `git2` `vendored-openssl` feature to keep the build self-contained.
+- Pulls in libgit2; the shipped `Cargo.toml` originally enabled the `git2` `vendored-openssl` feature to keep the build self-contained. **Superseded in part by [ADR-0163](0163-windows-build-git2-no-default-features.md):** because cxpak does only local git, `git2` was later set to `default-features = false`, dropping the unused OpenSSL/SSH transport (and unblocking Windows builds). The decision to use git2 for local access stands.
 
 ### Neutral
 - `extract_git_context()` caps at `max_commits` (20 for overview) and aggregates churn plus contributors in a single revwalk.
 
 ## Revisit if
-- The libgit2/openssl build burden outweighs the benefit.
+- The libgit2/openssl build burden outweighs the benefit. *(This materialized for Windows; resolved by ADR-0163.)*
 - A required git feature turns out to be unavailable via libgit2.

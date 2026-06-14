@@ -8,9 +8,9 @@ Each ADR uses [`template.md`](./template.md): YAML frontmatter (`id`, `title`, `
 
 ## Retroactive backfill
 
-ADRs 0001–NNNN were reconstructed retroactively (June 2026) from the project's internal design and implementation documents (`docs/plans/`, kept local) and from the shipped code across releases v0.4.0 → v2.2.1. They carry `status: ACCEPTED` with the `date` set to when the decision actually landed, and each cites the design document or code that originated it. Where a decision was later changed or superseded, that is recorded via `SUPERSEDED by ADR-MMMM`.
+ADRs 0001–0162 were reconstructed retroactively (June 2026) from the project's internal design and implementation documents (`docs/plans/`, kept local) and from the shipped code across releases v0.1.0 → v2.2.1. They carry `status: ACCEPTED` with the `date` set to when the decision actually landed, and each cites the design document or code that originated it. Where a decision was later changed or superseded, that is noted in the record (e.g. ADR-0002 is superseded in part by ADR-0163).
 
-From this point forward, ADRs are written at decision time, not backfilled.
+From ADR-0163 onward, ADRs are written at decision time, not backfilled.
 
 ## Index
 

@@ -1,6 +1,6 @@
 # ADR Index
 
-162 architecture decision records, reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1). See [README](./README.md) for methodology.
+163 architecture decision records. 0001–0162 reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1); 0163 onward written at decision time. See [README](./README.md) for methodology.
 
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
@@ -166,3 +166,4 @@
 | [0160](0160-spa-single-html-hash-routing.md) | Single self-contained HTML SPA with client-side hash routing for all six views | ACCEPTED | 2026-04-17 |
 | [0161](0161-theme-attribute-not-light-dark.md) | Attribute-based theming (data-theme on <html>) instead of CSS light-dark() | ACCEPTED | 2026-04-17 |
 | [0162](0162-v1-api-param-normalization-two-normalizers.md) | v1 API parameter validation: two normalizers (path vs symbol), JSON error envelope, and caps | ACCEPTED | 2026-04-17 |
+| [0163](0163-windows-build-git2-no-default-features.md) | Enable Windows builds by dropping git2 default features (cxpak does only local git) | ACCEPTED | 2026-06-14 |

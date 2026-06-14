@@ -45,8 +45,11 @@ cxpak indexes your codebase using tree-sitter across 43 languages, builds a type
 
 ```bash
 brew tap Barnett-Studios/tap && brew install cxpak   # macOS/Linux
-cargo install cxpak                                   # or via cargo
+cargo install cxpak                                   # any platform, incl. Windows
 ```
+
+On Windows, `cargo install cxpak` works, or download the prebuilt
+`cxpak-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/Barnett-Studios/cxpak/releases/latest).
 
 ## Quick start
 
