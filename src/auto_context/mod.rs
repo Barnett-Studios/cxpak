@@ -1,5 +1,6 @@
 pub mod briefing;
 pub mod diff;
+pub mod efficiency;
 pub mod noise;
 
 use crate::auto_context::noise::{FilteredFile, ScoredFileEntry};
