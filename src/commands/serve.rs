@@ -595,6 +595,7 @@ async fn v1_briefing_handler(
         guard.clone()
     };
     let opts = crate::auto_context::AutoContextOpts {
+        cost_model: None,
         tokens: params.tokens.unwrap_or(50_000),
         focus: params.focus,
         include_tests: true,
@@ -1441,6 +1442,7 @@ async fn auto_context_handler(
         .and_then(|t| crate::cli::parse_token_count(t).ok())
         .unwrap_or(50_000);
     let opts = crate::auto_context::AutoContextOpts {
+        cost_model: None,
         tokens: token_budget,
         focus: params.focus,
         include_tests: params.include_tests.unwrap_or(true),
@@ -2400,6 +2402,7 @@ pub fn handle_tool_call(
                 .unwrap_or("full")
                 .to_string();
             let opts = crate::auto_context::AutoContextOpts {
+                cost_model: None,
                 tokens: token_budget,
                 focus,
                 include_tests,
@@ -3180,6 +3183,7 @@ pub fn handle_tool_call(
                 .unwrap_or(50_000);
             let focus = args.get("focus").and_then(|f| f.as_str()).map(String::from);
             let opts = crate::auto_context::AutoContextOpts {
+                cost_model: None,
                 tokens: token_budget,
                 focus,
                 include_tests: true,

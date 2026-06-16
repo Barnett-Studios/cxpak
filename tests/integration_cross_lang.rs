@@ -106,6 +106,7 @@ fn test_cross_lang_fixture_graph_edges() {
 fn test_cross_lang_fixture_auto_context_surfaces_edges() {
     let (index, _dir) = build_fixture();
     let opts = AutoContextOpts {
+        cost_model: None,
         tokens: 20_000,
         focus: None,
         include_tests: false,

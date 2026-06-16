@@ -23,6 +23,8 @@ pub struct AutoContextOpts {
     pub include_tests: bool,
     pub include_blast_radius: bool,
     pub mode: String, // "full" (default) or "briefing"
+    /// Opt-in cost model name; when `Some`, the efficiency report includes a USD estimate.
+    pub cost_model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -330,12 +332,20 @@ mod tests {
 
     fn default_opts(tokens: usize) -> AutoContextOpts {
         AutoContextOpts {
+            cost_model: None,
             tokens,
             focus: None,
             include_tests: false,
             include_blast_radius: false,
             mode: "full".to_string(),
         }
+    }
+
+    #[test]
+    fn opts_default_has_no_cost_model() {
+        // Default opts must not request a cost estimate (cost is strictly opt-in).
+        let opts = default_opts(10_000);
+        assert!(opts.cost_model.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -458,6 +468,7 @@ mod tests {
             ("src/db/query.rs", "pub fn run_query() {}"),
         ]);
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: Some("src/api/".to_string()),
             include_tests: false,
@@ -568,6 +579,7 @@ mod tests {
             "pub fn authenticate(user: &str) -> bool { true }",
         )]);
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: false,
@@ -617,6 +629,7 @@ mod tests {
             ),
         ]);
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: false,
@@ -693,6 +706,7 @@ mod tests {
         );
 
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: true,
@@ -751,6 +765,7 @@ mod tests {
         );
 
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: true,
@@ -800,6 +815,7 @@ mod tests {
             ("src/session.rs", "pub fn make_session() {}"),
         ]);
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: false,
