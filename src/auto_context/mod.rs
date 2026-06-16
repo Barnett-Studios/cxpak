@@ -34,6 +34,8 @@ pub struct AutoContextResult {
     pub budget: crate::auto_context::briefing::BudgetSummary,
     pub sections: crate::auto_context::briefing::PackedSections,
     pub filtered_out: Vec<FilteredFile>,
+    // v2.3.0 efficiency / cost reporting (ADR-0168)
+    pub efficiency: crate::auto_context::efficiency::EfficiencyReport,
     // v1.2.0 compound intelligence
     pub health: HealthScore,
     pub risks: Vec<RiskEntry>,
@@ -278,12 +280,56 @@ pub fn auto_context(
         }
     };
 
+    // Efficiency report (ADR-0168) — computed from data in scope, before `packed`
+    // and `filtered` are moved into the result. `kept` is the relevant set.
+    let selected_tokens = packed.sections.target_files.tokens
+        + packed.sections.test_files.tokens
+        + packed.sections.schema_context.tokens;
+    let filtered_tokens: usize = filtered.filtered_out.iter().map(|f| f.tokens).sum();
+    let included: std::collections::HashSet<&str> = packed
+        .sections
+        .target_files
+        .files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    let relevant_total = kept.len();
+    let relevant_covered = kept
+        .iter()
+        .filter(|e| included.contains(e.path.as_str()))
+        .count();
+    let marginal_included_score = kept
+        .iter()
+        .filter(|e| included.contains(e.path.as_str()))
+        .map(|e| e.score)
+        .fold(None, |acc: Option<f64>, s| Some(acc.map_or(s, |a| a.min(s))));
+    let marginal_excluded_score = kept
+        .iter()
+        .filter(|e| !included.contains(e.path.as_str()))
+        .map(|e| e.score)
+        .fold(None, |acc: Option<f64>, s| Some(acc.map_or(s, |a| a.max(s))));
+    let efficiency = crate::auto_context::efficiency::compute_efficiency(
+        crate::auto_context::efficiency::EfficiencyInputs {
+            repo_tokens: index.total_tokens,
+            selected_tokens,
+            budget_total: packed.budget.total,
+            budget_used: packed.budget.used,
+            filtered_tokens,
+            relevant_total,
+            relevant_covered,
+            marginal_included_score,
+            marginal_excluded_score,
+            cost_model: opts.cost_model.clone(),
+        },
+    );
+
     AutoContextResult {
         task: task.to_string(),
         dna: effective_dna,
         budget: packed.budget,
         sections: packed.sections,
         filtered_out: filtered.filtered_out,
+        efficiency,
         health,
         risks,
         architecture,
@@ -346,6 +392,33 @@ mod tests {
         // Default opts must not request a cost estimate (cost is strictly opt-in).
         let opts = default_opts(10_000);
         assert!(opts.cost_model.is_none());
+    }
+
+    #[test]
+    fn auto_context_result_has_efficiency_block() {
+        let (index, _dir) = make_index(&[
+            ("src/a.rs", "pub fn a() {}"),
+            ("src/b.rs", "pub fn b() {}"),
+        ]);
+        let opts = default_opts(10_000);
+        let result = auto_context("explain a", &index, &opts);
+
+        assert_eq!(result.efficiency.repo_tokens, index.total_tokens);
+        assert!(result.efficiency.selected_tokens <= result.efficiency.repo_tokens);
+        assert!(
+            result.efficiency.relevant_coverage >= 0.0
+                && result.efficiency.relevant_coverage <= 1.0
+        );
+        assert!(result.efficiency.relevant_covered <= result.efficiency.relevant_total);
+        assert!(
+            result.efficiency.absolute_coverage >= 0.0
+                && result.efficiency.absolute_coverage <= 1.0
+        );
+        // marginal_included is Some when at least one relevant file was packed
+        if result.efficiency.relevant_covered > 0 {
+            assert!(result.efficiency.marginal_included_score.is_some());
+        }
+        assert!(result.efficiency.cost_estimate.is_none()); // default opts
     }
 
     // -----------------------------------------------------------------------
