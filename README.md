@@ -45,8 +45,11 @@ cxpak indexes your codebase using tree-sitter across 43 languages, builds a type
 
 ```bash
 brew tap Barnett-Studios/tap && brew install cxpak   # macOS/Linux
-cargo install cxpak                                   # or via cargo
+cargo install cxpak                                   # any platform, incl. Windows
 ```
+
+On Windows, `cargo install cxpak` works, or download the prebuilt
+`cxpak-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/Barnett-Studios/cxpak/releases/latest).
 
 ## Quick start
 
@@ -215,6 +218,10 @@ Parse results cached in `.cxpak/cache/` keyed on file mtime and size. Cache inva
 ## Stable API
 
 v2.0.0 establishes semver for the MCP API. Tool names, parameters, and response structures are stable across 2.x.
+
+## Architecture decisions
+
+Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution, reconstructed across v0.1.0 -> v2.2.1. Start with [the index](docs/adrs/INDEX.md).
 
 ## License
 

@@ -27,7 +27,7 @@ tree-sitter-go = { version = "0.23", optional = true }
 tree-sitter-c = { version = "0.24", optional = true }
 tree-sitter-cpp = { version = "0.23", optional = true }
 tiktoken-rs = "0.6"
-git2 = { version = "0.19", features = ["vendored-openssl"] }
+git2 = { version = "0.19", default-features = false }
 ignore = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -77,7 +77,7 @@ candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
-reqwest = { version = "0.12", features = ["json", "blocking"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"], optional = true }
 bincode = { version = "1", optional = true }
 tower-lsp = { version = "0.20", optional = true }
 fs2 = "0.4"

@@ -4,6 +4,9 @@ coverage/
 references/
 tarpaulin-report.*
 
+# git worktrees (scriptorium-style isolation: root stays on main)
+.worktrees/
+
 # LLM-collaboration artifacts kept locally only
 .claude/
 docs/plans/
