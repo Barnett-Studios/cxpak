@@ -207,6 +207,8 @@ pub struct ScoredFileEntry {
 pub struct FilteredFile {
     pub path: String,
     pub reason: String,
+    /// Token cost of the file that was filtered out — summed for "tokens saved by filtering".
+    pub tokens: usize,
 }
 
 /// The result of running `filter_noise()`.
@@ -260,6 +262,7 @@ pub fn filter_noise(
                 "blocklist: unknown".to_string()
             };
             filtered_out.push(FilteredFile {
+                tokens: entry.token_count,
                 path: entry.path,
                 reason,
             });
@@ -270,6 +273,7 @@ pub fn filter_noise(
         if let Some(file) = index.files.iter().find(|f| f.relative_path == entry.path) {
             if has_generated_marker(&file.content) {
                 filtered_out.push(FilteredFile {
+                    tokens: entry.token_count,
                     path: entry.path,
                     reason: "generated_file".to_string(),
                 });
@@ -296,11 +300,20 @@ pub fn filter_noise(
         })
         .collect();
 
+    // Token cost per path, captured before `after_blocklist` is consumed by dedup —
+    // the dedup result yields only (filtered_path, kept_path), no token count.
+    let token_by_path: HashMap<String, usize> = after_blocklist
+        .iter()
+        .map(|e| (e.path.clone(), e.token_count))
+        .collect();
+
     let (after_dedup, dedup_reasons) =
         dedup_similar_files(after_blocklist, &symbols_by_path, pagerank);
 
     for (filtered_path, kept_path) in dedup_reasons {
+        let tokens = token_by_path.get(&filtered_path).copied().unwrap_or(0);
         filtered_out.push(FilteredFile {
+            tokens,
             path: filtered_path,
             reason: format!("similar_to: {kept_path}"),
         });
@@ -310,6 +323,7 @@ pub fn filter_noise(
     for entry in after_dedup {
         if entry.score < DEFAULT_RELEVANCE_FLOOR {
             filtered_out.push(FilteredFile {
+                tokens: entry.token_count,
                 path: entry.path,
                 reason: format!("below_relevance_floor: {:.4}", entry.score),
             });
@@ -331,6 +345,16 @@ mod tests {
     use crate::budget::counter::TokenCounter;
     use crate::scanner::ScannedFile;
     use std::collections::HashMap;
+
+    #[test]
+    fn filtered_file_carries_token_count() {
+        let f = FilteredFile {
+            path: "src/x.rs".to_string(),
+            reason: "blocklist: generated".to_string(),
+            tokens: 1234,
+        };
+        assert_eq!(f.tokens, 1234);
+    }
 
     // -----------------------------------------------------------------------
     // Task 2 tests
