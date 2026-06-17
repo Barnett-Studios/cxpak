@@ -27,8 +27,14 @@ pub struct AutoContextOpts {
     pub cost_model: Option<String>,
 }
 
+/// Version of the `auto_context` output contract (ADR-0169). Bump on a breaking
+/// change to the serialized shape; additive fields do not require a bump.
+pub const FORMAT_VERSION: &str = "2.3";
+
 #[derive(Debug, Serialize)]
 pub struct AutoContextResult {
+    /// Version of this output contract (see [`FORMAT_VERSION`]).
+    pub format_version: &'static str,
     pub task: String,
     pub dna: String,
     pub budget: crate::auto_context::briefing::BudgetSummary,
@@ -324,6 +330,7 @@ pub fn auto_context(
     );
 
     AutoContextResult {
+        format_version: FORMAT_VERSION,
         task: task.to_string(),
         dna: effective_dna,
         budget: packed.budget,
@@ -419,6 +426,14 @@ mod tests {
             assert!(result.efficiency.marginal_included_score.is_some());
         }
         assert!(result.efficiency.cost_estimate.is_none()); // default opts
+    }
+
+    #[test]
+    fn result_advertises_format_version() {
+        let (index, _dir) = make_index(&[("src/a.rs", "pub fn a() {}")]);
+        let result = auto_context("a", &index, &default_opts(10_000));
+        assert_eq!(result.format_version, FORMAT_VERSION);
+        assert_eq!(FORMAT_VERSION, "2.3");
     }
 
     // -----------------------------------------------------------------------

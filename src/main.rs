@@ -9,6 +9,7 @@ fn main() {
 
     let result = match &cli.command {
         Commands::Clean { path } => commands::clean::run(path),
+        Commands::Schema => commands::schema::run(),
         #[cfg(feature = "daemon")]
         Commands::Serve {
             port,
