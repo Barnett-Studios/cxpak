@@ -193,7 +193,6 @@ pub fn run(
     timing: bool,
     review: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = review; // inert until the review bundle lands (W3 Task 2)
     let total_start = std::time::Instant::now();
 
     // 1. Extract git changes
@@ -353,7 +352,21 @@ pub fn run(
         git_context: String::new(),
     };
 
-    let rendered = output::render(&sections, format);
+    let mut rendered = output::render(&sections, format);
+
+    // --review: append a risk-ordered change-impact section. It is a markdown
+    // block, so it is only appended for markdown output (appending to JSON/XML
+    // would corrupt the document). `git_ref` is threaded straight through so the
+    // review observes the same revision as the diff above.
+    if review && matches!(format, OutputFormat::Markdown) {
+        match build_review_bundle(&index, path, git_ref) {
+            Ok(bundle) => rendered.push_str(&render_review(&bundle)),
+            Err(e) => {
+                eprintln!("cxpak: review bundle skipped: {e}");
+            }
+        }
+    }
+
     if timing {
         eprintln!("cxpak [timing]: render     {:.1?}", render_start.elapsed());
         eprintln!("cxpak [timing]: total      {:.1?}", total_start.elapsed());
@@ -414,6 +427,359 @@ fn render_context_signatures(
     budgeted
 }
 
+// ---------------------------------------------------------------------------
+// Review: expected-but-absent changes (the headline `--review` signal)
+// ---------------------------------------------------------------------------
+
+/// Why a file is flagged as expected-but-absent from the current change set.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) enum OmissionKind {
+    /// `expected_file` historically changed together with a changed file
+    /// (`with`) `count` times in the mined co-change window.
+    CoChange { with: String, count: u32 },
+    /// `expected_file` is a high-confidence test of a changed source file.
+    MissingTest { for_source: String },
+}
+
+/// A file cxpak expected to be in the diff (based on history / test mapping)
+/// but which was not changed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct Omission {
+    pub expected_file: String,
+    pub kind: OmissionKind,
+    /// Ranking key: co-change strength (count × recency_weight), or +inf for a
+    /// missing high-confidence test so those sort to the top.
+    pub weight: f64,
+}
+
+/// Minimum co-change strength (`count × recency_weight`) to surface, to avoid
+/// noise from incidental one-off pairings. Conservative; covered by tests.
+const OMISSION_MIN_WEIGHT: f64 = 1.0;
+
+/// Detect expected-but-absent changes. Pure: depends only on its arguments, so
+/// it is fully unit-testable with synthetic inputs (no git fixture required).
+///
+/// Two signals:
+/// 1. **Co-change** — a mined pair where exactly one side is in the diff and the
+///    other (above [`OMISSION_MIN_WEIGHT`]) is absent.
+/// 2. **Missing test** — a changed source file whose high-confidence test
+///    (NameMatch / Both) is not itself in the diff.
+///
+/// De-duped by `expected_file` (a file flagged by both signals appears once),
+/// then sorted strongest-first by `weight`.
+pub(crate) fn detect_omissions(
+    changed: &[String],
+    co_changes: &[crate::intelligence::co_change::CoChangeEdge],
+    test_map: &std::collections::HashMap<String, Vec<crate::intelligence::test_map::TestFileRef>>,
+) -> Vec<Omission> {
+    use std::collections::HashSet;
+    let changed_set: HashSet<&str> = changed.iter().map(|s| s.as_str()).collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<Omission> = Vec::new();
+
+    // 1. Co-change omissions: exactly ONE side changed, the other is absent.
+    for e in co_changes {
+        let a_in = changed_set.contains(e.file_a.as_str());
+        let b_in = changed_set.contains(e.file_b.as_str());
+        if a_in == b_in {
+            continue; // both changed, or neither — not an omission for this diff
+        }
+        let (present, absent) = if a_in {
+            (&e.file_a, &e.file_b)
+        } else {
+            (&e.file_b, &e.file_a)
+        };
+        let weight = e.count as f64 * e.recency_weight;
+        if weight < OMISSION_MIN_WEIGHT || changed_set.contains(absent.as_str()) {
+            continue;
+        }
+        if seen.insert(absent.clone()) {
+            out.push(Omission {
+                expected_file: absent.clone(),
+                kind: OmissionKind::CoChange {
+                    with: present.clone(),
+                    count: e.count,
+                },
+                weight,
+            });
+        }
+    }
+
+    // 2. Missing-test omissions: a changed source whose high-confidence test is absent.
+    for src in changed {
+        if let Some(tests) = test_map.get(src) {
+            for t in tests {
+                let strong = matches!(
+                    t.confidence,
+                    crate::intelligence::test_map::TestConfidence::Both
+                        | crate::intelligence::test_map::TestConfidence::NameMatch
+                );
+                if strong && !changed_set.contains(t.path.as_str()) && seen.insert(t.path.clone()) {
+                    out.push(Omission {
+                        expected_file: t.path.clone(),
+                        kind: OmissionKind::MissingTest {
+                            for_source: src.clone(),
+                        },
+                        weight: f64::INFINITY, // tests-not-updated ranks at the top
+                    });
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Review bundle: change-impact context composed from existing intelligence
+// ---------------------------------------------------------------------------
+
+/// Change-impact context for `cxpak diff --review`. Composes already-tested
+/// intelligence functions over exactly the changed surface — no new analysis.
+pub(crate) struct ReviewBundle {
+    pub changed_paths: Vec<String>,
+    pub blast: crate::intelligence::blast_radius::BlastRadiusResult,
+    pub predicted_tests: Vec<crate::intelligence::predict::TestPrediction>,
+    pub violations: Vec<crate::conventions::verify::Violation>,
+    pub security: crate::intelligence::security::SecuritySurface,
+    /// Expected-but-absent changes (the headline `--review` signal).
+    pub omissions: Vec<Omission>,
+}
+
+/// Build the review bundle for the changed surface implied by `git_ref`
+/// (or the uncommitted working tree when `git_ref` is `None`).
+///
+/// `diff::run` builds its index via `CodebaseIndex::build_with_content`, which
+/// populates `graph`/`co_changes` but leaves `pagerank` and `test_map` EMPTY.
+/// Reading those empty fields would collapse blast-radius risk to ~0 and yield
+/// zero impacted tests, so this fn computes pagerank + test_map locally — making
+/// the bundle correct and self-contained regardless of how the index was built.
+pub(crate) fn build_review_bundle(
+    index: &crate::index::CodebaseIndex,
+    repo_path: &std::path::Path,
+    git_ref: Option<&str>,
+) -> Result<ReviewBundle, String> {
+    let changed = crate::conventions::verify::get_changed_lines(repo_path, git_ref, None)?;
+    let changed_paths: Vec<String> = changed.iter().map(|c| c.path.clone()).collect();
+    let refs: Vec<&str> = changed_paths.iter().map(|s| s.as_str()).collect();
+
+    // Locally derived (the diff-path index leaves these empty — see doc comment).
+    let pagerank = crate::intelligence::pagerank::compute_pagerank(&index.graph, 0.85, 100);
+    let all_paths: std::collections::HashSet<String> = index
+        .files
+        .iter()
+        .map(|f| f.relative_path.clone())
+        .collect();
+    let test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
+
+    let blast = crate::intelligence::blast_radius::compute_blast_radius(
+        &refs,
+        &index.graph,
+        &pagerank,
+        &test_map,
+        2,
+        None,
+    );
+    let prediction = crate::intelligence::predict::predict(
+        &refs,
+        &index.graph,
+        &pagerank,
+        &index.co_changes,
+        &test_map,
+        2,
+    );
+    let verify = crate::conventions::verify::verify_changes(&changed, index, repo_path);
+    // Same default auth-pattern slice the serve `cxpak_security_surface` handler passes.
+    let security = crate::intelligence::security::build_security_surface(
+        index,
+        crate::intelligence::security::DEFAULT_AUTH_PATTERNS,
+        None,
+    );
+
+    // Headline feature: what SHOULD have changed but didn't. Reuses the test_map
+    // built above and the index's mined co-change edges (live on the run path).
+    let omissions = detect_omissions(&changed_paths, &index.co_changes, &test_map);
+
+    Ok(ReviewBundle {
+        changed_paths,
+        blast,
+        predicted_tests: prediction.test_impact,
+        violations: verify.violations,
+        security,
+        omissions,
+    })
+}
+
+/// Render the review bundle as a risk-ordered markdown section. Leads with the
+/// headline "Possibly missing" omissions (omitted entirely when empty — no
+/// nagging), then blast radius, impacted tests, convention violations, and
+/// security findings scoped to the changed files.
+pub(crate) fn render_review(bundle: &ReviewBundle) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    s.push_str("\n## Review\n\n");
+
+    // Headline: expected-but-absent changes (already weight-sorted).
+    if !bundle.omissions.is_empty() {
+        s.push_str("### ⚠ Possibly missing\n\n");
+        for o in &bundle.omissions {
+            match &o.kind {
+                OmissionKind::CoChange { with, count } => {
+                    let _ = writeln!(
+                        s,
+                        "- `{}` usually changes with `{}` (co-changed {}×) but isn't in this diff",
+                        o.expected_file, with, count
+                    );
+                }
+                OmissionKind::MissingTest { for_source } => {
+                    let _ = writeln!(
+                        s,
+                        "- `{}` changed but its test `{}` did not",
+                        for_source, o.expected_file
+                    );
+                }
+            }
+        }
+        s.push('\n');
+    }
+
+    // Blast radius: direct then transitive, each sorted by risk descending.
+    s.push_str("### Blast radius\n\n");
+    let mut affected: Vec<(&str, &crate::intelligence::blast_radius::AffectedFile)> = bundle
+        .blast
+        .categories
+        .direct_dependents
+        .iter()
+        .map(|f| ("direct", f))
+        .chain(
+            bundle
+                .blast
+                .categories
+                .transitive_dependents
+                .iter()
+                .map(|f| ("transitive", f)),
+        )
+        .collect();
+    affected.sort_by(|a, b| {
+        b.1.risk
+            .partial_cmp(&a.1.risk)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if affected.is_empty() {
+        s.push_str("_No dependents affected._\n\n");
+    } else {
+        for (kind, f) in affected {
+            let _ = writeln!(
+                s,
+                "- `{}` ({}, {} hop(s), risk {:.2})",
+                f.path, kind, f.hops, f.risk
+            );
+        }
+        s.push('\n');
+    }
+
+    // Impacted tests, by confidence descending.
+    if !bundle.predicted_tests.is_empty() {
+        let mut tests: Vec<&crate::intelligence::predict::TestPrediction> =
+            bundle.predicted_tests.iter().collect();
+        tests.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        s.push_str("### Impacted tests\n\n");
+        for t in tests {
+            let _ = writeln!(s, "- `{}` (confidence {:.2})", t.test_file, t.confidence);
+        }
+        s.push('\n');
+    }
+
+    // Convention violations, grouped by the changed file (path prefix of location).
+    if !bundle.violations.is_empty() {
+        s.push_str("### Convention violations\n\n");
+        for p in &bundle.changed_paths {
+            let mut group: Vec<&crate::conventions::verify::Violation> = bundle
+                .violations
+                .iter()
+                .filter(|v| v.location.starts_with(p.as_str()))
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            group.sort_by(|a, b| a.location.cmp(&b.location));
+            let _ = writeln!(s, "**`{p}`**");
+            for v in group {
+                let _ = writeln!(s, "- [{}] {} — {}", v.severity, v.location, v.message);
+            }
+            s.push('\n');
+        }
+    }
+
+    // Security findings, scoped to changed files only.
+    let in_changed = |p: &str| bundle.changed_paths.iter().any(|c| c == p);
+    let mut sec = String::new();
+    for e in bundle
+        .security
+        .unprotected_endpoints
+        .iter()
+        .filter(|e| in_changed(&e.file))
+    {
+        let _ = writeln!(
+            sec,
+            "- Unprotected endpoint `{} {}` in `{}` (handler `{}`)",
+            e.method, e.path, e.file, e.handler
+        );
+    }
+    for e in bundle
+        .security
+        .secret_patterns
+        .iter()
+        .filter(|e| in_changed(&e.file))
+    {
+        let _ = writeln!(
+            sec,
+            "- Secret pattern `{}` in `{}:{}`",
+            e.pattern_name, e.file, e.line
+        );
+    }
+    for e in bundle
+        .security
+        .sql_injection_surface
+        .iter()
+        .filter(|e| in_changed(&e.file))
+    {
+        let _ = writeln!(
+            sec,
+            "- SQL injection risk in `{}:{}` ({})",
+            e.file, e.line, e.interpolation_type
+        );
+    }
+    for e in bundle
+        .security
+        .input_validation_gaps
+        .iter()
+        .filter(|e| in_changed(&e.file))
+    {
+        let _ = writeln!(
+            sec,
+            "- Validation gap on `{}` param `{}` in `{}:{}`",
+            e.function_name, e.parameter, e.file, e.line
+        );
+    }
+    if !sec.is_empty() {
+        s.push_str("### Security\n\n");
+        s.push_str(&sec);
+        s.push('\n');
+    }
+
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +803,290 @@ mod tests {
             .unwrap();
 
         dir
+    }
+
+    /// Build a temp repo where `src/main.rs` depends on `src/helper.rs`
+    /// (`use crate::helper::work;`), commits both, then edits `helper.rs` on
+    /// disk and leaves the edit UNCOMMITTED. `get_changed_lines(repo, None)`
+    /// diffs the working tree vs HEAD, so the uncommitted edit is the change
+    /// set; changing `helper.rs` gives `main.rs` as a direct dependent.
+    /// Returns the index built the same way `run` does (`build_with_content`).
+    fn review_test_repo() -> (tempfile::TempDir, CodebaseIndex) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/helper.rs"),
+            "pub fn work() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "use crate::helper::work;\nfn main() {\n    let _ = work();\n}\n",
+        )
+        .unwrap();
+
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+
+        // Modify the depended-upon file, leaving it UNCOMMITTED (working tree).
+        std::fs::write(
+            dir.path().join("src/helper.rs"),
+            "pub fn work() -> i32 {\n    2\n}\n",
+        )
+        .unwrap();
+
+        // Build the index exactly as `run` does.
+        let scanner = Scanner::new(dir.path()).unwrap();
+        let files = scanner.scan().unwrap();
+        let counter = TokenCounter::new();
+        let (parse_results, content_map) =
+            crate::cache::parse::parse_with_cache(&files, dir.path(), &counter, false);
+        let mut index =
+            CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        index.conventions = crate::conventions::build_convention_profile(&index, dir.path());
+        index.co_changes = index.conventions.git_health.co_changes.clone();
+
+        (dir, index)
+    }
+
+    #[test]
+    fn review_bundle_covers_changed_surface() {
+        let (repo, index) = review_test_repo();
+        let bundle = build_review_bundle(&index, repo.path(), None).unwrap();
+
+        // helper.rs is the changed file; main.rs imports it → dependent expected.
+        assert!(
+            bundle.changed_paths.iter().any(|p| p == "src/helper.rs"),
+            "changed surface should include the uncommitted edit"
+        );
+        assert!(
+            !bundle.blast.categories.direct_dependents.is_empty()
+                || !bundle.blast.categories.transitive_dependents.is_empty(),
+            "a changed file with a dependent must show blast-radius entries"
+        );
+        // impacted tests come from predict.test_impact; confidences are valid probabilities
+        assert!(bundle
+            .predicted_tests
+            .iter()
+            .all(|t| t.confidence >= 0.0 && t.confidence <= 1.0));
+        // convention violations are limited to changed files — Violation has no
+        // `file`, so match the path prefix of `location` ("{path}:{line}" or "{path}")
+        assert!(bundle.violations.iter().all(|v| bundle
+            .changed_paths
+            .iter()
+            .any(|p| v.location.starts_with(p.as_str()))));
+    }
+
+    #[test]
+    fn render_review_orders_by_risk_and_filters_security() {
+        let (repo, index) = review_test_repo();
+        let bundle = build_review_bundle(&index, repo.path(), None).unwrap();
+        let md = render_review(&bundle);
+        assert!(md.contains("## Review"));
+        assert!(md.contains("Blast radius"));
+        // security entries are rendered only for changed files. SecuritySurface
+        // has no `findings`; filter each typed vec by its file/path field.
+        let in_changed = |p: &str| bundle.changed_paths.iter().any(|c| c == p);
+        assert!(
+            bundle
+                .security
+                .unprotected_endpoints
+                .iter()
+                .all(|e| in_changed(&e.file))
+                || !md.contains("Unprotected endpoint")
+        );
+        assert!(
+            bundle
+                .security
+                .secret_patterns
+                .iter()
+                .all(|e| in_changed(&e.file))
+                || !md.contains("Secret pattern")
+        );
+    }
+
+    #[test]
+    fn render_review_surfaces_missing_test_omission() {
+        // Synthetic bundle: a changed source with an absent high-confidence test
+        // must render under the "Possibly missing" subsection.
+        use crate::intelligence::blast_radius::{
+            BlastRadiusCategories, BlastRadiusResult, RiskSummary,
+        };
+        use crate::intelligence::security::SecuritySurface;
+
+        let bundle = ReviewBundle {
+            changed_paths: vec!["src/svc.rs".to_string()],
+            blast: BlastRadiusResult {
+                changed_files: vec!["src/svc.rs".to_string()],
+                total_affected: 0,
+                categories: BlastRadiusCategories {
+                    direct_dependents: vec![],
+                    transitive_dependents: vec![],
+                    test_files: vec![],
+                    schema_dependents: vec![],
+                },
+                risk_summary: RiskSummary {
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                },
+            },
+            predicted_tests: vec![],
+            violations: vec![],
+            security: SecuritySurface {
+                unprotected_endpoints: vec![],
+                input_validation_gaps: vec![],
+                secret_patterns: vec![],
+                sql_injection_surface: vec![],
+                exposure_scores: vec![],
+            },
+            omissions: vec![Omission {
+                expected_file: "tests/svc_test.rs".to_string(),
+                kind: OmissionKind::MissingTest {
+                    for_source: "src/svc.rs".to_string(),
+                },
+                weight: f64::INFINITY,
+            }],
+        };
+        let md = render_review(&bundle);
+        assert!(md.contains("Possibly missing"));
+        assert!(md.contains("tests/svc_test.rs"));
+        assert!(md.contains("src/svc.rs"));
+    }
+
+    #[test]
+    fn render_review_omits_missing_subsection_when_no_omissions() {
+        let (repo, index) = review_test_repo();
+        let mut bundle = build_review_bundle(&index, repo.path(), None).unwrap();
+        bundle.omissions.clear();
+        let md = render_review(&bundle);
+        assert!(!md.contains("Possibly missing")); // no nagging when nothing is absent
+    }
+
+    #[test]
+    fn detects_cochange_and_missing_test_omissions() {
+        use crate::intelligence::co_change::CoChangeEdge;
+        use crate::intelligence::test_map::{TestConfidence, TestFileRef};
+        use std::collections::HashMap;
+
+        let changed = vec!["src/handler.rs".to_string()];
+        let co = vec![
+            // handler.rs co-changed with its test 14x recently, but the test isn't in the diff
+            CoChangeEdge {
+                file_a: "src/handler.rs".into(),
+                file_b: "src/handler_test.rs".into(),
+                count: 14,
+                recency_weight: 0.9,
+            },
+            // a weak, stale pairing below threshold — must NOT be reported
+            CoChangeEdge {
+                file_a: "src/handler.rs".into(),
+                file_b: "README.md".into(),
+                count: 1,
+                recency_weight: 0.05,
+            },
+            // a pairing where BOTH sides are the changed file — not an omission
+            CoChangeEdge {
+                file_a: "src/handler.rs".into(),
+                file_b: "src/handler.rs".into(),
+                count: 9,
+                recency_weight: 0.9,
+            },
+        ];
+        let mut test_map: HashMap<String, Vec<TestFileRef>> = HashMap::new();
+        test_map.insert(
+            "src/handler.rs".into(),
+            vec![TestFileRef {
+                path: "src/handler_test.rs".into(),
+                confidence: TestConfidence::Both,
+            }],
+        );
+
+        let oms = detect_omissions(&changed, &co, &test_map);
+
+        // the strong co-change to the absent test is reported (de-duped: the
+        // missing-test pass sees it already in `seen`, so it appears exactly once)
+        assert!(oms.iter().any(|o| o.expected_file == "src/handler_test.rs"));
+        assert_eq!(
+            oms.iter()
+                .filter(|o| o.expected_file == "src/handler_test.rs")
+                .count(),
+            1,
+            "expected_file must be de-duped across both signals"
+        );
+        // the co-change signal won (registered first) with the verified count
+        assert!(oms.iter().any(|o| o.expected_file == "src/handler_test.rs"
+            && matches!(o.kind, OmissionKind::CoChange { count: 14, .. })));
+        // the weak/stale pairing is filtered out by OMISSION_MIN_WEIGHT
+        assert!(!oms.iter().any(|o| o.expected_file == "README.md"));
+        // results are ranked strongest-first (weight desc)
+        assert!(oms.windows(2).all(|w| w[0].weight >= w[1].weight));
+    }
+
+    #[test]
+    fn detects_missing_test_when_no_cochange_history() {
+        use crate::intelligence::test_map::{TestConfidence, TestFileRef};
+        use std::collections::HashMap;
+
+        // No co-change edges at all — the missing-test signal must still fire.
+        let changed = vec!["src/svc.rs".to_string()];
+        let mut test_map: HashMap<String, Vec<TestFileRef>> = HashMap::new();
+        test_map.insert(
+            "src/svc.rs".into(),
+            vec![TestFileRef {
+                path: "tests/svc_test.rs".into(),
+                confidence: TestConfidence::NameMatch,
+            }],
+        );
+
+        let oms = detect_omissions(&changed, &[], &test_map);
+        assert_eq!(oms.len(), 1);
+        assert_eq!(oms[0].expected_file, "tests/svc_test.rs");
+        assert!(matches!(oms[0].kind, OmissionKind::MissingTest { .. }));
+        assert!(oms[0].weight.is_infinite());
+    }
+
+    #[test]
+    fn missing_test_ignores_weak_import_only_confidence() {
+        use crate::intelligence::test_map::{TestConfidence, TestFileRef};
+        use std::collections::HashMap;
+
+        // ImportMatch alone is not strong enough to nag about.
+        let changed = vec!["src/svc.rs".to_string()];
+        let mut test_map: HashMap<String, Vec<TestFileRef>> = HashMap::new();
+        test_map.insert(
+            "src/svc.rs".into(),
+            vec![TestFileRef {
+                path: "tests/svc_test.rs".into(),
+                confidence: TestConfidence::ImportMatch,
+            }],
+        );
+
+        let oms = detect_omissions(&changed, &[], &test_map);
+        assert!(oms.is_empty());
+    }
+
+    #[test]
+    fn no_omissions_when_everything_changed_together() {
+        use crate::intelligence::co_change::CoChangeEdge;
+        let changed = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let co = vec![CoChangeEdge {
+            file_a: "a.rs".into(),
+            file_b: "b.rs".into(),
+            count: 20,
+            recency_weight: 1.0,
+        }];
+        let oms = detect_omissions(&changed, &co, &std::collections::HashMap::new());
+        assert!(oms.is_empty()); // both sides present → nothing absent
     }
 
     #[test]
