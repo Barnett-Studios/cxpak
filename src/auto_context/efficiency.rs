@@ -75,8 +75,12 @@ pub fn compute_efficiency(i: EfficiencyInputs) -> EfficiencyReport {
             .iter()
             .find(|(name, _)| *name == m)
             .map(|(name, rate)| CostEstimate {
+                // Base the estimate on the authoritative packed-token total
+                // (budget.used), which counts ALL packed sections — DNA, API
+                // surface, blast radius, cross-language — not just the file
+                // sections in `selected_tokens`, which would under-report.
                 model: (*name).to_string(),
-                input_usd: i.selected_tokens as f64 / 1_000_000.0 * rate,
+                input_usd: i.budget_used as f64 / 1_000_000.0 * rate,
                 rates_dated: RATES_DATED,
             })
     });
