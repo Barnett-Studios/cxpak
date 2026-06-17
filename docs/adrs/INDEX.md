@@ -167,3 +167,5 @@
 | [0161](0161-theme-attribute-not-light-dark.md) | Attribute-based theming (data-theme on <html>) instead of CSS light-dark() | ACCEPTED | 2026-04-17 |
 | [0162](0162-v1-api-param-normalization-two-normalizers.md) | v1 API parameter validation: two normalizers (path vs symbol), JSON error envelope, and caps | ACCEPTED | 2026-04-17 |
 | [0163](0163-windows-build-git2-no-default-features.md) | Enable Windows builds by dropping git2 default features (cxpak does only local git) | ACCEPTED | 2026-06-14 |
+| [0168](0168-efficiency-report-and-filtered-tokens.md) | Efficiency report as decision-support (relevant-set coverage + budget-margin), aggregated from existing data; cost estimate opt-in | ACCEPTED | 2026-06-16 |
+| [0169](0169-versioned-context-format-schema.md) | Publish a versioned context-format schema over the existing JSON output, not a new format | ACCEPTED | 2026-06-14 |

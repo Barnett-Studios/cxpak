@@ -7,6 +7,7 @@ pub mod onboard;
 pub mod overview;
 #[cfg(feature = "plugins")]
 pub mod plugin;
+pub mod schema;
 #[cfg(feature = "daemon")]
 pub mod serve;
 pub mod trace;
