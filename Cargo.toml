@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "development-tools"]
 # (see doc.rust-lang.org/cargo/commands/cargo-install.html "Configuration
 # Discovery"), but stripping the dir from the tarball keeps source-browsers
 # from being misled.
-exclude = [".cargo"]
+exclude = [".cargo", "vendor"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -206,3 +206,18 @@ debug = false
 # fixtures) attach without surprise.
 [profile.test]
 debug = "line-tables-only"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vendored patches for the x86_64-pc-windows-msvc build.  Both crates pass a
+# GCC/Clang-only flag to the compiler via cc's raw `.flag()`, which MSVC's
+# cl.exe rejects — breaking the Windows build.  Each vendored copy is byte-
+# identical except `.flag()` -> `.flag_if_supported()` (kept on GCC/Clang where
+# the flag is valid, probed-and-dropped on MSVC).  Remove once fixed upstream.
+# Excluded from the published crate (see `exclude` above).
+#   - tree-sitter-scss 1.0.0: `-Wno-unused-parameter` (cl error D8021)
+#   - esaxx-rs 0.1.10:        `-std=c++11` (ungated for non-macOS; cl defaults
+#                             to c++14, a superset, so dropping it is safe)
+# ─────────────────────────────────────────────────────────────────────────────
+[patch.crates-io]
+tree-sitter-scss = { path = "vendor/tree-sitter-scss" }
+esaxx-rs = { path = "vendor/esaxx-rs" }

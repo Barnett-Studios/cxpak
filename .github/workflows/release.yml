@@ -15,6 +15,7 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false   # one target failing shouldn't cancel/mask the others
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
