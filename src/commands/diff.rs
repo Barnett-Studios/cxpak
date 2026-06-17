@@ -624,12 +624,24 @@ pub(crate) fn render_review(bundle: &ReviewBundle) -> String {
     let mut s = String::new();
     s.push_str("\n## Review\n\n");
 
-    // Headline: expected-but-absent changes (already weight-sorted).
+    // Headline: expected-but-absent changes (already weight-sorted, strongest
+    // first). Missing high-confidence tests always render (highest signal, few
+    // in number). Co-change candidates are capped to the strongest few so the
+    // genuine catch isn't buried under a long tail of weak pairings; the
+    // remainder is summarized (never silently dropped).
     if !bundle.omissions.is_empty() {
+        const MAX_COCHANGE_SHOWN: usize = 7;
         s.push_str("### ⚠ Possibly missing\n\n");
+        let mut cochange_shown = 0usize;
+        let mut cochange_hidden = 0usize;
         for o in &bundle.omissions {
             match &o.kind {
                 OmissionKind::CoChange { with, count } => {
+                    if cochange_shown >= MAX_COCHANGE_SHOWN {
+                        cochange_hidden += 1;
+                        continue;
+                    }
+                    cochange_shown += 1;
                     let _ = writeln!(
                         s,
                         "- `{}` usually changes with `{}` (co-changed {}×) but isn't in this diff",
@@ -644,6 +656,12 @@ pub(crate) fn render_review(bundle: &ReviewBundle) -> String {
                     );
                 }
             }
+        }
+        if cochange_hidden > 0 {
+            let _ = writeln!(
+                s,
+                "- _…and {cochange_hidden} more lower-confidence co-change candidate(s)_"
+            );
         }
         s.push('\n');
     }
@@ -961,6 +979,79 @@ mod tests {
         assert!(md.contains("Possibly missing"));
         assert!(md.contains("tests/svc_test.rs"));
         assert!(md.contains("src/svc.rs"));
+    }
+
+    #[test]
+    fn render_review_caps_cochange_omissions_and_summarizes_remainder() {
+        use crate::intelligence::blast_radius::{
+            BlastRadiusCategories, BlastRadiusResult, RiskSummary,
+        };
+        use crate::intelligence::security::SecuritySurface;
+
+        // 10 co-change omissions (descending weight) + 1 missing test.
+        let mut omissions: Vec<Omission> = (0..10)
+            .map(|i| Omission {
+                expected_file: format!("src/dep{i}.rs"),
+                kind: OmissionKind::CoChange {
+                    with: "src/svc.rs".to_string(),
+                    count: (20 - i) as u32,
+                },
+                weight: (20 - i) as f64,
+            })
+            .collect();
+        omissions.push(Omission {
+            expected_file: "tests/svc_test.rs".to_string(),
+            kind: OmissionKind::MissingTest {
+                for_source: "src/svc.rs".to_string(),
+            },
+            weight: f64::INFINITY,
+        });
+        // Sort as the detector would (strongest first; +inf at top).
+        omissions.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let bundle = ReviewBundle {
+            changed_paths: vec!["src/svc.rs".to_string()],
+            blast: BlastRadiusResult {
+                changed_files: vec![],
+                total_affected: 0,
+                categories: BlastRadiusCategories {
+                    direct_dependents: vec![],
+                    transitive_dependents: vec![],
+                    test_files: vec![],
+                    schema_dependents: vec![],
+                },
+                risk_summary: RiskSummary {
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                },
+            },
+            predicted_tests: vec![],
+            violations: vec![],
+            security: SecuritySurface {
+                unprotected_endpoints: vec![],
+                input_validation_gaps: vec![],
+                secret_patterns: vec![],
+                sql_injection_surface: vec![],
+                exposure_scores: vec![],
+            },
+            omissions,
+        };
+        let md = render_review(&bundle);
+
+        // At most 7 co-change lines rendered; 3 summarized as "more".
+        let cochange_lines = md.matches("usually changes with").count();
+        assert_eq!(cochange_lines, 7, "co-change list must be capped at 7");
+        assert!(md.contains("and 3 more lower-confidence co-change candidate(s)"));
+        // The missing-test omission is never capped — always rendered.
+        assert!(md.contains("its test `tests/svc_test.rs` did not"));
+        // The strongest candidate (count 20) is kept; the weakest (count 11) dropped.
+        assert!(md.contains("co-changed 20×"));
+        assert!(!md.contains("co-changed 11×"));
     }
 
     #[test]
