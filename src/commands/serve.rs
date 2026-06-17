@@ -2100,7 +2100,8 @@ pub fn mcp_stdio_loop_with_io(
                                         "description": "Token budget",
                                         "default": "50k"
                                     },
-                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
+                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" },
+                                    "review": { "type": "boolean", "description": "Attach a change-impact review bundle: blast radius, impacted tests, convention + security deltas, and expected-but-absent changes (co-change omissions).", "default": false }
                                 }
                             }
                         },
@@ -2637,6 +2638,10 @@ pub fn handle_tool_call(
         "cxpak_diff" => {
             let git_ref = args.get("git_ref").and_then(|r| r.as_str());
             let focus = args.get("focus").and_then(|f| f.as_str());
+            let review = args
+                .get("review")
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false);
             let token_budget = args
                 .get("tokens")
                 .and_then(|t| t.as_str())
@@ -2680,6 +2685,23 @@ pub fn handle_tool_call(
                     });
                     if let Some(f) = focus {
                         result["focus"] = json!(f);
+                    }
+
+                    // --review: attach the structured change-impact bundle
+                    // (blast radius, impacted tests, convention + security
+                    // deltas, and expected-but-absent changes). Self-contained:
+                    // build_review_bundle recomputes pagerank/test_map locally.
+                    if review {
+                        match crate::commands::diff::build_review_bundle(index, repo_path, git_ref)
+                        {
+                            Ok(bundle) => {
+                                result["review"] =
+                                    serde_json::to_value(&bundle).unwrap_or(Value::Null);
+                            }
+                            Err(e) => {
+                                result["review_error"] = json!(e);
+                            }
+                        }
                     }
 
                     mcp_tool_result(
@@ -4197,6 +4219,97 @@ mod tests {
         assert_eq!(parsed["found"], true);
         assert!(parsed["content_matches"].as_u64().unwrap() > 0);
         assert_eq!(parsed["symbol_matches"], 0);
+    }
+
+    /// Build a temp git repo where `src/main.rs` imports `src/helper.rs`,
+    /// commit both, then edit `helper.rs` on disk (uncommitted) so the
+    /// working-tree diff is non-empty with a real dependent edge.
+    fn review_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/helper.rs"),
+            "pub fn work() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "use crate::helper::work;\nfn main() {\n    let _ = work();\n}\n",
+        )
+        .unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+        // Uncommitted edit to the depended-upon file.
+        std::fs::write(
+            dir.path().join("src/helper.rs"),
+            "pub fn work() -> i32 {\n    2\n}\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_handle_tool_call_diff_without_review_has_no_review_field() {
+        let dir = review_git_repo();
+        let index = build_index(dir.path()).unwrap();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(10)),
+            "cxpak_diff",
+            &json!({}),
+            &index,
+            dir.path(),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(parsed["changed_files"].as_u64().unwrap() >= 1);
+        assert!(parsed.get("review").is_none(), "review must be opt-in");
+    }
+
+    #[test]
+    fn test_handle_tool_call_diff_review_attaches_bundle() {
+        let dir = review_git_repo();
+        let index = build_index(dir.path()).unwrap();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(11)),
+            "cxpak_diff",
+            &json!({"review": true}),
+            &index,
+            dir.path(),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let review = parsed
+            .get("review")
+            .expect("review bundle present when review=true");
+        // The structured bundle carries its sub-sections.
+        assert!(review.get("changed_paths").is_some());
+        assert!(review.get("blast").is_some());
+        assert!(review.get("omissions").is_some());
+        // helper.rs is the changed file; main.rs imports it → a dependent.
+        let changed = review["changed_paths"].as_array().unwrap();
+        assert!(changed.iter().any(|p| p == "src/helper.rs"));
+        let direct = review["blast"]["categories"]["direct_dependents"]
+            .as_array()
+            .unwrap();
+        let transitive = review["blast"]["categories"]["transitive_dependents"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !direct.is_empty() || !transitive.is_empty(),
+            "a changed file with a dependent must populate blast radius"
+        );
     }
 
     #[test]

@@ -541,6 +541,7 @@ pub(crate) fn detect_omissions(
 
 /// Change-impact context for `cxpak diff --review`. Composes already-tested
 /// intelligence functions over exactly the changed surface — no new analysis.
+#[derive(serde::Serialize)]
 pub(crate) struct ReviewBundle {
     pub changed_paths: Vec<String>,
     pub blast: crate::intelligence::blast_radius::BlastRadiusResult,
