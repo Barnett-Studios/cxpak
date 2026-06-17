@@ -1868,6 +1868,55 @@ mod tests {
     }
 
     #[test]
+    fn run_one_hop_walks_changed_file_dependencies() {
+        // The CHANGED file has an outgoing dependency (main.rs → helper.rs),
+        // exercising the 1-hop `dependencies(file)` extend branch (the dependents
+        // branch is covered when helper.rs is the change instead).
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/helper.rs"),
+            "pub fn work() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "use crate::helper::work;\nfn main() {\n    let _ = work();\n}\n",
+        )
+        .unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+        // Modify the IMPORTING file (main.rs), leaving it uncommitted.
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "use crate::helper::work;\nfn main() {\n    let _ = work() + 1;\n}\n",
+        )
+        .unwrap();
+
+        let result = run(
+            dir.path(),
+            None,
+            50_000,
+            &OutputFormat::Markdown,
+            None,
+            false,
+            false, // 1-hop
+            None,
+            false,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn run_with_focus_applies_focus_ranking() {
         let (repo, _index) = review_test_repo();
         let result = run(
