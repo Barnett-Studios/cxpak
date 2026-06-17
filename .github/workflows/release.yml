@@ -3,7 +3,8 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'        # release: full pipeline
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'      # prerelease (e.g. -rc.1): build + image only
 
 permissions:
   contents: write
@@ -89,6 +90,7 @@ jobs:
         uses: softprops/action-gh-release@v2.6.1
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: artifacts/*
 
   docker:
@@ -161,6 +163,7 @@ jobs:
 
   publish:
     needs: build
+    if: ${{ !contains(github.ref_name, '-') }}   # skip crates.io on prerelease tags
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
@@ -171,6 +174,7 @@ jobs:
 
   update-homebrew:
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}   # skip Homebrew tap on prerelease tags
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
