@@ -308,12 +308,16 @@ pub fn auto_context(
         .iter()
         .filter(|e| included.contains(e.path.as_str()))
         .map(|e| e.score)
-        .fold(None, |acc: Option<f64>, s| Some(acc.map_or(s, |a| a.min(s))));
+        .fold(None, |acc: Option<f64>, s| {
+            Some(acc.map_or(s, |a| a.min(s)))
+        });
     let marginal_excluded_score = kept
         .iter()
         .filter(|e| !included.contains(e.path.as_str()))
         .map(|e| e.score)
-        .fold(None, |acc: Option<f64>, s| Some(acc.map_or(s, |a| a.max(s))));
+        .fold(None, |acc: Option<f64>, s| {
+            Some(acc.map_or(s, |a| a.max(s)))
+        });
     let efficiency = crate::auto_context::efficiency::compute_efficiency(
         crate::auto_context::efficiency::EfficiencyInputs {
             repo_tokens: index.total_tokens,
@@ -403,10 +407,8 @@ mod tests {
 
     #[test]
     fn auto_context_result_has_efficiency_block() {
-        let (index, _dir) = make_index(&[
-            ("src/a.rs", "pub fn a() {}"),
-            ("src/b.rs", "pub fn b() {}"),
-        ]);
+        let (index, _dir) =
+            make_index(&[("src/a.rs", "pub fn a() {}"), ("src/b.rs", "pub fn b() {}")]);
         let opts = default_opts(10_000);
         let result = auto_context("explain a", &index, &opts);
 
