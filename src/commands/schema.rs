@@ -39,11 +39,31 @@ pub fn auto_context_schema() -> serde_json::Value {
             },
             "sections": {
                 "type": "object",
-                "description": "Packed context sections (target/test/schema files, API surface, blast radius).",
+                "description": "Packed context sections.",
+                "required": [
+                    "target_files", "test_files", "schema_context",
+                    "api_surface", "blast_radius", "cross_language_tokens"
+                ],
                 "properties": {
                     "target_files": { "$ref": "#/$defs/packedFileSection" },
                     "test_files": { "$ref": "#/$defs/packedFileSection" },
-                    "schema_context": { "$ref": "#/$defs/packedFileSection" }
+                    "schema_context": { "$ref": "#/$defs/packedFileSection" },
+                    "api_surface": {
+                        "type": ["object", "array", "null"],
+                        "description": "Public API surface (present-but-null when absent)."
+                    },
+                    "blast_radius": {
+                        "type": ["object", "array", "null"],
+                        "description": "Blast-radius analysis of the top files (present-but-null when absent)."
+                    },
+                    "cross_language_edges": {
+                        "type": ["object", "array", "null"],
+                        "description": "Cross-language boundary edges. OMITTED from the JSON when absent (serde skip_serializing_if), unlike api_surface/blast_radius which serialize as null."
+                    },
+                    "cross_language_tokens": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Token count consumed by the cross-language edges section."
+                    }
                 }
             },
             "filtered_out": {

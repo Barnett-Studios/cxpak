@@ -292,11 +292,16 @@ pub fn auto_context(
         + packed.sections.test_files.tokens
         + packed.sections.schema_context.tokens;
     let filtered_tokens: usize = filtered.filtered_out.iter().map(|f| f.tokens).sum();
+    // A relevant candidate counts as "covered" if it was packed into ANY file
+    // section — target, test, or schema — not just target_files (else a kept file
+    // packed as a test would be miscounted as excluded, skewing coverage + advisory).
     let included: std::collections::HashSet<&str> = packed
         .sections
         .target_files
         .files
         .iter()
+        .chain(packed.sections.test_files.files.iter())
+        .chain(packed.sections.schema_context.files.iter())
         .map(|f| f.path.as_str())
         .collect();
     let relevant_total = kept.len();
@@ -436,6 +441,34 @@ mod tests {
         let result = auto_context("a", &index, &default_opts(10_000));
         assert_eq!(result.format_version, FORMAT_VERSION);
         assert_eq!(FORMAT_VERSION, "2.3");
+    }
+
+    #[test]
+    fn schema_documents_every_serialized_field() {
+        // Drift guard (ADR-0169): a real serialized AutoContextResult must have
+        // every top-level key AND every `sections` key documented in the published
+        // schema. Adding a struct field without updating the schema fails here.
+        let (index, _dir) = make_index(&[("src/a.rs", "pub fn a() {}")]);
+        let result = auto_context("a", &index, &default_opts(10_000));
+        let json = serde_json::to_value(&result).unwrap();
+        let schema = crate::commands::schema::auto_context_schema();
+
+        let props = schema["properties"].as_object().unwrap();
+        for key in json.as_object().unwrap().keys() {
+            assert!(
+                props.contains_key(key),
+                "schema is missing documented top-level field: {key}"
+            );
+        }
+        let sect_props = schema["properties"]["sections"]["properties"]
+            .as_object()
+            .unwrap();
+        for key in json["sections"].as_object().unwrap().keys() {
+            assert!(
+                sect_props.contains_key(key),
+                "schema sections is missing documented field: {key}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
