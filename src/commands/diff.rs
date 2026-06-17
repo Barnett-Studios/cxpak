@@ -1065,6 +1065,212 @@ mod tests {
     }
 
     #[test]
+    fn review_bundle_empty_when_no_changes() {
+        // A clean working tree (committed, nothing modified) → empty change set.
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+
+        let scanner = Scanner::new(dir.path()).unwrap();
+        let files = scanner.scan().unwrap();
+        let counter = TokenCounter::new();
+        let (parse_results, content_map) =
+            crate::cache::parse::parse_with_cache(&files, dir.path(), &counter, false);
+        let mut index =
+            CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        index.conventions = crate::conventions::build_convention_profile(&index, dir.path());
+        index.co_changes = index.conventions.git_health.co_changes.clone();
+
+        let bundle = build_review_bundle(&index, dir.path(), None).unwrap();
+        assert!(bundle.changed_paths.is_empty());
+        assert!(bundle.blast.categories.direct_dependents.is_empty());
+        assert!(bundle.blast.categories.transitive_dependents.is_empty());
+        assert!(bundle.omissions.is_empty());
+        // render of an empty bundle still produces the header, no nagging subsections
+        let md = render_review(&bundle);
+        assert!(md.contains("## Review"));
+        assert!(!md.contains("Possibly missing"));
+        assert!(md.contains("_No dependents affected._"));
+    }
+
+    #[test]
+    fn render_review_includes_all_populated_sections() {
+        use crate::conventions::verify::{Violation, ViolationEvidence};
+        use crate::intelligence::blast_radius::{
+            AffectedFile, BlastRadiusCategories, BlastRadiusResult, RiskSummary,
+        };
+        use crate::intelligence::predict::TestPrediction;
+        use crate::intelligence::security::{
+            SecretPattern, SecuritySurface, SqlInjectionRisk, UnprotectedEndpoint, ValidationGap,
+        };
+
+        let bundle = ReviewBundle {
+            changed_paths: vec!["src/api.rs".to_string()],
+            blast: BlastRadiusResult {
+                changed_files: vec!["src/api.rs".to_string()],
+                total_affected: 2,
+                categories: BlastRadiusCategories {
+                    direct_dependents: vec![AffectedFile {
+                        path: "src/router.rs".to_string(),
+                        edge_type: "import".to_string(),
+                        hops: 1,
+                        risk: 0.80,
+                        note: None,
+                    }],
+                    transitive_dependents: vec![AffectedFile {
+                        path: "src/app.rs".to_string(),
+                        edge_type: "import".to_string(),
+                        hops: 2,
+                        risk: 0.30,
+                        note: None,
+                    }],
+                    test_files: vec![],
+                    schema_dependents: vec![],
+                },
+                risk_summary: RiskSummary {
+                    high: 1,
+                    medium: 0,
+                    low: 1,
+                },
+            },
+            predicted_tests: vec![
+                TestPrediction {
+                    test_file: "tests/api_test.rs".to_string(),
+                    test_function: None,
+                    signals: vec![],
+                    confidence: 0.9,
+                },
+                TestPrediction {
+                    test_file: "tests/smoke.rs".to_string(),
+                    test_function: None,
+                    signals: vec![],
+                    confidence: 0.4,
+                },
+            ],
+            violations: vec![Violation {
+                severity: "high".to_string(),
+                category: "naming".to_string(),
+                location: "src/api.rs:12".to_string(),
+                message: "snake_case expected".to_string(),
+                evidence: ViolationEvidence {
+                    dominant_pattern: "snake_case".to_string(),
+                    count: "90%".to_string(),
+                    strength: "strong".to_string(),
+                    history: None,
+                },
+                suggestion: None,
+            }],
+            security: SecuritySurface {
+                unprotected_endpoints: vec![UnprotectedEndpoint {
+                    file: "src/api.rs".to_string(),
+                    method: "GET".to_string(),
+                    path: "/admin".to_string(),
+                    handler: "admin".to_string(),
+                    line: 5,
+                }],
+                input_validation_gaps: vec![ValidationGap {
+                    file: "src/api.rs".to_string(),
+                    function_name: "create".to_string(),
+                    parameter: "body".to_string(),
+                    line: 9,
+                }],
+                secret_patterns: vec![SecretPattern {
+                    file: "src/api.rs".to_string(),
+                    line: 3,
+                    pattern_name: "aws_key".to_string(),
+                    snippet: "AKIA...".to_string(),
+                }],
+                sql_injection_surface: vec![SqlInjectionRisk {
+                    file: "src/api.rs".to_string(),
+                    line: 20,
+                    language: "rust".to_string(),
+                    snippet: "format!(...)".to_string(),
+                    interpolation_type: "format".to_string(),
+                }],
+                exposure_scores: vec![],
+            },
+            omissions: vec![],
+        };
+        let md = render_review(&bundle);
+        // impacted-tests section, ordered by confidence desc
+        assert!(md.contains("### Impacted tests"));
+        assert!(
+            md.find("tests/api_test.rs").unwrap() < md.find("tests/smoke.rs").unwrap(),
+            "impacted tests must be ordered by confidence descending"
+        );
+        // blast radius ordered by risk desc (router 0.80 before app 0.30)
+        assert!(md.find("src/router.rs").unwrap() < md.find("src/app.rs").unwrap());
+        // violations grouped under the changed file
+        assert!(md.contains("### Convention violations"));
+        assert!(md.contains("src/api.rs:12"));
+        // all security finding kinds rendered (scoped to the changed file)
+        assert!(md.contains("### Security"));
+        assert!(md.contains("Unprotected endpoint"));
+        assert!(md.contains("Secret pattern"));
+        assert!(md.contains("SQL injection risk"));
+        assert!(md.contains("Validation gap"));
+    }
+
+    #[test]
+    fn render_review_drops_security_findings_outside_changed_files() {
+        use crate::intelligence::blast_radius::{
+            BlastRadiusCategories, BlastRadiusResult, RiskSummary,
+        };
+        use crate::intelligence::security::{SecretPattern, SecuritySurface};
+
+        // A secret in a file NOT in the change set must not be rendered.
+        let bundle = ReviewBundle {
+            changed_paths: vec!["src/changed.rs".to_string()],
+            blast: BlastRadiusResult {
+                changed_files: vec![],
+                total_affected: 0,
+                categories: BlastRadiusCategories {
+                    direct_dependents: vec![],
+                    transitive_dependents: vec![],
+                    test_files: vec![],
+                    schema_dependents: vec![],
+                },
+                risk_summary: RiskSummary {
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                },
+            },
+            predicted_tests: vec![],
+            violations: vec![],
+            security: SecuritySurface {
+                unprotected_endpoints: vec![],
+                input_validation_gaps: vec![],
+                secret_patterns: vec![SecretPattern {
+                    file: "src/other.rs".to_string(),
+                    line: 1,
+                    pattern_name: "aws_key".to_string(),
+                    snippet: "AKIA...".to_string(),
+                }],
+                sql_injection_surface: vec![],
+                exposure_scores: vec![],
+            },
+            omissions: vec![],
+        };
+        let md = render_review(&bundle);
+        assert!(
+            !md.contains("### Security"),
+            "no in-scope findings → no section"
+        );
+        assert!(!md.contains("src/other.rs"));
+    }
+
+    #[test]
     fn detects_cochange_and_missing_test_omissions() {
         use crate::intelligence::co_change::CoChangeEdge;
         use crate::intelligence::test_map::{TestConfidence, TestFileRef};
