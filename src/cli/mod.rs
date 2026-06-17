@@ -58,6 +58,10 @@ pub enum Commands {
         verbose: bool,
         #[arg(long)]
         all: bool,
+        /// Pack change-impact review context: blast radius, impacted tests,
+        /// convention + security deltas, and expected-but-absent changes.
+        #[arg(long)]
+        review: bool,
         /// Git ref to diff against (default: HEAD for working tree changes)
         #[arg(long)]
         git_ref: Option<String>,

@@ -191,7 +191,9 @@ pub fn run(
     all: bool,
     focus: Option<&str>,
     timing: bool,
+    review: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = review; // inert until the review bundle lands (W3 Task 2)
     let total_start = std::time::Instant::now();
 
     // 1. Extract git changes
@@ -814,6 +816,7 @@ mod tests {
             true,  // all
             None,  // focus
             false, // timing
+            false, // review
         );
         assert!(result.is_ok());
     }
