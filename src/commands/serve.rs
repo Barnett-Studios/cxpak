@@ -456,6 +456,8 @@ struct V1BriefingParams {
     task: String,
     tokens: Option<usize>,
     focus: Option<String>,
+    /// Opt-in: model name for a USD cost estimate in the efficiency report.
+    cost_model: Option<String>,
 }
 
 pub fn v1_error(
@@ -595,6 +597,7 @@ async fn v1_briefing_handler(
         guard.clone()
     };
     let opts = crate::auto_context::AutoContextOpts {
+        cost_model: params.cost_model,
         tokens: params.tokens.unwrap_or(50_000),
         focus: params.focus,
         include_tests: true,
@@ -1416,6 +1419,8 @@ struct AutoContextParams {
     include_tests: Option<bool>,
     include_blast_radius: Option<bool>,
     mode: Option<String>,
+    /// Opt-in: model name for a USD cost estimate in the efficiency report.
+    cost_model: Option<String>,
 }
 
 async fn auto_context_handler(
@@ -1441,6 +1446,7 @@ async fn auto_context_handler(
         .and_then(|t| crate::cli::parse_token_count(t).ok())
         .unwrap_or(50_000);
     let opts = crate::auto_context::AutoContextOpts {
+        cost_model: params.cost_model,
         tokens: token_budget,
         focus: params.focus,
         include_tests: params.include_tests.unwrap_or(true),
@@ -1977,7 +1983,8 @@ pub fn mcp_stdio_loop_with_io(
                                     "focus": { "type": "string", "description": "Path prefix to scope" },
                                     "include_tests": { "type": "boolean", "description": "Include mapped test files (default true)", "default": true },
                                     "include_blast_radius": { "type": "boolean", "description": "Include blast radius analysis (default true)", "default": true },
-                                    "mode": { "type": "string", "description": "Context mode: 'full' (default) or 'briefing'", "enum": ["full", "briefing"] }
+                                    "mode": { "type": "string", "description": "Context mode: 'full' (default) or 'briefing'", "enum": ["full", "briefing"] },
+                                    "cost_model": { "type": "string", "description": "Opt-in: model name (e.g. 'claude-opus-4-8') for a USD cost estimate in the efficiency report" }
                                 },
                                 "required": ["task"]
                             }
@@ -2186,7 +2193,8 @@ pub fn mcp_stdio_loop_with_io(
                                 "properties": {
                                     "task": { "type": "string", "description": "Natural language task description" },
                                     "tokens": { "type": "string", "description": "Token budget (default '50k')", "default": "50k" },
-                                    "focus": { "type": "string", "description": "Path prefix to scope" }
+                                    "focus": { "type": "string", "description": "Path prefix to scope" },
+                                    "cost_model": { "type": "string", "description": "Opt-in: model name (e.g. 'claude-opus-4-8') for a USD cost estimate in the efficiency report" }
                                 },
                                 "required": ["task"]
                             }
@@ -2399,7 +2407,12 @@ pub fn handle_tool_call(
                 .and_then(|v| v.as_str())
                 .unwrap_or("full")
                 .to_string();
+            let cost_model = args
+                .get("cost_model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let opts = crate::auto_context::AutoContextOpts {
+                cost_model,
                 tokens: token_budget,
                 focus,
                 include_tests,
@@ -3179,7 +3192,12 @@ pub fn handle_tool_call(
                 .and_then(|t| crate::cli::parse_token_count(t).ok())
                 .unwrap_or(50_000);
             let focus = args.get("focus").and_then(|f| f.as_str()).map(String::from);
+            let cost_model = args
+                .get("cost_model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let opts = crate::auto_context::AutoContextOpts {
+                cost_model,
                 tokens: token_budget,
                 focus,
                 include_tests: true,
@@ -4232,6 +4250,51 @@ mod tests {
         assert!(
             text.contains("required"),
             "missing symbol should error with 'required', got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_auto_context_cost_model_reaches_estimate() {
+        // Proves the cost_model param is wired end-to-end through the MCP entry
+        // point into the efficiency report (not just reachable in a unit test).
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(42)),
+            "cxpak_auto_context",
+            &json!({"task": "main", "cost_model": "claude-opus-4-8"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let cost = &parsed["efficiency"]["cost_estimate"];
+        assert!(
+            cost.is_object(),
+            "cost_model param must produce a cost_estimate; got {cost}"
+        );
+        assert_eq!(cost["model"], json!("claude-opus-4-8"));
+        assert!(cost["input_usd"].as_f64().unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn test_mcp_auto_context_no_cost_model_no_estimate() {
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(43)),
+            "cxpak_auto_context",
+            &json!({"task": "main"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed["efficiency"]["cost_estimate"].is_null(),
+            "no cost_model → no estimate"
         );
     }
 

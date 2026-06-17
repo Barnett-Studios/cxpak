@@ -1,5 +1,6 @@
 pub mod briefing;
 pub mod diff;
+pub mod efficiency;
 pub mod noise;
 
 use crate::auto_context::noise::{FilteredFile, ScoredFileEntry};
@@ -22,15 +23,25 @@ pub struct AutoContextOpts {
     pub include_tests: bool,
     pub include_blast_radius: bool,
     pub mode: String, // "full" (default) or "briefing"
+    /// Opt-in cost model name; when `Some`, the efficiency report includes a USD estimate.
+    pub cost_model: Option<String>,
 }
+
+/// Version of the `auto_context` output contract (ADR-0169). Bump on a breaking
+/// change to the serialized shape; additive fields do not require a bump.
+pub const FORMAT_VERSION: &str = "2.3";
 
 #[derive(Debug, Serialize)]
 pub struct AutoContextResult {
+    /// Version of this output contract (see [`FORMAT_VERSION`]).
+    pub format_version: &'static str,
     pub task: String,
     pub dna: String,
     pub budget: crate::auto_context::briefing::BudgetSummary,
     pub sections: crate::auto_context::briefing::PackedSections,
     pub filtered_out: Vec<FilteredFile>,
+    // v2.3.0 efficiency / cost reporting (ADR-0168)
+    pub efficiency: crate::auto_context::efficiency::EfficiencyReport,
     // v1.2.0 compound intelligence
     pub health: HealthScore,
     pub risks: Vec<RiskEntry>,
@@ -275,12 +286,66 @@ pub fn auto_context(
         }
     };
 
+    // Efficiency report (ADR-0168) — computed from data in scope, before `packed`
+    // and `filtered` are moved into the result. `kept` is the relevant set.
+    let selected_tokens = packed.sections.target_files.tokens
+        + packed.sections.test_files.tokens
+        + packed.sections.schema_context.tokens;
+    let filtered_tokens: usize = filtered.filtered_out.iter().map(|f| f.tokens).sum();
+    // A relevant candidate counts as "covered" if it was packed into ANY file
+    // section — target, test, or schema — not just target_files (else a kept file
+    // packed as a test would be miscounted as excluded, skewing coverage + advisory).
+    let included: std::collections::HashSet<&str> = packed
+        .sections
+        .target_files
+        .files
+        .iter()
+        .chain(packed.sections.test_files.files.iter())
+        .chain(packed.sections.schema_context.files.iter())
+        .map(|f| f.path.as_str())
+        .collect();
+    let relevant_total = kept.len();
+    let relevant_covered = kept
+        .iter()
+        .filter(|e| included.contains(e.path.as_str()))
+        .count();
+    let marginal_included_score = kept
+        .iter()
+        .filter(|e| included.contains(e.path.as_str()))
+        .map(|e| e.score)
+        .fold(None, |acc: Option<f64>, s| {
+            Some(acc.map_or(s, |a| a.min(s)))
+        });
+    let marginal_excluded_score = kept
+        .iter()
+        .filter(|e| !included.contains(e.path.as_str()))
+        .map(|e| e.score)
+        .fold(None, |acc: Option<f64>, s| {
+            Some(acc.map_or(s, |a| a.max(s)))
+        });
+    let efficiency = crate::auto_context::efficiency::compute_efficiency(
+        crate::auto_context::efficiency::EfficiencyInputs {
+            repo_tokens: index.total_tokens,
+            selected_tokens,
+            budget_total: packed.budget.total,
+            budget_used: packed.budget.used,
+            filtered_tokens,
+            relevant_total,
+            relevant_covered,
+            marginal_included_score,
+            marginal_excluded_score,
+            cost_model: opts.cost_model.clone(),
+        },
+    );
+
     AutoContextResult {
+        format_version: FORMAT_VERSION,
         task: task.to_string(),
         dna: effective_dna,
         budget: packed.budget,
         sections: packed.sections,
         filtered_out: filtered.filtered_out,
+        efficiency,
         health,
         risks,
         architecture,
@@ -329,11 +394,80 @@ mod tests {
 
     fn default_opts(tokens: usize) -> AutoContextOpts {
         AutoContextOpts {
+            cost_model: None,
             tokens,
             focus: None,
             include_tests: false,
             include_blast_radius: false,
             mode: "full".to_string(),
+        }
+    }
+
+    #[test]
+    fn opts_default_has_no_cost_model() {
+        // Default opts must not request a cost estimate (cost is strictly opt-in).
+        let opts = default_opts(10_000);
+        assert!(opts.cost_model.is_none());
+    }
+
+    #[test]
+    fn auto_context_result_has_efficiency_block() {
+        let (index, _dir) =
+            make_index(&[("src/a.rs", "pub fn a() {}"), ("src/b.rs", "pub fn b() {}")]);
+        let opts = default_opts(10_000);
+        let result = auto_context("explain a", &index, &opts);
+
+        assert_eq!(result.efficiency.repo_tokens, index.total_tokens);
+        assert!(result.efficiency.selected_tokens <= result.efficiency.repo_tokens);
+        assert!(
+            result.efficiency.relevant_coverage >= 0.0
+                && result.efficiency.relevant_coverage <= 1.0
+        );
+        assert!(result.efficiency.relevant_covered <= result.efficiency.relevant_total);
+        assert!(
+            result.efficiency.absolute_coverage >= 0.0
+                && result.efficiency.absolute_coverage <= 1.0
+        );
+        // marginal_included is Some when at least one relevant file was packed
+        if result.efficiency.relevant_covered > 0 {
+            assert!(result.efficiency.marginal_included_score.is_some());
+        }
+        assert!(result.efficiency.cost_estimate.is_none()); // default opts
+    }
+
+    #[test]
+    fn result_advertises_format_version() {
+        let (index, _dir) = make_index(&[("src/a.rs", "pub fn a() {}")]);
+        let result = auto_context("a", &index, &default_opts(10_000));
+        assert_eq!(result.format_version, FORMAT_VERSION);
+        assert_eq!(FORMAT_VERSION, "2.3");
+    }
+
+    #[test]
+    fn schema_documents_every_serialized_field() {
+        // Drift guard (ADR-0169): a real serialized AutoContextResult must have
+        // every top-level key AND every `sections` key documented in the published
+        // schema. Adding a struct field without updating the schema fails here.
+        let (index, _dir) = make_index(&[("src/a.rs", "pub fn a() {}")]);
+        let result = auto_context("a", &index, &default_opts(10_000));
+        let json = serde_json::to_value(&result).unwrap();
+        let schema = crate::commands::schema::auto_context_schema();
+
+        let props = schema["properties"].as_object().unwrap();
+        for key in json.as_object().unwrap().keys() {
+            assert!(
+                props.contains_key(key),
+                "schema is missing documented top-level field: {key}"
+            );
+        }
+        let sect_props = schema["properties"]["sections"]["properties"]
+            .as_object()
+            .unwrap();
+        for key in json["sections"].as_object().unwrap().keys() {
+            assert!(
+                sect_props.contains_key(key),
+                "schema sections is missing documented field: {key}"
+            );
         }
     }
 
@@ -457,6 +591,7 @@ mod tests {
             ("src/db/query.rs", "pub fn run_query() {}"),
         ]);
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: Some("src/api/".to_string()),
             include_tests: false,
@@ -567,6 +702,7 @@ mod tests {
             "pub fn authenticate(user: &str) -> bool { true }",
         )]);
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: false,
@@ -616,6 +752,7 @@ mod tests {
             ),
         ]);
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: false,
@@ -692,6 +829,7 @@ mod tests {
         );
 
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: true,
@@ -750,6 +888,7 @@ mod tests {
         );
 
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: true,
@@ -799,6 +938,7 @@ mod tests {
             ("src/session.rs", "pub fn make_session() {}"),
         ]);
         let opts = AutoContextOpts {
+            cost_model: None,
             tokens: 50_000,
             focus: None,
             include_tests: false,

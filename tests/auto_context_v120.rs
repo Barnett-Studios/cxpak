@@ -41,6 +41,7 @@ fn make_test_index() -> (CodebaseIndex, tempfile::TempDir) {
 fn test_v120_auto_context_result_has_all_fields() {
     let (index, _dir) = make_test_index();
     let opts = AutoContextOpts {
+        cost_model: None,
         tokens: 50_000,
         focus: None,
         include_tests: false,
@@ -106,6 +107,7 @@ fn test_v120_auto_context_result_has_all_fields() {
 fn test_v120_briefing_mode_content_is_none() {
     let (index, _dir) = make_test_index();
     let opts = AutoContextOpts {
+        cost_model: None,
         tokens: 50_000,
         focus: None,
         include_tests: false,
@@ -132,6 +134,7 @@ fn test_v120_briefing_mode_content_is_none() {
 fn test_v120_risks_sorted_descending() {
     let (index, _dir) = make_test_index();
     let opts = AutoContextOpts {
+        cost_model: None,
         tokens: 50_000,
         focus: None,
         include_tests: false,

@@ -207,6 +207,8 @@ pub struct ScoredFileEntry {
 pub struct FilteredFile {
     pub path: String,
     pub reason: String,
+    /// Token cost of the file that was filtered out — summed for "tokens saved by filtering".
+    pub tokens: usize,
 }
 
 /// The result of running `filter_noise()`.
@@ -260,6 +262,7 @@ pub fn filter_noise(
                 "blocklist: unknown".to_string()
             };
             filtered_out.push(FilteredFile {
+                tokens: entry.token_count,
                 path: entry.path,
                 reason,
             });
@@ -270,6 +273,7 @@ pub fn filter_noise(
         if let Some(file) = index.files.iter().find(|f| f.relative_path == entry.path) {
             if has_generated_marker(&file.content) {
                 filtered_out.push(FilteredFile {
+                    tokens: entry.token_count,
                     path: entry.path,
                     reason: "generated_file".to_string(),
                 });
@@ -296,11 +300,20 @@ pub fn filter_noise(
         })
         .collect();
 
+    // Token cost per path, captured before `after_blocklist` is consumed by dedup —
+    // the dedup result yields only (filtered_path, kept_path), no token count.
+    let token_by_path: HashMap<String, usize> = after_blocklist
+        .iter()
+        .map(|e| (e.path.clone(), e.token_count))
+        .collect();
+
     let (after_dedup, dedup_reasons) =
         dedup_similar_files(after_blocklist, &symbols_by_path, pagerank);
 
     for (filtered_path, kept_path) in dedup_reasons {
+        let tokens = token_by_path.get(&filtered_path).copied().unwrap_or(0);
         filtered_out.push(FilteredFile {
+            tokens,
             path: filtered_path,
             reason: format!("similar_to: {kept_path}"),
         });
@@ -310,6 +323,7 @@ pub fn filter_noise(
     for entry in after_dedup {
         if entry.score < DEFAULT_RELEVANCE_FLOOR {
             filtered_out.push(FilteredFile {
+                tokens: entry.token_count,
                 path: entry.path,
                 reason: format!("below_relevance_floor: {:.4}", entry.score),
             });
@@ -331,6 +345,16 @@ mod tests {
     use crate::budget::counter::TokenCounter;
     use crate::scanner::ScannedFile;
     use std::collections::HashMap;
+
+    #[test]
+    fn filtered_file_carries_token_count() {
+        let f = FilteredFile {
+            path: "src/x.rs".to_string(),
+            reason: "blocklist: generated".to_string(),
+            tokens: 1234,
+        };
+        assert_eq!(f.tokens, 1234);
+    }
 
     // -----------------------------------------------------------------------
     // Task 2 tests
@@ -611,6 +635,80 @@ mod tests {
         assert!(result.filtered_out[0]
             .reason
             .starts_with("below_relevance_floor"));
+    }
+
+    #[test]
+    fn test_dedup_filtered_file_carries_tokens() {
+        use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
+
+        // Build an index where two files share an identical symbol set so the
+        // similarity-dedup layer drops one. Verifies the dropped file's token
+        // count is propagated onto the FilteredFile (Layer-2 `tokens` propagation).
+        let sym = |name: &str| Symbol {
+            name: name.into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: format!("fn {name}()"),
+            body: "{}".into(),
+            start_line: 1,
+            end_line: 1,
+        };
+        let symbols = vec![sym("alpha"), sym("beta"), sym("gamma")];
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut files = Vec::new();
+        let mut pr: HashMap<String, ParseResult> = HashMap::new();
+        for rel in ["src/a.rs", "src/b.rs"] {
+            let abs = dir.path().join(rel.replace('/', "_"));
+            std::fs::write(&abs, "pub fn alpha() {}\n").unwrap();
+            files.push(ScannedFile {
+                relative_path: rel.to_string(),
+                absolute_path: abs,
+                language: Some("rust".into()),
+                size_bytes: 18,
+            });
+            pr.insert(
+                rel.to_string(),
+                ParseResult {
+                    symbols: symbols.clone(),
+                    imports: vec![],
+                    exports: vec![],
+                },
+            );
+        }
+        let index = crate::index::CodebaseIndex::build(files, pr, &counter);
+
+        let mut pagerank = HashMap::new();
+        pagerank.insert("src/a.rs".to_string(), 0.9); // higher rank → kept on score tie
+        pagerank.insert("src/b.rs".to_string(), 0.1); // lower rank → dropped
+        let candidates = vec![
+            ScoredFileEntry {
+                path: "src/a.rs".to_string(),
+                score: 0.9,
+                token_count: 111,
+            },
+            ScoredFileEntry {
+                path: "src/b.rs".to_string(),
+                score: 0.9,
+                token_count: 222,
+            },
+        ];
+        let result = filter_noise(candidates, &index, &pagerank);
+        let sim: Vec<&FilteredFile> = result
+            .filtered_out
+            .iter()
+            .filter(|f| f.reason.starts_with("similar_to"))
+            .collect();
+        assert_eq!(sim.len(), 1, "one file should be dropped as similar");
+        assert_eq!(
+            sim[0].path, "src/b.rs",
+            "lower-pagerank dup should be dropped"
+        );
+        assert_eq!(
+            sim[0].tokens, 222,
+            "dedup-filtered file must carry its own token count"
+        );
     }
 
     #[test]

@@ -28,7 +28,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
-          # Windows: cargo install cxpak (vendored libgit2 linking issue)
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -52,11 +54,18 @@ jobs:
       - name: Build
         run: cargo build --release --features daemon --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../cxpak-${{ matrix.target }}.tar.gz cxpak
           cd ../../..
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/cxpak.exe -DestinationPath cxpak-${{ matrix.target }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.0

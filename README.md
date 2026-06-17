@@ -45,25 +45,38 @@ cxpak indexes your codebase using tree-sitter across 43 languages, builds a type
 
 ```bash
 brew tap Barnett-Studios/tap && brew install cxpak   # macOS/Linux
-cargo install cxpak                                   # or via cargo
+cargo install cxpak                                   # any platform, incl. Windows
 ```
+
+On Windows, `cargo install cxpak` works, or download the prebuilt
+`cxpak-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/Barnett-Studios/cxpak/releases/latest).
 
 ## Docker
 
 Docker is a first-class deployment option — useful anywhere you want a reproducible, isolated install without managing a Rust toolchain: CI pipelines, sandboxed servers, Windows machines, or air-gapped environments.
 
-### Standalone (no source needed)
+### Official image (recommended)
 
-Copy [`Dockerfile.standalone`](Dockerfile.standalone) anywhere and build:
+Multi-arch (`amd64` / `arm64`) images are published to GitHub Container Registry on every release — no build, no Rust toolchain, no source checkout:
 
 ```bash
-docker build -f Dockerfile.standalone -t cxpak .
-
-# Pin a specific release:
-docker build -f Dockerfile.standalone --build-arg VERSION=2.1.0 -t cxpak:2.1.0 .
+docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak overview .
 ```
 
-Fetches the pre-built Linux binary from GitHub Releases. Supports `amd64` and `arm64`.
+Pin a tag or an immutable digest for reproducible deploys:
+
+```bash
+docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak:2.2.1 overview .
+docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak@sha256:<digest> overview .
+```
+
+Images are signed with [cosign](https://github.com/sigstore/cosign) (keyless) and carry SBOM + build-provenance attestations. Verify before deploying:
+
+```bash
+cosign verify ghcr.io/barnett-studios/cxpak:2.2.1 \
+  --certificate-identity-regexp '^https://github.com/Barnett-Studios/cxpak/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
 
 ### From source
 
@@ -71,45 +84,45 @@ Fetches the pre-built Linux binary from GitHub Releases. Supports `amd64` and `a
 docker build -t cxpak .
 ```
 
-Builds the full default feature set from your local checkout. First build is slow (candle ML deps); subsequent builds are fast — dependencies are cached in a separate layer.
+Builds the full default feature set from your local checkout. First build is slow (candle ML deps); subsequent builds reuse a cached dependency layer.
 
 ### Usage
+
+The container runs as a non-root user; the embedding model weights (~30 MB, downloaded on first use) live under `/home/cxpak/.cxpak` — mount a named volume there to persist them across runs.
 
 **macOS / Linux:**
 ```bash
 # One-shot command
-docker run --rm -v $(pwd):/repo cxpak overview .
+docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak overview .
 
 # HTTP server (--bind 0.0.0.0 required to reach the container from the host;
 # --token is mandatory when binding to a non-loopback address)
 docker run -d -p 3000:3000 \
-  -v $(pwd):/repo \
-  -v cxpak-models:/root/.cxpak \
-  cxpak serve --bind 0.0.0.0 --token mysecret .
+  -v "$(pwd):/repo" \
+  -v cxpak-models:/home/cxpak/.cxpak \
+  ghcr.io/barnett-studios/cxpak serve --bind 0.0.0.0 --token mysecret .
 
 # MCP — stdio only, one repo per instance (see note below)
-docker run --rm -i -v $(pwd):/repo cxpak serve --mcp .
+docker run --rm -i -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak serve --mcp .
 ```
 
 **Windows (PowerShell):**
 ```powershell
 # One-shot command
-docker run --rm -v ${PWD}:/repo cxpak overview .
+docker run --rm -v ${PWD}:/repo ghcr.io/barnett-studios/cxpak overview .
 
 # HTTP server
 docker run -d -p 3000:3000 `
   -v ${PWD}:/repo `
-  -v cxpak-models:/root/.cxpak `
-  cxpak serve --bind 0.0.0.0 --token mysecret .
+  -v cxpak-models:/home/cxpak/.cxpak `
+  ghcr.io/barnett-studios/cxpak serve --bind 0.0.0.0 --token mysecret .
 
 # Verify (use curl.exe — PowerShell's curl alias does not work here)
 curl.exe http://localhost:3000/health
 
 # MCP — stdio only, one repo per instance (see note below)
-docker run --rm -i -v ${PWD}:/repo cxpak serve --mcp .
+docker run --rm -i -v ${PWD}:/repo ghcr.io/barnett-studios/cxpak serve --mcp .
 ```
-
-Mount `/root/.cxpak` as a named volume to persist the embedding model weights (~30 MB, downloaded on first use).
 
 Replace `mysecret` with any non-empty secret of your choice. Authenticated endpoints are under `/v1/`:
 ```bash
@@ -288,6 +301,10 @@ Parse results cached in `.cxpak/cache/` keyed on file mtime and size. Cache inva
 ## Stable API
 
 v2.0.0 establishes semver for the MCP API. Tool names, parameters, and response structures are stable across 2.x.
+
+## Architecture decisions
+
+Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution, reconstructed across v0.1.0 -> v2.2.1. Start with [the index](docs/adrs/INDEX.md).
 
 ## License
 

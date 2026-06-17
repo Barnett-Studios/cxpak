@@ -44,6 +44,8 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Print the JSON Schema for the auto_context output contract (versioned, ADR-0169)
+    Schema,
     /// Show token-budgeted change summary with dependency context
     Diff {
         #[arg(long, default_value = "50k")]
