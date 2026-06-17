@@ -1115,7 +1115,9 @@ mod tests {
         };
 
         let bundle = ReviewBundle {
-            changed_paths: vec!["src/api.rs".to_string()],
+            // src/clean.rs is changed but has NO violations — exercises the
+            // empty-group `continue` in the violations grouping loop.
+            changed_paths: vec!["src/api.rs".to_string(), "src/clean.rs".to_string()],
             blast: BlastRadiusResult {
                 changed_files: vec!["src/api.rs".to_string()],
                 total_affected: 2,
@@ -1371,6 +1373,36 @@ mod tests {
 
         let oms = detect_omissions(&changed, &[], &test_map);
         assert!(oms.is_empty());
+    }
+
+    #[test]
+    fn detect_omissions_handles_file_b_side_and_sorts_multiple() {
+        use crate::intelligence::co_change::CoChangeEdge;
+        use std::collections::HashMap;
+
+        // The changed file appears as `file_b` in one edge and `file_a` in
+        // another — exercises both sides of the present/absent split. Two
+        // qualifying co-change omissions means the sort comparator runs.
+        let changed = vec!["src/x.rs".to_string()];
+        let co = vec![
+            CoChangeEdge {
+                file_a: "src/weak.rs".into(),
+                file_b: "src/x.rs".into(), // x.rs is file_b here
+                count: 5,
+                recency_weight: 1.0,
+            },
+            CoChangeEdge {
+                file_a: "src/x.rs".into(), // x.rs is file_a here
+                file_b: "src/strong.rs".into(),
+                count: 12,
+                recency_weight: 1.0,
+            },
+        ];
+        let oms = detect_omissions(&changed, &co, &HashMap::new());
+        assert_eq!(oms.len(), 2);
+        // strongest first (12 before 5) — exercises the sort comparator
+        assert_eq!(oms[0].expected_file, "src/strong.rs");
+        assert_eq!(oms[1].expected_file, "src/weak.rs");
     }
 
     #[test]
