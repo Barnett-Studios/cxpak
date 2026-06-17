@@ -169,4 +169,10 @@ mod tests {
         // valid, serializable JSON
         assert!(serde_json::to_string_pretty(&schema).is_ok());
     }
+
+    #[test]
+    fn run_prints_without_error() {
+        // Exercises the print path; stdout is captured by the test harness.
+        assert!(run().is_ok());
+    }
 }
