@@ -124,10 +124,10 @@ curl.exe http://localhost:3000/health
 docker run --rm -i -v ${PWD}:/repo ghcr.io/barnett-studios/cxpak serve --mcp .
 ```
 
-Replace `mysecret` with any non-empty secret of your choice. Authenticated endpoints are under `/v1/`:
+Replace `mysecret` with any non-empty secret of your choice. `/health` is open (GET); every `/v1/*` endpoint is a POST and requires the bearer token:
 ```bash
 curl http://localhost:3000/health                                        # no auth required
-curl -H "Authorization: Bearer mysecret" http://localhost:3000/v1/overview
+curl -X POST -H "Authorization: Bearer mysecret" http://localhost:3000/v1/conventions
 ```
 
 > **HTTP vs MCP:** These are two separate transports — you cannot use the HTTP server as an MCP endpoint.

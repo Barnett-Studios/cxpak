@@ -1,6 +1,6 @@
 # ADR Index
 
-163 architecture decision records. 0001–0162 reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1); 0163 onward written at decision time. See [README](./README.md) for methodology.
+166 architecture decision records. 0001–0162 reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1); 0163 onward written at decision time. See [README](./README.md) for methodology.
 
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
@@ -169,3 +169,4 @@
 | [0163](0163-windows-build-git2-no-default-features.md) | Enable Windows builds by dropping git2 default features (cxpak does only local git) | ACCEPTED | 2026-06-14 |
 | [0168](0168-efficiency-report-and-filtered-tokens.md) | Efficiency report as decision-support (relevant-set coverage + budget-margin), aggregated from existing data; cost estimate opt-in | ACCEPTED | 2026-06-16 |
 | [0169](0169-versioned-context-format-schema.md) | Publish a versioned context-format schema over the existing JSON output, not a new format | ACCEPTED | 2026-06-14 |
+| [0170](0170-official-container-images-from-ci.md) | Publish official multi-arch container images from CI, built from release artifacts and signed | ACCEPTED | 2026-06-18 |

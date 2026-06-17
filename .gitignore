@@ -17,6 +17,9 @@ docs/ROADMAP_RECOMMENDATIONS.md
 docs/RESEARCH_INDEX.md
 cxpak-architecture.mmd
 
+# Docker: per-arch release binaries staged for Dockerfile.dist (populated by CI)
+/dist/
+
 # cxpak generated artifacts during local dev
 /cxpak-all.html
 /.playwright-mcp/

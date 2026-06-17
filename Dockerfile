@@ -1,13 +1,18 @@
 # syntax=docker/dockerfile:1.7
-# ── Builder ───────────────────────────────────────────────────────────────────
-FROM rust:1.91-slim-bookworm AS builder
+# Build cxpak from source. For most users the published image is easier:
+#   docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak overview .
+# This Dockerfile is for building from a local checkout (development / forks).
 
-# cmake + perl are required by vendored OpenSSL (git2 dep).
+# ── Builder ───────────────────────────────────────────────────────────────────
+FROM rust:1.91-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65 AS builder
+
+# build-essential: C toolchain for ring (rustls) and the tree-sitter grammar crates.
+# pkg-config: probed by some *-sys build scripts.
+# No cmake/perl: git2 is default-features=false and reqwest uses rustls, so the
+# build pulls no OpenSSL (see docs/adrs/0163).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
-        cmake \
         build-essential \
-        perl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -21,27 +26,37 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && rm -rf src
 
 COPY src/ ./src/
-# Touch main.rs so cargo considers the real source newer than the cached dep artifacts.
-RUN touch src/main.rs && cargo build --release
+RUN cargo build --release
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
 
-# ca-certificates: needed for HTTPS when embeddings downloads model weights on first use.
-# libgcc-s1:       Rust panic unwinding runtime.
+LABEL org.opencontainers.image.source="https://github.com/Barnett-Studios/cxpak" \
+      org.opencontainers.image.description="Token-budgeted codebase context for LLMs" \
+      org.opencontainers.image.licenses="MIT"
+
+# ca-certificates: HTTPS for the first-use embedding-model download.
+# libgcc-s1: Rust panic-unwinding runtime (stripped from debian:*-slim).
+# curl: HEALTHCHECK probe for `cxpak serve`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libgcc-s1 \
-    && rm -rf /var/lib/apt/lists/*
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home --user-group cxpak
 
 COPY --from=builder /build/target/release/cxpak /usr/local/bin/cxpak
 
-# all-MiniLM-L6-v2 weights are downloaded on first use to ~/.cxpak/models/.
-# Mount a host path here to persist them across container runs:
-#   docker run -v cxpak-models:/root/.cxpak ...
-VOLUME ["/root/.cxpak"]
-
+# Model weights (~30 MB) download on first use to $HOME/.cxpak/models. Mount a
+# named volume at /home/cxpak/.cxpak to persist them across runs.
+ENV HOME=/home/cxpak
+USER 10001
 WORKDIR /repo
+VOLUME ["/home/cxpak/.cxpak"]
 EXPOSE 3000
+
+# Probes the HTTP server (`cxpak serve`). One-shot CLI runs exit before this matters.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:3000/health || exit 1
 
 ENTRYPOINT ["cxpak"]
