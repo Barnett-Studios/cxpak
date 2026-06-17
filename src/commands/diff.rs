@@ -1802,6 +1802,119 @@ mod tests {
     }
 
     #[test]
+    fn run_reports_no_changes_on_clean_tree() {
+        // Committed, nothing modified → extract_changes empty → early "No changes" return.
+        let repo = make_diff_repo();
+        let result = run(
+            repo.path(),
+            None,
+            50_000,
+            &OutputFormat::Markdown,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_verbose_timing_review_one_hop_to_stdout() {
+        // review_test_repo leaves an uncommitted edit to helper.rs (main.rs
+        // depends on it). Exercises the verbose + timing eprintln branches, the
+        // 1-hop dependents walk (all=false), the review Ok branch, and the
+        // stdout write path in a single run.
+        let (repo, _index) = review_test_repo();
+        let result = run(
+            repo.path(),
+            None,
+            50_000,
+            &OutputFormat::Markdown,
+            None,
+            true,  // verbose
+            false, // all → 1-hop branch
+            None,
+            true, // timing
+            true, // review
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_writes_to_out_file_verbose() {
+        let (repo, _index) = review_test_repo();
+        let out = repo.path().join("diff_out.md");
+        let result = run(
+            repo.path(),
+            None,
+            50_000,
+            &OutputFormat::Markdown,
+            Some(&out),
+            true,  // verbose → "written to" branch
+            false, // all
+            None,
+            false,
+            true, // review (appended before write)
+        );
+        assert!(result.is_ok());
+        assert!(out.exists(), "diff output must be written to the out file");
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            written.contains("## Review"),
+            "review section persisted to file"
+        );
+    }
+
+    #[test]
+    fn run_with_focus_applies_focus_ranking() {
+        let (repo, _index) = review_test_repo();
+        let result = run(
+            repo.path(),
+            None,
+            50_000,
+            &OutputFormat::Markdown,
+            None,
+            false,
+            false,
+            Some("src/"), // focus → apply_focus branch
+            false,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_review_skipped_for_non_markdown_format() {
+        // review=true but JSON format → the review block is gated out (no append).
+        let (repo, _index) = review_test_repo();
+        let result = run(
+            repo.path(),
+            None,
+            50_000,
+            &OutputFormat::Json,
+            None,
+            false,
+            false,
+            None,
+            false,
+            true, // review, but format is JSON
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn extract_changes_handles_deleted_file() {
+        // A working-tree deletion still yields a diff; exercises the diff
+        // callback path for removed content.
+        let repo = make_diff_repo();
+        std::fs::remove_file(repo.path().join("src/main.rs")).unwrap();
+        let changes = extract_changes(repo.path(), None).unwrap();
+        assert!(changes.iter().any(|c| c.path == "src/main.rs"));
+    }
+
+    #[test]
     fn test_parse_time_expression_overflow() {
         // Huge number that overflows u64 parse — covers line 37
         let result = parse_time_expression("99999999999999999999999d");
