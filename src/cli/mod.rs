@@ -60,6 +60,7 @@ pub enum Commands {
         all: bool,
         /// Pack change-impact review context: blast radius, impacted tests,
         /// convention + security deltas, and expected-but-absent changes.
+        /// Markdown output only; ignored with --format json/xml.
         #[arg(long)]
         review: bool,
         /// Git ref to diff against (default: HEAD for working tree changes)
