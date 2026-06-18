@@ -170,6 +170,87 @@ proptest::proptest! {
 
 use proptest::prelude::*;
 
+/// `incremental_rebuild` (edge-delta + warm PageRank) over a content
+/// modification must equal a from-scratch full build — graph edges exactly,
+/// PageRank within epsilon. This pins the Task 3 wiring end-to-end.
+#[test]
+fn incremental_rebuild_matches_full_build() {
+    use cxpak::budget::counter::TokenCounter;
+    use cxpak::scanner::ScannedFile;
+
+    let counter = TokenCounter::new();
+    let dir = tempfile::TempDir::new().unwrap();
+    let write = |rel: &str, content: &str| -> ScannedFile {
+        let abs = dir.path().join(rel.replace('/', "_"));
+        std::fs::write(&abs, content).unwrap();
+        ScannedFile {
+            relative_path: rel.to_string(),
+            absolute_path: abs,
+            language: Some("rust".to_string()),
+            size_bytes: content.len() as u64,
+        }
+    };
+    let pr = |imports: &[&str]| ParseResult {
+        symbols: vec![],
+        imports: imports
+            .iter()
+            .map(|s| Import {
+                source: (*s).to_string(),
+                names: vec![],
+            })
+            .collect(),
+        exports: vec![],
+    };
+
+    // Initial state: a imports b; b and c are plain.
+    let a = write("src/a.rs", "use crate::b;");
+    let b = write("src/b.rs", "pub fn b() {}");
+    let c = write("src/c.rs", "pub fn c() {}");
+    let mut parses = HashMap::new();
+    parses.insert("src/a.rs".to_string(), pr(&["crate::b"]));
+    parses.insert("src/b.rs".to_string(), pr(&[]));
+    parses.insert("src/c.rs".to_string(), pr(&[]));
+
+    let mut inc = CodebaseIndex::build(
+        vec![a.clone(), b.clone(), c.clone()],
+        parses.clone(),
+        &counter,
+    );
+
+    // Modify a to import c instead of b (different size → needs_update fires;
+    // a is already a graph node + no schema → exact per-file delta path).
+    let a2 = write(
+        "src/a.rs",
+        "use crate::c; // modified: now imports c instead",
+    );
+    let mut parses2 = parses.clone();
+    parses2.insert("src/a.rs".to_string(), pr(&["crate::c"]));
+    inc.incremental_rebuild(&[a2.clone(), b.clone(), c.clone()], &parses2, &counter);
+
+    let full = CodebaseIndex::build(vec![a2, b, c], parses2, &counter);
+
+    assert_eq!(
+        inc.graph.edges, full.graph.edges,
+        "incremental graph edges must equal full rebuild"
+    );
+    assert_eq!(inc.graph.reverse_edges, full.graph.reverse_edges);
+    // the modified edge actually moved a→b ⇒ a→c
+    assert!(inc
+        .graph
+        .dependencies("src/a.rs")
+        .map(|s| s.iter().any(|e| e.target == "src/c.rs"))
+        .unwrap_or(false));
+    assert_eq!(inc.pagerank.len(), full.pagerank.len());
+    for (k, &v) in &full.pagerank {
+        assert!(
+            (inc.pagerank[k] - v).abs() <= 2e-6,
+            "pagerank {k}: inc {} full {}",
+            inc.pagerank[k],
+            v
+        );
+    }
+}
+
 /// A changed file with a data layer present MUST fall back to a full rebuild so
 /// schema-derived edges (here a foreign key) survive — a naive import-only
 /// delta would silently drop them. Mandated by the W1 plan's schema boundary.

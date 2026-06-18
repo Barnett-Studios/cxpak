@@ -538,11 +538,14 @@ impl CodebaseIndex {
             .filter(|f| !current_paths.contains(&f.relative_path))
             .map(|f| f.relative_path.clone())
             .collect();
+        let removed: std::collections::HashSet<String> = to_remove.iter().cloned().collect();
         for path in &to_remove {
             self.remove_file(path);
         }
 
-        // Upsert changed or new files
+        // Upsert changed or new files, tracking which paths actually changed so
+        // the graph can be rebuilt by edge-delta rather than from scratch.
+        let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for file in current_files {
             let mtime_secs = std::fs::metadata(&file.absolute_path)
                 .ok()
@@ -573,12 +576,21 @@ impl CodebaseIndex {
                     counter,
                     mtime_secs,
                 );
+                changed.insert(file.relative_path.clone());
             }
         }
 
-        // Rebuild graph and recompute derived scores
-        self.rebuild_graph();
-        self.pagerank = crate::intelligence::pagerank::compute_pagerank(&self.graph, 0.85, 100);
+        // Edge-delta graph rebuild (exact vs full rebuild; falls back internally
+        // on structural/schema changes — ADR-0166), then warm-started PageRank
+        // seeded from the current scores (ADR-0165). Conventions/test_map are
+        // cheap aggregates and recomputed in full.
+        self.rebuild_graph_delta(&changed, &removed);
+        self.pagerank = crate::intelligence::pagerank::compute_pagerank_seeded(
+            &self.graph,
+            0.85,
+            100,
+            &self.pagerank,
+        );
         let all_paths: std::collections::HashSet<String> =
             self.files.iter().map(|f| f.relative_path.clone()).collect();
         self.test_map = crate::intelligence::test_map::build_test_map(&self.files, &all_paths);
