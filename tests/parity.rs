@@ -251,6 +251,128 @@ fn incremental_rebuild_matches_full_build() {
     }
 }
 
+/// Init a git repo at `dir` with `files` (relative_path, content), committed.
+fn init_repo_with_files(dir: &std::path::Path, files: &[(&str, &str)]) {
+    let repo = git2::Repository::init(dir).unwrap();
+    let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+    for (rel, content) in files {
+        let abs = dir.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, content).unwrap();
+    }
+    let mut idx = repo.index().unwrap();
+    idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    idx.write().unwrap();
+    let tree_id = idx.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+        .unwrap();
+}
+
+/// Recursively copy a directory tree (used to simulate a clone to a new path).
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn derived_cache_hit_equals_full_build() {
+    use cxpak::commands::serve::build_index;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    init_repo_with_files(
+        dir.path(),
+        &[
+            ("src/a.rs", "use crate::b;\npub fn a() {}\n"),
+            ("src/b.rs", "pub fn b() {}\n"),
+        ],
+    );
+
+    let full = build_index(dir.path()).unwrap(); // miss → builds + saves derived cache
+    let cached = build_index(dir.path()).unwrap(); // hit → restores from derived cache
+
+    assert_eq!(
+        full.graph.edges, cached.graph.edges,
+        "cache-hit graph must equal the full build"
+    );
+    assert_eq!(full.graph.reverse_edges, cached.graph.reverse_edges);
+    assert_eq!(full.pagerank.len(), cached.pagerank.len());
+    for (k, &v) in &full.pagerank {
+        assert!((cached.pagerank[k] - v).abs() <= 2e-6, "pagerank {k}");
+    }
+    // ConventionProfile / CoChangeEdge have no PartialEq; compare as serde_json
+    // Values (whose object Map is a sorted BTreeMap, so HashMap key-ordering in
+    // the conventions — e.g. churn_trend — is normalised, comparing data, not
+    // serialization order).
+    assert_eq!(
+        serde_json::to_value(&full.conventions).unwrap(),
+        serde_json::to_value(&cached.conventions).unwrap(),
+        "restored conventions must equal the mined conventions"
+    );
+    assert_eq!(
+        serde_json::to_value(&full.co_changes).unwrap(),
+        serde_json::to_value(&cached.co_changes).unwrap(),
+    );
+    // The derived cache file was actually written.
+    assert!(dir.path().join(".cxpak/cache/root/derived.json").exists());
+}
+
+#[test]
+fn cache_is_portable_across_paths() {
+    use cxpak::cache::{content_fingerprint, DerivedCache};
+    use cxpak::commands::serve::build_index;
+
+    // Build in A (writes the derived cache).
+    let dir_a = tempfile::TempDir::new().unwrap();
+    init_repo_with_files(
+        dir_a.path(),
+        &[
+            ("src/a.rs", "use crate::b;\npub fn a() {}\n"),
+            ("src/b.rs", "pub fn b() {}\n"),
+        ],
+    );
+    let index_a = build_index(dir_a.path()).unwrap();
+
+    // The fingerprint A used (content + HEAD), recomputed independently.
+    let head_oid = {
+        let repo = git2::Repository::discover(dir_a.path()).unwrap();
+        let oid = repo.head().unwrap().target().unwrap().to_string();
+        oid
+    };
+    let fp_files: Vec<(String, String)> = index_a
+        .files
+        .iter()
+        .map(|f| (f.relative_path.clone(), f.content.clone()))
+        .collect();
+    let fingerprint = content_fingerprint(&fp_files, &head_oid);
+
+    // Copy the entire tree (source + .git + .cxpak) to B — a different absolute
+    // path, identical content and HEAD, as a clone to another machine would be.
+    let dir_b = tempfile::TempDir::new().unwrap();
+    copy_tree(dir_a.path(), dir_b.path());
+
+    // The cache written by A must HIT in B under the same content fingerprint —
+    // the fingerprint is content-based, so it is path-independent.
+    let cache_dir_b = dir_b.path().join(".cxpak/cache/root");
+    assert!(
+        DerivedCache::load(&cache_dir_b, &fingerprint).is_some(),
+        "derived cache must be portable: same content+HEAD must hit at a new path"
+    );
+
+    // And a full build in B equals the build in A.
+    let index_b = build_index(dir_b.path()).unwrap();
+    assert_eq!(index_a.graph.edges, index_b.graph.edges);
+}
+
 /// A changed file with a data layer present MUST fall back to a full rebuild so
 /// schema-derived edges (here a foreign key) survive — a naive import-only
 /// delta would silently drop them. Mandated by the W1 plan's schema boundary.

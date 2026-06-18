@@ -131,10 +131,60 @@ pub fn build_index_with_workspace(
     }
 
     let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
-    index.conventions = crate::conventions::build_convention_profile(&index, path);
-    // Propagate co-change data from git_health into the top-level index field
-    index.co_changes = index.conventions.git_health.co_changes.clone();
+
+    // Derived-index cache (ADR-0167): on a content+HEAD fingerprint hit, restore
+    // the derived analysis — crucially skipping the expensive git-mined
+    // conventions/co-changes recompute — instead of re-mining history. The
+    // fingerprint is content-based, so the cache is portable across clones/CI
+    // and never serves stale data on a same-size edit. Fail-closed: any miss /
+    // corruption falls through to a full rebuild.
+    let cache_dir = path.join(cache_namespace(path, workspace));
+    let head_oid = git_head_oid(path);
+    let fp_files: Vec<(String, String)> = index
+        .files
+        .iter()
+        .map(|f| (f.relative_path.clone(), f.content.clone()))
+        .collect();
+    let fingerprint = crate::cache::content_fingerprint(&fp_files, &head_oid);
+
+    match crate::cache::DerivedCache::load(&cache_dir, &fingerprint) {
+        Some(derived) => {
+            index.graph = derived.graph;
+            index.pagerank = derived.pagerank;
+            index.call_graph = derived.call_graph;
+            index.conventions = derived.conventions;
+            index.co_changes = derived.co_changes;
+        }
+        None => {
+            index.conventions = crate::conventions::build_convention_profile(&index, path);
+            index.co_changes = index.conventions.git_health.co_changes.clone();
+            let derived = crate::cache::DerivedCache::new(
+                fingerprint,
+                index.graph.clone(),
+                index.call_graph.clone(),
+                index.pagerank.clone(),
+                index.conventions.clone(),
+                index.co_changes.clone(),
+            );
+            // Persisting is best-effort; a write failure must not fail indexing.
+            let _ = derived.save(&cache_dir);
+        }
+    }
     Ok(index)
+}
+
+/// Current git HEAD commit oid as a hex string, or `""` when `path` is not a
+/// git repository / has no commits. Part of the derived-cache fingerprint so a
+/// HEAD move invalidates history-derived data (conventions, co-changes).
+fn git_head_oid(path: &Path) -> String {
+    let Ok(repo) = git2::Repository::discover(path) else {
+        return String::new();
+    };
+    repo.head()
+        .ok()
+        .and_then(|head| head.target())
+        .map(|oid| oid.to_string())
+        .unwrap_or_default()
 }
 
 /// Returns a cache directory name scoped to the given workspace.

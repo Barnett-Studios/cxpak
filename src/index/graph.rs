@@ -55,7 +55,7 @@ pub struct TypedEdge {
 /// by the file count (low thousands at most for the sizes cxpak indexes),
 /// log₂(n) ≈ 11–13, and the graph is built once per index build.  No
 /// measurable wall-clock impact.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DependencyGraph {
     pub edges: BTreeMap<String, BTreeSet<TypedEdge>>,
     pub reverse_edges: BTreeMap<String, BTreeSet<TypedEdge>>,

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::Path;
 
-pub const CACHE_VERSION: u32 = 2;
+pub const CACHE_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileCache {
@@ -94,6 +94,112 @@ impl FileCache {
 impl Default for FileCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Derived-index cache (ADR-0167): persist the expensive derived analysis
+// (dependency graph, call graph, PageRank, conventions, co-changes) keyed by a
+// **content** fingerprint so the cache survives `git checkout` / clone / CI and
+// is portable across machines (mtimes are meaningless across clones; content
+// hashes are not). Fail-closed: any mismatch / corruption → full rebuild.
+// ---------------------------------------------------------------------------
+
+/// SHA-256 content fingerprint over `(relative_path, sha256(content))` pairs
+/// (sorted for determinism) plus the git HEAD oid. Two checkouts with identical
+/// file contents and HEAD produce the same fingerprint on any machine; a
+/// same-size content edit changes it (unlike `(mtime, size)`), and a HEAD move
+/// changes it (so history-derived data — conventions, co-changes — is rebuilt).
+pub fn content_fingerprint(files: &[(String, String)], head_oid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut pairs: Vec<(&str, String)> = files
+        .iter()
+        .map(|(path, content)| {
+            (
+                path.as_str(),
+                format!("{:x}", Sha256::digest(content.as_bytes())),
+            )
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = Sha256::new();
+    for (path, content_hash) in &pairs {
+        hasher.update(path.as_bytes());
+        hasher.update(b":");
+        hasher.update(content_hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(b"HEAD:");
+    hasher.update(head_oid.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Persisted derived analysis. Validated on load by `version` + `grammar_hash`
+/// + `fingerprint`; any mismatch is treated as a miss (fail-closed).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DerivedCache {
+    pub version: u32,
+    pub grammar_hash: String,
+    pub fingerprint: String,
+    pub graph: crate::index::graph::DependencyGraph,
+    pub call_graph: crate::intelligence::call_graph::CallGraph,
+    pub pagerank: HashMap<String, f64>,
+    pub conventions: crate::conventions::ConventionProfile,
+    pub co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
+}
+
+impl DerivedCache {
+    /// Construct a derived cache stamped with the current `CACHE_VERSION` and
+    /// grammar hash, ready to [`save`](Self::save).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        fingerprint: String,
+        graph: crate::index::graph::DependencyGraph,
+        call_graph: crate::intelligence::call_graph::CallGraph,
+        pagerank: HashMap<String, f64>,
+        conventions: crate::conventions::ConventionProfile,
+        co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
+    ) -> Self {
+        Self {
+            version: CACHE_VERSION,
+            grammar_hash: CURRENT_GRAMMAR_HASH.to_string(),
+            fingerprint,
+            graph,
+            call_graph,
+            pagerank,
+            conventions,
+            co_changes,
+        }
+    }
+
+    /// Load the derived cache and return it only if it is structurally valid AND
+    /// matches the current grammar hash and the supplied content `fingerprint`.
+    /// Returns `None` on any error, version/grammar/fingerprint mismatch, or
+    /// corruption — the caller must then rebuild from scratch (fail-closed).
+    pub fn load(cache_dir: &Path, fingerprint: &str) -> Option<Self> {
+        let path = cache_dir.join("derived.json");
+        let _lock = lock_cache(cache_dir).ok();
+        let content = std::fs::read_to_string(&path).ok()?;
+        let cache: DerivedCache = serde_json::from_str(&content).ok()?;
+        if cache.version == CACHE_VERSION
+            && cache.grammar_hash == CURRENT_GRAMMAR_HASH
+            && cache.fingerprint == fingerprint
+        {
+            Some(cache)
+        } else {
+            None
+        }
+    }
+
+    /// Atomically persist the derived cache (lock + temp-write + rename), mirroring
+    /// [`FileCache::save`]. Errors are returned but are non-fatal to the caller.
+    pub fn save(&self, cache_dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(cache_dir)?;
+        let _lock = lock_cache(cache_dir)?;
+        let json = serde_json::to_string(self)?;
+        let tmp = cache_dir.join("derived.json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(tmp, cache_dir.join("derived.json"))
     }
 }
 
@@ -379,6 +485,107 @@ mod tests {
         let loaded = FileCache::load(dir.path());
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].relative_path, "src/main.rs");
+    }
+
+    // ── DerivedCache (ADR-0167) ────────────────────────────────────────────
+
+    fn sample_derived(fingerprint: &str) -> DerivedCache {
+        let mut graph = crate::index::graph::DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs", crate::index::graph::EdgeType::Import);
+        let mut pagerank = HashMap::new();
+        pagerank.insert("a.rs".to_string(), 0.5);
+        DerivedCache::new(
+            fingerprint.to_string(),
+            graph,
+            crate::intelligence::call_graph::CallGraph::default(),
+            pagerank,
+            crate::conventions::ConventionProfile::default(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn derived_cache_roundtrip_hit_on_matching_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_derived("fp-abc").save(dir.path()).unwrap();
+        let loaded = DerivedCache::load(dir.path(), "fp-abc").expect("hit on matching fingerprint");
+        assert_eq!(loaded.fingerprint, "fp-abc");
+        assert!(loaded
+            .graph
+            .dependencies("a.rs")
+            .map(|s| s.iter().any(|e| e.target == "b.rs"))
+            .unwrap_or(false));
+        assert_eq!(loaded.pagerank.get("a.rs"), Some(&0.5));
+    }
+
+    #[test]
+    fn derived_cache_fingerprint_mismatch_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_derived("fp-abc").save(dir.path()).unwrap();
+        // A different content fingerprint must be a miss, never a stale hit.
+        assert!(DerivedCache::load(dir.path(), "fp-different").is_none());
+    }
+
+    #[test]
+    fn derived_cache_corrupt_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("derived.json"), "{ not valid json").unwrap();
+        assert!(DerivedCache::load(dir.path(), "fp-abc").is_none());
+    }
+
+    #[test]
+    fn derived_cache_missing_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(DerivedCache::load(dir.path(), "fp-abc").is_none());
+    }
+
+    #[test]
+    fn content_fingerprint_is_content_based_and_order_independent() {
+        let a = vec![
+            ("src/a.rs".to_string(), "fn a() {}".to_string()),
+            ("src/b.rs".to_string(), "fn b() {}".to_string()),
+        ];
+        // Same contents, different input ordering → identical fingerprint (sorted).
+        let b = vec![
+            ("src/b.rs".to_string(), "fn b() {}".to_string()),
+            ("src/a.rs".to_string(), "fn a() {}".to_string()),
+        ];
+        assert_eq!(
+            content_fingerprint(&a, "head1"),
+            content_fingerprint(&b, "head1")
+        );
+        // A content change flips the fingerprint (unlike a (mtime,size) key).
+        let changed = vec![
+            ("src/a.rs".to_string(), "fn a() { 1 }".to_string()),
+            ("src/b.rs".to_string(), "fn b() {}".to_string()),
+        ];
+        assert_ne!(
+            content_fingerprint(&a, "head1"),
+            content_fingerprint(&changed, "head1")
+        );
+        // A HEAD move flips it (history-derived data must be rebuilt).
+        assert_ne!(
+            content_fingerprint(&a, "head1"),
+            content_fingerprint(&a, "head2")
+        );
+    }
+
+    #[test]
+    fn derived_cache_grammar_or_version_mismatch_fails_closed() {
+        // A derived.json with a stale grammar_hash must be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let stale = serde_json::json!({
+            "version": CACHE_VERSION,
+            "grammar_hash": "stale-grammar",
+            "fingerprint": "fp-abc",
+            "graph": { "edges": {}, "reverse_edges": {} },
+            "call_graph": crate::intelligence::call_graph::CallGraph::default(),
+            "pagerank": {},
+            "conventions": crate::conventions::ConventionProfile::default(),
+            "co_changes": [],
+        });
+        std::fs::write(dir.path().join("derived.json"), stale.to_string()).unwrap();
+        assert!(DerivedCache::load(dir.path(), "fp-abc").is_none());
     }
 
     #[test]
