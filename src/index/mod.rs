@@ -820,6 +820,108 @@ pub fn build_embedding_index(
 mod tests {
     use super::*;
 
+    /// Build an index from `(path, imports)` specs (Rust files under `src/`,
+    /// imports as `crate::X` strings), with a full graph.
+    fn idx_with_imports(spec: &[(&str, &[&str])]) -> CodebaseIndex {
+        use crate::parser::language::{Import, ParseResult};
+        let mut idx = CodebaseIndex::empty();
+        idx.files = spec
+            .iter()
+            .map(|(path, imports)| IndexedFile {
+                relative_path: path.to_string(),
+                language: Some("rust".to_string()),
+                size_bytes: 0,
+                token_count: 0,
+                parse_result: Some(ParseResult {
+                    symbols: vec![],
+                    imports: imports
+                        .iter()
+                        .map(|s| Import {
+                            source: (*s).to_string(),
+                            names: vec![],
+                        })
+                        .collect(),
+                    exports: vec![],
+                }),
+                content: String::new(),
+                mtime_secs: None,
+            })
+            .collect();
+        idx.total_files = idx.files.len();
+        idx.rebuild_graph();
+        idx
+    }
+
+    #[test]
+    fn rebuild_graph_delta_content_modify_equals_full() {
+        use crate::parser::language::Import;
+        let mut delta = idx_with_imports(&[
+            ("src/a.rs", &["crate::b"]),
+            ("src/b.rs", &[]),
+            ("src/c.rs", &[]),
+        ]);
+        // Modify a's imports b → c (content change, a is already a node, no schema).
+        if let Some(f) = delta
+            .files
+            .iter_mut()
+            .find(|f| f.relative_path == "src/a.rs")
+        {
+            f.parse_result.as_mut().unwrap().imports = vec![Import {
+                source: "crate::c".to_string(),
+                names: vec![],
+            }];
+        }
+        let mut changed = std::collections::HashSet::new();
+        changed.insert("src/a.rs".to_string());
+        delta.rebuild_graph_delta(&changed, &std::collections::HashSet::new());
+
+        let full = idx_with_imports(&[
+            ("src/a.rs", &["crate::c"]),
+            ("src/b.rs", &[]),
+            ("src/c.rs", &[]),
+        ]);
+        assert_eq!(delta.graph.edges, full.graph.edges);
+        assert_eq!(delta.graph.reverse_edges, full.graph.reverse_edges);
+    }
+
+    #[test]
+    fn rebuild_graph_delta_removal_falls_back_to_full() {
+        let mut delta = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        delta.files.retain(|f| f.relative_path != "src/b.rs"); // remove b
+        let mut removed = std::collections::HashSet::new();
+        removed.insert("src/b.rs".to_string());
+        delta.rebuild_graph_delta(&std::collections::HashSet::new(), &removed);
+
+        // b is gone → a's `crate::b` no longer resolves → no edge, same as full.
+        let full = idx_with_imports(&[("src/a.rs", &["crate::b"])]);
+        assert_eq!(delta.graph.edges, full.graph.edges);
+        assert_eq!(delta.graph.reverse_edges, full.graph.reverse_edges);
+    }
+
+    #[test]
+    fn rebuild_graph_delta_with_schema_falls_back_to_full() {
+        use crate::schema::SchemaIndex;
+        let empty_schema = SchemaIndex {
+            tables: HashMap::new(),
+            views: HashMap::new(),
+            functions: HashMap::new(),
+            orm_models: HashMap::new(),
+            migrations: Vec::new(),
+        };
+        let mut delta = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        delta.schema = Some(empty_schema.clone());
+        delta.rebuild_graph();
+        let mut changed = std::collections::HashSet::new();
+        changed.insert("src/a.rs".to_string());
+        // schema.is_some() → full-rebuild fallback path.
+        delta.rebuild_graph_delta(&changed, &std::collections::HashSet::new());
+
+        let mut full = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        full.schema = Some(empty_schema);
+        full.rebuild_graph();
+        assert_eq!(delta.graph.edges, full.graph.edges);
+    }
+
     #[test]
     fn test_codebase_index_cross_lang_field() {
         // A two-file fixture: TypeScript calling fetch and Python exposing

@@ -1037,6 +1037,33 @@ mod tests {
     }
 
     #[test]
+    fn test_contains_node() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs", EdgeType::Import);
+        assert!(graph.contains_node("a.rs"), "source of an edge is a node");
+        assert!(graph.contains_node("b.rs"), "target of an edge is a node");
+        assert!(
+            !graph.contains_node("z.rs"),
+            "a file with no edges is not a node"
+        );
+    }
+
+    #[test]
+    fn test_edges_for_file_returns_resolved_imports() {
+        let files = [
+            make_indexed_file("src/a.rs", "rust", vec!["crate::b"]),
+            make_indexed_file("src/b.rs", "rust", vec![]),
+        ];
+        let all_paths: HashSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        let edges = edges_for_file(&files[0], &all_paths);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].0, "src/b.rs");
+        assert_eq!(edges[0].1, EdgeType::Import);
+        // A file with no parse result / no imports yields no edges.
+        assert!(edges_for_file(&files[1], &all_paths).is_empty());
+    }
+
+    #[test]
     fn test_dependents() {
         let mut graph = DependencyGraph::new();
         graph.add_edge("a.rs", "b.rs", EdgeType::Import);
