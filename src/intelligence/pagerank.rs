@@ -39,6 +39,22 @@ pub fn compute_pagerank(
     damping: f64,
     max_iterations: usize,
 ) -> HashMap<String, f64> {
+    // Empty seed → every node falls back to 1/N, i.e. exactly the original
+    // cold-start behaviour.
+    compute_pagerank_seeded(graph, damping, max_iterations, &HashMap::new())
+}
+
+/// Warm-started PageRank (ADR-0165). Identical to [`compute_pagerank`] except
+/// each node's initial rank is taken from `initial` when present, falling back
+/// to `1/N` otherwise. Seeding from a previously-converged result reaches the
+/// same fixed point in fewer iterations — PageRank's stationary distribution is
+/// unique for a given graph, so warm == cold within float epsilon.
+pub fn compute_pagerank_seeded(
+    graph: &DependencyGraph,
+    damping: f64,
+    max_iterations: usize,
+    initial: &HashMap<String, f64>,
+) -> HashMap<String, f64> {
     // ── 1. Collect the universe of nodes ───────────────────────────────────
     // A node is any file that appears as a source *or* target of any edge.
     let mut nodes: HashSet<String> = HashSet::new();
@@ -77,11 +93,14 @@ pub fn compute_pagerank(
         })
         .collect();
 
-    // ── 3. Initialise ranks to 1/N ─────────────────────────────────────────
-    let initial_rank = 1.0 / n as f64;
+    // ── 3. Initialise ranks: warm seed when provided, else 1/N ──────────────
+    let default_rank = 1.0 / n as f64;
     let mut rank: HashMap<&str, f64> = nodes
         .iter()
-        .map(|node| (node.as_str(), initial_rank))
+        .map(|node| {
+            let seed = initial.get(node.as_str()).copied().unwrap_or(default_rank);
+            (node.as_str(), seed)
+        })
         .collect();
 
     let teleport = (1.0 - damping) / n as f64;
