@@ -923,6 +923,47 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_graph_delta_reinjects_cross_language_edges() {
+        use crate::index::graph::{BridgeType, EdgeType};
+        use crate::intelligence::cross_lang::CrossLangEdge;
+        let edge = CrossLangEdge {
+            source_file: "src/a.rs".to_string(),
+            source_symbol: "call".to_string(),
+            source_language: "rust".to_string(),
+            target_file: "src/b.rs".to_string(),
+            target_symbol: "handler".to_string(),
+            target_language: "rust".to_string(),
+            bridge_type: BridgeType::HttpCall,
+        };
+
+        let mut delta = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        delta.cross_lang_edges = vec![edge.clone()];
+        delta.rebuild_graph(); // inject the cross-lang edge into the baseline graph
+        let mut changed = std::collections::HashSet::new();
+        changed.insert("src/a.rs".to_string());
+        // Delta drops src/a.rs's outgoing edges (import + cross-lang) and must
+        // re-inject the cross-language edge for the changed file.
+        delta.rebuild_graph_delta(&changed, &std::collections::HashSet::new());
+
+        let mut full = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        full.cross_lang_edges = vec![edge];
+        full.rebuild_graph();
+
+        assert_eq!(delta.graph.edges, full.graph.edges);
+        assert_eq!(delta.graph.reverse_edges, full.graph.reverse_edges);
+        assert!(
+            delta
+                .graph
+                .edges
+                .get("src/a.rs")
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.edge_type, EdgeType::CrossLanguage(_))),
+            "the cross-language edge must survive the per-file delta"
+        );
+    }
+
+    #[test]
     fn test_codebase_index_cross_lang_field() {
         // A two-file fixture: TypeScript calling fetch and Python exposing
         // a matching Flask route. The build should populate cross_lang_edges
