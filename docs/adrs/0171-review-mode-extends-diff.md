@@ -1,5 +1,5 @@
 ---
-id: '0170'
+id: '0171'
 title: Review mode as a --review extension of cxpak diff, composing existing intelligence + expected-but-absent detection
 status: ACCEPTED
 date: 2026-06-16
@@ -7,7 +7,7 @@ triggered_by: v2.3.0 W3 — a review-context entry point, without duplicating di
 loop: planning
 ---
 
-# ADR-0170: Review mode as a `--review` extension of `cxpak diff`
+# ADR-0171: Review mode as a `--review` extension of `cxpak diff`
 
 ## Context
 
