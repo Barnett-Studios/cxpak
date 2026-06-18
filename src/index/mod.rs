@@ -447,6 +447,71 @@ impl CodebaseIndex {
         }
     }
 
+    /// Incrementally update the dependency graph for a set of `changed` files
+    /// (content modifications) and `removed` files, producing a graph that is
+    /// **bit-for-bit equal to a full [`rebuild_graph`]** (ADR-0166).
+    ///
+    /// Exactness reasoning — a per-file delta is only exact when the change
+    /// cannot ripple into *unchanged* files' edges:
+    /// - **Structural changes** (any removal, or a `changed` path that is not
+    ///   yet a graph node, i.e. an addition) alter the path universe, so an
+    ///   unchanged file's import could newly resolve to / stop resolving to the
+    ///   added/removed path. The per-file delta cannot see that ripple.
+    /// - **Schema present** — FK / view / function / ORM / migration / embedded
+    ///   -SQL edges derive from the `SchemaIndex` and file content scans; a
+    ///   per-file import delta would miss them.
+    ///
+    /// In either case we fall back to a full `rebuild_graph` (still far cheaper
+    /// than re-parsing, which the caller already did). Otherwise — pure content
+    /// modifications of existing files with no data layer — we recompute only
+    /// the changed files' import edges, which is exact because every other
+    /// file's edges are a pure function of unchanged inputs.
+    pub fn rebuild_graph_delta(
+        &mut self,
+        changed: &std::collections::HashSet<String>,
+        removed: &std::collections::HashSet<String>,
+    ) {
+        let structural =
+            !removed.is_empty() || changed.iter().any(|p| !self.graph.contains_node(p));
+        if structural || self.schema.is_some() {
+            self.rebuild_graph();
+            return;
+        }
+
+        // Pure content modifications, no schema → exact per-file import delta.
+        for p in changed {
+            self.graph.remove_edges_for(p);
+        }
+        let all_paths: std::collections::HashSet<&str> = self
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        for p in changed {
+            if let Some(file) = self.files.iter().find(|f| &f.relative_path == p) {
+                for (target, edge_type) in crate::index::graph::edges_for_file(file, &all_paths) {
+                    self.graph.add_edge(p, &target, edge_type);
+                }
+            }
+        }
+        // Re-inject cross-language edges for the changed files (mirrors
+        // `rebuild_graph`; only the changed files' cross-lang edges were dropped
+        // by `remove_edges_for`, so re-adding just those keeps parity).
+        for e in self
+            .cross_lang_edges
+            .iter()
+            .filter(|e| changed.contains(&e.source_file))
+        {
+            self.graph.add_edge(
+                &e.source_file,
+                &e.target_file,
+                crate::index::graph::EdgeType::CrossLanguage(e.bridge_type.clone()),
+            );
+        }
+        // Keep the call graph consistent with the delta (mirrors `rebuild_graph`).
+        self.call_graph = crate::intelligence::call_graph::build_call_graph(self);
+    }
+
     /// Rebuild the index incrementally: re-parse only files whose mtime/size differs.
     ///
     /// Steps:

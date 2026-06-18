@@ -106,6 +106,15 @@ impl DependencyGraph {
         self.edges.get(path)
     }
 
+    /// True when `path` participates in at least one edge (as a source or a
+    /// target). A file with no edges in either direction is not a node and
+    /// contributes nothing to the graph. Used by the incremental delta to
+    /// detect file-set changes (a changed path that is not yet a node is
+    /// treated as an addition → conservative full rebuild).
+    pub fn contains_node(&self, path: &str) -> bool {
+        self.edges.contains_key(path) || self.reverse_edges.contains_key(path)
+    }
+
     /// Remove all outgoing edges from `source` and clean up corresponding reverse edges.
     ///
     /// Used during incremental re-indexing: call this before re-adding the new
@@ -525,6 +534,37 @@ fn resolve_import(
 /// `build_schema_edges`.  When present, FK, ORM, embedded-SQL,
 /// migration-sequence, view-reference and function-reference edges are added
 /// in addition to the import edges derived from parse results.
+/// All **import** edges a single file contributes, as `(target, edge_type)`
+/// pairs. This is the per-file extraction factored out of
+/// [`build_dependency_graph`]'s loop so the full build and the incremental
+/// edge-delta rebuild share one source of truth — which is what keeps the
+/// delta exactly equal to a full rebuild by construction (ADR-0166).
+///
+/// Resolution uses `all_paths` (the current file universe); a file's import
+/// edges are a pure function of its own imports and that universe.
+///
+/// Schema-derived edges (FK / view / function / ORM / migration / embedded SQL)
+/// are intentionally NOT produced here: they come from the global
+/// [`crate::schema::link::build_schema_edges`] over the `SchemaIndex`, and the
+/// incremental path falls back to a full rebuild whenever a schema is present
+/// (see `CodebaseIndex::rebuild_graph_delta`), so a per-file schema extraction
+/// is never needed for the delta and is kept out to avoid a second, divergent
+/// implementation of that logic.
+pub(crate) fn edges_for_file(
+    file: &IndexedFile,
+    all_paths: &HashSet<&str>,
+) -> Vec<(String, EdgeType)> {
+    let mut out = Vec::new();
+    if let Some(pr) = &file.parse_result {
+        for import in &pr.imports {
+            if let Some(target) = resolve_import(&file.relative_path, &import.source, all_paths) {
+                out.push((target, EdgeType::Import));
+            }
+        }
+    }
+    out
+}
+
 pub fn build_dependency_graph(
     files: &[IndexedFile],
     schema: Option<&crate::schema::SchemaIndex>,
@@ -534,14 +574,8 @@ pub fn build_dependency_graph(
     let mut graph = DependencyGraph::new();
 
     for file in files {
-        let Some(pr) = &file.parse_result else {
-            continue;
-        };
-
-        for import in &pr.imports {
-            if let Some(target) = resolve_import(&file.relative_path, &import.source, &all_paths) {
-                graph.add_edge(&file.relative_path, &target, EdgeType::Import);
-            }
+        for (target, edge_type) in edges_for_file(file, &all_paths) {
+            graph.add_edge(&file.relative_path, &target, edge_type);
         }
     }
 
