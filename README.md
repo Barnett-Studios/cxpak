@@ -51,6 +51,89 @@ cargo install cxpak                                   # any platform, incl. Wind
 On Windows, `cargo install cxpak` works, or download the prebuilt
 `cxpak-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/Barnett-Studios/cxpak/releases/latest).
 
+## Docker
+
+Docker is a first-class deployment option — useful anywhere you want a reproducible, isolated install without managing a Rust toolchain: CI pipelines, sandboxed servers, Windows machines, or air-gapped environments.
+
+### Official image (recommended)
+
+Multi-arch (`amd64` / `arm64`) images are published to GitHub Container Registry on every release — no build, no Rust toolchain, no source checkout:
+
+```bash
+docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak overview .
+```
+
+Pin a tag or an immutable digest for reproducible deploys:
+
+```bash
+docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak:2.2.1 overview .
+docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak@sha256:<digest> overview .
+```
+
+Images are signed with [cosign](https://github.com/sigstore/cosign) (keyless) and carry SBOM + build-provenance attestations. Verify before deploying:
+
+```bash
+cosign verify ghcr.io/barnett-studios/cxpak:2.2.1 \
+  --certificate-identity-regexp '^https://github.com/Barnett-Studios/cxpak/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+### From source
+
+```bash
+docker build -t cxpak .
+```
+
+Builds the full default feature set from your local checkout. First build is slow (candle ML deps); subsequent builds reuse a cached dependency layer.
+
+### Usage
+
+The container runs as a non-root user; the embedding model weights (~30 MB, downloaded on first use) live under `/home/cxpak/.cxpak` — mount a named volume there to persist them across runs.
+
+**macOS / Linux:**
+```bash
+# One-shot command
+docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak overview .
+
+# HTTP server (--bind 0.0.0.0 required to reach the container from the host;
+# --token is mandatory when binding to a non-loopback address)
+docker run -d -p 3000:3000 \
+  -v "$(pwd):/repo" \
+  -v cxpak-models:/home/cxpak/.cxpak \
+  ghcr.io/barnett-studios/cxpak serve --bind 0.0.0.0 --token mysecret .
+
+# MCP — stdio only, one repo per instance (see note below)
+docker run --rm -i -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak serve --mcp .
+```
+
+**Windows (PowerShell):**
+```powershell
+# One-shot command
+docker run --rm -v ${PWD}:/repo ghcr.io/barnett-studios/cxpak overview .
+
+# HTTP server
+docker run -d -p 3000:3000 `
+  -v ${PWD}:/repo `
+  -v cxpak-models:/home/cxpak/.cxpak `
+  ghcr.io/barnett-studios/cxpak serve --bind 0.0.0.0 --token mysecret .
+
+# Verify (use curl.exe — PowerShell's curl alias does not work here)
+curl.exe http://localhost:3000/health
+
+# MCP — stdio only, one repo per instance (see note below)
+docker run --rm -i -v ${PWD}:/repo ghcr.io/barnett-studios/cxpak serve --mcp .
+```
+
+Replace `mysecret` with any non-empty secret of your choice. `/health` is open (GET); every `/v1/*` endpoint is a POST and requires the bearer token:
+```bash
+curl http://localhost:3000/health                                        # no auth required
+curl -X POST -H "Authorization: Bearer mysecret" http://localhost:3000/v1/conventions
+```
+
+> **HTTP vs MCP:** These are two separate transports — you cannot use the HTTP server as an MCP endpoint.
+>
+> **MCP scope:** Each MCP instance indexes exactly one repository — the path passed at startup (`.` in the examples above, which maps to the mounted `/repo`). To serve multiple repos simultaneously, run one container per repo and register each in your MCP client config. The HTTP server has the same single-repo scope.
+
 ## Quick start
 
 ```bash

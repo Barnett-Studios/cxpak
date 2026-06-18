@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.7
+# Runtime image built from a pre-compiled cxpak binary — no source, no toolchain.
+#
+# CI (.github/workflows/release.yml) extracts each release tarball into
+# dist/linux/<arch>/cxpak and builds this with `buildx --platform
+# linux/amd64,linux/arm64`; buildx selects the matching binary per platform via
+# $TARGETARCH, producing a multi-arch manifest with no QEMU emulation.
+#
+# Manual single-arch build:
+#   mkdir -p dist/linux/amd64
+#   tar -xzf cxpak-x86_64-unknown-linux-gnu.tar.gz -C dist/linux/amd64/
+#   docker build -f Dockerfile.dist -t cxpak .
+#
+# ubuntu:24.04 matches the release builder (ubuntu-latest, glibc 2.39) and ships
+# libgcc-s1 by default; the binaries are OpenSSL-free (rustls), so only
+# ca-certificates is needed for the first-use model download.
+FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
+
+LABEL org.opencontainers.image.source="https://github.com/Barnett-Studios/cxpak" \
+      org.opencontainers.image.description="Token-budgeted codebase context for LLMs" \
+      org.opencontainers.image.licenses="MIT"
+
+# curl: HEALTHCHECK probe for `cxpak serve`.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home --user-group cxpak
+
+# Populated by CI (or a manual tar extraction) before build; buildx sets TARGETARCH.
+ARG TARGETARCH
+COPY --chmod=755 dist/linux/${TARGETARCH}/cxpak /usr/local/bin/cxpak
+
+# Model weights (~30 MB) download on first use to $HOME/.cxpak/models. Mount a
+# named volume at /home/cxpak/.cxpak to persist them across runs.
+ENV HOME=/home/cxpak
+USER 10001
+WORKDIR /repo
+VOLUME ["/home/cxpak/.cxpak"]
+EXPOSE 3000
+
+# Probes the HTTP server (`cxpak serve`). One-shot CLI runs exit before this matters.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:3000/health || exit 1
+
+ENTRYPOINT ["cxpak"]

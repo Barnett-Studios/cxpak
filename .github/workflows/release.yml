@@ -3,7 +3,8 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'        # release: full pipeline
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'      # prerelease (e.g. -rc.1): build + image only
 
 permissions:
   contents: write
@@ -14,6 +15,7 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false   # one target failing shouldn't cancel/mask the others
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -89,10 +91,80 @@ jobs:
         uses: softprops/action-gh-release@v2.6.1
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: artifacts/*
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # cosign keyless signing via GitHub OIDC
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Compute lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Stage per-arch binaries for Dockerfile.dist
+        run: |
+          mkdir -p dist/linux/amd64 dist/linux/arm64
+          tar -xzf artifacts/cxpak-x86_64-unknown-linux-gnu.tar.gz -C dist/linux/amd64/
+          tar -xzf artifacts/cxpak-aarch64-unknown-linux-gnu.tar.gz -C dist/linux/arm64/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags + OCI labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      # COPY-only Dockerfile.dist needs no QEMU: buildx assembles the manifest
+      # from the prebuilt per-arch binaries.
+      - name: Build and push multi-arch image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dist
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
   publish:
     needs: build
+    if: ${{ !contains(github.ref_name, '-') }}   # skip crates.io on prerelease tags
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
@@ -103,6 +175,7 @@ jobs:
 
   update-homebrew:
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}   # skip Homebrew tap on prerelease tags
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
