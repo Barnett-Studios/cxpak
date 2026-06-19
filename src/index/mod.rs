@@ -447,6 +447,71 @@ impl CodebaseIndex {
         }
     }
 
+    /// Incrementally update the dependency graph for a set of `changed` files
+    /// (content modifications) and `removed` files, producing a graph that is
+    /// **bit-for-bit equal to a full [`rebuild_graph`]** (ADR-0166).
+    ///
+    /// Exactness reasoning — a per-file delta is only exact when the change
+    /// cannot ripple into *unchanged* files' edges:
+    /// - **Structural changes** (any removal, or a `changed` path that is not
+    ///   yet a graph node, i.e. an addition) alter the path universe, so an
+    ///   unchanged file's import could newly resolve to / stop resolving to the
+    ///   added/removed path. The per-file delta cannot see that ripple.
+    /// - **Schema present** — FK / view / function / ORM / migration / embedded
+    ///   -SQL edges derive from the `SchemaIndex` and file content scans; a
+    ///   per-file import delta would miss them.
+    ///
+    /// In either case we fall back to a full `rebuild_graph` (still far cheaper
+    /// than re-parsing, which the caller already did). Otherwise — pure content
+    /// modifications of existing files with no data layer — we recompute only
+    /// the changed files' import edges, which is exact because every other
+    /// file's edges are a pure function of unchanged inputs.
+    pub fn rebuild_graph_delta(
+        &mut self,
+        changed: &std::collections::HashSet<String>,
+        removed: &std::collections::HashSet<String>,
+    ) {
+        let structural =
+            !removed.is_empty() || changed.iter().any(|p| !self.graph.contains_node(p));
+        if structural || self.schema.is_some() {
+            self.rebuild_graph();
+            return;
+        }
+
+        // Pure content modifications, no schema → exact per-file import delta.
+        for p in changed {
+            self.graph.remove_edges_for(p);
+        }
+        let all_paths: std::collections::HashSet<&str> = self
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        for p in changed {
+            if let Some(file) = self.files.iter().find(|f| &f.relative_path == p) {
+                for (target, edge_type) in crate::index::graph::edges_for_file(file, &all_paths) {
+                    self.graph.add_edge(p, &target, edge_type);
+                }
+            }
+        }
+        // Re-inject cross-language edges for the changed files (mirrors
+        // `rebuild_graph`; only the changed files' cross-lang edges were dropped
+        // by `remove_edges_for`, so re-adding just those keeps parity).
+        for e in self
+            .cross_lang_edges
+            .iter()
+            .filter(|e| changed.contains(&e.source_file))
+        {
+            self.graph.add_edge(
+                &e.source_file,
+                &e.target_file,
+                crate::index::graph::EdgeType::CrossLanguage(e.bridge_type.clone()),
+            );
+        }
+        // Keep the call graph consistent with the delta (mirrors `rebuild_graph`).
+        self.call_graph = crate::intelligence::call_graph::build_call_graph(self);
+    }
+
     /// Rebuild the index incrementally: re-parse only files whose mtime/size differs.
     ///
     /// Steps:
@@ -473,11 +538,14 @@ impl CodebaseIndex {
             .filter(|f| !current_paths.contains(&f.relative_path))
             .map(|f| f.relative_path.clone())
             .collect();
+        let removed: std::collections::HashSet<String> = to_remove.iter().cloned().collect();
         for path in &to_remove {
             self.remove_file(path);
         }
 
-        // Upsert changed or new files
+        // Upsert changed or new files, tracking which paths actually changed so
+        // the graph can be rebuilt by edge-delta rather than from scratch.
+        let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for file in current_files {
             let mtime_secs = std::fs::metadata(&file.absolute_path)
                 .ok()
@@ -508,12 +576,21 @@ impl CodebaseIndex {
                     counter,
                     mtime_secs,
                 );
+                changed.insert(file.relative_path.clone());
             }
         }
 
-        // Rebuild graph and recompute derived scores
-        self.rebuild_graph();
-        self.pagerank = crate::intelligence::pagerank::compute_pagerank(&self.graph, 0.85, 100);
+        // Edge-delta graph rebuild (exact vs full rebuild; falls back internally
+        // on structural/schema changes — ADR-0166), then warm-started PageRank
+        // seeded from the current scores (ADR-0165). Conventions/test_map are
+        // cheap aggregates and recomputed in full.
+        self.rebuild_graph_delta(&changed, &removed);
+        self.pagerank = crate::intelligence::pagerank::compute_pagerank_seeded(
+            &self.graph,
+            0.85,
+            100,
+            &self.pagerank,
+        );
         let all_paths: std::collections::HashSet<String> =
             self.files.iter().map(|f| f.relative_path.clone()).collect();
         self.test_map = crate::intelligence::test_map::build_test_map(&self.files, &all_paths);
@@ -742,6 +819,149 @@ pub fn build_embedding_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build an index from `(path, imports)` specs (Rust files under `src/`,
+    /// imports as `crate::X` strings), with a full graph.
+    fn idx_with_imports(spec: &[(&str, &[&str])]) -> CodebaseIndex {
+        use crate::parser::language::{Import, ParseResult};
+        let mut idx = CodebaseIndex::empty();
+        idx.files = spec
+            .iter()
+            .map(|(path, imports)| IndexedFile {
+                relative_path: path.to_string(),
+                language: Some("rust".to_string()),
+                size_bytes: 0,
+                token_count: 0,
+                parse_result: Some(ParseResult {
+                    symbols: vec![],
+                    imports: imports
+                        .iter()
+                        .map(|s| Import {
+                            source: (*s).to_string(),
+                            names: vec![],
+                        })
+                        .collect(),
+                    exports: vec![],
+                }),
+                content: String::new(),
+                mtime_secs: None,
+            })
+            .collect();
+        idx.total_files = idx.files.len();
+        idx.rebuild_graph();
+        idx
+    }
+
+    #[test]
+    fn rebuild_graph_delta_content_modify_equals_full() {
+        use crate::parser::language::Import;
+        let mut delta = idx_with_imports(&[
+            ("src/a.rs", &["crate::b"]),
+            ("src/b.rs", &[]),
+            ("src/c.rs", &[]),
+        ]);
+        // Modify a's imports b → c (content change, a is already a node, no schema).
+        if let Some(f) = delta
+            .files
+            .iter_mut()
+            .find(|f| f.relative_path == "src/a.rs")
+        {
+            f.parse_result.as_mut().unwrap().imports = vec![Import {
+                source: "crate::c".to_string(),
+                names: vec![],
+            }];
+        }
+        let mut changed = std::collections::HashSet::new();
+        changed.insert("src/a.rs".to_string());
+        delta.rebuild_graph_delta(&changed, &std::collections::HashSet::new());
+
+        let full = idx_with_imports(&[
+            ("src/a.rs", &["crate::c"]),
+            ("src/b.rs", &[]),
+            ("src/c.rs", &[]),
+        ]);
+        assert_eq!(delta.graph.edges, full.graph.edges);
+        assert_eq!(delta.graph.reverse_edges, full.graph.reverse_edges);
+    }
+
+    #[test]
+    fn rebuild_graph_delta_removal_falls_back_to_full() {
+        let mut delta = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        delta.files.retain(|f| f.relative_path != "src/b.rs"); // remove b
+        let mut removed = std::collections::HashSet::new();
+        removed.insert("src/b.rs".to_string());
+        delta.rebuild_graph_delta(&std::collections::HashSet::new(), &removed);
+
+        // b is gone → a's `crate::b` no longer resolves → no edge, same as full.
+        let full = idx_with_imports(&[("src/a.rs", &["crate::b"])]);
+        assert_eq!(delta.graph.edges, full.graph.edges);
+        assert_eq!(delta.graph.reverse_edges, full.graph.reverse_edges);
+    }
+
+    #[test]
+    fn rebuild_graph_delta_with_schema_falls_back_to_full() {
+        use crate::schema::SchemaIndex;
+        let empty_schema = SchemaIndex {
+            tables: HashMap::new(),
+            views: HashMap::new(),
+            functions: HashMap::new(),
+            orm_models: HashMap::new(),
+            migrations: Vec::new(),
+        };
+        let mut delta = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        delta.schema = Some(empty_schema.clone());
+        delta.rebuild_graph();
+        let mut changed = std::collections::HashSet::new();
+        changed.insert("src/a.rs".to_string());
+        // schema.is_some() → full-rebuild fallback path.
+        delta.rebuild_graph_delta(&changed, &std::collections::HashSet::new());
+
+        let mut full = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        full.schema = Some(empty_schema);
+        full.rebuild_graph();
+        assert_eq!(delta.graph.edges, full.graph.edges);
+    }
+
+    #[test]
+    fn rebuild_graph_delta_reinjects_cross_language_edges() {
+        use crate::index::graph::{BridgeType, EdgeType};
+        use crate::intelligence::cross_lang::CrossLangEdge;
+        let edge = CrossLangEdge {
+            source_file: "src/a.rs".to_string(),
+            source_symbol: "call".to_string(),
+            source_language: "rust".to_string(),
+            target_file: "src/b.rs".to_string(),
+            target_symbol: "handler".to_string(),
+            target_language: "rust".to_string(),
+            bridge_type: BridgeType::HttpCall,
+        };
+
+        let mut delta = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        delta.cross_lang_edges = vec![edge.clone()];
+        delta.rebuild_graph(); // inject the cross-lang edge into the baseline graph
+        let mut changed = std::collections::HashSet::new();
+        changed.insert("src/a.rs".to_string());
+        // Delta drops src/a.rs's outgoing edges (import + cross-lang) and must
+        // re-inject the cross-language edge for the changed file.
+        delta.rebuild_graph_delta(&changed, &std::collections::HashSet::new());
+
+        let mut full = idx_with_imports(&[("src/a.rs", &["crate::b"]), ("src/b.rs", &[])]);
+        full.cross_lang_edges = vec![edge];
+        full.rebuild_graph();
+
+        assert_eq!(delta.graph.edges, full.graph.edges);
+        assert_eq!(delta.graph.reverse_edges, full.graph.reverse_edges);
+        assert!(
+            delta
+                .graph
+                .edges
+                .get("src/a.rs")
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.edge_type, EdgeType::CrossLanguage(_))),
+            "the cross-language edge must survive the per-file delta"
+        );
+    }
 
     #[test]
     fn test_codebase_index_cross_lang_field() {
