@@ -91,6 +91,7 @@ fn main() {
             format,
             verbose,
             all,
+            review,
             git_ref,
             focus,
             since,
@@ -129,6 +130,7 @@ fn main() {
                 *all,
                 focus.as_deref(),
                 *timing,
+                *review,
             )
         }
         Commands::Overview {

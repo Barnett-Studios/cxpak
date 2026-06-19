@@ -174,3 +174,4 @@
 | [0168](0168-efficiency-report-and-filtered-tokens.md) | Efficiency report as decision-support (relevant-set coverage + budget-margin), aggregated from existing data; cost estimate opt-in | ACCEPTED | 2026-06-16 |
 | [0169](0169-versioned-context-format-schema.md) | Publish a versioned context-format schema over the existing JSON output, not a new format | ACCEPTED | 2026-06-14 |
 | [0170](0170-official-container-images-from-ci.md) | Publish official multi-arch container images from CI, built from release artifacts and signed | ACCEPTED | 2026-06-18 |
+| [0171](0171-review-mode-extends-diff.md) | Review mode as a --review extension of cxpak diff, composing existing intelligence + expected-but-absent detection | ACCEPTED | 2026-06-16 |
