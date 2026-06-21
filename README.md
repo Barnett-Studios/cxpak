@@ -86,6 +86,24 @@ docker build -t cxpak .
 
 Builds the full default feature set from your local checkout. First build is slow (candle ML deps); subsequent builds reuse a cached dependency layer.
 
+### Self-hosted / air-gapped
+
+[`Dockerfile.standalone`](Dockerfile.standalone) fetches the pre-built release binary, verifies its SHA-256 checksum, and packages it into an `ubuntu:24.04` runtime — no source checkout or Rust toolchain required. All base images and the downloaded binary are digest-pinned for reproducible builds.
+
+```bash
+docker build -f Dockerfile.standalone -t cxpak .
+```
+
+To pin a specific release, pass its version and per-arch checksums (available on the [releases page](https://github.com/Barnett-Studios/cxpak/releases)):
+
+```bash
+docker build -f Dockerfile.standalone \
+  --build-arg VERSION=2.3.0 \
+  --build-arg SHA256_AMD64=c98d142aec62a70bb5ecccdf44120aaa55641a26b27d5a52821a093c79dd8cac \
+  --build-arg SHA256_ARM64=2f7cc078446a65bdb8f2cbcc81b2e1932431b066d560fe99e90519c7afd3d580 \
+  -t cxpak:2.3.0 .
+```
+
 ### Usage
 
 The container runs as a non-root user; the embedding model weights (~30 MB, downloaded on first use) live under `/home/cxpak/.cxpak` — mount a named volume there to persist them across runs.
