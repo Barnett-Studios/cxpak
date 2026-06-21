@@ -155,7 +155,7 @@ pub fn detect_embedded_sql(content: &str) -> Vec<EmbeddedSqlRef> {
 /// - ORM model file → table definition file
 /// - Migration sequence (each migration → its predecessor)
 pub fn build_schema_edges(
-    files: &[crate::index::IndexedFile],
+    files: &[crate::core_graph::IndexedFile],
     schema_index: &crate::schema::SchemaIndex,
 ) -> Vec<(String, String, EdgeType)> {
     let mut edges = Vec::new();
@@ -271,7 +271,7 @@ pub fn build_schema_edges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::IndexedFile;
+    use crate::core_graph::IndexedFile;
     use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
     use crate::schema::{
         ColumnSchema, ForeignKeyRef, MigrationChain, MigrationEntry, MigrationFramework,

@@ -1,6 +1,6 @@
 // ORM pattern matchers, Terraform tagging, migration detection
 
-use crate::index::CodebaseIndex;
+use crate::core_graph::CodebaseIndex;
 use crate::parser::language::SymbolKind;
 use crate::schema::{
     MigrationChain, MigrationEntry, MigrationFramework, OrmFieldSchema, OrmFramework,
@@ -518,7 +518,7 @@ pub fn detect_terraform_schemas(index: &CodebaseIndex, schema: &mut SchemaIndex)
 /// Detect migration chains across all files in the index.
 pub fn detect_migrations(index: &CodebaseIndex) -> Vec<MigrationChain> {
     // Group files by directory
-    let mut dir_groups: HashMap<String, Vec<&crate::index::IndexedFile>> = HashMap::new();
+    let mut dir_groups: HashMap<String, Vec<&crate::core_graph::IndexedFile>> = HashMap::new();
     for file in &index.files {
         let dir = parent_dir(&file.relative_path);
         dir_groups.entry(dir).or_default().push(file);
@@ -564,7 +564,10 @@ fn filename(path: &str) -> &str {
 }
 
 // Rails: db/migrate/ directory, YYYYMMDDHHMMSS_name.rb
-fn try_rails_migrations(dir: &str, files: &[&crate::index::IndexedFile]) -> Option<MigrationChain> {
+fn try_rails_migrations(
+    dir: &str,
+    files: &[&crate::core_graph::IndexedFile],
+) -> Option<MigrationChain> {
     if !dir.ends_with("db/migrate") && !dir.contains("db/migrate/") {
         return None;
     }
@@ -599,7 +602,7 @@ fn try_rails_migrations(dir: &str, files: &[&crate::index::IndexedFile]) -> Opti
 // Alembic: alembic/versions/ directory, hash_name.py, reads revision from content
 fn try_alembic_migrations(
     dir: &str,
-    files: &[&crate::index::IndexedFile],
+    files: &[&crate::core_graph::IndexedFile],
 ) -> Option<MigrationChain> {
     if !dir.ends_with("alembic/versions") && !dir.contains("alembic/versions") {
         return None;
@@ -651,7 +654,7 @@ fn try_alembic_migrations(
 // Flyway: any directory, V{N}__name.sql
 fn try_flyway_migrations(
     dir: &str,
-    files: &[&crate::index::IndexedFile],
+    files: &[&crate::core_graph::IndexedFile],
 ) -> Option<MigrationChain> {
     let mut entries: Vec<MigrationEntry> = files
         .iter()
@@ -688,7 +691,7 @@ fn try_flyway_migrations(
 // Django: */migrations/ directory, NNNN_name.py
 fn try_django_migrations(
     dir: &str,
-    files: &[&crate::index::IndexedFile],
+    files: &[&crate::core_graph::IndexedFile],
 ) -> Option<MigrationChain> {
     if !dir.ends_with("/migrations") && !dir.ends_with("migrations") {
         return None;
@@ -721,7 +724,10 @@ fn try_django_migrations(
 }
 
 // Knex: migrations/ directory, YYYYMMDDHHMMSS_name.js/.ts
-fn try_knex_migrations(dir: &str, files: &[&crate::index::IndexedFile]) -> Option<MigrationChain> {
+fn try_knex_migrations(
+    dir: &str,
+    files: &[&crate::core_graph::IndexedFile],
+) -> Option<MigrationChain> {
     if !dir.ends_with("migrations") {
         return None;
     }
@@ -759,8 +765,8 @@ fn try_knex_migrations(dir: &str, files: &[&crate::index::IndexedFile]) -> Optio
 //       We need to group by the parent of parent (prisma/migrations)
 fn try_prisma_migrations(
     dir: &str,
-    _files: &[&crate::index::IndexedFile],
-    all_dirs: &HashMap<String, Vec<&crate::index::IndexedFile>>,
+    _files: &[&crate::core_graph::IndexedFile],
+    all_dirs: &HashMap<String, Vec<&crate::core_graph::IndexedFile>>,
 ) -> Option<MigrationChain> {
     // This function is called with dir = "prisma/migrations/TIMESTAMP_name"
     // We check: does this dir match prisma/migrations/{timestamp}_{name}?
@@ -848,7 +854,7 @@ fn try_prisma_migrations(
 // Drizzle: drizzle/ directory, NNNN_name.sql
 fn try_drizzle_migrations(
     dir: &str,
-    files: &[&crate::index::IndexedFile],
+    files: &[&crate::core_graph::IndexedFile],
 ) -> Option<MigrationChain> {
     if !dir.ends_with("drizzle") && !dir.contains("/drizzle/") {
         return None;
@@ -883,7 +889,7 @@ fn try_drizzle_migrations(
 // Generic: any dir with 3+ sequenced SQL files, NNN_name.sql or YYYYMMDDHHMMSS_name.sql
 fn try_generic_migrations(
     dir: &str,
-    files: &[&crate::index::IndexedFile],
+    files: &[&crate::core_graph::IndexedFile],
 ) -> Option<MigrationChain> {
     // Match numeric prefix + underscore + name + .sql
     let mut entries: Vec<MigrationEntry> = files
@@ -926,7 +932,7 @@ fn try_generic_migrations(
 /// provided `CodebaseIndex`.  Returns `None` when nothing schema-related is
 /// found so callers can keep `index.schema = None` for plain code repos.
 pub fn build_schema_index(
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
 ) -> Option<crate::schema::SchemaIndex> {
     let mut schema = crate::schema::SchemaIndex::empty();
 
@@ -1019,7 +1025,7 @@ pub fn build_schema_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::IndexedFile;
+    use crate::core_graph::IndexedFile;
     use crate::parser::language::{Import, ParseResult, Symbol, SymbolKind, Visibility};
 
     // Helper: build a minimal IndexedFile with a given parse result

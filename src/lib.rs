@@ -5,6 +5,7 @@ pub mod cli;
 pub mod commands;
 pub mod context_quality;
 pub mod conventions;
+pub mod core_graph;
 #[cfg(feature = "daemon")]
 pub mod daemon;
 pub mod dev_maintenance;

@@ -1,4 +1,4 @@
-use crate::index::graph::DependencyGraph;
+use crate::core_graph::graph::DependencyGraph;
 use crate::intelligence::co_change::CoChangeEdge;
 use crate::intelligence::test_map::TestFileRef;
 use serde::{Deserialize, Serialize};
@@ -393,7 +393,7 @@ pub fn predict_with_call_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::graph::DependencyGraph;
+    use crate::core_graph::graph::DependencyGraph;
     use crate::schema::EdgeType;
 
     fn make_graph_chain() -> DependencyGraph {

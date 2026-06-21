@@ -213,7 +213,7 @@ pub fn save_baseline(
 // ---------------------------------------------------------------------------
 
 pub fn snapshot_from_index(
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
     timestamp: &str,
 ) -> ArchitectureSnapshot {
     use std::collections::HashMap;
@@ -314,7 +314,7 @@ fn module_prefix(path: &str, depth: usize) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn build_drift_report(
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
     repo_root: &Path,
     save_baseline_flag: bool,
 ) -> DriftReport {
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_from_index_empty() {
-        let index = crate::index::CodebaseIndex::empty();
+        let index = crate::core_graph::CodebaseIndex::empty();
         let snap = snapshot_from_index(&index, "2026-04-01T00:00:00Z");
         assert_eq!(snap.timestamp, "2026-04-01T00:00:00Z");
         assert_eq!(snap.metrics.module_count, 0);
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_from_index_with_files_and_edges() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
         use crate::schema::EdgeType;
 
         let mut index = CodebaseIndex::empty();
@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_from_index_module_below_min_files_skipped() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
 
         let mut index = CodebaseIndex::empty();
 
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_from_index_no_edges_zero_coupling() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
 
         let mut index = CodebaseIndex::empty();
 
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn test_build_drift_report_with_empty_index() {
-        let index = crate::index::CodebaseIndex::empty();
+        let index = crate::core_graph::CodebaseIndex::empty();
         let dir = tempfile::TempDir::new().unwrap();
         let report = build_drift_report(&index, dir.path(), false);
         // No baseline saved before -> baseline comparison is None
@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_build_drift_report_saves_baseline_when_flagged() {
-        let index = crate::index::CodebaseIndex::empty();
+        let index = crate::core_graph::CodebaseIndex::empty();
         let dir = tempfile::TempDir::new().unwrap();
         let _report = build_drift_report(&index, dir.path(), true);
         // Baseline file should now exist
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn test_build_drift_report_hotspots_from_high_coupling() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
         use crate::schema::EdgeType;
 
         let mut index = CodebaseIndex::empty();
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn test_build_drift_report_with_existing_baseline() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
 
         let dir = tempfile::TempDir::new().unwrap();
 
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn test_module_count_matches_mean_coupling_denominator() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
         use crate::schema::EdgeType;
 
         let mut index = CodebaseIndex::empty();

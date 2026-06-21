@@ -1,4 +1,4 @@
-use crate::index::graph::DependencyGraph;
+use crate::core_graph::graph::DependencyGraph;
 use crate::intelligence::test_map::TestFileRef;
 use crate::schema::EdgeType;
 use serde::Serialize;

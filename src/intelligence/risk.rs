@@ -1,4 +1,4 @@
-use crate::index::CodebaseIndex;
+use crate::core_graph::CodebaseIndex;
 use crate::intelligence::health::has_inline_tests;
 use serde::Serialize;
 
@@ -236,8 +236,12 @@ mod tests {
         let mut c = HashMap::new();
         c.insert("src/b.rs".into(), "fn x(){}".into());
         c.insert("src/a.rs".into(), "fn x(){}".into());
-        let idx =
-            crate::index::CodebaseIndex::build_with_content(files, HashMap::new(), &counter, c);
+        let idx = crate::core_graph::CodebaseIndex::build_with_content(
+            files,
+            HashMap::new(),
+            &counter,
+            c,
+        );
         let ranked = compute_risk_ranking(&idx);
         let a_idx = ranked.iter().position(|r| r.path == "src/a.rs");
         let b_idx = ranked.iter().position(|r| r.path == "src/b.rs");

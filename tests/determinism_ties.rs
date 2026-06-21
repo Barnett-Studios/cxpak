@@ -69,7 +69,9 @@ fn pagerank_sort_secondary_key_is_path_lexicographic() {
 /// (4000+ divergent f64 values across 5 processes before the fix; 0 after).
 #[test]
 fn dependency_graph_uses_btreemap_btreeset_for_determinism() {
-    let source = include_str!("../src/index/graph.rs");
+    // `DependencyGraph` was relocated to `core_graph` in cxpak 3.0.0 Phase 0
+    // (de-cycle); the determinism invariant moved with the struct definition.
+    let source = include_str!("../src/core_graph/graph.rs");
     let edges_decl = source
         .lines()
         .find(|l| l.contains("pub edges:"))

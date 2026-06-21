@@ -1,4 +1,4 @@
-use crate::index::graph::DependencyGraph;
+use crate::core_graph::graph::DependencyGraph;
 use std::collections::{HashMap, HashSet};
 
 /// Compute PageRank scores for all files in the dependency graph.

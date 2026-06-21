@@ -1,19 +1,9 @@
-use crate::index::IndexedFile;
-use serde::{Deserialize, Serialize};
+use crate::core_graph::IndexedFile;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TestFileRef {
-    pub path: String,
-    pub confidence: TestConfidence,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TestConfidence {
-    NameMatch,
-    ImportMatch,
-    Both,
-}
+// `TestFileRef`/`TestConfidence` are data-model types now in `core_graph`
+// (cxpak 3.0.0 Phase 0 de-cycle); the mapping logic below stays here.
+pub use crate::core_graph::intel::{TestConfidence, TestFileRef};
 
 /// Returns true when `path` looks like a test file (contains a standard test
 /// directory component or a test-naming marker in the filename).

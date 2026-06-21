@@ -1,23 +1,10 @@
-use crate::conventions::PatternObservation;
-use crate::index::CodebaseIndex;
-use serde::{Deserialize, Serialize};
+use crate::core_graph::CodebaseIndex;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DependencyConventions {
-    pub strict_layers: Vec<DirectionPair>,
-    pub circular_deps: Vec<String>,
-    pub db_isolation: Option<PatternObservation>,
-    pub additional: Vec<PatternObservation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectionPair {
-    pub from: String,
-    pub to: String,
-    pub edge_count: usize,
-    pub reverse_count: usize,
-}
+// `DependencyConventions` and `DirectionPair` are data-model types now in
+// `core_graph::conventions` (cxpak 3.0.0 Phase 0 de-cycle); the extraction
+// logic stays here.
+pub use crate::core_graph::conventions::{DependencyConventions, DirectionPair};
 
 /// Extract dependency direction conventions from the dependency graph.
 pub fn extract_deps(index: &CodebaseIndex) -> DependencyConventions {
@@ -123,7 +110,7 @@ fn detect_circular_deps(dir_edges: &HashMap<(String, String), usize>) -> Vec<Str
 mod tests {
     use super::*;
     use crate::budget::counter::TokenCounter;
-    use crate::index::graph::DependencyGraph;
+    use crate::core_graph::graph::DependencyGraph;
     use crate::scanner::ScannedFile;
     use crate::schema::EdgeType;
 

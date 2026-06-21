@@ -1,17 +1,10 @@
 use crate::conventions::{FileContribution, PatternObservation};
-use crate::index::{CodebaseIndex, IndexedFile};
-use serde::{Deserialize, Serialize};
+use crate::core_graph::{CodebaseIndex, IndexedFile};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ImportConventions {
-    pub style: Option<PatternObservation>,
-    pub grouping: Option<PatternObservation>,
-    pub re_exports: Option<PatternObservation>,
-    pub additional: Vec<PatternObservation>,
-    #[serde(skip)]
-    pub file_contributions: HashMap<String, FileContribution>,
-}
+// `ImportConventions` is a data-model type now in `core_graph::conventions`
+// (cxpak 3.0.0 Phase 0 de-cycle); the extraction logic stays here.
+pub use crate::core_graph::conventions::ImportConventions;
 
 /// Detect import grouping/re-exports for Rust source files.
 fn detect_rust_grouping(

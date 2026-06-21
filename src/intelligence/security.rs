@@ -409,7 +409,7 @@ pub fn endpoint_is_protected(content: &str, handler: &str, auth_patterns: &[&str
 // ---------------------------------------------------------------------------
 
 pub fn build_security_surface(
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
     auth_patterns: &[&str],
     focus: Option<&str>,
 ) -> SecuritySurface {
@@ -837,8 +837,8 @@ pub fn process_input(data: String) {
         path: &str,
         content: &str,
         symbols: Vec<crate::parser::language::Symbol>,
-    ) -> crate::index::IndexedFile {
-        crate::index::IndexedFile {
+    ) -> crate::core_graph::IndexedFile {
+        crate::core_graph::IndexedFile {
             relative_path: path.to_string(),
             language: Some("rust".into()),
             size_bytes: content.len() as u64,
@@ -867,7 +867,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_empty_index() {
-        let index = crate::index::CodebaseIndex::empty();
+        let index = crate::core_graph::CodebaseIndex::empty();
         let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
         assert!(surface.secret_patterns.is_empty());
         assert!(surface.sql_injection_surface.is_empty());
@@ -878,7 +878,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_detects_secrets() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let content = "const KEY = \"AKIAIOSFODNN7EXAMPLE123\";";
         index
             .files
@@ -894,7 +894,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_detects_sql_injection() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let content = r#"let q = format!("SELECT * FROM users WHERE id = '{}'", id);"#;
         index
             .files
@@ -910,7 +910,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_detects_validation_gaps() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let content = "pub fn create_user(name: String) {\n    db.insert(name);\n}\n";
         index
             .files
@@ -927,7 +927,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_detects_unprotected_endpoints() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         // Express-style route that detect_routes can find — must include an express import
         // so the framework-import gate allows route detection.
         let content = "const express = require('express');\napp.get('/api/users', listUsers);";
@@ -949,7 +949,7 @@ pub fn process_input(data: String) {
     fn test_build_security_surface_exposure_scores_with_pub_symbols() {
         use crate::schema::EdgeType;
 
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let symbols = vec![make_pub_symbol("handle_request"), make_pub_symbol("serve")];
         index.files.push(make_indexed_file(
             "src/api.rs",
@@ -976,7 +976,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_focus_filters_files() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let secret_content = "const KEY = \"AKIAIOSFODNN7EXAMPLE123\";";
         index
             .files
@@ -999,7 +999,7 @@ pub fn process_input(data: String) {
     fn test_build_security_surface_exposure_sorted_descending() {
         use crate::schema::EdgeType;
 
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
 
         // File A: 1 pub symbol, 1 inbound edge
         index.files.push(make_indexed_file(
@@ -1048,7 +1048,7 @@ pub fn process_input(data: String) {
         // Secrets and SQL patterns inside #[cfg(test)] mod tests { ... } must
         // NOT generate security findings — they are test fixtures, not real
         // credentials or injection vectors.
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let content = r#"
 pub fn real_function() {}
 
@@ -1083,7 +1083,7 @@ mod tests {
     fn test_build_security_surface_tested_file_zero_exposure() {
         use crate::intelligence::test_map::{TestConfidence, TestFileRef};
 
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let symbols = vec![make_pub_symbol("handle")];
         index.files.push(make_indexed_file(
             "src/api.rs",
