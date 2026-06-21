@@ -10,6 +10,11 @@ tarpaulin-report.*
 # LLM-collaboration artifacts kept locally only
 .claude/
 docs/plans/
+
+# superpowers brainstorm/spec/plan artifacts (kept local, never committed)
+.superpowers/
+/plans/
+/specs/
 docs/release/
 docs/LANDSCAPE_RESEARCH_2026.md
 docs/MARKET_ANALYSIS_SUMMARY.md
