@@ -1051,10 +1051,14 @@ mod tests {
         }
     }
 
-    // Helper: build a CodebaseIndex from a list of IndexedFile (no disk access)
+    // Helper: build a CodebaseIndex from a list of IndexedFile (no disk access).
+    // `build_schema_index` reads only `index.files`, never `index.graph`, so the
+    // graph is left empty here — that keeps the schema layer free of any
+    // dependency on the index-layer graph builder (cxpak 3.0.0 Phase 0 de-cycle).
     fn make_index(files: Vec<IndexedFile>) -> CodebaseIndex {
+        use crate::core_graph::graph::DependencyGraph;
         use std::collections::{HashMap, HashSet};
-        let graph = crate::index::graph::build_dependency_graph(&files, None);
+        let graph = DependencyGraph::new();
         CodebaseIndex {
             total_files: files.len(),
             total_bytes: files.iter().map(|f| f.size_bytes).sum(),

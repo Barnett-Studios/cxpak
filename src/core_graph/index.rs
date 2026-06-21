@@ -13,8 +13,8 @@
 //! into scanner/parser/schema/intelligence/conventions/embeddings and therefore
 //! belong above this boundary.
 
-use crate::context_quality::expansion::Domain;
 use crate::core_graph::conventions::ConventionProfile;
+use crate::core_graph::domain::Domain;
 use crate::core_graph::graph::DependencyGraph;
 use crate::core_graph::intel::{CallGraph, CoChangeEdge, CrossLangEdge, DeadSymbol, HealthScore};
 use crate::core_graph::schema::SchemaIndex;
@@ -47,9 +47,9 @@ pub struct CodebaseIndex {
     #[cfg(feature = "embeddings")]
     pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
     /// Memoized `detect_dead_code(self, None)` result. Populated lazily on
-    /// first call to [`crate::index::CodebaseIndex::dead_code_cached`]. Shared
-    /// across clones via `Arc`, so any clone that triggers computation benefits
-    /// all clones.
+    /// first call to `CodebaseIndex::dead_code_cached` (the orchestration method
+    /// defined in `crate`'s index module). Shared across clones via `Arc`, so any
+    /// clone that triggers computation benefits all clones.
     ///
     /// Invalidation contract: callers that mutate the index in-place (e.g.,
     /// `commands::serve::process_watcher_changes` after
