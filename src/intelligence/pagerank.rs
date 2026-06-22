@@ -1,4 +1,5 @@
 use crate::core_graph::graph::DependencyGraph;
+use crate::core_graph::index::normalize_identifier;
 use std::collections::{HashMap, HashSet};
 
 /// Compute PageRank scores for all files in the dependency graph.
@@ -219,9 +220,9 @@ pub fn symbol_importance(
     use crate::parser::language::Visibility;
     let weight = match symbol.visibility {
         Visibility::Public => {
-            let name_lower = symbol.name.to_lowercase();
+            let name_normalized = normalize_identifier(&symbol.name);
             let referenced_elsewhere = cross_refs
-                .get(&name_lower)
+                .get(&name_normalized)
                 .map(|files| files.iter().any(|f| f != file_path))
                 .unwrap_or(false);
             if referenced_elsewhere {

@@ -21,6 +21,7 @@ use crate::core_graph::schema::SchemaIndex;
 use crate::parser::language::{Import, ParseResult, Symbol, Visibility};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone)]
 pub struct CodebaseIndex {
@@ -85,9 +86,24 @@ pub struct LanguageStats {
     pub total_tokens: usize,
 }
 
-pub(crate) fn compute_term_frequencies(content: &str) -> HashMap<String, u32> {
+/// NFKC-normalize then lowercase an identifier string.
+///
+/// Applied at BOTH the term-production site (`split_identifier`) and the
+/// lookup site (`symbol_importance`) so they can never produce divergent keys.
+/// Order is fixed: NFKC first, then `to_lowercase()`.  On pure-ASCII input
+/// NFKC is a no-op, so ASCII identifiers are byte-for-byte unchanged.
+pub fn normalize_identifier(s: &str) -> String {
+    s.nfkc().collect::<String>().to_lowercase()
+}
+
+pub fn compute_term_frequencies(content: &str) -> HashMap<String, u32> {
+    // NFKC-normalize the full content before splitting so that combining
+    // diacritics (e.g. NFD decompositions) are composed into single codepoints
+    // and do not act as word-boundary delimiters.  split_identifier then
+    // re-applies NFKC on each token (idempotent) before camel/snake splitting.
+    let normalized_content: String = content.nfkc().collect();
     let mut counts: HashMap<String, u32> = HashMap::new();
-    for word in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
+    for word in normalized_content.split(|c: char| !c.is_alphanumeric() && c != '_') {
         if word.len() < 2 {
             continue;
         }
@@ -100,9 +116,13 @@ pub(crate) fn compute_term_frequencies(content: &str) -> HashMap<String, u32> {
     counts
 }
 
-pub(crate) fn split_identifier(s: &str) -> Vec<String> {
+pub fn split_identifier(s: &str) -> Vec<String> {
+    // NFKC-normalize the input so Unicode-equivalent forms produce identical
+    // terms.  Lowercase is applied per-part below (as before), so camelCase
+    // boundary detection on uppercase ASCII chars is unaffected.
+    let nfkc: String = s.nfkc().collect();
     let mut parts = Vec::new();
-    for segment in s.split('_') {
+    for segment in nfkc.split('_') {
         if segment.is_empty() {
             continue;
         }
