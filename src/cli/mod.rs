@@ -44,8 +44,14 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Print the JSON Schema for the auto_context output contract (versioned, ADR-0169)
-    Schema,
+    /// Print the JSON Schema for a capability's output contract (versioned, ADR-0169).
+    /// Known capability ids: context, graph, data, review.
+    /// With no argument, prints the context (auto_context) schema for back-compat.
+    Schema {
+        /// Capability id to print schema for (context, graph, data, review).
+        /// Omit to print the context schema (back-compat).
+        capability: Option<String>,
+    },
     /// Show token-budgeted change summary with dependency context
     Diff {
         #[arg(long, default_value = "50k")]
