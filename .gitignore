@@ -1,4 +1,8 @@
 /target
+# D2.2 benchmark: corpus repos fetched at base_sha for recall measurement.
+# Covered by /target already; listed explicitly so the cache's purpose is clear
+# and it is never committed.
+/target/bench-repos/
 coverage/
 .cxpak/
 references/

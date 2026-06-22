@@ -9,6 +9,7 @@
 // of the binary and delegating auth to the user's existing gh session.
 
 pub mod fetch;
+pub mod recall;
 
 use serde::Deserialize;
 use std::path::Path;
