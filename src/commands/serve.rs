@@ -148,8 +148,10 @@ pub fn build_index_with_workspace(
     let head_oid = git_head_oid(path);
 
     // Build file list with mtime_ns + size_bytes for the stat-index fast-path.
-    // Files not present in file_stats (shouldn't happen) fall back to (0, 0)
-    // which guarantees a stat-index miss → full re-hash (fail-closed).
+    // Files not present in file_stats (shouldn't happen — metadata read failed)
+    // fall back to (0, 0), a degenerate value that will only hit a stat-index
+    // entry previously stored with the same (0, 0) key; in practice this means
+    // a failed-metadata file is re-hashed on every build, which is safe.
     let fp_files: Vec<(String, String, u64, u64)> = index
         .files
         .iter()

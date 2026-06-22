@@ -203,19 +203,19 @@ pub fn strip_md_frontmatter(content: &str) -> &str {
         Some(rest) => rest,
         None => return content,
     };
-    // Find the closing `---\n` (or `---` at end-of-string).
-    // We scan line by line so we don't accidentally match `---` inside a value.
+    // Scan line by line to find the closing delimiter.  We advance one line at
+    // a time so body content — including horizontal rules (`---`) — is never
+    // mistaken for the frontmatter close.
     let mut rest = after_open;
-    let mut consumed = 4_usize; // length of "---\n"
+    let mut consumed = 4_usize; // length of opening "---\n"
     loop {
         if rest.starts_with("---\n") {
-            // Found closing delimiter; return everything after it.
+            // Closing `---` followed by a newline: body starts after it.
             let body_start = consumed + 4;
             return &content[body_start..];
         }
-        if rest == "---" || rest.ends_with("\n---") {
-            // Closing `---` at the very end without a trailing newline.
-            // Return empty string — no body.
+        if rest == "---" {
+            // Closing `---` at EOF with no trailing newline: no body.
             return "";
         }
         match rest.find('\n') {

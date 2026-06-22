@@ -343,3 +343,56 @@ fn stat_index_roundtrip_save_load() {
     assert_eq!(entry.size_bytes, 128);
     assert_eq!(entry.content_sha256, "aabbcc");
 }
+
+// ---------------------------------------------------------------------------
+// Test 9: Body ending in `\n---` must NOT be over-stripped.
+//
+// Regression for the bug where `rest.ends_with("\n---")` caused the scanner
+// to return `""` for any content whose body contained a horizontal rule at
+// EOF — violating ADR-0167 content-sensitivity.
+// ---------------------------------------------------------------------------
+#[test]
+fn strip_md_frontmatter_body_ending_in_hr_is_preserved() {
+    // Valid frontmatter followed by a body that ends with a `---` HR (no
+    // trailing newline).  The body must be returned intact.
+    let md = "---\ntitle: X\n---\n# Body\n---";
+    let stripped = cxpak::cache::strip_md_frontmatter(md);
+    assert_eq!(
+        stripped, "# Body\n---",
+        "body ending in \\n--- must be preserved, not over-stripped"
+    );
+
+    // Same document but body ends with `---\n` (trailing newline).
+    let md_nl = "---\ntitle: X\n---\n# Body\n---\n";
+    let stripped_nl = cxpak::cache::strip_md_frontmatter(md_nl);
+    assert_eq!(
+        stripped_nl, "# Body\n---\n",
+        "body ending in ---\\n must also be preserved"
+    );
+
+    // Two DISTINCT bodies ending in `\n---` must produce DISTINCT fingerprints
+    // (content-sensitivity restored after the over-strip bug fix).
+    let doc_a: Vec<(String, String, u64, u64)> = vec![(
+        "doc.md".to_string(),
+        "---\ntitle: A\n---\n# Alpha\n---".to_string(),
+        1_u64,
+        27_u64,
+    )];
+    let doc_b: Vec<(String, String, u64, u64)> = vec![(
+        "doc.md".to_string(),
+        "---\ntitle: B\n---\n# Beta body\n---".to_string(),
+        2_u64,
+        31_u64,
+    )];
+
+    let mut idx_a = StatIndex::default();
+    let mut idx_b = StatIndex::default();
+
+    let fp_a = content_fingerprint_with_stat_index(&doc_a, "head", &mut idx_a, sha256_of);
+    let fp_b = content_fingerprint_with_stat_index(&doc_b, "head", &mut idx_b, sha256_of);
+
+    assert_ne!(
+        fp_a, fp_b,
+        "distinct bodies ending in \\n--- must produce distinct fingerprints"
+    );
+}
