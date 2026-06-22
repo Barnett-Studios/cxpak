@@ -7,7 +7,14 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::Path;
 
-pub const CACHE_VERSION: u32 = 4;
+/// Cache schema version.  Bumped 4→5 in Task 0.4 (cxpak 3.0.0 Phase 0)
+/// because `TypedEdge` gained a `confidence: EdgeConfidence` field that is
+/// serialized into `DerivedCache.graph`.  A stale v4 derived.json would
+/// deserialize successfully (the field has `serde(default)`) but all edges
+/// would carry `Extracted` regardless of their true confidence.  Bumping the
+/// version forces a clean rebuild so every edge gets the correct value from
+/// `EdgeType::default_confidence()`.
+pub const CACHE_VERSION: u32 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileCache {

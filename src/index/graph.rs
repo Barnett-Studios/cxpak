@@ -2,7 +2,9 @@ use super::IndexedFile;
 // Graph primitives now live in `core_graph` (cxpak 3.0.0 Phase 0 de-cycle).
 // Re-exported here so the historical `crate::index::graph::{...}` paths used
 // across the crate and external tests keep resolving unchanged.
-pub use crate::core_graph::graph::{BridgeType, DependencyGraph, EdgeType, TypedEdge};
+pub use crate::core_graph::graph::{
+    BridgeType, DependencyGraph, EdgeConfidence, EdgeType, TypedEdge,
+};
 use std::collections::HashSet;
 
 // ─── Import resolution helpers ────────────────────────────────────────────────
@@ -1110,10 +1112,12 @@ mod tests {
         set.insert(TypedEdge {
             target: "b.rs".into(),
             edge_type: EdgeType::CrossLanguage(BridgeType::HttpCall),
+            confidence: EdgeConfidence::Inferred,
         });
         set.insert(TypedEdge {
             target: "b.rs".into(),
             edge_type: EdgeType::CrossLanguage(BridgeType::FfiBinding),
+            confidence: EdgeConfidence::Inferred,
         });
         // Same target, different bridge types — both unique edges.
         assert_eq!(set.len(), 2);
@@ -1133,6 +1137,7 @@ mod tests {
             let edge = TypedEdge {
                 target: "x.py".into(),
                 edge_type: EdgeType::CrossLanguage(bt.clone()),
+                confidence: EdgeConfidence::Inferred,
             };
             let json = serde_json::to_string(&edge).unwrap();
             let back: TypedEdge = serde_json::from_str(&json).unwrap();

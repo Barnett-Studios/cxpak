@@ -285,14 +285,14 @@ fn strip_md_frontmatter_no_closing_delimiter_is_left_untouched() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: CACHE_VERSION is 4.
+// Test 6: CACHE_VERSION is 5 (bumped in Task 0.4 for EdgeConfidence field).
 // ---------------------------------------------------------------------------
 #[test]
-fn cache_version_is_4() {
+fn cache_version_is_5() {
     assert_eq!(
         cxpak::cache::CACHE_VERSION,
-        4,
-        "CACHE_VERSION must be bumped to 4"
+        5,
+        "CACHE_VERSION must be 5 (bumped in Task 0.4 for EdgeConfidence on TypedEdge)"
     );
 }
 

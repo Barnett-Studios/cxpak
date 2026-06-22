@@ -24,4 +24,5 @@ pub mod intel;
 pub mod schema;
 
 pub use domain::Domain;
+pub use graph::EdgeConfidence;
 pub use index::{CodebaseIndex, IndexedFile, LanguageStats};

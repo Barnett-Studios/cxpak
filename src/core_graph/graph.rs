@@ -10,6 +10,31 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
+// ---------------------------------------------------------------------------
+// EdgeConfidence (Task 0.4 — ADR-0176 descriptive-honesty)
+// ---------------------------------------------------------------------------
+
+/// Whether an edge was structurally extracted from explicit source or
+/// heuristically inferred from pattern matching.
+///
+/// "Every edge proven, never inferred" — and when it IS inferred, say so.
+/// Added as the LAST field on [`TypedEdge`] so the derived `Ord` (which
+/// compares `target` then `edge_type` first) remains stable: `BTreeSet`
+/// iteration order and `edge_count` are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum EdgeConfidence {
+    /// Extracted from explicit source: `use` statements, FK/ORM/migration/view
+    /// metadata — structurally unambiguous.
+    Extracted,
+    /// Inferred by heuristic pattern matching: embedded-SQL regex, cross-language
+    /// bridge detection.  Correct most of the time but not provably exact.
+    Inferred,
+}
+
+fn default_confidence_extracted() -> EdgeConfidence {
+    EdgeConfidence::Extracted
+}
+
 /// Identifies a cross-language boundary type. Used as the payload of
 /// [`EdgeType::CrossLanguage`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -43,10 +68,37 @@ pub enum EdgeType {
     CrossLanguage(BridgeType),
 }
 
+impl EdgeType {
+    /// Canonical confidence for this edge type.  Single source of truth so
+    /// every call site (including future ones) derives the correct value
+    /// automatically.
+    ///
+    /// Inferred: `EmbeddedSql` (regex-based table-name matching) and
+    ///           `CrossLanguage(_)` (heuristic bridge detection).
+    /// Extracted: all other types (explicit `use` / FK / ORM / migration /
+    ///            view / function metadata — structurally unambiguous).
+    pub fn default_confidence(&self) -> EdgeConfidence {
+        match self {
+            EdgeType::EmbeddedSql | EdgeType::CrossLanguage(_) => EdgeConfidence::Inferred,
+            _ => EdgeConfidence::Extracted,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TypedEdge {
     pub target: String,
     pub edge_type: EdgeType,
+    /// Whether this edge was structurally [`Extracted`][EdgeConfidence::Extracted]
+    /// or heuristically [`Inferred`][EdgeConfidence::Inferred].
+    ///
+    /// Placed last so derived `Ord` keeps comparing `target`→`edge_type` first,
+    /// leaving `BTreeSet<TypedEdge>` order and `edge_count` unchanged.
+    ///
+    /// Defaults to `Extracted` on deserialization so stale cache JSON without
+    /// this field (written before CACHE_VERSION 5) is accepted without error.
+    #[serde(default = "default_confidence_extracted")]
+    pub confidence: EdgeConfidence,
 }
 
 /// Backed by `BTreeMap`/`BTreeSet` rather than the hash equivalents so iteration
@@ -87,12 +139,14 @@ impl DependencyGraph {
     }
 
     pub fn add_edge(&mut self, from: &str, to: &str, edge_type: EdgeType) {
+        let confidence = edge_type.default_confidence();
         self.edges
             .entry(from.to_string())
             .or_default()
             .insert(TypedEdge {
                 target: to.to_string(),
                 edge_type: edge_type.clone(),
+                confidence,
             });
         self.reverse_edges
             .entry(to.to_string())
@@ -100,6 +154,7 @@ impl DependencyGraph {
             .insert(TypedEdge {
                 target: from.to_string(),
                 edge_type,
+                confidence,
             });
     }
 
@@ -195,10 +250,12 @@ mod tests {
         set.insert(TypedEdge {
             target: "a.rs".into(),
             edge_type: EdgeType::Import,
+            confidence: EdgeConfidence::Extracted,
         });
         set.insert(TypedEdge {
             target: "a.rs".into(),
             edge_type: EdgeType::ForeignKey,
+            confidence: EdgeConfidence::Extracted,
         });
         assert_eq!(
             set.len(),

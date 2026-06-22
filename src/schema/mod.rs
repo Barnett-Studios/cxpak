@@ -6,7 +6,7 @@ pub mod link;
 // de-cycle). Re-exported at the historical `crate::schema::{...}` paths so
 // every existing reference (detect/extract/link, intelligence, conventions,
 // commands, tests) keeps resolving unchanged.
-pub use crate::core_graph::graph::{EdgeType, TypedEdge};
+pub use crate::core_graph::graph::{EdgeConfidence, EdgeType, TypedEdge};
 pub use crate::core_graph::schema::{
     ColumnSchema, DbFunctionSchema, ForeignKeyRef, IndexSchema, MigrationChain, MigrationEntry,
     MigrationFramework, OrmFieldSchema, OrmFramework, OrmModelSchema, SchemaIndex, TableSchema,
@@ -32,10 +32,12 @@ mod tests {
         set.insert(TypedEdge {
             target: "a.rs".into(),
             edge_type: EdgeType::Import,
+            confidence: EdgeConfidence::Extracted,
         });
         set.insert(TypedEdge {
             target: "a.rs".into(),
             edge_type: EdgeType::ForeignKey,
+            confidence: EdgeConfidence::Extracted,
         });
         assert_eq!(
             set.len(),
