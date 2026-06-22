@@ -1,0 +1,515 @@
+# cxpak benchmark corpus — committed manifest of real merged PRs.
+# Each entry is a (repo, pr, base_sha, head_sha) tuple identifying a merged PR
+# whose changed-file set is the ground-truth for recall evaluation.
+# Source repos are NOT committed; CI fetches changed files on demand via gh api.
+#
+# Coverage: 6 repos, 52 PRs, 5 languages (Rust, Python, JavaScript, Go, Java, TypeScript).
+# Gathered: 2026-06-22 via `gh pr list --state merged` + `gh api repos/R/pulls/<n>`.
+
+# ── BurntSushi/ripgrep (Rust, 12 PRs) ──────────────────────────────────────────
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3444
+base_sha = "82313cf95849bfe425109ad9506a52154879b1b1"
+head_sha = "f5e76914659673fe2a191f0795423b5f9d504859"
+lang     = "Rust"
+title    = "Add Hurl"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3433
+base_sha = "4857d6fa67db69a95cd4b6f2adda5d807d4d0119"
+head_sha = "2afad21d03178a80e2a7df874854d9baadac0a35"
+lang     = "Rust"
+title    = "docs: update GUIDE to use lexopt"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3431
+base_sha = "4857d6fa67db69a95cd4b6f2adda5d807d4d0119"
+head_sha = "d913049ba8f7aa3208be9c165c8c0776c2f1dcde"
+lang     = "Rust"
+title    = "ci: add support for aarch64-unknown-linux-musl"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3420
+base_sha = "48a6ad93f152dc848f1883ceb3bf2c7baab6738c"
+head_sha = "b6722c177f85a01ed2304781118651c058df3286"
+lang     = "Rust"
+title    = "ignore: scope compiled parent matchers by root"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3418
+base_sha = "f0cec341ab95c25c691ad3d5754d4bd9eedde21f"
+head_sha = "dc1bfa280a4189acb83b38d16060650299527db1"
+lang     = "Rust"
+title    = "docs: s/our projects/this project in AI policy"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3416
+base_sha = "4519153e5e461527f4bca45b042fff45c4ec6fb9"
+head_sha = "543c11321b2eeb0db63acb37d1f9d993559d20bc"
+lang     = "Rust"
+title    = "docs: add AI policy for contributors"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3279
+base_sha = "cb66736f146f093497f4dc537b33d0826f9af33c"
+head_sha = "3fc9f4134bb95364f8748610d69f27dfa3ca472b"
+lang     = "Rust"
+title    = "docs: clarify half-boundary syntax for -w/--word-regexp"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3278
+base_sha = "9b84e154c8e404f4c40f6f4e4c674ea02e77324a"
+head_sha = "aa09897f8a6a05856d90595dae5f8cadf63e9df2"
+lang     = "Rust"
+title    = "core: bleat a DEBUG message when RIPGREP_CONFIG_PATH is not set"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3271
+base_sha = "0a88cccd5188074de96f54a4b6b44a63971ac157"
+head_sha = "a50ddc7ce17f98b9624e7a663bb080dd8580427a"
+lang     = "Rust"
+title    = "ignore/types: add Containerfile"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3248
+base_sha = "cd1f981beafaeb9b61537e47e91314cea125400b"
+head_sha = "0ab6dd87ce7427e869eaca194f6e2b7579a25936"
+lang     = "Rust"
+title    = "Fix compression tests in QEMU cross-compilation environments"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3229
+base_sha = "57c190d56eedac90c061a238b63dbfed434fee50"
+head_sha = "ff8ba58cae09e52d5fc11b50324c2bb8ff03d12b"
+lang     = "Rust"
+title    = "fix: clippy::derivable_impls"
+
+[[entry]]
+repo     = "BurntSushi/ripgrep"
+pr       = 3212
+base_sha = "36b7597693c994ffaf023b95d2e18aeeda7d9286"
+head_sha = "b9517b5c3054385cdad0a4e681e1df5c7b0bcea5"
+lang     = "Rust"
+title    = "ignore: only stat .jj if we actually care"
+
+# ── pallets/flask (Python, 10 PRs) ─────────────────────────────────────────────
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 6013
+base_sha = "06ea505ce2b2042af26e96d35ebf159af7c0869d"
+head_sha = "9368fb3f3c52d74534d14c1bef03c79c103356cd"
+lang     = "Python"
+title    = "autoescape selection uses case-insensitive comparison"
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 5962
+base_sha = "4cae5d8e411b1e69949d8fae669afeacbd3e5908"
+head_sha = "91c6b3fecf36b1f04554e57cc4060ccb737a445d"
+lang     = "Python"
+title    = "remove unicode host test"
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 5945
+base_sha = "a29f88ce6f2f9843bd6fcbbfce1390a2071965d6"
+head_sha = "560c119e3dc33b35b9c57172fae521d99c2a1421"
+lang     = "Python"
+title    = "add zizmor to scan workflows"
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 5928
+base_sha = "7b0088693ece1bd3a9238a6fdf56ed8df7a4d43b"
+head_sha = "fbb6f0bc4c60a0bada0e03c3480d0ccf30a3c1df"
+lang     = "Python"
+title    = "all teardown callbacks are called despite errors"
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 5924
+base_sha = "089cb86dd22bff589a4eafb7ab8e42dc357623b4"
+head_sha = "22d924701a6ae2e4cd01e9a15bbaf3946094af65"
+lang     = "Python"
+title    = "release version 3.1.3"
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 5917
+base_sha = "d3b78fd18a8d9e224cb9ef58a23cec9b1ffc9ce9"
+head_sha = "e82db2ca3a22c9614c1987392c9cfaa8c6ce99ad"
+lang     = "Python"
+title    = "fix provide_automatic_options override"
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 5903
+base_sha = "407eb76b27884848383a37c7274654f0271e4bc4"
+head_sha = "3d03098a97ddc6a908aa4a50c2ef7381f8297d0a"
+lang     = "Python"
+title    = "Abort if the instance folder cannot be created"
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 5900
+base_sha = "4f79d5b59a56bc4356a97f2e81a35f98cb18d7b3"
+head_sha = "ac5664d2281533eacafd64f5cc7d5edcdaccab60"
+lang     = "Python"
+title    = "document using gevent for async"
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 5899
+base_sha = "9b74a90dd3c47f792734823e8793ac36f38bc4dd"
+head_sha = "c77a5203438fe772d41f6a47303ad3f57a4efe6d"
+lang     = "Python"
+title    = "deprecate should_ignore_error"
+
+[[entry]]
+repo     = "pallets/flask"
+pr       = 5898
+base_sha = "eb58d862cc4a8f31a369b6e9ad1724e9e642f13f"
+head_sha = "eca5fd1dfdc614c2df876cc32018a7d71f84ea82"
+lang     = "Python"
+title    = "redirect defaults to 303"
+
+# ── expressjs/express (JavaScript, 10 PRs) ─────────────────────────────────────
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7305
+base_sha = "dae209ae6559c29cfca2a1f4414c51d89ea643d5"
+head_sha = "3233065ebc1102fd191591a3e6d7d034e2f9df3d"
+lang     = "JavaScript"
+title    = "fix: bump qs minimum to 6.15.2"
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7297
+base_sha = "dae209ae6559c29cfca2a1f4414c51d89ea643d5"
+head_sha = "ead103e91075da8386261491a535f7d25e20c713"
+lang     = "JavaScript"
+title    = "build(deps): bump github/codeql-action from 4.35.2 to 4.36.0"
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7265
+base_sha = "dae209ae6559c29cfca2a1f4414c51d89ea643d5"
+head_sha = "bf6754c69c2676fe4acbab0ffd59c3c27c06bea3"
+lang     = "JavaScript"
+title    = "fix: replace deprecated trimRight() with trimEnd()"
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7234
+base_sha = "f873ac23124ffcff8c040b4bd257b32c29828d53"
+head_sha = "0b8f68b8a7f525bc81c973b5596ae0826228f19f"
+lang     = "JavaScript"
+title    = "Upgrade content-type"
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7233
+base_sha = "b3004cb8c825321279efa48d6ad115d91a6c1b83"
+head_sha = "754a1831de09be6ffb81acf7af12c60164c7f7f7"
+lang     = "JavaScript"
+title    = "Upgrade content-disposition"
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7225
+base_sha = "836d36668ea750f78b4373b4de79bbd22634e6ec"
+head_sha = "9519b3e106817d2d069abc1eb1f048d4a5729a12"
+lang     = "JavaScript"
+title    = "release: 4.22.2"
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7224
+base_sha = "8d09bfe6d88983da5c3e12cfdd54782c4dc675db"
+head_sha = "c16927d88dab50580cc0893fa31d9afb475a5dc3"
+lang     = "JavaScript"
+title    = "4.x update qs to 6.15.1, body-parser 1.20.5"
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7218
+base_sha = "f873ac23124ffcff8c040b4bd257b32c29828d53"
+head_sha = "9ecb54ea61f3e66aedfe336901fcfc37870c71f4"
+lang     = "JavaScript"
+title    = "ci: build express with node.js v26"
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7212
+base_sha = "6340c1eaaedc0ddcae8be8df2cdb1d2e961cbf2f"
+head_sha = "e41bb718cdaf5daf4b3c01b26c10fabb4326b37c"
+lang     = "JavaScript"
+title    = "build(deps): bump github/codeql-action from 4.35.1 to 4.35.2"
+
+[[entry]]
+repo     = "expressjs/express"
+pr       = 7211
+base_sha = "6340c1eaaedc0ddcae8be8df2cdb1d2e961cbf2f"
+head_sha = "9d6c42763bafb93ad952252ab548f8c6b3b8c63f"
+lang     = "JavaScript"
+title    = "build(deps): bump actions/upload-artifact from 7.0.0 to 7.0.1"
+
+# ── cli/cli (Go, 10 PRs) ───────────────────────────────────────────────────────
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13688
+base_sha = "70bb306bd25eb407f90eabefd98824aed62cf519"
+head_sha = "84ca6a74ec09b08a38e3e3f08d885f2072134b5d"
+lang     = "Go"
+title    = "docs: fix broken anchor link in release-process-deep-dive"
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13674
+base_sha = "d05c71a9da4bce4d57f622aacc6a8ee24e5e158e"
+head_sha = "b40186264b8f8d1586249068963fb8a0928c1623"
+lang     = "Go"
+title    = "Bump Go in devcontainer"
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13663
+base_sha = "a834c677235216410b3977eec60504acefa6c4d4"
+head_sha = "49b18f5b049b1cd5a0263b7d60c14a560d29d055"
+lang     = "Go"
+title    = "chore(deps): bump charm.land/lipgloss/v2 from 2.0.3 to 2.0.4"
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13662
+base_sha = "a834c677235216410b3977eec60504acefa6c4d4"
+head_sha = "6f665ede4d11b62090c005ee864433d3cafb4bd6"
+lang     = "Go"
+title    = "chore(deps): bump github.com/sigstore/sigstore-go from 1.1.4 to 1.2.1"
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13661
+base_sha = "f4cab89a423c31a156c2f21dda5e6eb7df538e32"
+head_sha = "981f43b93c9fa649171cb5b75aeaedfc0802bad0"
+lang     = "Go"
+title    = "chore(deps): bump golang.org/x/term from 0.43.0 to 0.44.0"
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13642
+base_sha = "57b9b207d900114092f30d78020c193b40621dfa"
+head_sha = "cb0c17b4fc61f48dcb431ef16d56cc05a3cd7143"
+lang     = "Go"
+title    = "Make filtering by bot authors more discoverable"
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13641
+base_sha = "54fa0c628cf20aaae3ab78abe49760c827a27d9f"
+head_sha = "ec0fe2834346e807a055af0066a9eb9f51380d20"
+lang     = "Go"
+title    = "chore(deps): bump golang.org/x/crypto from 0.52.0 to 0.53.0"
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13640
+base_sha = "57b9b207d900114092f30d78020c193b40621dfa"
+head_sha = "6e755dfef96720062c044b081197e10fb4f7ae05"
+lang     = "Go"
+title    = "chore(deps): bump golang.org/x/text from 0.37.0 to 0.38.0"
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13632
+base_sha = "cac0ba166220017af1d299001b698e811077d5a6"
+head_sha = "2ededc5f5e7fac24a90cfa82aafa812720f5e1a9"
+lang     = "Go"
+title    = "docs(discussion): polish help docs"
+
+[[entry]]
+repo     = "cli/cli"
+pr       = 13631
+base_sha = "52e8e7427702e023d743318f748fceda4c0dcf37"
+head_sha = "850b34b72fdbc38853b8677f06c60804970114be"
+lang     = "Go"
+title    = "Add gh discussion and Issues 2.0 reference"
+
+# ── spring-projects/spring-boot (Java, 10 PRs) ────────────────────────────────
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50804
+base_sha = "4b542efc0c3c6a5b753a7ec198b7162d2879b99e"
+head_sha = "57dec87e28589c14e342b36927c5d088576593c2"
+lang     = "Java"
+title    = "Fix typo in DataSourceBuilderTests"
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50781
+base_sha = "262437f94cada5846a1353402d5233450f707ff8"
+head_sha = "4b542efc0c3c6a5b753a7ec198b7162d2879b99e"
+lang     = "Java"
+title    = "Setting server.servlet.session.cookie.partitioned to false still emits the Partitioned cookie attribute"
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50773
+base_sha = "f71e7977614682ced49221321a38bb5cb18bc938"
+head_sha = "12eb46696aa65e0e8dc11ed305bd4685110c127b"
+lang     = "Java"
+title    = "Map properties bound from empty strings fail with ConverterNotFoundException"
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50699
+base_sha = "2556ef46be7521ee7f18102264801483b272c37c"
+head_sha = "3ebc0419677e81973103de9a06312bcd1b728f0d"
+lang     = "Java"
+title    = "Fix Javadoc for GraylogExtendedLogFormatProperties"
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50669
+base_sha = "91ed06d8517bb823e68c96c7255ff22f11e79ace"
+head_sha = "962df3378847537fcd209d60af4229421089c7f0"
+lang     = "Java"
+title    = "Bump @springio/antora-extensions from 1.14.11 to 1.14.12 in /antora"
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50641
+base_sha = "cc90a0862a50b21433bba5c6427ea04235cbba68"
+head_sha = "becb0bbc7c56787e49acc6bc04f6b90d21081155"
+lang     = "Java"
+title    = "Fix reference to Gradle documentation for module replacement"
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50640
+base_sha = "98048ef12edd485abaecb4cf9127d517e25b94bb"
+head_sha = "9446bd7420247f52b67bfc14fef9b1a11d4c5269"
+lang     = "Java"
+title    = "NullPointerException in reactor-netty SniProvider and unmapped SSL bundle with RSocket"
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50639
+base_sha = "3cafe9b602a969db9f52f4683dc2875708e03b18"
+head_sha = "eaf4a0a2861c1246316265b11341469b118a4508"
+lang     = "Java"
+title    = "Close FileOutputStream delegate in InspectingOutputStream"
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50626
+base_sha = "a009ea4bee6d1176b831125bad67d1950592900a"
+head_sha = "6d9fd88ae9b0e228c42640b40db7bb894476a84e"
+lang     = "Java"
+title    = "Close URLClassLoader in ArchitectureCheck"
+
+[[entry]]
+repo     = "spring-projects/spring-boot"
+pr       = 50624
+base_sha = "8288b8fc367608d9a07fe4a49bb33244e2df4a12"
+head_sha = "88a7a44bafca87fe17e5381b146b2dc90a190a50"
+lang     = "Java"
+title    = "SSL should not be enabled when a SSL bundle is overridden to an empty string"
+
+# ── microsoft/TypeScript (TypeScript, 10 PRs) ──────────────────────────────────
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63544
+base_sha = "3e2482c4fa6ab1915df31cdc6dd12f23f18e5310"
+head_sha = "cbff98575a2e29d4b29156a8b590ff390cecf0ab"
+lang     = "TypeScript"
+title    = "Update git identity from typescript-bot to typescript-automation[bot]"
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63538
+base_sha = "6fbce89821d93a5b761581d9ac540455f38e9acb"
+head_sha = "defed171494583412d443f0c962c64f5e3a740ce"
+lang     = "TypeScript"
+title    = "Switch from bot PAT to GitHub App token via Azure Key Vault"
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63529
+base_sha = "345012d5a9c9f047f44dbf32d0348921c5072c2f"
+head_sha = "5ff5aa5505f36983ffd7e6456098bb514b5f6d57"
+lang     = "TypeScript"
+title    = "Bump the github-actions group across 1 directory with 7 updates"
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63528
+base_sha = "f3d3968058b5ee0f1c78dc1484a287d9f33bf638"
+head_sha = "470903be1fa6582e88505b3cfcb82914d57a357d"
+lang     = "TypeScript"
+title    = "Delete browser-integration job from ci.yml"
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63525
+base_sha = "2cf042088ff05dd055f649d5bc7b085e418c02b3"
+head_sha = "5a27cf1df39e9c4e523f687d2aef21b3cdfc2367"
+lang     = "TypeScript"
+title    = "Fix JSDoc grammar typo"
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63516
+base_sha = "2cf042088ff05dd055f649d5bc7b085e418c02b3"
+head_sha = "05dccf3295c641951adee80d1efd1f9b21c76ffa"
+lang     = "TypeScript"
+title    = "Update toFixed/toExponential/toPrecision digit range in docs to match the spec"
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63504
+base_sha = "e5509e211f5df999f54527daefaf47bc7bc1b1eb"
+head_sha = "aabbe022a38ea45895c102714137acc11279fc8e"
+lang     = "TypeScript"
+title    = "lib: fix misleading maxLength param on string pad* methods"
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63496
+base_sha = "0105bbb63689372f2cbeec7c884c27906ac0ef7f"
+head_sha = "dd8b4b342dc3554bad156569e2c4a5602730f7d1"
+lang     = "TypeScript"
+title    = "Update AI assistance guidelines in CONTRIBUTING.md"
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63492
+base_sha = "f350b52331494b68c90ab02e2b6d0828d2a22a74"
+head_sha = "800658d88b3474aea2820e78540cbf07e696ac62"
+lang     = "TypeScript"
+title    = "Fix typo in README: behavorial -> behavioral"
+
+[[entry]]
+repo     = "microsoft/TypeScript"
+pr       = 63491
+base_sha = "f350b52331494b68c90ab02e2b6d0828d2a22a74"
+head_sha = "4ef712c17e0ac53cfc133e0a6bc0516e7c17f0af"
+lang     = "TypeScript"
+title    = "63480"

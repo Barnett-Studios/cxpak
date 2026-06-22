@@ -1,4 +1,6 @@
 pub mod auto_context;
+#[cfg(feature = "bench")]
+pub mod bench;
 pub mod budget;
 pub mod cache;
 pub mod capability;

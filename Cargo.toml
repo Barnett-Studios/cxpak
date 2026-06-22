@@ -84,6 +84,7 @@ tower-lsp = { version = "0.20", optional = true }
 fs2 = "0.4"
 sha2 = "0.10"
 subtle = "2"
+toml = { version = "0.8", optional = true }
 resvg = { version = "0.47", optional = true }
 petgraph = { version = "0.6", optional = true }
 thiserror = { version = "2", optional = true }
@@ -177,6 +178,7 @@ embeddings = [
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
 e2e-browser = []
 plugins = ["dep:wasmtime"]
+bench = ["dep:toml"]
 
 # `dev_maintenance` cfg is flipped on by the project-local .cargo/config.toml
 # via rustflags during maintainer builds.  Whitelist it so rustc's
