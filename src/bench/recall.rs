@@ -154,7 +154,27 @@ pub const BUDGET_32K: usize = 32_000;
 ///
 /// Returns one [`SystemResult`] per system, with metrics averaged over the
 /// entries that ran. Errors only on a total wipe-out (no entry produced data).
+///
+/// Note: the means are over the SURVIVING entries only. A caller comparing
+/// against a baseline computed on a different entry count is comparing
+/// apples-to-oranges — use [`run_harness_counted`] and check the count when that
+/// matters (the recall gate does).
 pub fn run_harness(entries: &[CorpusEntry], repo_root: &Path) -> Result<Vec<SystemResult>, String> {
+    run_harness_counted(entries, repo_root).map(|(results, _counted)| results)
+}
+
+/// Like [`run_harness`], but also returns how many of `entries` actually
+/// produced data (the divisor behind every mean).
+///
+/// A partial run — where some entries silently failed to fetch/index — averages
+/// over fewer entries than were requested. That mean is NOT comparable to a
+/// baseline mean taken over the full subset, so any caller that compares against
+/// a fixed baseline (the recall gate) MUST verify `counted == entries.len()` and
+/// refuse a partial run rather than compare across a different denominator.
+pub fn run_harness_counted(
+    entries: &[CorpusEntry],
+    repo_root: &Path,
+) -> Result<(Vec<SystemResult>, usize), String> {
     // Accumulators keyed by system name → (sum_recall_8k, sum_recall_32k, sum_mrr).
     // Order MUST match the row order produced by `run_entry`.
     //
@@ -197,7 +217,7 @@ pub fn run_harness(entries: &[CorpusEntry], repo_root: &Path) -> Result<Vec<Syst
     }
 
     let n = counted as f64;
-    Ok(systems
+    let results = systems
         .iter()
         .enumerate()
         .map(|(i, name)| SystemResult {
@@ -206,7 +226,8 @@ pub fn run_harness(entries: &[CorpusEntry], repo_root: &Path) -> Result<Vec<Syst
             recall_32k: acc[i].1 / n,
             mrr: acc[i].2 / n,
         })
-        .collect())
+        .collect();
+    Ok((results, counted))
 }
 
 /// Run every system for a single corpus entry, returning per-system

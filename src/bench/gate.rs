@@ -23,7 +23,7 @@
 //   * The baseline subset is PINNED by (repo, pr): merged PRs are immutable, so
 //     the measured numbers are reproducible run-to-run.
 
-use crate::bench::recall::{run_harness, SystemResult};
+use crate::bench::recall::{run_harness_counted, SystemResult};
 use crate::bench::CorpusEntry;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -220,6 +220,25 @@ impl GateOutcome {
     }
 }
 
+/// Guard that a harness run covered EVERY pinned subset entry.
+///
+/// Pure, no-I/O — the count comparison the gate (and baseline generation) rely
+/// on, factored out so it can be unit-tested without the network. `counted` is
+/// how many entries actually produced data; `expected` is the pinned subset
+/// size. The metrics are means, so `counted < expected` yields a mean over a
+/// different denominator than the committed baseline — not comparable. Returns
+/// `Err` on any mismatch (`context` names the caller for a clear message),
+/// `Ok(())` only when the full subset ran.
+pub fn verify_full_subset(counted: usize, expected: usize, context: &str) -> Result<(), String> {
+    if counted != expected {
+        return Err(format!(
+            "{context}: ran {counted} of {expected} subset entries (need all {expected}); \
+             a partial-subset mean is not comparable to the full-subset baseline"
+        ));
+    }
+    Ok(())
+}
+
 /// Compare a freshly-measured gate row against the baseline gate row.
 ///
 /// Pure: no I/O. PRIMARY gate is recall non-regression at each budget
@@ -295,7 +314,10 @@ pub fn generate_baseline(
 ) -> Result<Baseline, String> {
     let corpus = crate::bench::load_corpus(repo_root)?;
     let entries = select_subset(&subset, &corpus)?;
-    let results = run_harness(&entries, repo_root)?;
+    let (results, counted) = run_harness_counted(&entries, repo_root)?;
+    // The committed baseline must be a FULL-subset mean — a baseline averaged
+    // over a partial run would bake a wrong denominator into the gate floor.
+    verify_full_subset(counted, entries.len(), "baseline generation")?;
     if !results.iter().any(|r| r.system == GATE_SYSTEM) {
         return Err(format!("harness produced no '{GATE_SYSTEM}' row"));
     }
@@ -321,7 +343,17 @@ pub fn run_gate(repo_root: &Path) -> Result<(GateOutcome, Vec<SystemResult>), St
     let corpus = crate::bench::load_corpus(repo_root)?;
     let subset = select_subset(&baseline.subset, &corpus)?;
 
-    let results = run_harness(&subset, repo_root)?;
+    let (results, counted) = run_harness_counted(&subset, repo_root)?;
+
+    // The baseline metrics are MEANS over the full pinned subset. If any entry
+    // silently failed to fetch/index (transient network/index error → the
+    // harness's "skipping…" note), `run_harness` would still return Ok with a
+    // mean over only the survivors — a different denominator than the baseline.
+    // Comparing that partial mean to the full-subset baseline is apples-to-
+    // oranges: it can spuriously PASS (masking a real regression) or FAIL
+    // (red-lighting a clean branch). Refuse it loudly — a partial run is a gate
+    // failure to RUN, not a recall verdict.
+    verify_full_subset(counted, subset.len(), "recall gate")?;
 
     let current = results
         .iter()
@@ -514,6 +546,41 @@ mod tests {
             err.contains("99"),
             "error should name the missing pr: {err}"
         );
+    }
+
+    #[test]
+    fn verify_full_subset_passes_on_full_run() {
+        // Every pinned entry produced data → Ok.
+        assert!(verify_full_subset(3, 3, "recall gate").is_ok());
+    }
+
+    #[test]
+    fn verify_full_subset_errs_on_partial_run() {
+        // A partial run (some entries silently failed) → Err, NOT a pass and NOT
+        // a recall-based fail. This is the load-bearing guard: a 2-of-3 mean is
+        // not comparable to a 3-entry baseline.
+        let err = verify_full_subset(2, 3, "recall gate")
+            .expect_err("partial run must Err, not silently compare");
+        assert!(
+            err.contains("2 of 3"),
+            "message should name the counts: {err}"
+        );
+        assert!(
+            err.contains("recall gate"),
+            "message should name the caller: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("not comparable"),
+            "message should explain why: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_full_subset_errs_on_total_wipeout() {
+        // Zero entries counted (every fetch failed) is also a refusal, not a
+        // pass. (run_harness already Errs on a total wipeout before reaching
+        // here, but the guard is defensive on its own.)
+        assert!(verify_full_subset(0, 3, "recall gate").is_err());
     }
 
     #[test]

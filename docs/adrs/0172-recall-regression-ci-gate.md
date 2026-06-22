@@ -93,10 +93,12 @@ checkout@v6.0.2 + rust-toolchain@1.94.1 + rust-cache@v2.9.1) that:
   `bench/baseline.json` minus a `1e-6` tolerance. MRR is computed, recorded, and
   printed but **not** gated. The gate's pass/fail is the job's exit status.
 - Runs with `GH_TOKEN: secrets.GITHUB_TOKEN` (auto-provided on this repo's
-  branch/PR runs; gh uses it for an authenticated, higher-rate-limit API) and
-  `CXPAK_BENCH_NET=1`. On forked-PR runs where the token is absent/limited it
-  **skips gracefully** (never claiming to have run) rather than false-failing —
-  but it runs with teeth on this repo's own branches and PRs.
+  branch/PR runs **and on forked-PR runs**, read-only there; gh uses it for an
+  authenticated, higher-rate-limit read) and `CXPAK_BENCH_NET=1` whenever that
+  token is present. Because the corpus repos are public, the gate **runs with
+  teeth wherever a token exists — including forked PRs**. It **skips gracefully**
+  (never claiming to have run) only if the token is genuinely empty/unavailable,
+  rather than false-failing.
 
 The committed `bench/baseline.json` (format_version 1) carries the pinned subset,
 the gated `cxpak (auto_context)` numbers, and every baseline system's numbers

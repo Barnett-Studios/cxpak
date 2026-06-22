@@ -69,15 +69,17 @@ jobs:
         run: cargo test --features bench --test bench_recall --test bench_gate
       - name: Recall-regression gate (network)
         env:
-          # secrets.GITHUB_TOKEN is auto-provided on this repo's branch/PR runs;
-          # gh reads GH_TOKEN. On forked-PR runs the token is absent/limited, so
-          # the gate skips gracefully (it never claims to have run without the
-          # env) rather than false-failing. On this repo it runs with teeth.
+          # secrets.GITHUB_TOKEN is auto-provided on this repo's branch/PR runs
+          # AND on forked-PR runs (read-only there); gh reads GH_TOKEN. The gate
+          # runs whenever a token is present — including forked PRs, since the
+          # corpus repos are public and only need an authenticated (higher-rate-
+          # limit) read. The skip below triggers only when the token is genuinely
+          # empty/unavailable, so the gate never claims to have run without it.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CXPAK_BENCH_NET: ${{ secrets.GITHUB_TOKEN != '' && '1' || '' }}
         run: |
           if [ -z "${CXPAK_BENCH_NET}" ]; then
-            echo "No GH token (likely a forked-PR run) — skipping network recall gate."
+            echo "No GH token available — skipping network recall gate."
             exit 0
           fi
           cargo test --features bench --test bench_gate recall_gate_holds -- --ignored --nocapture
