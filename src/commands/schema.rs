@@ -68,7 +68,7 @@ pub fn capability_schema(id: &str) -> Result<serde_json::Value, UnknownCapabilit
 /// `FORMAT_VERSION`. Kept in one place so the advertised contract and the const
 /// never drift.
 pub fn auto_context_schema() -> serde_json::Value {
-    let version = crate::auto_context::FORMAT_VERSION;
+    let version = CONTEXT_FORMAT_VERSION;
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "AutoContextResult",
