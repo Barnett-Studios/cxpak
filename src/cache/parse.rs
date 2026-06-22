@@ -218,22 +218,23 @@ mod tests {
     use std::fs;
 
     /// Create a minimal git repo with one Rust source file and return its root.
+    ///
+    /// Uses `git2` to avoid spawning a `git` subprocess; subprocess-based init
+    /// is prone to resource contention under high test parallelism on macOS.
     fn make_test_repo(tmp: &tempfile::TempDir, source: &str) -> std::path::PathBuf {
         let root = tmp.path().to_path_buf();
         // Initialise a git repo so Scanner accepts the directory.
-        std::process::Command::new("git")
-            .args(["init", root.to_str().unwrap()])
-            .output()
-            .expect("git init");
+        let repo = git2::Repository::init(&root).expect("git2 init");
         let src_dir = root.join("src");
         fs::create_dir_all(&src_dir).unwrap();
         let file = src_dir.join("lib.rs");
         fs::write(&file, source).unwrap();
         // Stage the file so it is git-tracked.
-        std::process::Command::new("git")
-            .args(["-C", root.to_str().unwrap(), "add", "src/lib.rs"])
-            .output()
-            .expect("git add");
+        let mut index = repo.index().expect("repo index");
+        index
+            .add_path(std::path::Path::new("src/lib.rs"))
+            .expect("git add src/lib.rs");
+        index.write().expect("index write");
         root
     }
 
@@ -391,11 +392,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
 
-        // Initialise a git repo.
-        std::process::Command::new("git")
-            .args(["init", root.to_str().unwrap()])
-            .output()
-            .expect("git init");
+        // Initialise a git repo via git2 to avoid subprocess contention.
+        let repo = git2::Repository::init(&root).expect("git2 init");
+        let mut index = repo.index().expect("repo index");
 
         let src_dir = root.join("src");
         fs::create_dir_all(&src_dir).unwrap();
@@ -412,16 +411,11 @@ mod tests {
         for (filename, source) in &files_and_fns {
             let path = src_dir.join(filename);
             fs::write(&path, source).unwrap();
-            std::process::Command::new("git")
-                .args([
-                    "-C",
-                    root.to_str().unwrap(),
-                    "add",
-                    &format!("src/{filename}"),
-                ])
-                .output()
+            index
+                .add_path(std::path::Path::new(&format!("src/{filename}")))
                 .expect("git add");
         }
+        index.write().expect("index write");
 
         let counter = TokenCounter::new();
         let scanned = scan_files(&root);

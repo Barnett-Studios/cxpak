@@ -27,11 +27,11 @@ fn load_fixture_index() -> cxpak::index::CodebaseIndex {
     // time we land a commit that touches a mirrored path.  `git init`
     // creates a hermetic empty repo so discovery stops here, every file
     // reports churn_30d=0, and the fixture is independent of outer history.
-    let _ = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(&fixture_root)
-        .status()
-        .expect("git init fixture");
+    // Use git2 to avoid subprocess resource contention under parallel tests.
+    // If the repo already exists (e.g. from a previous run), open it instead.
+    if !fixture_root.join(".git").exists() {
+        git2::Repository::init(&fixture_root).expect("git2 init fixture");
+    }
     cxpak::commands::serve::build_index(&fixture_root).expect("fixture index builds")
 }
 

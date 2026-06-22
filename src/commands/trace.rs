@@ -649,36 +649,18 @@ mod tests {
         use crate::cli::OutputFormat;
         let dir = tempfile::TempDir::new().unwrap();
 
-        // Initialise a bare git repo so git::extract_git_context doesn't error out
-        // before we even reach the symbol lookup.
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .ok();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir.path())
-            .output()
-            .ok();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .ok();
+        // Initialise a git repo via git2 so git::extract_git_context doesn't
+        // error out before we even reach the symbol lookup.  Subprocess-based
+        // git init is prone to resource contention under high test parallelism.
+        let repo = git2::Repository::init(dir.path()).expect("git2 init");
 
-        // Write a Rust file and commit it so the scanner can find files.
+        // Write a Rust file and stage it so the scanner can find files.
         std::fs::write(dir.path().join("main.rs"), "fn hello() {}").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .ok();
-        std::process::Command::new("git")
-            .args(["commit", "--allow-empty-message", "-m", "init"])
-            .current_dir(dir.path())
-            .output()
-            .ok();
+        let mut index = repo.index().expect("repo index");
+        index
+            .add_path(std::path::Path::new("main.rs"))
+            .expect("git add main.rs");
+        index.write().expect("index write");
 
         let result = run(
             dir.path(),
