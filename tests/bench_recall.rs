@@ -11,11 +11,22 @@
 // Requires the `bench` feature; without it the crate exposes no `bench` module.
 #![cfg(feature = "bench")]
 
-use cxpak::bench::recall::{mrr, recall_at_budget, render_comparison_table, SystemResult};
+use cxpak::bench::recall::{
+    ground_truth_at_base, mrr, recall_at_budget, render_comparison_table, ChangedFile, SystemResult,
+};
 use std::collections::HashSet;
 
 fn gt(files: &[&str]) -> HashSet<String> {
     files.iter().map(|s| s.to_string()).collect()
+}
+
+/// Construct a `ChangedFile` record (mirrors the `gh api .../files` shape).
+fn cf(filename: &str, status: &str, previous: Option<&str>) -> ChangedFile {
+    ChangedFile {
+        filename: filename.to_string(),
+        status: status.to_string(),
+        previous_filename: previous.map(str::to_string),
+    }
 }
 
 // ── recall_at_budget ──────────────────────────────────────────────────────
@@ -146,6 +157,75 @@ fn table_handles_empty_results() {
     );
 }
 
+// ── ground_truth_at_base (NO network — the base-tree nuance) ───────────────
+//
+// Ground truth = changed files that EXIST at base_sha. Retrieval runs over the
+// base tree, so `added` files (which don't exist there) must be excluded;
+// `renamed` files exist under their PREVIOUS path; everything else exists under
+// its current path. These pure cases are the most error-prone part of the
+// metric, so they get explicit coverage in the default-with-bench suite.
+
+#[test]
+fn gt_added_is_excluded() {
+    // An added file does not exist at base — it cannot be retrieved, so it must
+    // not appear in (or inflate) the ground-truth denominator.
+    let result = ground_truth_at_base(&[cf("src/new.rs", "added", None)]);
+    assert!(
+        result.is_empty(),
+        "added file must be excluded, got {result:?}"
+    );
+}
+
+#[test]
+fn gt_modified_is_kept() {
+    let result = ground_truth_at_base(&[cf("src/lib.rs", "modified", None)]);
+    assert_eq!(result, gt(&["src/lib.rs"]));
+}
+
+#[test]
+fn gt_removed_is_kept() {
+    // A removed/deleted file still exists at base (the PR deletes it).
+    let result = ground_truth_at_base(&[cf("src/old.rs", "removed", None)]);
+    assert_eq!(result, gt(&["src/old.rs"]));
+}
+
+#[test]
+fn gt_renamed_uses_previous_filename() {
+    // The base-tree path is the PRE-rename path; the post-rename name does not
+    // exist at base, so it must NOT be in the ground truth.
+    let result = ground_truth_at_base(&[cf("src/new_name.rs", "renamed", Some("src/old_name.rs"))]);
+    assert_eq!(result, gt(&["src/old_name.rs"]));
+    assert!(
+        !result.contains("src/new_name.rs"),
+        "post-rename name must not be in gt: {result:?}"
+    );
+}
+
+#[test]
+fn gt_renamed_without_previous_falls_back_to_filename() {
+    // Defensive: GitHub always supplies previous_filename for a rename, but if
+    // it is absent we fall back to the current filename rather than dropping it.
+    let result = ground_truth_at_base(&[cf("src/renamed.rs", "renamed", None)]);
+    assert_eq!(result, gt(&["src/renamed.rs"]));
+}
+
+#[test]
+fn gt_mixed_statuses() {
+    // A realistic mix: added excluded; modified/removed kept by name; renamed
+    // kept by previous path.
+    let result = ground_truth_at_base(&[
+        cf("a_added.rs", "added", None),
+        cf("b_modified.rs", "modified", None),
+        cf("c_removed.rs", "removed", None),
+        cf("d_new.rs", "renamed", Some("d_old.rs")),
+    ]);
+    assert_eq!(
+        result,
+        gt(&["b_modified.rs", "c_removed.rs", "d_old.rs"]),
+        "mixed-status ground truth incorrect"
+    );
+}
+
 // ── Harness smoke (NETWORK + compute, gated) ───────────────────────────────
 //
 // Runs the FULL pipeline (fetch repo@base_sha → index → all systems at {8k,32k})
@@ -187,7 +267,8 @@ fn harness_smoke_subset() {
     // Every system must appear.
     let systems: HashSet<&str> = results.iter().map(|r| r.system.as_str()).collect();
     for expected in [
-        "cxpak",
+        "cxpak (auto_context)",
+        "cxpak (score_all ranking)",
         "ripgrep",
         "embeddings-only",
         "repomap (PageRank proxy)",

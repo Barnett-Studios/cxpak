@@ -156,8 +156,16 @@ pub const BUDGET_32K: usize = 32_000;
 /// entries that ran. Errors only on a total wipe-out (no entry produced data).
 pub fn run_harness(entries: &[CorpusEntry], repo_root: &Path) -> Result<Vec<SystemResult>, String> {
     // Accumulators keyed by system name → (sum_recall_8k, sum_recall_32k, sum_mrr).
+    // Order MUST match the row order produced by `run_entry`.
+    //
+    // Two cxpak rows, clearly labeled:
+    //   * "cxpak (auto_context)"     — the shipped product C2/D1 gate against:
+    //     seed selection + 1-hop graph fan-out + noise filtering, then budgeting.
+    //   * "cxpak (score_all ranking)" — the raw multi-signal ranking, kept as the
+    //     fair apples-to-apples cross-system comparison vs the other baselines.
     let systems = [
-        "cxpak",
+        "cxpak (auto_context)",
+        "cxpak (score_all ranking)",
         "ripgrep",
         "embeddings-only",
         "repomap (PageRank proxy)",
@@ -228,8 +236,8 @@ fn run_entry(entry: &CorpusEntry, repo_root: &Path) -> Result<Vec<(f64, f64, f64
     let ranked_ripgrep = rank_ripgrep(&query, &checkout, &index);
     let ranked_repomap = rank_repomap_proxy(&index);
 
-    // 4. For each system, take the budget prefix for recall and the full ranked
-    //    list for MRR.
+    // 4. Ranking-based systems: take the budget prefix for recall and the full
+    //    ranked list for MRR.
     let row = |ranked: &[(String, usize)]| -> (f64, f64, f64) {
         let sel_8k = take_within_budget(ranked, BUDGET_8K);
         let sel_32k = take_within_budget(ranked, BUDGET_32K);
@@ -241,7 +249,41 @@ fn run_entry(entry: &CorpusEntry, repo_root: &Path) -> Result<Vec<(f64, f64, f64
         )
     };
 
+    // 5. cxpak (auto_context): the SHIPPED product C2/D1 gate against. Unlike the
+    //    raw `score_all` ranking, auto_context applies seed selection + 1-hop
+    //    graph fan-out + noise filtering before its OWN budget allocation, so we
+    //    call it once per budget and read back the files it actually selected
+    //    (`sections.target_files`) — no external `take_within_budget`.
+    //    MRR is undefined for a budget-selected *set* (no global rank beyond the
+    //    cutoff), so we report MRR on the underlying `score_all` ranking — the
+    //    same ordering auto_context's seed selection consumes — and document it.
+    let ac_mrr = {
+        let order: Vec<String> = ranked_cxpak.iter().map(|(p, _)| p.clone()).collect();
+        mrr(&order, &ground_truth)
+    };
+    let ac_recall = |budget: usize| -> f64 {
+        let opts = crate::auto_context::AutoContextOpts {
+            tokens: budget,
+            focus: None,
+            include_tests: false,
+            include_blast_radius: false,
+            mode: "full".to_string(),
+            cost_model: None,
+        };
+        let result = crate::auto_context::auto_context(&query, &index, &opts);
+        let selected: Vec<String> = result
+            .sections
+            .target_files
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        recall_at_budget(&selected, &ground_truth)
+    };
+    let row_auto_context = (ac_recall(BUDGET_8K), ac_recall(BUDGET_32K), ac_mrr);
+
     Ok(vec![
+        row_auto_context,
         row(&ranked_cxpak),
         row(&ranked_ripgrep),
         row(&ranked_embeddings),
@@ -249,9 +291,12 @@ fn run_entry(entry: &CorpusEntry, repo_root: &Path) -> Result<Vec<(f64, f64, f64
     ])
 }
 
-/// Greedily accumulate file paths from the ranked list until the next file
-/// would exceed `budget` tokens. Mirrors how cxpak packs context: rank order is
-/// authoritative, a file is included only if it fits.
+/// Pack file paths from the ranked list within `budget` tokens, skipping any
+/// file that would overflow and continuing with later (smaller) files rather
+/// than stopping at the first overflow. Rank order is authoritative; a file is
+/// included iff it fits in the remaining budget. This skip-and-continue policy
+/// is applied uniformly across every ranking-based system, so it cannot bias the
+/// cross-system comparison.
 fn take_within_budget(ranked: &[(String, usize)], budget: usize) -> Vec<String> {
     let mut used = 0usize;
     let mut selected = Vec::new();
@@ -265,9 +310,13 @@ fn take_within_budget(ranked: &[(String, usize)], budget: usize) -> Vec<String> 
     selected
 }
 
-/// cxpak's own multi-signal ranking — the system under test.
+/// cxpak's raw multi-signal ranking — the "cxpak (score_all ranking)" row.
 ///
-/// Uses the same `MultiSignalScorer` cxpak's `auto_context` drives, sorted by
+/// This is the underlying `MultiSignalScorer` ranking that auto_context's seed
+/// selection consumes, BEFORE auto_context layers on seed selection, 1-hop graph
+/// fan-out, and noise filtering. Kept as the fair apples-to-apples cross-system
+/// comparison against ripgrep / embeddings-only / repomap; the separate
+/// "cxpak (auto_context)" row measures the shipped product end-to-end. Sorted by
 /// score descending with a path tiebreak for determinism. Returns
 /// `(relative_path, token_count)` pairs.
 fn rank_cxpak(query: &str, index: &crate::index::CodebaseIndex) -> Vec<(String, usize)> {
