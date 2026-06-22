@@ -240,13 +240,8 @@ fn graph_schema() -> serde_json::Value {
         "description": "Dependency graph produced by cxpak indexing. Nodes are file paths; edges are typed and carry confidence.",
         "type": "object",
         "x-format-version": version,
-        "required": ["format_version", "edges", "reverse_edges"],
+        "required": ["edges", "reverse_edges"],
         "properties": {
-            "format_version": {
-                "type": "string",
-                "const": version,
-                "description": "Version of this output contract."
-            },
             "edges": {
                 "type": "object",
                 "description": "Map from source file path to the set of outgoing typed edges.",
@@ -326,13 +321,8 @@ fn data_schema() -> serde_json::Value {
         "description": "Data-layer index produced by cxpak: tables, views, DB functions, ORM models, and migration chains.",
         "type": "object",
         "x-format-version": version,
-        "required": ["format_version", "tables", "views", "functions", "orm_models", "migrations"],
+        "required": ["tables", "views", "functions", "orm_models", "migrations"],
         "properties": {
-            "format_version": {
-                "type": "string",
-                "const": version,
-                "description": "Version of this output contract."
-            },
             "tables": {
                 "type": "object",
                 "description": "Map from table name to TableSchema.",
@@ -521,16 +511,10 @@ fn review_schema() -> serde_json::Value {
         "type": "object",
         "x-format-version": version,
         "required": [
-            "format_version",
             "modified_files", "new_files", "deleted_files",
             "new_symbols", "removed_symbols", "graph_changes", "recommendation"
         ],
         "properties": {
-            "format_version": {
-                "type": "string",
-                "const": version,
-                "description": "Version of this output contract."
-            },
             "modified_files": {
                 "type": "array",
                 "items": { "$ref": "#/$defs/fileChange" }
