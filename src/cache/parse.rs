@@ -101,6 +101,8 @@ pub fn parse_with_cache(
                             language: file.language.clone(),
                             token_count: 0,
                             parse_result: None,
+                            mtime_ns: None,
+                            content_sha256: None,
                         },
                         None,
                     );
@@ -143,6 +145,8 @@ pub fn parse_with_cache(
                 language: file.language.clone(),
                 token_count,
                 parse_result: parse_result.clone(),
+                mtime_ns: None,
+                content_sha256: None,
             };
 
             (parse_result, cache_entry, source_opt)

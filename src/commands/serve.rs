@@ -114,6 +114,10 @@ pub fn build_index_with_workspace(
 
     let mut parse_results = HashMap::new();
     let mut content_map = HashMap::new();
+    // Capture mtime_ns + size_bytes per file before `files` is consumed by
+    // build_with_content.  These feed the stat-index to skip re-hashing
+    // files whose (mtime_ns, size_bytes) are unchanged (Task 0.2).
+    let mut file_stats: HashMap<String, (u64, u64)> = HashMap::new();
     for file in &files {
         let source = std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
         if let Some(lang_name) = &file.language {
@@ -127,6 +131,8 @@ pub fn build_index_with_workspace(
                 }
             }
         }
+        let mtime_ns = crate::cache::file_mtime_ns(&file.absolute_path);
+        file_stats.insert(file.relative_path.clone(), (mtime_ns, file.size_bytes));
         content_map.insert(file.relative_path.clone(), source);
     }
 
@@ -140,12 +146,43 @@ pub fn build_index_with_workspace(
     // corruption falls through to a full rebuild.
     let cache_dir = path.join(cache_namespace(path, workspace));
     let head_oid = git_head_oid(path);
-    let fp_files: Vec<(String, String)> = index
+
+    // Build file list with mtime_ns + size_bytes for the stat-index fast-path.
+    // Files not present in file_stats (shouldn't happen) fall back to (0, 0)
+    // which guarantees a stat-index miss → full re-hash (fail-closed).
+    let fp_files: Vec<(String, String, u64, u64)> = index
         .files
         .iter()
-        .map(|f| (f.relative_path.clone(), f.content.clone()))
+        .map(|f| {
+            let (mtime_ns, size_bytes) =
+                file_stats.get(&f.relative_path).copied().unwrap_or((0, 0));
+            (
+                f.relative_path.clone(),
+                f.content.clone(),
+                mtime_ns,
+                size_bytes,
+            )
+        })
         .collect();
-    let fingerprint = crate::cache::content_fingerprint(&fp_files, &head_oid);
+
+    // Load the stat-index (fail-closed: empty on any error).
+    let mut stat_index = crate::cache::StatIndex::load(&cache_dir);
+
+    // Production content hasher: strips markdown frontmatter, then SHA-256.
+    let fingerprint = crate::cache::content_fingerprint_with_stat_index(
+        &fp_files,
+        &head_oid,
+        &mut stat_index,
+        |content| {
+            use sha2::{Digest, Sha256};
+            let body = crate::cache::strip_md_frontmatter(content);
+            format!("{:x}", Sha256::digest(body.as_bytes()))
+        },
+    );
+
+    // Persist the updated stat-index (best-effort; a write failure must not
+    // fail indexing).
+    let _ = stat_index.save(&cache_dir);
 
     match crate::cache::DerivedCache::load(&cache_dir, &fingerprint) {
         Some(derived) => {
