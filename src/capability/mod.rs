@@ -171,10 +171,14 @@ fn build_catalog() -> Vec<Capability> {
             intent: Intent::Context,
             inputs: &["task", "budget", "files"],
             has_schema: true,
+            // Reachable today ONLY via the MCP `cxpak_auto_context` tool. There
+            // is no `cxpak context` CLI subcommand, no `/v1/context` route, no
+            // `cxpak/context` LSP method, and the SPA does not render the
+            // context bundle — so every other bit is honestly false.
             projections: SurfaceSet {
                 mcp: true,
                 lsp: false,
-                cli: true,
+                cli: false,
                 http: false,
                 visual: false,
             },
@@ -185,12 +189,20 @@ fn build_catalog() -> Vec<Capability> {
             intent: Intent::Graph,
             inputs: &["symbol", "depth"],
             has_schema: true,
+            // The dependency graph is built and consumed internally (trace walks
+            // it, the visual architecture/flow views draw it), but NO surface
+            // returns the `DependencyGraph` contract (Task 0.5 `graph` schema)
+            // as a retrievable result today: `cxpak_trace`/`cxpak/trace` emit
+            // packed code paths, `cxpak_call_graph`/`/v1/call_graph` emit the
+            // call graph (a different structure), and the visual views render a
+            // drawing, not the graph JSON. Kept in the catalog to anchor its 0.5
+            // schema; surfaced as a retrievable result in B1 (graph-query).
             projections: SurfaceSet {
-                mcp: true,
-                lsp: true,
-                cli: true,
-                http: true,
-                visual: true,
+                mcp: false,
+                lsp: false,
+                cli: false,
+                http: false,
+                visual: false,
             },
         },
         Capability {
@@ -199,11 +211,18 @@ fn build_catalog() -> Vec<Capability> {
             intent: Intent::Data,
             inputs: &["focus"],
             has_schema: true,
+            // The `SchemaIndex` is indexed internally (consumed for query
+            // expansion / schema-aware edges) but is NOT yet surfaced as a
+            // retrievable result: there is no `/v1/data` route (`/v1/data_flow`
+            // is the distinct cross-language data-flow capability), no MCP tool
+            // emits the SchemaIndex, and `cxpak schema data` prints the schema
+            // CONTRACT, not the indexed tables. Kept to anchor its 0.5 schema;
+            // wired to a surface in A2/C3.
             projections: SurfaceSet {
-                mcp: true,
+                mcp: false,
                 lsp: false,
-                cli: true,
-                http: true,
+                cli: false,
+                http: false,
                 visual: false,
             },
         },
@@ -213,12 +232,18 @@ fn build_catalog() -> Vec<Capability> {
             intent: Intent::Review,
             inputs: &["base", "head"],
             has_schema: true,
+            // The `ContextDelta` (Task 0.5 `review` schema) is returned today
+            // ONLY by the MCP `cxpak_context_diff` tool (= `compute_diff`). The
+            // CLI `cxpak diff --review` emits a markdown change-impact bundle
+            // (not ContextDelta JSON), `cxpak/diff` (LSP) returns raw git
+            // changes (not ContextDelta), there is no `/v1/` ContextDelta route,
+            // and the SPA inits its diff data to null. So MCP only.
             projections: SurfaceSet {
                 mcp: true,
-                lsp: true,
-                cli: true,
+                lsp: false,
+                cli: false,
                 http: false,
-                visual: true,
+                visual: false,
             },
         },
         Capability {
@@ -319,8 +344,20 @@ mod tests {
             visual: false,
         };
         assert_eq!(s.count(), 3);
+        // A capability may legitimately be on ZERO surfaces today if it exists
+        // only to anchor its Task 0.5 schema until a surface is wired (e.g.
+        // `graph`/`data`). Such a capability MUST be schema-backed — an
+        // unsurfaced capability with no schema would be entirely unreachable
+        // and has no business in the catalog.
         for cap in catalog() {
-            assert!(cap.projections.count() >= 1, "{} is on no surface", cap.id);
+            if cap.projections.count() == 0 {
+                assert!(
+                    cap.has_schema,
+                    "{} is on no surface and has no schema — it is unreachable; \
+                     drop it from the catalog or wire a surface",
+                    cap.id
+                );
+            }
         }
     }
 

@@ -11,6 +11,29 @@
 //! catch third-decimal drift and HashMap-ordering drift. A capability that does
 //! NOT declare a surface is intentionally not tested for that surface (the
 //! dashed cell in the capability × surface matrix).
+//!
+//! # Scope of this gate (read before trusting a green run)
+//!
+//! This gate validates the projection framework's round-trip **invertibility**
+//! using STUB core values: it asserts that `recover_core(project(core)) == core`
+//! for every declared (capability, surface) cell. That is the correct
+//! foundational scope for Task 0.6 — the framework is parallel, and live
+//! surfaces do not yet route through it.
+//!
+//! It deliberately does NOT validate that a declared surface actually exposes
+//! the capability today. The test iterates the catalog's OWN declared bits and
+//! round-trips a stub through identity project/recover, so an *aspirational*
+//! surface bit would still pass green. Surface honesty is enforced separately by
+//! keeping the catalog's `projections` bits descriptive (only `true` where a
+//! surface genuinely returns that capability's data today — see
+//! `src/capability/mod.rs`).
+//!
+//! When B1/C3 route live surfaces through the adapter, this harness should swap
+//! the stub `sample_core` for real `intelligence::*` results and add a
+//! per-(capability, surface) **reachability** assertion (the surface must
+//! actually produce the capability's data). Until then: a green run here means
+//! "the projection framework is invertible", NOT "every declared surface is
+//! verified to exist".
 
 use cxpak::capability::adapter::{project, recover_core, Surface, ALL_SURFACES};
 use cxpak::capability::{catalog, Capability};
