@@ -3,7 +3,7 @@
 # whose changed-file set is the ground-truth for recall evaluation.
 # Source repos are NOT committed; CI fetches changed files on demand via gh api.
 #
-# Coverage: 6 repos, 52 PRs, 5 languages (Rust, Python, JavaScript, Go, Java, TypeScript).
+# Coverage: 6 repos, 62 PRs, 6 languages (Rust, Python, JavaScript, Go, Java, TypeScript).
 # Gathered: 2026-06-22 via `gh pr list --state merged` + `gh api repos/R/pulls/<n>`.
 
 # ── BurntSushi/ripgrep (Rust, 12 PRs) ──────────────────────────────────────────

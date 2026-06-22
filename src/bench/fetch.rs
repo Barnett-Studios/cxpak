@@ -154,10 +154,6 @@ mod tests {
     #[test]
     #[ignore = "network test — run with: cargo test --features bench -- --ignored"]
     fn fetch_reconstruction_pinned_pr() {
-        if std::env::var("CXPAK_BENCH_NET").unwrap_or_default() != "1" {
-            // Allow running without the env var when explicitly --ignored is passed.
-        }
-
         let entry = CorpusEntry {
             repo: "BurntSushi/ripgrep".to_string(),
             pr: 3271,
