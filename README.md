@@ -90,11 +90,7 @@ Builds the full default feature set from your local checkout. First build is slo
 
 [`Dockerfile.standalone`](Dockerfile.standalone) fetches the pre-built release binary, verifies its SHA-256 checksum, and packages it into an `ubuntu:24.04` runtime — no source checkout or Rust toolchain required. All base images and the downloaded binary are digest-pinned for reproducible builds.
 
-```bash
-docker build -f Dockerfile.standalone -t cxpak .
-```
-
-To pin a specific release, pass its version and per-arch checksums (available on the [releases page](https://github.com/Barnett-Studios/cxpak/releases)):
+All three build-args are **required** — the build fails immediately if any is omitted, so you can never accidentally produce a stale or mismatched image. Checksums are available on the [releases page](https://github.com/Barnett-Studios/cxpak/releases).
 
 ```bash
 docker build -f Dockerfile.standalone \

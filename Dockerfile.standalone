@@ -8,13 +8,16 @@
 # Use this Dockerfile when you need to self-host, audit every layer, or operate
 # in an environment that cannot reach ghcr.io.
 #
-# Build:
-#   docker build -f Dockerfile.standalone -t cxpak .
+# Build (all three args are required — the build fails fast if any is missing):
 #   docker build -f Dockerfile.standalone \
 #     --build-arg VERSION=2.3.0 \
 #     --build-arg SHA256_AMD64=c98d142aec62a70bb5ecccdf44120aaa55641a26b27d5a52821a093c79dd8cac \
 #     --build-arg SHA256_ARM64=2f7cc078446a65bdb8f2cbcc81b2e1932431b066d560fe99e90519c7afd3d580 \
 #     -t cxpak:2.3.0 .
+#
+# Obtain checksums from the GitHub releases page or:
+#   sha256sum cxpak-x86_64-unknown-linux-gnu.tar.gz
+#   sha256sum cxpak-aarch64-unknown-linux-gnu.tar.gz
 #
 # Run:
 #   docker run --rm -v "$(pwd):/repo" cxpak overview .
@@ -22,13 +25,12 @@
 #     cxpak serve --bind 0.0.0.0 --token mysecret .
 #   docker run --rm -i -v "$(pwd):/repo" cxpak serve --mcp .
 
-# ── Build args ────────────────────────────────────────────────────────────────
-# Default to the current release. When bumping VERSION also update the SHA256
-# build-args — obtain them from the GitHub release page or with:
-#   sha256sum cxpak-<arch>-unknown-linux-gnu.tar.gz
-ARG VERSION=2.3.0
-ARG SHA256_AMD64=c98d142aec62a70bb5ecccdf44120aaa55641a26b27d5a52821a093c79dd8cac
-ARG SHA256_ARM64=2f7cc078446a65bdb8f2cbcc81b2e1932431b066d560fe99e90519c7afd3d580
+# ── Build args (all required — no defaults) ───────────────────────────────────
+# No defaults are provided: a build without explicit args fails immediately
+# rather than silently producing a stale or mismatched image.
+ARG VERSION
+ARG SHA256_AMD64
+ARG SHA256_ARM64
 ARG TARGETARCH
 
 # ubuntu:24.04 matches the upstream release builder (glibc 2.39).
@@ -44,6 +46,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Fail fast if any required build-arg was omitted.
+RUN : "${VERSION:?--build-arg VERSION=X.Y.Z is required}" \
+ && : "${SHA256_AMD64:?--build-arg SHA256_AMD64=<hex> is required}" \
+ && : "${SHA256_ARM64:?--build-arg SHA256_ARM64=<hex> is required}"
 
 RUN set -eu; \
     case "$TARGETARCH" in \
