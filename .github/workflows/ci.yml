@@ -50,6 +50,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo test --verbose
 
+  bench:
+    # Recall-regression gate (ADR-0172). Two layers:
+    #   * always: the no-network corpus-integrity + metric + baseline tests.
+    #   * network gate: runs the harness on the FIXED resource-safe subset
+    #     (ripgrep/flask/express PRs) and FAILS the job if cxpak (auto_context)
+    #     recall drops below the committed bench/baseline.json. `gh` is
+    #     preinstalled on ubuntu-latest and reads GH_TOKEN for an authenticated
+    #     (higher-rate-limit) API.
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: No-network bench tests (corpus + metrics + baseline integrity)
+        run: cargo test --features bench --test bench_recall --test bench_gate
+      - name: Recall-regression gate (network)
+        env:
+          # secrets.GITHUB_TOKEN is auto-provided on this repo's branch/PR runs;
+          # gh reads GH_TOKEN. On forked-PR runs the token is absent/limited, so
+          # the gate skips gracefully (it never claims to have run without the
+          # env) rather than false-failing. On this repo it runs with teeth.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CXPAK_BENCH_NET: ${{ secrets.GITHUB_TOKEN != '' && '1' || '' }}
+        run: |
+          if [ -z "${CXPAK_BENCH_NET}" ]; then
+            echo "No GH token (likely a forked-PR run) — skipping network recall gate."
+            exit 0
+          fi
+          cargo test --features bench --test bench_gate recall_gate_holds -- --ignored --nocapture
+
   msrv:
     runs-on: ubuntu-latest
     needs: [fmt, clippy]

@@ -1,6 +1,6 @@
 # ADR Index
 
-166 architecture decision records. 0001–0162 reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1); 0163 onward written at decision time. See [README](./README.md) for methodology.
+172 architecture decision records. 0001–0162 reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1); 0163 onward written at decision time. See [README](./README.md) for methodology.
 
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
@@ -175,3 +175,4 @@
 | [0169](0169-versioned-context-format-schema.md) | Publish a versioned context-format schema over the existing JSON output, not a new format | ACCEPTED | 2026-06-14 |
 | [0170](0170-official-container-images-from-ci.md) | Publish official multi-arch container images from CI, built from release artifacts and signed | ACCEPTED | 2026-06-18 |
 | [0171](0171-review-mode-extends-diff.md) | Review mode as a --review extension of cxpak diff, composing existing intelligence + expected-but-absent detection | ACCEPTED | 2026-06-16 |
+| [0172](0172-recall-regression-ci-gate.md) | CI recall-regression gate on a bounded subset; gate recall@budget, track MRR | ACCEPTED | 2026-06-22 |
