@@ -55,6 +55,7 @@ fn is_dangerous_format_char(c: char) -> bool {
             | '\u{2066}'..='\u{2069}'  // LRI/RLI/FSI/PDI
             | '\u{200B}'..='\u{200F}'  // ZWSP/ZWNJ/ZWJ/LRM/RLM
             | '\u{061C}'  // ALM
+            | '\u{2060}'  // WJ Word Joiner
     )
 }
 
@@ -104,5 +105,10 @@ mod tests {
         ensure_gitignore_entry(dir.path()).unwrap();
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert_eq!(content.matches(".cxpak/").count(), 1);
+    }
+
+    #[test]
+    fn test_sanitize_word_joiner() {
+        assert!(sanitize_bidi("a\u{2060}b").contains("<U+2060>"));
     }
 }
