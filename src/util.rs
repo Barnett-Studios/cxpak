@@ -58,6 +58,7 @@ fn is_dangerous_format_char(c: char) -> bool {
             | '\u{2060}'  // WJ Word Joiner
             | '\u{FEFF}'  // ZWNBSP/BOM
             | '\u{206A}'..='\u{206F}'  // deprecated format controls
+            | '\u{180E}'  // Mongolian Vowel Separator
     )
 }
 
@@ -123,5 +124,10 @@ mod tests {
     fn test_sanitize_deprecated_format() {
         assert!(sanitize_bidi("a\u{206A}b").contains("<U+206A>"));
         assert!(sanitize_bidi("a\u{206F}b").contains("<U+206F>"));
+    }
+
+    #[test]
+    fn test_sanitize_mongolian_sep() {
+        assert!(sanitize_bidi("a\u{180E}b").contains("<U+180E>"));
     }
 }
