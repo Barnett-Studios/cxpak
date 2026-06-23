@@ -56,6 +56,7 @@ fn is_dangerous_format_char(c: char) -> bool {
             | '\u{200B}'..='\u{200F}'  // ZWSP/ZWNJ/ZWJ/LRM/RLM
             | '\u{061C}'  // ALM
             | '\u{2060}'  // WJ Word Joiner
+            | '\u{FEFF}'  // ZWNBSP/BOM
     )
 }
 
@@ -110,5 +111,10 @@ mod tests {
     #[test]
     fn test_sanitize_word_joiner() {
         assert!(sanitize_bidi("a\u{2060}b").contains("<U+2060>"));
+    }
+
+    #[test]
+    fn test_sanitize_bom() {
+        assert!(sanitize_bidi("a\u{FEFF}b").contains("<U+FEFF>"));
     }
 }
