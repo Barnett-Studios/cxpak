@@ -28,6 +28,10 @@ use std::path::Path;
 /// - U+200B ZWSP Zero-Width Space (homograph attack vector)
 /// - U+200C ZWNJ Zero-Width Non-Joiner
 /// - U+200D ZWJ  Zero-Width Joiner
+/// - U+2060 WJ   Word Joiner
+/// - U+FEFF ZWNBSP Byte Order Mark
+/// - U+206A..U+206F Deprecated format controls
+/// - U+180E MVS  Mongolian Vowel Separator
 ///
 /// Returns the input unchanged if it contains none of these — the
 /// allocation cost is paid only when sanitisation is actually needed.
