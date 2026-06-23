@@ -57,6 +57,7 @@ fn is_dangerous_format_char(c: char) -> bool {
             | '\u{061C}'  // ALM
             | '\u{2060}'  // WJ Word Joiner
             | '\u{FEFF}'  // ZWNBSP/BOM
+            | '\u{206A}'..='\u{206F}'  // deprecated format controls
     )
 }
 
@@ -116,5 +117,11 @@ mod tests {
     #[test]
     fn test_sanitize_bom() {
         assert!(sanitize_bidi("a\u{FEFF}b").contains("<U+FEFF>"));
+    }
+
+    #[test]
+    fn test_sanitize_deprecated_format() {
+        assert!(sanitize_bidi("a\u{206A}b").contains("<U+206A>"));
+        assert!(sanitize_bidi("a\u{206F}b").contains("<U+206F>"));
     }
 }
