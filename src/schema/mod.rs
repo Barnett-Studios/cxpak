@@ -1,5 +1,6 @@
 pub mod detect;
 pub mod extract;
+pub mod introspect;
 pub mod link;
 
 // Graph + schema data types live in `core_graph` (cxpak 3.0.0 Phase 0

@@ -176,3 +176,4 @@
 | [0170](0170-official-container-images-from-ci.md) | Publish official multi-arch container images from CI, built from release artifacts and signed | ACCEPTED | 2026-06-18 |
 | [0171](0171-review-mode-extends-diff.md) | Review mode as a --review extension of cxpak diff, composing existing intelligence + expected-but-absent detection | ACCEPTED | 2026-06-16 |
 | [0172](0172-recall-regression-ci-gate.md) | CI recall-regression gate on a bounded subset; gate recall@budget, track MRR | ACCEPTED | 2026-06-22 |
+| [0173](0173-live-db-introspection-rustls.md) | Live DB introspection + schema drift; rustls drivers (tokio-postgres + mysql_async), feature-gated, DSN-scrubbed, read-only | ACCEPTED | 2026-06-24 |

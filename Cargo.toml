@@ -89,6 +89,12 @@ resvg = { version = "0.47", optional = true }
 petgraph = { version = "0.6", optional = true }
 thiserror = { version = "2", optional = true }
 wasmtime = { version = "43", optional = true }
+# Live DB introspection (feature `data-introspect`, off by default).  All TLS is
+# rustls — NO native-tls/openssl anywhere in the tree (ADR-0163, ADR-0173).
+tokio-postgres = { version = "0.7", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
+mysql_async = { version = "0.34", optional = true, default-features = false, features = ["minimal", "rustls-tls"] }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -178,6 +184,12 @@ embeddings = [
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
 e2e-browser = []
 plugins = ["dep:wasmtime"]
+# Live DB introspection: rustls-only Postgres + MySQL drivers + a scoped tokio
+# runtime.  Off by default — keeps the default build OpenSSL-free AND DB-free.
+data-introspect = [
+    "dep:tokio", "dep:tokio-postgres", "dep:tokio-postgres-rustls",
+    "dep:rustls", "dep:mysql_async",
+]
 bench = ["dep:toml"]
 
 # `dev_maintenance` cfg is flipped on by the project-local .cargo/config.toml
