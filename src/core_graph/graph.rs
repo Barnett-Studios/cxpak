@@ -66,6 +66,15 @@ pub enum EdgeType {
     MigrationSequence,
     /// Cross-language symbol resolution edge (v1.5.0).
     CrossLanguage(BridgeType),
+    /// Reference to a specific column node (cxpak 3.0.0 Task A2 — column-level
+    /// lineage). Connects a source file (query / ORM model) to a `col:table.col`
+    /// node, and that column node to its table-definition file. Confidence is
+    /// per-edge: structurally [`Extracted`][EdgeConfidence::Extracted] for ORM
+    /// fields and the column→table anchor, [`Inferred`][EdgeConfidence::Inferred]
+    /// for heuristic embedded-SQL column refs and `SELECT *` fan-out — so the
+    /// default below is the conservative `Inferred`, overridden per-edge via
+    /// [`DependencyGraph::add_edge_with_confidence`] where the ref is structural.
+    ColumnReference,
 }
 
 impl EdgeType {
@@ -79,7 +88,13 @@ impl EdgeType {
     ///            view / function metadata — structurally unambiguous).
     pub fn default_confidence(&self) -> EdgeConfidence {
         match self {
-            EdgeType::EmbeddedSql | EdgeType::CrossLanguage(_) => EdgeConfidence::Inferred,
+            // `ColumnReference` defaults to Inferred because the majority of
+            // column edges originate from heuristic embedded-SQL parsing; the
+            // structurally-extracted cases (ORM fields, the column→table anchor)
+            // are stamped Extracted explicitly via `add_edge_with_confidence`.
+            EdgeType::EmbeddedSql | EdgeType::CrossLanguage(_) | EdgeType::ColumnReference => {
+                EdgeConfidence::Inferred
+            }
             _ => EdgeConfidence::Extracted,
         }
     }
@@ -140,6 +155,24 @@ impl DependencyGraph {
 
     pub fn add_edge(&mut self, from: &str, to: &str, edge_type: EdgeType) {
         let confidence = edge_type.default_confidence();
+        self.add_edge_with_confidence(from, to, edge_type, confidence);
+    }
+
+    /// Add a typed edge with an explicit [`EdgeConfidence`], overriding the
+    /// edge type's `default_confidence()`.
+    ///
+    /// Used by the column-lineage path (Task A2): a `ColumnReference` edge
+    /// defaults to `Inferred`, but ORM-field and column→table-anchor edges are
+    /// structurally proven and must be stamped `Extracted`. All other call
+    /// sites go through [`add_edge`], which derives the default — so existing
+    /// edge confidence values are unchanged.
+    pub fn add_edge_with_confidence(
+        &mut self,
+        from: &str,
+        to: &str,
+        edge_type: EdgeType,
+        confidence: EdgeConfidence,
+    ) {
         self.edges
             .entry(from.to_string())
             .or_default()

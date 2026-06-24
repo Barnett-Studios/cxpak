@@ -7,6 +7,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Stable, normalized identity for a column as a dependency-graph node
+/// (cxpak 3.0.0 Task A2 — column-level lineage).
+///
+/// Form: `col:{table}.{column}`, both lowercased. The `col:` prefix namespaces
+/// these synthetic nodes so they can never collide with a real file path (no
+/// indexed file path begins with `col:`). Lowercasing keeps the key consistent
+/// with how tables are keyed in [`SchemaIndex::tables`] (extraction lowercases
+/// identifiers), making the id case-insensitive and collision-safe across
+/// schemas. Pure function of its inputs → deterministic.
+pub fn column_node_id(table: &str, column: &str) -> String {
+    format!("col:{}.{}", table.to_lowercase(), column.to_lowercase())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaIndex {
     pub tables: HashMap<String, TableSchema>,

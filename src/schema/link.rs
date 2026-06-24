@@ -1,9 +1,28 @@
 // Embedded SQL detection, ORM→table linking, schema edge production
 
-use crate::schema::EdgeType;
+use crate::schema::{EdgeConfidence, EdgeType, SchemaIndex};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::LazyLock;
+
+/// Matches a `SELECT ... FROM` projection list. Capture group 1 is the raw
+/// column list between `SELECT` and `FROM`.
+static RE_SELECT_LIST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)\bSELECT\s+(.+?)\s+FROM\b").expect("RE_SELECT_LIST"));
+
+/// Matches a `column = value` / `column <op> value` comparison or assignment in
+/// WHERE / SET / ON clauses. Capture group 1 is the (optionally table-qualified)
+/// column reference, e.g. `email` or `u.email`.
+static RE_COL_PREDICATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)\s*(?:=|<>|!=|<=|>=|<|>|\bLIKE\b|\bIN\b|\bIS\b)")
+        .expect("RE_COL_PREDICATE")
+});
+
+/// Matches an `INSERT INTO table (col, col, ...)` column list. Capture group 1
+/// is the raw parenthesized column list.
+static RE_INSERT_COLS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)\bINSERT\s+INTO\s+[a-z_][a-z0-9_]*\s*\(([^)]*)\)").expect("RE_INSERT_COLS")
+});
 
 static RE_EMBEDDED_SQL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -142,23 +161,227 @@ pub fn detect_embedded_sql(content: &str) -> Vec<EmbeddedSqlRef> {
 }
 
 // ---------------------------------------------------------------------------
+// Task A2: Column-level reference extraction (cxpak 3.0.0)
+// ---------------------------------------------------------------------------
+
+/// SQL keywords / tokens that can appear in a projection or predicate position
+/// but are not column names. Used to filter the candidate column set.
+const SQL_NON_COLUMN_TOKENS: &[&str] = &[
+    "select", "from", "where", "and", "or", "not", "null", "is", "in", "as", "on", "join", "inner",
+    "left", "right", "outer", "full", "cross", "natural", "using", "group", "by", "order",
+    "having", "limit", "offset", "union", "all", "distinct", "case", "when", "then", "else", "end",
+    "true", "false", "like", "between", "asc", "desc", "count", "sum", "avg", "min", "max",
+    "coalesce", "values", "set", "into", "insert", "update", "delete", "create", "table",
+];
+
+/// Extract `(table, column)` references from a string of (possibly embedded)
+/// SQL, resolved against `schema_index`.
+///
+/// Precision policy (deterministic; documented in ADR-0174):
+/// - The query's referenced tables are first detected via [`detect_embedded_sql`].
+///   Only those tables (intersected with the schema) are candidates.
+/// - **`SELECT *`** (or `SELECT t.*`): we cannot name the columns, so we **fan
+///   out to every column of each detected table** and the caller marks these
+///   edges `Inferred`. This is explicit over-attribution, never a silent drop.
+/// - **Qualified `t.col`:** attributed to table `t` if `t` is a detected table
+///   (by table name or — best-effort — any detected table that owns `col`).
+/// - **Bare `col`:** attributed only if **exactly one** detected table owns a
+///   column named `col`. If zero or more-than-one detected table owns it, the
+///   reference is left **unresolved** (dropped) rather than mis-attributed.
+/// - Columns not owned by any detected table are dropped (never invented).
+///
+/// Returns a sorted, deduplicated vector so the output is insertion-order
+/// independent.
+pub fn extract_embedded_column_refs(
+    content: &str,
+    schema_index: &SchemaIndex,
+) -> Vec<(String, String)> {
+    // Detected tables present in the schema.
+    let detected: Vec<&str> = detect_embedded_sql(content)
+        .into_iter()
+        .map(|r| r.table_name)
+        .filter(|t| schema_index.tables.contains_key(t))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|t| {
+            // Borrow the schema's canonical key string for stable references.
+            schema_index
+                .tables
+                .get_key_value(&t)
+                .map(|(k, _)| k.as_str())
+                .unwrap_or("")
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if detected.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: BTreeSet<(String, String)> = BTreeSet::new();
+
+    // Gather candidate column tokens (lowercased, possibly table-qualified).
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    let mut star = false;
+
+    for cap in RE_SELECT_LIST.captures_iter(content) {
+        let list = &cap[1];
+        for tok in list.split(',') {
+            let tok = tok.trim();
+            if tok == "*" || tok.ends_with(".*") {
+                star = true;
+                continue;
+            }
+            // Strip aliasing (`col AS alias`) — keep the first identifier path.
+            let first = tok.split_whitespace().next().unwrap_or(tok);
+            collect_identifier(first, &mut candidates);
+        }
+    }
+    for cap in RE_INSERT_COLS.captures_iter(content) {
+        for tok in cap[1].split(',') {
+            collect_identifier(tok.trim(), &mut candidates);
+        }
+    }
+    for cap in RE_COL_PREDICATE.captures_iter(content) {
+        collect_identifier(&cap[1], &mut candidates);
+    }
+
+    // SELECT * fan-out: every column of every detected table.
+    if star {
+        for table_name in &detected {
+            if let Some(table) = schema_index.tables.get(*table_name) {
+                for col in &table.columns {
+                    out.insert((table_name.to_string(), col.name.clone()));
+                }
+            }
+        }
+    }
+
+    // Resolve the named candidates.
+    for cand in &candidates {
+        let lower = cand.to_lowercase();
+        if SQL_NON_COLUMN_TOKENS.contains(&lower.as_str()) {
+            continue;
+        }
+        if let Some((qual, col)) = lower.split_once('.') {
+            // Qualified `t.col`: attribute to detected table `t` if it owns `col`,
+            // else any detected table that owns `col`.
+            if let Some(t) = detected
+                .iter()
+                .find(|t| t.to_lowercase() == qual && table_owns_column(schema_index, t, col))
+            {
+                out.insert((t.to_string(), column_name_of(schema_index, t, col)));
+            } else if let Some(t) = detected
+                .iter()
+                .find(|t| table_owns_column(schema_index, t, col))
+            {
+                out.insert((t.to_string(), column_name_of(schema_index, t, col)));
+            }
+        } else {
+            // Bare `col`: attribute only if exactly one detected table owns it.
+            let owners: Vec<&&str> = detected
+                .iter()
+                .filter(|t| table_owns_column(schema_index, t, &lower))
+                .collect();
+            if owners.len() == 1 {
+                let t = owners[0];
+                out.insert((t.to_string(), column_name_of(schema_index, t, &lower)));
+            }
+            // 0 owners → unknown column (dropped); >1 owners → ambiguous (dropped).
+        }
+    }
+
+    out.into_iter().collect()
+}
+
+/// Push the leading identifier path of `tok` (e.g. `u.email` or `email`) into
+/// `candidates`, lowercased. Ignores function calls and literals.
+fn collect_identifier(tok: &str, candidates: &mut BTreeSet<String>) {
+    let tok = tok.trim().trim_matches(|c| c == '(' || c == ')');
+    // Reject anything that isn't an identifier or qualified identifier.
+    if tok.is_empty() {
+        return;
+    }
+    let valid = tok
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.');
+    if !valid {
+        return;
+    }
+    candidates.insert(tok.to_lowercase());
+}
+
+/// True when `table` (a schema key) owns a column named `col` (case-insensitive).
+fn table_owns_column(schema_index: &SchemaIndex, table: &str, col: &str) -> bool {
+    schema_index
+        .tables
+        .get(table)
+        .map(|t| t.columns.iter().any(|c| c.name.to_lowercase() == col))
+        .unwrap_or(false)
+}
+
+/// Return the canonical (as-declared) column name for `col` in `table`,
+/// falling back to `col` if not found.
+fn column_name_of(schema_index: &SchemaIndex, table: &str, col: &str) -> String {
+    schema_index
+        .tables
+        .get(table)
+        .and_then(|t| {
+            t.columns
+                .iter()
+                .find(|c| c.name.to_lowercase() == col)
+                .map(|c| c.name.clone())
+        })
+        .unwrap_or_else(|| col.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Task 13: Build schema edges
 // ---------------------------------------------------------------------------
 
 /// Build typed edges that connect source files to schema artifacts.
+///
+/// Each edge carries an explicit [`EdgeConfidence`]: structurally-proven edges
+/// (FK / ORM / view / function / migration / column→table anchor / ORM-field
+/// column refs) are [`Extracted`][EdgeConfidence::Extracted]; heuristic
+/// edges (embedded-SQL table refs, embedded-SQL column refs, `SELECT *`
+/// fan-out) are [`Inferred`][EdgeConfidence::Inferred]. The 4-tuple lets the
+/// graph builder stamp the right confidence per edge rather than deriving a
+/// single value from the edge type.
 ///
 /// Produces edges for:
 /// - FK references between table definition files
 /// - View → source table
 /// - DB function → referenced table
 /// - Embedded SQL in application code → table definition file
+/// - Embedded SQL / ORM field → specific column node → table file (Task A2)
 /// - ORM model file → table definition file
 /// - Migration sequence (each migration → its predecessor)
 pub fn build_schema_edges(
     files: &[crate::core_graph::IndexedFile],
     schema_index: &crate::schema::SchemaIndex,
-) -> Vec<(String, String, EdgeType)> {
-    let mut edges = Vec::new();
+) -> Vec<(String, String, EdgeType, EdgeConfidence)> {
+    let mut edges: Vec<(String, String, EdgeType, EdgeConfidence)> = Vec::new();
+    // Set of column nodes already anchored to their table file, so each
+    // `col:table.col → table_file` anchor edge is emitted at most once
+    // regardless of how many source files reference the column.
+    let mut anchored_columns: HashSet<String> = HashSet::new();
+
+    // Helper: push the `col:table.col → table_file` anchor edge once.
+    let mut anchor_column = |edges: &mut Vec<(String, String, EdgeType, EdgeConfidence)>,
+                             node: &str,
+                             table_file: &str| {
+        if anchored_columns.insert(node.to_string()) {
+            edges.push((
+                node.to_string(),
+                table_file.to_string(),
+                EdgeType::ColumnReference,
+                // The column→table anchor is structurally proven: the column
+                // belongs to a table whose definition file is known.
+                EdgeConfidence::Extracted,
+            ));
+        }
+    };
 
     // FK edges: table file → referenced table file
     for table in schema_index.tables.values() {
@@ -170,6 +393,7 @@ pub fn build_schema_edges(
                             table.file_path.clone(),
                             target.file_path.clone(),
                             EdgeType::ForeignKey,
+                            EdgeConfidence::Extracted,
                         ));
                     }
                 }
@@ -185,6 +409,7 @@ pub fn build_schema_edges(
                     view.file_path.clone(),
                     table.file_path.clone(),
                     EdgeType::ViewReference,
+                    EdgeConfidence::Extracted,
                 ));
             }
         }
@@ -198,12 +423,14 @@ pub fn build_schema_edges(
                     func.file_path.clone(),
                     table.file_path.clone(),
                     EdgeType::FunctionReference,
+                    EdgeConfidence::Extracted,
                 ));
             }
         }
     }
 
-    // Embedded SQL edges (scan all files)
+    // Embedded SQL edges (scan all files): table-level (EmbeddedSql) edges are
+    // preserved exactly, AND column-level (ColumnReference) edges are added.
     for file in files {
         let lang = file.language.as_deref().unwrap_or("");
         // Skip SQL files themselves (they define tables, not embed SQL)
@@ -212,41 +439,91 @@ pub fn build_schema_edges(
         }
 
         let mut file_tables: HashSet<String> = HashSet::new();
+        // (table_name, column_name) pairs this file references at column
+        // resolution, deduplicated.
+        let mut file_columns: HashSet<(String, String)> = HashSet::new();
+
+        let mut scan = |text: &str| {
+            for sql_ref in detect_embedded_sql(text) {
+                file_tables.insert(sql_ref.table_name);
+            }
+            for (table, column) in extract_embedded_column_refs(text, schema_index) {
+                file_columns.insert((table, column));
+            }
+        };
 
         // Scan symbol bodies
         if let Some(pr) = &file.parse_result {
             for symbol in &pr.symbols {
-                for sql_ref in detect_embedded_sql(&symbol.body) {
-                    file_tables.insert(sql_ref.table_name);
-                }
+                scan(&symbol.body);
             }
         }
+        // Scan file content directly (module-level SQL, files without parse results)
+        scan(&file.content);
 
-        // Scan file content directly (for module-level SQL, files without parse results)
-        for sql_ref in detect_embedded_sql(&file.content) {
-            file_tables.insert(sql_ref.table_name);
-        }
-
-        // Create edges for matched tables
+        // Table-level edges (unchanged behavior).
         for table_name in &file_tables {
             if let Some(table) = schema_index.tables.get(table_name) {
                 edges.push((
                     file.relative_path.clone(),
                     table.file_path.clone(),
                     EdgeType::EmbeddedSql,
+                    EdgeConfidence::Inferred,
                 ));
+            }
+        }
+
+        // Column-level edges: file → col:table.col, plus the column→table anchor.
+        for (table_name, column) in &file_columns {
+            if let Some(table) = schema_index.tables.get(table_name) {
+                let node = crate::schema::column_node_id(table_name, column);
+                edges.push((
+                    file.relative_path.clone(),
+                    node.clone(),
+                    EdgeType::ColumnReference,
+                    // Embedded-SQL column refs are heuristic (regex-extracted).
+                    EdgeConfidence::Inferred,
+                ));
+                anchor_column(&mut edges, &node, &table.file_path);
             }
         }
     }
 
-    // ORM model → table edges
+    // ORM model → table edges, plus ORM-field → column edges.
     for model in schema_index.orm_models.values() {
         if let Some(table) = schema_index.tables.get(&model.table_name) {
             edges.push((
                 model.file_path.clone(),
                 table.file_path.clone(),
                 EdgeType::OrmModel,
+                EdgeConfidence::Extracted,
             ));
+
+            // Map each ORM field to a column of the model's table. A field maps
+            // to a column when its name matches a declared column (case-
+            // insensitive). Relation fields (FKs to other models) are skipped:
+            // they reference another model, not a scalar column of this table.
+            for field in &model.fields {
+                if field.is_relation {
+                    continue;
+                }
+                let field_lower = field.name.to_lowercase();
+                if table
+                    .columns
+                    .iter()
+                    .any(|c| c.name.to_lowercase() == field_lower)
+                {
+                    let node = crate::schema::column_node_id(&model.table_name, &field.name);
+                    edges.push((
+                        model.file_path.clone(),
+                        node.clone(),
+                        EdgeType::ColumnReference,
+                        // ORM field → column is structurally proven (declared field).
+                        EdgeConfidence::Extracted,
+                    ));
+                    anchor_column(&mut edges, &node, &table.file_path);
+                }
+            }
         }
     }
 
@@ -257,6 +534,7 @@ pub fn build_schema_edges(
                 chain.migrations[i].file_path.clone(),
                 chain.migrations[i - 1].file_path.clone(),
                 EdgeType::MigrationSequence,
+                EdgeConfidence::Extracted,
             ));
         }
     }
@@ -581,7 +859,7 @@ mod tests {
         assert!(
             edges
                 .iter()
-                .any(|(from, to, etype)| from == "schema/orders.sql"
+                .any(|(from, to, etype, _)| from == "schema/orders.sql"
                     && to == "schema/users.sql"
                     && *etype == EdgeType::ForeignKey),
             "should have FK edge from orders to users: {:?}",
@@ -610,9 +888,11 @@ mod tests {
         let edges = build_schema_edges(&files, &schema);
 
         assert!(
-            edges.iter().any(|(from, to, etype)| from == "src/repo.rs"
-                && to == "schema/products.sql"
-                && *etype == EdgeType::EmbeddedSql),
+            edges
+                .iter()
+                .any(|(from, to, etype, _)| from == "src/repo.rs"
+                    && to == "schema/products.sql"
+                    && *etype == EdgeType::EmbeddedSql),
             "should have EmbeddedSql edge from repo.rs to products.sql: {:?}",
             edges
         );
@@ -652,7 +932,7 @@ mod tests {
         assert!(
             edges
                 .iter()
-                .any(|(from, to, etype)| from == "db/migrate/002_add_email.rb"
+                .any(|(from, to, etype, _)| from == "db/migrate/002_add_email.rb"
                     && to == "db/migrate/001_create_users.rb"
                     && *etype == EdgeType::MigrationSequence),
             "should have edge 002→001: {:?}",
@@ -661,7 +941,7 @@ mod tests {
         assert!(
             edges
                 .iter()
-                .any(|(from, to, etype)| from == "db/migrate/003_add_index.rb"
+                .any(|(from, to, etype, _)| from == "db/migrate/003_add_index.rb"
                     && to == "db/migrate/002_add_email.rb"
                     && *etype == EdgeType::MigrationSequence),
             "should have edge 003→002: {:?}",
@@ -689,9 +969,11 @@ mod tests {
         let edges = build_schema_edges(&files, &schema);
 
         assert!(
-            edges.iter().any(|(from, to, etype)| from == "app/models.py"
-                && to == "schema/users.sql"
-                && *etype == EdgeType::OrmModel),
+            edges
+                .iter()
+                .any(|(from, to, etype, _)| from == "app/models.py"
+                    && to == "schema/users.sql"
+                    && *etype == EdgeType::OrmModel),
             "should have ORM→table edge: {:?}",
             edges
         );
@@ -720,14 +1002,14 @@ mod tests {
 
         // Both FK edges should appear
         assert!(
-            edges.iter().any(|(from, to, etype)| from == "a.sql"
+            edges.iter().any(|(from, to, etype, _)| from == "a.sql"
                 && to == "b.sql"
                 && *etype == EdgeType::ForeignKey),
             "should have FK a→b: {:?}",
             edges
         );
         assert!(
-            edges.iter().any(|(from, to, etype)| from == "b.sql"
+            edges.iter().any(|(from, to, etype, _)| from == "b.sql"
                 && to == "a.sql"
                 && *etype == EdgeType::ForeignKey),
             "should have FK b→a: {:?}",
@@ -756,7 +1038,7 @@ mod tests {
         assert!(
             !edges
                 .iter()
-                .any(|(from, _, etype)| from == "other.sql" && *etype == EdgeType::EmbeddedSql),
+                .any(|(from, _, etype, _)| from == "other.sql" && *etype == EdgeType::EmbeddedSql),
             "SQL files should not generate EmbeddedSql edges: {:?}",
             edges
         );
@@ -776,9 +1058,11 @@ mod tests {
         let edges = build_schema_edges(&files, &schema);
 
         assert!(
-            edges.iter().any(|(from, to, etype)| from == "src/orders.ts"
-                && to == "db/schema.sql"
-                && *etype == EdgeType::EmbeddedSql),
+            edges
+                .iter()
+                .any(|(from, to, etype, _)| from == "src/orders.ts"
+                    && to == "db/schema.sql"
+                    && *etype == EdgeType::EmbeddedSql),
             "should detect embedded SQL in symbol body: {:?}",
             edges
         );

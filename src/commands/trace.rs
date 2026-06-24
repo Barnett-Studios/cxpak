@@ -351,6 +351,7 @@ fn edge_type_display(et: &EdgeType) -> String {
         EdgeType::OrmModel => "orm_model".to_string(),
         EdgeType::MigrationSequence => "migration_sequence".to_string(),
         EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
+        EdgeType::ColumnReference => "column_reference".to_string(),
     }
 }
 

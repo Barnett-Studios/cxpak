@@ -419,8 +419,8 @@ pub fn build_dependency_graph(
     // Inject schema-aware edges when a schema index is available.
     if let Some(schema_index) = schema {
         let schema_edges = crate::schema::link::build_schema_edges(files, schema_index);
-        for (from, to, edge_type) in schema_edges {
-            graph.add_edge(&from, &to, edge_type);
+        for (from, to, edge_type, confidence) in schema_edges {
+            graph.add_edge_with_confidence(&from, &to, edge_type, confidence);
         }
     }
 

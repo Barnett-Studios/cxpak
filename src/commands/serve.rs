@@ -2997,6 +2997,7 @@ pub fn handle_tool_call(
                             EdgeType::OrmModel => "orm_model".to_string(),
                             EdgeType::MigrationSequence => "migration_sequence".to_string(),
                             EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
+                            EdgeType::ColumnReference => "column_reference".to_string(),
                             // Import edges are excluded by the guard `*et != EdgeType::Import`
                             // above; this arm is unreachable at runtime.
                             EdgeType::Import => return p.clone(),

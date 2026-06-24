@@ -107,8 +107,8 @@ fn fk_edge_is_extracted() {
 
     // Wire the raw edges into a graph the same way `build_dependency_graph` does.
     let mut g = DependencyGraph::new();
-    for (from, to, etype) in raw_edges {
-        g.add_edge(&from, &to, etype);
+    for (from, to, etype, conf) in raw_edges {
+        g.add_edge_with_confidence(&from, &to, etype, conf);
     }
 
     let edges = g
@@ -143,8 +143,8 @@ fn embedded_sql_edge_is_inferred() {
     let raw_edges = cxpak::schema::link::build_schema_edges(&[rust_file], &schema);
 
     let mut g = DependencyGraph::new();
-    for (from, to, etype) in raw_edges {
-        g.add_edge(&from, &to, etype);
+    for (from, to, etype, conf) in raw_edges {
+        g.add_edge_with_confidence(&from, &to, etype, conf);
     }
 
     let edges = g.dependencies("src/repo.rs").expect("repo.rs in graph");

@@ -484,6 +484,7 @@ fn render_dependency_graph(
                         EdgeType::OrmModel => "orm_model".to_string(),
                         EdgeType::MigrationSequence => "migration_sequence".to_string(),
                         EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
+                        EdgeType::ColumnReference => "column_reference".to_string(),
                         EdgeType::Import => continue, // Import edges filtered upstream
                     };
                     full.push_str(&format!("- {} ({})\n", edge.target, label));

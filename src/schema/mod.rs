@@ -9,9 +9,9 @@ pub mod link;
 // commands, tests) keeps resolving unchanged.
 pub use crate::core_graph::graph::{EdgeConfidence, EdgeType, TypedEdge};
 pub use crate::core_graph::schema::{
-    ColumnSchema, DbFunctionSchema, ForeignKeyRef, IndexSchema, MigrationChain, MigrationEntry,
-    MigrationFramework, OrmFieldSchema, OrmFramework, OrmModelSchema, SchemaIndex, TableSchema,
-    ViewSchema,
+    column_node_id, ColumnSchema, DbFunctionSchema, ForeignKeyRef, IndexSchema, MigrationChain,
+    MigrationEntry, MigrationFramework, OrmFieldSchema, OrmFramework, OrmModelSchema, SchemaIndex,
+    TableSchema, ViewSchema,
 };
 
 #[cfg(test)]
