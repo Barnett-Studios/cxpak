@@ -28,10 +28,13 @@
 # ── Build args (all required — no defaults) ───────────────────────────────────
 # No defaults are provided: a build without explicit args fails immediately
 # rather than silently producing a stale or mismatched image.
+# NOTE: TARGETARCH is intentionally NOT declared here in global scope.
+# Declaring a predefined platform ARG globally opts out of BuildKit's automatic
+# population, leaving it unset inside stages. It is declared only in the stage
+# that needs it (downloader), where BuildKit populates it automatically.
 ARG VERSION
 ARG SHA256_AMD64
 ARG SHA256_ARM64
-ARG TARGETARCH
 
 # ubuntu:24.04 matches the upstream release builder (glibc 2.39).
 # digest pinned to avoid silent tag mutation; keep the tag as a readable comment.
