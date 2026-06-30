@@ -221,6 +221,18 @@ pub fn compute_blast_radius(
             continue;
         }
 
+        // Synthetic column nodes (Task A2, `col:{table}.{column}`) are an internal
+        // lineage construct reachable via the `col:→table_file` anchor edge. They
+        // must never surface as `AffectedFile` entries nor be traversed by the
+        // file/table blast path — skipping on dequeue keeps that path identical to
+        // pre-A2 behaviour. Column blast (`compute_column_blast_radius`) seeds at a
+        // `col:` node, but its real-file dependents are enqueued directly, so this
+        // guard only ever drops phantom column nodes, never legitimate results.
+        // (`col:` is reserved; no real file path starts with it.)
+        if path.starts_with("col:") {
+            continue;
+        }
+
         let file_pagerank = pagerank.get(&path).copied().unwrap_or(0.0);
         let has_test = covered_test_files.contains(&path)
             || test_map

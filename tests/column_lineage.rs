@@ -14,7 +14,7 @@
 
 use cxpak::core_graph::IndexedFile;
 use cxpak::index::graph::build_dependency_graph;
-use cxpak::intelligence::blast_radius::compute_column_blast_radius;
+use cxpak::intelligence::blast_radius::{compute_blast_radius, compute_column_blast_radius};
 use cxpak::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
 use cxpak::schema::link::build_schema_edges;
 use cxpak::schema::{
@@ -451,6 +451,35 @@ fn alter_users_email_blast_includes_email_touchers() {
             "email blast must include {expected}; got {all:?}"
         );
     }
+}
+
+/// Regression (review-A2 IMPORTANT-1): synthetic `col:` nodes reach `table_file`
+/// via the `col:→table_file` anchor edge, so the legacy file/table blast path
+/// must drop them — seeding `compute_blast_radius` at the table-definition file
+/// must surface zero `col:`-prefixed phantom entries.
+#[test]
+fn table_file_blast_excludes_synthetic_column_nodes() {
+    let (files, schema) = fixture();
+    let graph = build_dependency_graph(&files, Some(&schema));
+    let pagerank = empty_pagerank(&graph);
+    let test_map: HashMap<String, Vec<_>> = HashMap::new();
+
+    let result = compute_blast_radius(&["schema/users.sql"], &graph, &pagerank, &test_map, 5, None);
+
+    let all: Vec<&str> = result
+        .categories
+        .direct_dependents
+        .iter()
+        .chain(result.categories.transitive_dependents.iter())
+        .chain(result.categories.schema_dependents.iter())
+        .chain(result.categories.test_files.iter())
+        .map(|a| a.path.as_str())
+        .collect();
+
+    assert!(
+        all.iter().all(|p| !p.starts_with("col:")),
+        "table/file blast must not contain synthetic column nodes; got {all:?}"
+    );
 }
 
 #[test]
