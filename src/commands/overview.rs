@@ -474,18 +474,14 @@ fn render_dependency_graph(
                     full.push_str(&format!("- {}\n", edge.target));
                 }
                 et => {
-                    let label = match et {
-                        EdgeType::ForeignKey => "foreign_key".to_string(),
-                        EdgeType::ViewReference => "view_reference".to_string(),
-                        EdgeType::TriggerTarget => "trigger_target".to_string(),
-                        EdgeType::IndexTarget => "index_target".to_string(),
-                        EdgeType::FunctionReference => "function_reference".to_string(),
-                        EdgeType::EmbeddedSql => "embedded_sql".to_string(),
-                        EdgeType::OrmModel => "orm_model".to_string(),
-                        EdgeType::MigrationSequence => "migration_sequence".to_string(),
-                        EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
-                        EdgeType::ColumnReference => "column_reference".to_string(),
-                        EdgeType::Import => continue, // Import edges filtered upstream
+                    // Heuristically inferred edges (embedded-SQL regex,
+                    // cross-language bridges, heuristic column refs) carry a
+                    // visible `inferred` tag so the reader knows the dependency
+                    // was pattern-matched, not structurally extracted.
+                    let label = if edge.confidence.is_inferred() {
+                        format!("{}, inferred", et.label())
+                    } else {
+                        et.label()
                     };
                     full.push_str(&format!("- {} ({})\n", edge.target, label));
                 }
@@ -882,6 +878,69 @@ mod tests {
         assert!(
             result.full.contains("schema/tables.sql"),
             "expected target in graph output"
+        );
+    }
+
+    #[test]
+    fn test_render_dependency_graph_tags_inferred_not_extracted() {
+        // A fixture with one Inferred edge (EmbeddedSql) and one Extracted
+        // non-import edge (ForeignKey): the inferred edge must carry the
+        // `inferred` tag, the extracted one must not.
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "api/orders.py".to_string(),
+                absolute_path: PathBuf::from("/tmp/api/orders.py"),
+                language: Some("python".to_string()),
+                size_bytes: 100,
+            },
+            ScannedFile {
+                relative_path: "schema/orders.sql".to_string(),
+                absolute_path: PathBuf::from("/tmp/schema/orders.sql"),
+                language: Some("sql".to_string()),
+                size_bytes: 200,
+            },
+            ScannedFile {
+                relative_path: "schema/users.sql".to_string(),
+                absolute_path: PathBuf::from("/tmp/schema/users.sql"),
+                language: Some("sql".to_string()),
+                size_bytes: 200,
+            },
+        ];
+        let content_map = HashMap::from([
+            (
+                "api/orders.py".to_string(),
+                "SELECT * FROM orders".to_string(),
+            ),
+            ("schema/orders.sql".to_string(), "CREATE TABLE".to_string()),
+            ("schema/users.sql".to_string(), "CREATE TABLE".to_string()),
+        ]);
+        let index = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map);
+        let mut graph = DependencyGraph::new();
+        // Inferred: heuristic embedded-SQL match.
+        graph.add_edge("api/orders.py", "schema/orders.sql", EdgeType::EmbeddedSql);
+        // Extracted: structural foreign key.
+        graph.add_edge(
+            "schema/orders.sql",
+            "schema/users.sql",
+            EdgeType::ForeignKey,
+        );
+        let result = render_dependency_graph(&index, &graph, 10000, &counter, false, "deps.md");
+
+        assert!(
+            result.full.contains("(embedded_sql, inferred)"),
+            "inferred embedded_sql edge must carry the `inferred` tag, got:\n{}",
+            result.full
+        );
+        assert!(
+            result.full.contains("(foreign_key)"),
+            "extracted foreign_key edge must render its label, got:\n{}",
+            result.full
+        );
+        assert!(
+            !result.full.contains("foreign_key, inferred"),
+            "extracted foreign_key edge must NOT be tagged inferred, got:\n{}",
+            result.full
         );
     }
 

@@ -221,57 +221,100 @@ pub fn diagnostics_for_file(
     // requests diagnostics per file open/save/focus, so the naive per-call
     // recomputation was O(F·S·C) per request, freezing editors on any
     // non-toy repo. The cache pays off on the second call onwards.
-    let Some(pr) = &file.parse_result else {
-        return Vec::new();
-    };
-    index
-        .dead_code_cached()
-        .iter()
-        .filter(|d| d.file == file.relative_path)
-        .filter_map(|d| {
-            let sym = pr
-                .symbols
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+
+    // Dead-code Warnings require a parse result to resolve declaration lines.
+    if let Some(pr) = &file.parse_result {
+        diagnostics.extend(
+            index
+                .dead_code_cached()
                 .iter()
-                .find(|s| s.name == d.symbol && s.kind == d.kind)?;
-            let line = sym.start_line.saturating_sub(1) as u32;
-            let end_line = sym.end_line.saturating_sub(1) as u32;
-            Some(Diagnostic {
+                .filter(|d| d.file == file.relative_path)
+                .filter_map(|d| {
+                    let sym = pr
+                        .symbols
+                        .iter()
+                        .find(|s| s.name == d.symbol && s.kind == d.kind)?;
+                    let line = sym.start_line.saturating_sub(1) as u32;
+                    let end_line = sym.end_line.saturating_sub(1) as u32;
+                    Some(Diagnostic {
+                        range: Range {
+                            start: Position { line, character: 0 },
+                            end: Position {
+                                line: end_line,
+                                character: 0,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "cxpak.dead_code".into(),
+                        )),
+                        code_description: None,
+                        source: Some("cxpak".into()),
+                        // Include kind and visibility so the IDE message is
+                        // actionable at a glance.  `d.reason` is the detector's
+                        // single fixed string ("zero callers, not entry point,
+                        // no test reference") — useful but repetitive across
+                        // every diagnostic; prefixing with kind+visibility tells
+                        // the user whether they can safely delete a private
+                        // function vs. whether a pub symbol requires review of
+                        // external callers.  Bidi-sanitised so a symbol named
+                        // with U+202E cannot flip the visual order of the
+                        // diagnostic message.
+                        message: format!(
+                            "dead code: {} {:?} `{}` — {}",
+                            visibility_label(&sym.visibility),
+                            d.kind,
+                            crate::util::sanitize_bidi(&d.symbol),
+                            d.reason,
+                        ),
+                        related_information: None,
+                        tags: Some(vec![tower_lsp::lsp_types::DiagnosticTag::UNNECESSARY]),
+                        data: None,
+                    })
+                }),
+        );
+    }
+
+    // Informational diagnostics for every heuristically *inferred* dependency
+    // edge originating from this file (embedded-SQL regex, cross-language
+    // bridges, heuristic column refs). Surfaces the "every edge proven, never
+    // inferred — and when it IS inferred, say so" honesty contract directly in
+    // the editor, distinct from the dead-code Warnings above. Edges carry no
+    // line numbers, so the diagnostic is anchored at the file head. Iterating
+    // the `BTreeSet` keeps the output order deterministic.
+    if let Some(deps) = index.graph.dependencies(&file.relative_path) {
+        for edge in deps.iter().filter(|e| e.confidence.is_inferred()) {
+            diagnostics.push(Diagnostic {
                 range: Range {
-                    start: Position { line, character: 0 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
                     end: Position {
-                        line: end_line,
+                        line: 0,
                         character: 0,
                     },
                 },
-                severity: Some(DiagnosticSeverity::WARNING),
+                severity: Some(DiagnosticSeverity::INFORMATION),
                 code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                    "cxpak.dead_code".into(),
+                    "cxpak.inferred_edge".into(),
                 )),
                 code_description: None,
                 source: Some("cxpak".into()),
-                // Include kind and visibility so the IDE message is
-                // actionable at a glance.  `d.reason` is the detector's
-                // single fixed string ("zero callers, not entry point,
-                // no test reference") — useful but repetitive across
-                // every diagnostic; prefixing with kind+visibility tells
-                // the user whether they can safely delete a private
-                // function vs. whether a pub symbol requires review of
-                // external callers.  Bidi-sanitised so a symbol named
-                // with U+202E cannot flip the visual order of the
-                // diagnostic message.
                 message: format!(
-                    "dead code: {} {:?} `{}` — {}",
-                    visibility_label(&sym.visibility),
-                    d.kind,
-                    crate::util::sanitize_bidi(&d.symbol),
-                    d.reason,
+                    "inferred dependency on `{}` (via {}): heuristic match, not structurally extracted",
+                    crate::util::sanitize_bidi(&edge.target),
+                    edge.edge_type.label(),
                 ),
                 related_information: None,
-                tags: Some(vec![tower_lsp::lsp_types::DiagnosticTag::UNNECESSARY]),
+                tags: None,
                 data: None,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+
+    diagnostics
 }
 
 pub fn workspace_symbols(
@@ -819,6 +862,81 @@ mod tests {
         assert_eq!(
             d.range.start.line, 6,
             "start line must be 0-indexed start_line-1"
+        );
+    }
+
+    #[test]
+    fn diagnostics_emit_information_for_inferred_edge_and_keep_dead_code_warning() {
+        use crate::core_graph::graph::EdgeType;
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        // A file with a dead private function (→ Warning) and an inferred
+        // outgoing dependency edge (embedded SQL → INFORMATION).
+        let counter = TokenCounter::new();
+        let file = ScannedFile {
+            relative_path: "src/repo.rs".to_string(),
+            absolute_path: std::path::PathBuf::from("/tmp/src/repo.rs"),
+            language: Some("rust".to_string()),
+            size_bytes: 100,
+        };
+        let mut parses = HashMap::new();
+        parses.insert(
+            "src/repo.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "unused_helper".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "fn unused_helper()".to_string(),
+                    body: "fn unused_helper() { 1 + 1; }".to_string(),
+                    start_line: 7,
+                    end_line: 9,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content = HashMap::new();
+        content.insert(
+            "src/repo.rs".to_string(),
+            "\n\n\n\n\n\nfn unused_helper() {}\n".to_string(),
+        );
+        let mut index = CodebaseIndex::build_with_content(vec![file], parses, &counter, content);
+        // Inferred edge: heuristic embedded-SQL match from this file.
+        index
+            .graph
+            .add_edge("src/repo.rs", "schema/orders.sql", EdgeType::EmbeddedSql);
+
+        let root = std::path::Path::new("/tmp");
+        let diags = diagnostics_for_file("src/repo.rs", &index, root);
+
+        // INFORMATION diagnostic for the inferred edge.
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::INFORMATION)
+                    && d.source.as_deref() == Some("cxpak")
+                    && d.message.contains("inferred dependency")
+                    && d.message.contains("schema/orders.sql")
+                    && d.message.contains("embedded_sql")),
+            "expected an INFORMATION diagnostic for the inferred edge, got {diags:?}"
+        );
+        // Inferred-edge diagnostic must NOT be tagged UNNECESSARY (that is
+        // reserved for dead code).
+        let info = diags
+            .iter()
+            .find(|d| d.severity == Some(DiagnosticSeverity::INFORMATION))
+            .unwrap();
+        assert!(
+            info.tags.is_none(),
+            "inferred-edge diagnostic must not carry the UNNECESSARY tag"
+        );
+        // Dead-code Warning must still be emitted.
+        assert!(
+            diags.iter().any(|d| d.severity == Some(DiagnosticSeverity::WARNING)
+                && d.message.contains("dead code")
+                && d.message.contains("unused_helper")),
+            "dead-code Warning must still be emitted alongside the inferred-edge diagnostic, got {diags:?}"
         );
     }
 

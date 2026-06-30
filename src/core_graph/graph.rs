@@ -98,6 +98,36 @@ impl EdgeType {
             _ => EdgeConfidence::Extracted,
         }
     }
+
+    /// Stable lowercase label used in human-readable edge renderings — the
+    /// `(via: <label>)` markers in the overview/trace dependency sections, the
+    /// auto_context dependency annotation, and the LSP inferred-edge
+    /// diagnostic.  Single source of truth so every surface agrees on the
+    /// spelling (previously inlined as four identical `match` arms that could
+    /// drift independently).
+    pub fn label(&self) -> String {
+        match self {
+            EdgeType::Import => "import".to_string(),
+            EdgeType::ForeignKey => "foreign_key".to_string(),
+            EdgeType::ViewReference => "view_reference".to_string(),
+            EdgeType::TriggerTarget => "trigger_target".to_string(),
+            EdgeType::IndexTarget => "index_target".to_string(),
+            EdgeType::FunctionReference => "function_reference".to_string(),
+            EdgeType::EmbeddedSql => "embedded_sql".to_string(),
+            EdgeType::OrmModel => "orm_model".to_string(),
+            EdgeType::MigrationSequence => "migration_sequence".to_string(),
+            EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
+            EdgeType::ColumnReference => "column_reference".to_string(),
+        }
+    }
+}
+
+impl EdgeConfidence {
+    /// True when this edge was heuristically inferred rather than structurally
+    /// extracted.  Drives the visible `inferred` tag in every edge rendering.
+    pub fn is_inferred(&self) -> bool {
+        matches!(self, EdgeConfidence::Inferred)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -295,6 +325,19 @@ mod tests {
             2,
             "same target, different types = different edges"
         );
+    }
+
+    #[test]
+    fn test_edge_type_label_and_is_inferred() {
+        assert_eq!(EdgeType::Import.label(), "import");
+        assert_eq!(EdgeType::EmbeddedSql.label(), "embedded_sql");
+        assert_eq!(EdgeType::ColumnReference.label(), "column_reference");
+        assert_eq!(
+            EdgeType::CrossLanguage(BridgeType::HttpCall).label(),
+            "cross_language:HttpCall"
+        );
+        assert!(EdgeConfidence::Inferred.is_inferred());
+        assert!(!EdgeConfidence::Extracted.is_inferred());
     }
 
     #[test]

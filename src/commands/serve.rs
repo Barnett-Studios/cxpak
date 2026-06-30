@@ -8,7 +8,7 @@ use crate::index::CodebaseIndex;
 use crate::intelligence::api_surface::extract_api_surface;
 use crate::parser::LanguageRegistry;
 use crate::scanner::Scanner;
-use crate::schema::EdgeType;
+use crate::schema::{EdgeConfidence, EdgeType};
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
@@ -49,6 +49,41 @@ fn matches_focus(path: &str, focus: Option<&str>) -> bool {
         Some(f) => path.starts_with(f),
         None => true,
     }
+}
+
+/// One auto_context target file: its path, role (selected vs. dependency), the
+/// file that pulled it in (for dependencies), the edge type that linked them,
+/// and that edge's [`EdgeConfidence`]. The confidence rides alongside the edge
+/// type so the dependency annotation can flag heuristically inferred edges.
+type AutoContextTarget = (
+    String,
+    FileRole,
+    Option<String>,
+    Option<EdgeType>,
+    EdgeConfidence,
+);
+
+/// Render the `parent` annotation for an auto_context dependency.
+///
+/// Import edges (the common case) render the bare parent path. Every other
+/// edge type appends `(via: <label>)`, and edges that were heuristically
+/// [`Inferred`][EdgeConfidence::Inferred] (embedded-SQL regex, cross-language
+/// bridges, heuristic column refs) additionally carry an `inferred` tag so the
+/// reader knows the dependency was pattern-matched, not structurally extracted.
+fn format_dependency_parent(
+    parent: &str,
+    edge_type: &EdgeType,
+    confidence: EdgeConfidence,
+) -> String {
+    if *edge_type == EdgeType::Import {
+        return parent.to_string();
+    }
+    let label = if confidence.is_inferred() {
+        format!("{}, inferred", edge_type.label())
+    } else {
+        edge_type.label()
+    };
+    format!("{parent} (via: {label})")
 }
 
 /// Remove PatternObservation entries from a serialized convention JSON value
@@ -2864,9 +2899,10 @@ pub fn handle_tool_call(
                 .collect();
 
             // Track which paths came from user selection vs. dependency expansion,
-            // the file that pulled each dependency in, and the edge type used.
-            let mut target_files: Vec<(String, FileRole, Option<String>, Option<EdgeType>)> =
-                vec![];
+            // the file that pulled each dependency in, the edge type used, and
+            // whether that edge was structurally extracted or heuristically
+            // inferred (so the annotation can flag inferred dependencies).
+            let mut target_files: Vec<AutoContextTarget> = vec![];
             let mut seen: HashSet<String> = HashSet::new();
             let graph = if include_deps {
                 Some(&index.graph)
@@ -2879,7 +2915,13 @@ pub fn handle_tool_call(
                     continue;
                 }
                 if seen.insert(path.clone()) {
-                    target_files.push((path.clone(), FileRole::Selected, None, None));
+                    target_files.push((
+                        path.clone(),
+                        FileRole::Selected,
+                        None,
+                        None,
+                        EdgeConfidence::Extracted,
+                    ));
                 }
                 if let Some(g) = &graph {
                     if let Some(deps) = g.dependencies(path) {
@@ -2890,6 +2932,7 @@ pub fn handle_tool_call(
                                     FileRole::Dependency,
                                     Some(path.clone()),
                                     Some(dep.edge_type.clone()),
+                                    dep.confidence,
                                 ));
                             }
                         }
@@ -2899,31 +2942,31 @@ pub fn handle_tool_call(
 
             // Auto-include test files for selected source files.
             if include_tests {
-                let test_additions: Vec<(String, FileRole, Option<String>, Option<EdgeType>)> =
-                    target_files
-                        .iter()
-                        .filter(|(_, role, _, _)| matches!(role, FileRole::Selected))
-                        .filter_map(|(path, _, _, _)| {
-                            index.test_map.get(path).map(|tests| {
-                                tests
-                                    .iter()
-                                    .filter_map(|t| {
-                                        if seen.insert(t.path.clone()) {
-                                            Some((
-                                                t.path.clone(),
-                                                FileRole::Dependency,
-                                                Some(path.clone()),
-                                                None,
-                                            ))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
+                let test_additions: Vec<AutoContextTarget> = target_files
+                    .iter()
+                    .filter(|(_, role, _, _, _)| matches!(role, FileRole::Selected))
+                    .filter_map(|(path, _, _, _, _)| {
+                        index.test_map.get(path).map(|tests| {
+                            tests
+                                .iter()
+                                .filter_map(|t| {
+                                    if seen.insert(t.path.clone()) {
+                                        Some((
+                                            t.path.clone(),
+                                            FileRole::Dependency,
+                                            Some(path.clone()),
+                                            None,
+                                            EdgeConfidence::Extracted,
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
                         })
-                        .flatten()
-                        .collect();
+                    })
+                    .flatten()
+                    .collect();
                 target_files.extend(test_additions);
             }
 
@@ -2934,11 +2977,12 @@ pub fn handle_tool_call(
                 f64,
                 Option<String>,
                 Option<EdgeType>,
+                EdgeConfidence,
             );
             let mut not_found: Vec<Value> = vec![];
             let mut indexed_targets: Vec<PackTarget<'_>> = vec![];
 
-            for (path, role, parent, edge_type) in &target_files {
+            for (path, role, parent, edge_type, confidence) in &target_files {
                 match index_map.get(path.as_str()) {
                     Some(&idx) => {
                         // Selected files get a high relevance score; dependencies lower.
@@ -2952,6 +2996,7 @@ pub fn handle_tool_call(
                             score,
                             parent.clone(),
                             edge_type.clone(),
+                            *confidence,
                         ));
                     }
                     None => {
@@ -2963,7 +3008,7 @@ pub fn handle_tool_call(
             // Allocate budget with progressive degradation.
             let alloc_inputs: Vec<(&crate::index::IndexedFile, FileRole, f64)> = indexed_targets
                 .iter()
-                .map(|(f, role, score, _, _)| (*f, *role, *score))
+                .map(|(f, role, score, _, _, _)| (*f, *role, *score))
                 .collect();
             let allocated =
                 allocate_with_degradation(&alloc_inputs, token_budget, Some(&index.pagerank));
@@ -2972,7 +3017,7 @@ pub fn handle_tool_call(
             let mut packed: Vec<Value> = vec![];
             let mut total_tokens = 0usize;
 
-            for (alloc, (indexed_file, role, _score, parent, edge_type)) in
+            for (alloc, (indexed_file, role, _score, parent, edge_type, confidence)) in
                 allocated.iter().zip(indexed_targets.iter())
             {
                 let rendered_tokens: usize = alloc.symbols.iter().map(|s| s.rendered_tokens).sum();
@@ -2984,27 +3029,11 @@ pub fn handle_tool_call(
                     indexed_file.token_count
                 };
 
-                // Build the annotation parent string: for non-Import edges, append the edge type.
+                // Build the annotation parent string: for non-Import edges,
+                // append the edge type and flag heuristically inferred edges.
                 let annotation_parent = parent.as_ref().map(|p| match edge_type {
-                    Some(et) if *et != EdgeType::Import => {
-                        let label = match et {
-                            EdgeType::ForeignKey => "foreign_key".to_string(),
-                            EdgeType::ViewReference => "view_reference".to_string(),
-                            EdgeType::TriggerTarget => "trigger_target".to_string(),
-                            EdgeType::IndexTarget => "index_target".to_string(),
-                            EdgeType::FunctionReference => "function_reference".to_string(),
-                            EdgeType::EmbeddedSql => "embedded_sql".to_string(),
-                            EdgeType::OrmModel => "orm_model".to_string(),
-                            EdgeType::MigrationSequence => "migration_sequence".to_string(),
-                            EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
-                            EdgeType::ColumnReference => "column_reference".to_string(),
-                            // Import edges are excluded by the guard `*et != EdgeType::Import`
-                            // above; this arm is unreachable at runtime.
-                            EdgeType::Import => return p.clone(),
-                        };
-                        format!("{p} (via: {label})")
-                    }
-                    _ => p.clone(),
+                    Some(et) => format_dependency_parent(p, et, *confidence),
+                    None => p.clone(),
                 });
 
                 let annotation_ctx = AnnotationContext {
@@ -6132,6 +6161,33 @@ mod tests {
         assert!(!matches_focus("lib/foo.rs", Some("src/")));
         assert!(matches_focus("", Some("")));
         assert!(matches_focus("anything", Some("")));
+    }
+
+    #[test]
+    fn test_format_dependency_parent_tags_inferred() {
+        // Import edges render the bare path.
+        assert_eq!(
+            format_dependency_parent("src/main.rs", &EdgeType::Import, EdgeConfidence::Extracted),
+            "src/main.rs"
+        );
+        // Extracted non-import edge: label, no `inferred` tag.
+        assert_eq!(
+            format_dependency_parent(
+                "schema/users.sql",
+                &EdgeType::ForeignKey,
+                EdgeConfidence::Extracted
+            ),
+            "schema/users.sql (via: foreign_key)"
+        );
+        // Inferred edge: label carries the `inferred` tag.
+        assert_eq!(
+            format_dependency_parent(
+                "schema/orders.sql",
+                &EdgeType::EmbeddedSql,
+                EdgeConfidence::Inferred
+            ),
+            "schema/orders.sql (via: embedded_sql, inferred)"
+        );
     }
 
     // --- Task 15: pack_context with degradation + annotations ---

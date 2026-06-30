@@ -340,19 +340,10 @@ fn render_relevant_signatures(
 }
 
 fn edge_type_display(et: &EdgeType) -> String {
-    match et {
-        EdgeType::Import => "import".to_string(),
-        EdgeType::ForeignKey => "foreign_key".to_string(),
-        EdgeType::ViewReference => "view_reference".to_string(),
-        EdgeType::TriggerTarget => "trigger_target".to_string(),
-        EdgeType::IndexTarget => "index_target".to_string(),
-        EdgeType::FunctionReference => "function_reference".to_string(),
-        EdgeType::EmbeddedSql => "embedded_sql".to_string(),
-        EdgeType::OrmModel => "orm_model".to_string(),
-        EdgeType::MigrationSequence => "migration_sequence".to_string(),
-        EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
-        EdgeType::ColumnReference => "column_reference".to_string(),
-    }
+    // Delegates to the canonical label so every edge-rendering surface
+    // (overview, trace, auto_context annotation, LSP diagnostic) spells edge
+    // types identically.
+    et.label()
 }
 
 /// Render the dependency edges for files in the relevant subgraph.
@@ -394,11 +385,15 @@ fn render_dependency_subgraph(
                     full.push_str(&format!("- `{}`\n", edge.target));
                 }
                 et => {
-                    full.push_str(&format!(
-                        "- `{}` (via: {})\n",
-                        edge.target,
+                    // Heuristically inferred edges carry a visible `inferred`
+                    // tag so the reader knows the dependency was pattern-matched,
+                    // not structurally extracted.
+                    let label = if edge.confidence.is_inferred() {
+                        format!("{}, inferred", edge_type_display(et))
+                    } else {
                         edge_type_display(et)
-                    ));
+                    };
+                    full.push_str(&format!("- `{}` (via: {})\n", edge.target, label));
                 }
             }
         }
@@ -595,6 +590,33 @@ mod tests {
             .collect();
         let result = render_dependency_subgraph(&index, &graph, &relevant, 50000, &counter);
         assert!(result.contains("(via: foreign_key)"));
+    }
+
+    #[test]
+    fn test_render_dependency_subgraph_tags_inferred_not_extracted() {
+        // Inferred edge (EmbeddedSql) carries `inferred`; Extracted non-import
+        // edge (ForeignKey) does not.
+        let counter = TokenCounter::new();
+        let index = make_trace_index();
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("src/main.rs", "src/lib.rs", EdgeType::EmbeddedSql);
+        graph.add_edge("src/main.rs", "src/util.rs", EdgeType::ForeignKey);
+        let relevant: HashSet<String> = [
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "src/util.rs".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let result = render_dependency_subgraph(&index, &graph, &relevant, 50000, &counter);
+        assert!(
+            result.contains("(via: embedded_sql, inferred)"),
+            "inferred edge must be tagged, got:\n{result}"
+        );
+        assert!(
+            result.contains("(via: foreign_key)") && !result.contains("foreign_key, inferred"),
+            "extracted edge must render its label untagged, got:\n{result}"
+        );
     }
 
     #[test]
