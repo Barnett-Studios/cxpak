@@ -154,6 +154,13 @@ impl CxpakLspBackend {
         self.dispatch("cxpak/callGraph", params).await
     }
 
+    pub async fn custom_graph(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/graph", params).await
+    }
+
     pub async fn custom_predict(
         &self,
         params: serde_json::Value,

@@ -46,7 +46,7 @@ fn git_tempdir() -> tempfile::TempDir {
 }
 
 #[test]
-fn all_14_lsp_methods_return_non_stub() {
+fn all_15_lsp_methods_return_non_stub() {
     let idx = make_idx();
     let temp = git_tempdir();
     let root = temp.path();
@@ -67,6 +67,8 @@ fn all_14_lsp_methods_return_non_stub() {
         "cxpak/drift",
         "cxpak/securitySurface",
         "cxpak/dataFlow",
+        // graph-query (cxpak 3.0.0 Task B1):
+        "cxpak/graph",
     ];
     for m in methods {
         let params = match m {
@@ -75,6 +77,7 @@ fn all_14_lsp_methods_return_non_stub() {
             "cxpak/predict" => serde_json::json!({"files": ["src/main.rs"]}),
             "cxpak/dataFlow" => serde_json::json!({"symbol": "main"}),
             "cxpak/blastRadius" => serde_json::json!({"file": "src/main.rs"}),
+            "cxpak/graph" => serde_json::json!({"op": "node", "id": "src/main.rs"}),
             _ => serde_json::Value::Null,
         };
         let result = cxpak::lsp::methods::handle_custom_method(m, params, &idx, root).expect(m);

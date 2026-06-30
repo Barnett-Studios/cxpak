@@ -2,6 +2,7 @@ pub mod clean;
 #[cfg(feature = "daemon")]
 pub mod conventions;
 pub mod diff;
+pub mod graph;
 #[cfg(feature = "visual")]
 pub mod onboard;
 pub mod overview;

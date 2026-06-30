@@ -167,6 +167,27 @@ fn main() {
                 workspace.as_deref(),
             )
         }
+        Commands::Graph {
+            op,
+            id,
+            from,
+            to,
+            direction,
+            seeds,
+            depth,
+            workspace,
+            path,
+        } => commands::graph::run(
+            path,
+            op,
+            id.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            direction,
+            seeds,
+            *depth,
+            workspace.as_deref(),
+        ),
         Commands::Trace {
             tokens,
             out,

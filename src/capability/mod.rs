@@ -185,23 +185,28 @@ fn build_catalog() -> Vec<Capability> {
         },
         Capability {
             id: "graph",
-            summary: "Typed dependency graph (imports + schema-aware edges).",
+            summary: "Query the typed dependency graph: node, neighbors, path, subgraph.",
             intent: Intent::Graph,
-            inputs: &["symbol", "depth"],
+            inputs: &["op", "id", "from", "to", "direction", "seeds", "depth"],
             has_schema: true,
-            // The dependency graph is built and consumed internally (trace walks
-            // it, the visual architecture/flow views draw it), but NO surface
-            // returns the `DependencyGraph` contract (Task 0.5 `graph` schema)
-            // as a retrievable result today: `cxpak_trace`/`cxpak/trace` emit
-            // packed code paths, `cxpak_call_graph`/`/v1/call_graph` emit the
-            // call graph (a different structure), and the visual views render a
-            // drawing, not the graph JSON. Kept in the catalog to anchor its 0.5
-            // schema; surfaced as a retrievable result in B1 (graph-query).
+            // B1 (graph-query) surfaces the typed graph as a retrievable result
+            // through the single core `intelligence::graph_query::execute`
+            // (node/neighbors/path/subgraph). All four surfaces below project
+            // that one core result — no re-derivation:
+            //   * CLI  — `cxpak graph <op> ...` (commands::graph).
+            //   * HTTP — `POST /v1/graph` (serve.rs `v1_graph_handler`).
+            //   * LSP  — `cxpak/graph` custom method (lsp::methods).
+            //   * MCP  — the `cxpak_graph` intent-tool, emitted by the catalog
+            //     adapter (`adapter::mcp_tools`), keeping the budget ≤8. The
+            //     live `serve.rs` MCP server is migrated onto the adapter in C3
+            //     (the 26→8 consolidation), which is out of scope here.
+            // `visual` stays false: the architecture/flow views draw the graph,
+            // they do not return the graph-query JSON contract.
             projections: SurfaceSet {
-                mcp: false,
-                lsp: false,
-                cli: false,
-                http: false,
+                mcp: true,
+                lsp: true,
+                cli: true,
+                http: true,
                 visual: false,
             },
         },

@@ -1,6 +1,6 @@
 # ADR Index
 
-175 architecture decision records. 0001–0162 reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1); 0163 onward written at decision time. See [README](./README.md) for methodology.
+176 architecture decision records. 0001–0162 reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1); 0163 onward written at decision time. See [README](./README.md) for methodology.
 
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
@@ -179,3 +179,4 @@
 | [0173](0173-live-db-introspection-rustls.md) | Live DB introspection + schema drift; rustls drivers (tokio-postgres + mysql_async), feature-gated, DSN-scrubbed, read-only | ACCEPTED | 2026-06-24 |
 | [0174](0174-column-level-lineage-blast-radius.md) | Column-level lineage + column-granular blast radius; columns as graph nodes, `EdgeType::ColumnReference`, per-edge confidence | ACCEPTED | 2026-06-24 |
 | [0175](0175-surface-edge-confidence-in-outputs.md) | Surface `EdgeConfidence`: tag only `Inferred` edges (`, inferred`) across overview/trace/auto_context renderings + an `INFORMATION` LSP diagnostic; canonical `EdgeType::label()` | ACCEPTED | 2026-06-30 |
+| [0176](0176-graph-query-capability-four-surfaces.md) | Deterministic graph-query (node/neighbors/path/subgraph) from one `intelligence::graph_query` core, projected to CLI/HTTP/LSP live + MCP via catalog adapter (≤8); lex-min shortest-path tiebreak | ACCEPTED | 2026-06-30 |

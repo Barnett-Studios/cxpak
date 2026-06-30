@@ -7,6 +7,7 @@ pub mod cross_lang;
 pub mod data_flow;
 pub mod dead_code;
 pub mod drift;
+pub mod graph_query;
 pub mod health;
 #[cfg(feature = "visual")]
 pub mod onboarding;

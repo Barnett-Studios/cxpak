@@ -527,6 +527,7 @@ fn build_v1_router(state: AppState) -> Router<AppState> {
             axum::routing::post(v1_architecture_handler),
         )
         .route("/v1/call_graph", axum::routing::post(v1_call_graph_handler))
+        .route("/v1/graph", axum::routing::post(v1_graph_handler))
         .route("/v1/dead_code", axum::routing::post(v1_dead_code_handler))
         .route("/v1/predict", axum::routing::post(v1_predict_handler))
         .route("/v1/drift", axum::routing::post(v1_drift_handler))
@@ -938,6 +939,34 @@ async fn v1_predict_handler(
         depth,
     );
     Ok(axum::Json(serde_json::to_value(result).unwrap()))
+}
+
+/// `POST /v1/graph` — deterministic graph-query (cxpak 3.0.0 Task B1).
+///
+/// The request body is `{ "op": "node"|"neighbors"|"path"|"subgraph", ... }`;
+/// the remaining fields are the op's params. The body is passed straight to the
+/// single core [`crate::intelligence::graph_query::execute`] — this surface only
+/// adapts transport, it does not re-derive. Malformed requests (missing `op`,
+/// missing a required param, bad direction, unknown op) map to `400`.
+async fn v1_graph_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let op = body
+        .get("op")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| v1_error(StatusCode::BAD_REQUEST, "missing_required_param", "op"))?
+        .to_string();
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    crate::intelligence::graph_query::execute(&idx.graph, &op, &body)
+        .map(axum::Json)
+        .map_err(|e| v1_error(StatusCode::BAD_REQUEST, "invalid_request", e.to_string()))
 }
 
 async fn v1_drift_handler(

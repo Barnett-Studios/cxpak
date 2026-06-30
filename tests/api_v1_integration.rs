@@ -110,6 +110,46 @@ mod api_v1 {
     }
 
     #[tokio::test]
+    async fn v1_graph_node_returns_result() {
+        let (app, _dir) = test_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/graph")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"op": "node", "id": "main.rs"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(val.get("out_degree").is_some());
+        assert!(val.get("in_degree").is_some());
+    }
+
+    #[tokio::test]
+    async fn v1_graph_missing_op_is_400() {
+        let (app, _dir) = test_router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/graph")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"id": "main.rs"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn v1_briefing_returns_task() {
         let (app, _dir) = test_router();
         let resp = app

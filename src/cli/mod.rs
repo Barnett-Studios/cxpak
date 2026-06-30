@@ -169,6 +169,34 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: PluginSubcommand,
     },
+    /// Query the dependency graph: node, neighbors, path, subgraph
+    Graph {
+        /// Operation: node | neighbors | path | subgraph
+        op: String,
+        /// Node id (for `node` and `neighbors`)
+        #[arg(long)]
+        id: Option<String>,
+        /// Source node (for `path`)
+        #[arg(long)]
+        from: Option<String>,
+        /// Target node (for `path`)
+        #[arg(long)]
+        to: Option<String>,
+        /// Neighbor direction: out | in | both
+        #[arg(long, default_value = "both")]
+        direction: String,
+        /// Seed nodes for `subgraph` (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        seeds: Vec<String>,
+        /// Hop depth for `subgraph`
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Monorepo workspace prefix (only index files under this path)
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Trace from error/function, pack relevant code paths
     Trace {
         #[arg(long, default_value = "50k")]
@@ -546,6 +574,52 @@ mod tests {
                 assert_eq!(tokens, "100k");
             }
             _ => panic!("expected Overview"),
+        }
+    }
+
+    #[test]
+    fn cli_graph_parses_subgraph() {
+        let cli = Cli::try_parse_from([
+            "cxpak", "graph", "subgraph", "--seeds", "a,b", "--depth", "2", "src",
+        ])
+        .expect("should parse graph subgraph");
+        match cli.command {
+            Commands::Graph {
+                op,
+                seeds,
+                depth,
+                path,
+                ..
+            } => {
+                assert_eq!(op, "subgraph");
+                assert_eq!(seeds, vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(depth, 2);
+                assert_eq!(path, std::path::PathBuf::from("src"));
+            }
+            _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn cli_graph_path_and_direction_defaults() {
+        let cli = Cli::try_parse_from(["cxpak", "graph", "path", "--from", "a", "--to", "d"])
+            .expect("should parse graph path");
+        match cli.command {
+            Commands::Graph {
+                op,
+                from,
+                to,
+                direction,
+                depth,
+                ..
+            } => {
+                assert_eq!(op, "path");
+                assert_eq!(from.as_deref(), Some("a"));
+                assert_eq!(to.as_deref(), Some("d"));
+                assert_eq!(direction, "both");
+                assert_eq!(depth, 1);
+            }
+            _ => panic!("expected Graph command"),
         }
     }
 
