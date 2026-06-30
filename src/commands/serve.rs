@@ -2462,9 +2462,9 @@ pub fn mcp_stdio_loop_with_io(
                                     },
                                     "format": {
                                         "type": "string",
-                                        "description": "Output format: 'html' (default), 'mermaid', 'svg', 'c4', 'json'",
+                                        "description": "Output format: 'html' (default), 'mermaid', 'svg', 'c4', 'json', 'cypher' (Neo4j import script), 'graphml' (XML graph)",
                                         "default": "html",
-                                        "enum": ["html", "mermaid", "svg", "c4", "json"]
+                                        "enum": ["html", "mermaid", "svg", "c4", "json", "cypher", "graphml"]
                                     },
                                     "focus": {
                                         "type": "string",
@@ -3773,6 +3773,8 @@ pub fn handle_tool_call(
                                 });
                             export::to_json(&computed)
                         }
+                        "cypher" => export::to_cypher(&index.graph, &metadata.repo_name),
+                        "graphml" => export::to_graphml(&index.graph, &metadata.repo_name),
                         _ => html, // html is the default
                     };
 

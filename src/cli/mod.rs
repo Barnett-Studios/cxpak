@@ -129,7 +129,7 @@ pub enum Commands {
         /// all | dashboard | architecture | risk | flow | timeline | diff
         #[arg(long, default_value = "all")]
         visual_type: VisualTypeArg,
-        /// html | mermaid | svg | png | c4 | json
+        /// html | mermaid | svg | png | c4 | json | cypher | graphml
         #[arg(long, default_value = "html")]
         format: VisualFormatArg,
         #[arg(long)]
@@ -288,6 +288,8 @@ pub enum VisualFormatArg {
     Png,
     C4,
     Json,
+    Cypher,
+    Graphml,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
