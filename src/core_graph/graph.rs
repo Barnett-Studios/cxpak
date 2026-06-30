@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 // ---------------------------------------------------------------------------
-// EdgeConfidence (Task 0.4 — ADR-0176 descriptive-honesty)
+// EdgeConfidence (Task 0.4 — ADR-0097 descriptive-honesty)
 // ---------------------------------------------------------------------------
 
 /// Whether an edge was structurally extracted from explicit source or

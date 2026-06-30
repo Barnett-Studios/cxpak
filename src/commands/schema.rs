@@ -295,7 +295,7 @@ fn graph_schema() -> serde_json::Value {
                     "confidence": {
                         "type": "string",
                         "enum": ["Extracted", "Inferred"],
-                        "description": "Whether this edge was structurally Extracted (explicit source) or heuristically Inferred (pattern matching). Added in Task 0.4 / ADR-0176."
+                        "description": "Whether this edge was structurally Extracted (explicit source) or heuristically Inferred (pattern matching). Added in Task 0.4 / ADR-0097."
                     }
                 }
             }
