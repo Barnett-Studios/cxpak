@@ -49,13 +49,45 @@ mod serve_tests {
     }
 
     fn wait_for_server(port: u16) -> bool {
+        // Poll the real /health endpoint until it answers 200. A bare TCP
+        // connect succeeds as soon as the listener is bound — but the HTTP
+        // layer may not yet respond, which produced intermittent empty
+        // ("status 0") responses under the hook's parallel load. Polling the
+        // actual endpoint closes that readiness window for every serve test.
         for _ in 0..50 {
-            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            if try_health(port) == Some(200) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         false
+    }
+
+    fn try_health(port: u16) -> Option<u16> {
+        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).ok()?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .ok()?;
+        let request =
+            format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut response = String::new();
+        let mut reader = BufReader::new(&stream);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => response.push_str(&line),
+                Err(_) => break,
+            }
+        }
+        response
+            .lines()
+            .next()?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u16>()
+            .ok()
     }
 
     fn http_get(port: u16, path: &str) -> (u16, String) {
