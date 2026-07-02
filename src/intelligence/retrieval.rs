@@ -15,9 +15,12 @@
 //!   [`CodebaseIndex::find_symbol`]-style symbol iteration and
 //!   [`CodebaseIndex::find_content_matches`]. Hits are ranked by a match tier,
 //!   PageRank-boosted, and returned in an explicit TOTAL ORDER.
-//! * [`references`] — where a symbol is referenced across files, reusing
-//!   [`build_symbol_cross_refs`] (the `symbol → files` inverted index) with the
-//!   SAME [`normalize_identifier`] key `symbol_importance` uses.
+//! * [`references`] — where a symbol is referenced across files, keyed on the
+//!   FULL [`normalize_identifier`]-normalized symbol name so compound
+//!   (snake_case / camelCase) identifiers resolve. It scans the index's own
+//!   extracted symbols (definition sites) and file bodies (usage sites, matched
+//!   as whole identifiers) — NOT the token-split `term_frequencies` map, whose
+//!   keys are the split parts and therefore never contain a compound name.
 //! * [`expand`] — widen a seed set to its bounded neighbourhood, reusing the B1
 //!   [`graph_query::subgraph`] primitive verbatim.
 //!
@@ -30,15 +33,15 @@
 //!   the collected hits by the total order `(score desc, path, symbol,
 //!   start_line, match_kind)`. `score` ties are broken by the string/line keys,
 //!   which are themselves total, so equal scores never reorder.
-//! * [`references`] collects the matching file set into a `Vec`, then `sort` +
-//!   `dedup` — the backing `HashSet` is never iterated into the output.
+//! * [`references`] iterates `index.files` (a `Vec`), pushes each matching
+//!   path, then `sort` + `dedup` — no `HashMap`/`HashSet` is consulted at all,
+//!   so no iteration order can leak into the output.
 //! * [`expand`] delegates to `graph_query::subgraph`, already byte-deterministic
 //!   (BTree-backed graph, sorted nodes and induced edges).
 
 use crate::core_graph::index::normalize_identifier;
 use crate::index::CodebaseIndex;
 use crate::intelligence::graph_query::{self, Subgraph};
-use crate::intelligence::pagerank::build_symbol_cross_refs;
 use crate::parser::language::SymbolKind;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -225,25 +228,62 @@ fn match_tier(name: &str, query: &str) -> Option<f64> {
     }
 }
 
-/// `references(symbol)` — files that reference `symbol`, from the index's
-/// inverted `symbol → files` map, sorted and de-duplicated.
+/// `references(symbol)` — files that reference `symbol` BY ITS FULL name,
+/// sorted and de-duplicated.
 ///
-/// Uses the SAME [`normalize_identifier`] key that `symbol_importance` uses, so
-/// a lookup here and a cross-ref weight there can never diverge. Results come
-/// purely from cxpak's own `term_frequencies` — no external process.
+/// Keys on the full, [`normalize_identifier`]-normalized symbol name (NFKC +
+/// lowercase, NO camel/snake splitting), so compound names like `run_search`
+/// resolve — unlike `term_frequencies`, whose keys are the token-SPLIT parts
+/// (`run`, `search`) and therefore never contain the full name. A file counts as
+/// a reference when EITHER it defines an extracted symbol whose normalized name
+/// equals the key, OR its body contains the identifier as a WHOLE token
+/// (`run_search` matches `run_search`, never `run_search_helper` — see
+/// [`file_references_symbol`]). Both the key and the per-token comparison use the
+/// SAME `normalize_identifier`, so they can never diverge. Results come purely
+/// from cxpak's own index — no external process.
 pub fn references(index: &CodebaseIndex, symbol: &str) -> ReferenceResult {
-    let cross_refs = build_symbol_cross_refs(&index.term_frequencies);
     let key = normalize_identifier(symbol);
-    let mut files: Vec<String> = cross_refs
-        .get(&key)
-        .map(|set| set.iter().cloned().collect())
-        .unwrap_or_default();
+    let mut files: Vec<String> = Vec::new();
+    // Iterate `index.files` (a `Vec`, insertion-ordered) — no hash-order source.
+    for file in &index.files {
+        if file_references_symbol(file, &key) {
+            files.push(file.relative_path.clone());
+        }
+    }
     files.sort();
     files.dedup();
     ReferenceResult {
         symbol: symbol.to_string(),
         files,
     }
+}
+
+/// Whether `file` references the symbol whose already-normalized name is `key`,
+/// as either a DEFINITION (an extracted symbol of that name) or a USAGE (the
+/// identifier appears in the body as a WHOLE token).
+///
+/// "Whole token" means the identifier is bounded by non-identifier characters —
+/// the body is split on every char that is neither alphanumeric nor `_` (the
+/// same identifier alphabet [`compute_term_frequencies`] uses), and each run is
+/// compared to `key` after `normalize_identifier`. This deliberately does NOT
+/// treat `run_search` as matching `run_search_helper` (a longer identifier);
+/// references means the identifier itself, not a prefix of another.
+fn file_references_symbol(file: &crate::core_graph::index::IndexedFile, key: &str) -> bool {
+    // Definition site: an extracted symbol whose full normalized name matches.
+    if let Some(parsed) = &file.parse_result {
+        if parsed
+            .symbols
+            .iter()
+            .any(|s| normalize_identifier(&s.name) == key)
+        {
+            return true;
+        }
+    }
+    // Usage site: the identifier occurs in the body as a whole token.
+    file.content
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|tok| !tok.is_empty())
+        .any(|tok| normalize_identifier(tok) == key)
 }
 
 /// `expand(seeds, depth)` — the bounded neighbourhood of `seeds`, delegated
@@ -484,6 +524,102 @@ mod tests {
     fn references_unknown_symbol_is_empty() {
         let idx = sample_index();
         assert!(references(&idx, "nonexistent_symbol_xyz").files.is_empty());
+    }
+
+    #[test]
+    fn references_resolve_compound_symbol_name() {
+        // Regression (C1): a compound (snake_case) symbol must resolve. Before
+        // the fix, `references` keyed a token-split map (`run_search` → `run`,
+        // `search`) with the un-split full name `run_search`, so the lookup
+        // missed and returned EMPTY. `run_search` is defined in main.rs and (via
+        // the file body `fn run_search() { helper(); }`) referenced there.
+        let idx = sample_index();
+        let r = references(&idx, "run_search");
+        assert_eq!(r.symbol, "run_search");
+        assert!(
+            !r.files.is_empty(),
+            "compound name must resolve to its definition/usage files, got empty"
+        );
+        assert!(
+            r.files.contains(&"src/main.rs".to_string()),
+            "run_search lives in src/main.rs, got {:?}",
+            r.files
+        );
+        // Sorted + deduped (deterministic; no hash-order leak).
+        let mut sorted = r.files.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(r.files, sorted);
+    }
+
+    #[test]
+    fn references_whole_identifier_only() {
+        // A compound name must match as a WHOLE identifier, never as a prefix of
+        // a longer identifier. `run_search` must not be satisfied by a file that
+        // only contains `run_search_helper`.
+        let counter = TokenCounter::new();
+        let files = vec![ScannedFile {
+            relative_path: "src/only_longer.rs".to_string(),
+            absolute_path: std::path::PathBuf::from("/tmp/src/only_longer.rs"),
+            language: Some("rust".to_string()),
+            size_bytes: 64,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/only_longer.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "run_search_helper".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn run_search_helper()".to_string(),
+                    body: "fn run_search_helper() {}".to_string(),
+                    start_line: 1,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content = HashMap::new();
+        content.insert(
+            "src/only_longer.rs".to_string(),
+            "pub fn run_search_helper() {}".to_string(),
+        );
+        let idx = CodebaseIndex::build_with_content(files, parse_results, &counter, content);
+        // `run_search` is a strict prefix of `run_search_helper`; whole-identifier
+        // matching must NOT report it.
+        assert!(
+            references(&idx, "run_search").files.is_empty(),
+            "whole-identifier match must not treat run_search as a prefix of run_search_helper"
+        );
+        // The full identifier still resolves.
+        assert_eq!(
+            references(&idx, "run_search_helper").files,
+            vec!["src/only_longer.rs"]
+        );
+    }
+
+    #[test]
+    fn loop_search_then_references_composes_for_compound_names() {
+        // The C1 loop: `search` returns a compound-named hit's raw `sym.name`,
+        // and feeding THAT into `references` must return a non-empty set. This is
+        // the real composition path — it was broken for every compound identifier
+        // before the fix.
+        let idx = sample_index();
+        let s = search(&idx, "run_search", 20);
+        let hit = s
+            .hits
+            .iter()
+            .find(|h| h.symbol.as_deref() == Some("run_search"))
+            .expect("run_search present as a search hit");
+        let sym = hit.symbol.as_deref().unwrap();
+        let r = references(&idx, sym);
+        assert!(
+            !r.files.is_empty(),
+            "feeding a search hit's compound symbol into references must compose"
+        );
+        assert!(r.files.contains(&"src/main.rs".to_string()));
     }
 
     #[test]

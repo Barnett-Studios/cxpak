@@ -49,9 +49,31 @@ pure primitives over `&CodebaseIndex`/`&DependencyGraph`:
 - `search(query, limit)` — reuses symbol iteration (`find_symbol`-style) +
   `find_content_matches`; ranks by a match tier (`exact > prefix > substring >
   content`) with a bounded PageRank boost.
-- `references(symbol)` — reuses `pagerank::build_symbol_cross_refs` with the SAME
-  `normalize_identifier` key `symbol_importance` uses.
+- `references(symbol)` — keys on the FULL `normalize_identifier`-normalized
+  symbol name (see the amendment below).
 - `expand(seeds, depth)` — delegates verbatim to the B1 `graph_query::subgraph`.
+
+> **Amendment (2026-07-02, C1 correctness fix):** the original `references`
+> reused `pagerank::build_symbol_cross_refs(&index.term_frequencies)`. That map's
+> keys come from `compute_term_frequencies` → `split_identifier`, which SPLITS
+> identifiers into lowercased tokens (`run_search` → `run`, `search`). The lookup
+> key, however, is `normalize_identifier(symbol)` — NFKC + lowercase with NO
+> splitting — so a compound name never matched a key in the split map and
+> `references` returned EMPTY for every snake_case / camelCase identifier (only
+> single-token names resolved). Since the loop is `search → references(hit.symbol)`
+> and `search` returns the raw compound `sym.name`, the op was broken for the
+> majority of real identifiers. Fix: `references` now builds its answer from the
+> actual extracted symbols (definition sites) and file bodies (usage sites),
+> keyed on the FULL normalized name. Usage sites are matched as WHOLE identifiers
+> (the body is split on non-`[alnum_]` chars and each run normalized), so
+> `run_search` matches `run_search` but never `run_search_helper` — references
+> means the identifier itself, not a prefix of a longer one. Token-intersection
+> (feeding split tokens back through the term map) was rejected: it is
+> semantically wrong (`run_search` would match any file containing both `run` and
+> `search`). Determinism is stronger than before — no `HashMap`/`HashSet` is
+> consulted; `references` iterates `index.files` (a `Vec`), pushes matches, then
+> `sort` + `dedup`. `symbol_importance`'s own use of `build_symbol_cross_refs` is
+> unchanged (out of scope for C1).
 
 `execute` is the single dispatch entry point every surface calls. The catalog
 gains one `retrieval` capability under `Intent::Context`, projected to MCP (as
