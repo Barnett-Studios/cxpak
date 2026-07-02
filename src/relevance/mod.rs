@@ -1,3 +1,4 @@
+pub mod identifier;
 pub mod seed;
 pub mod signals;
 
@@ -133,6 +134,19 @@ impl MultiSignalScorer {
         #[cfg(not(feature = "embeddings"))]
         let query_embedding: Option<Vec<f32>> = None;
 
+        // Identifier-level ranking (C2, ADR-0181): a single global pass over the
+        // codebase's `(file, identifier)` units yields a boost-only per-file
+        // factor fused with the conventions DNA. Built once here (it needs global
+        // scope: ambiguity counts, personalized PageRank, cross-file
+        // normalization) and shared across the per-file loop, mirroring the query
+        // embedding. Uses the same expanded/normalized tokens the other signals
+        // consume so identifier matching is consistent.
+        let query_tokens: std::collections::HashSet<String> = self
+            .expanded_tokens
+            .clone()
+            .unwrap_or_else(|| signals::tokenize(query));
+        let ident_ranking = identifier::build_identifier_ranking(index, &query_tokens);
+
         index
             .files
             .iter()
@@ -142,6 +156,7 @@ impl MultiSignalScorer {
                     &f.relative_path,
                     index,
                     query_embedding.as_deref(),
+                    Some(&ident_ranking),
                 )
             })
             .collect()
@@ -153,6 +168,7 @@ impl MultiSignalScorer {
         file_path: &str,
         index: &CodebaseIndex,
         query_embedding: Option<&[f32]>,
+        ident_ranking: Option<&identifier::IdentifierRanking>,
     ) -> ScoredFile {
         let w = &self.weights;
         let expanded = self.expanded_tokens.as_ref();
@@ -185,8 +201,22 @@ impl MultiSignalScorer {
             + w.pagerank * pr_sig.score
             + w.embedding_similarity * emb_sig.score;
 
+        // Signal 8: identifier-level ranking (C2, ADR-0181). Applied as a
+        // boost-only multiplier (factor >= 1.0) on the weighted-sum base so a
+        // file whose identifiers match the query and conform to the conventions
+        // DNA is lifted, while no file can be demoted — keeping the D2 recall
+        // gate monotone. The factor defaults to the neutral 1.0 on the
+        // single-file scoring path (no global ranking available).
+        let ident_factor = ident_ranking.map(|r| r.factor(file_path)).unwrap_or(1.0);
+        let ident_signal = ident_ranking.map(|r| r.signal(file_path)).unwrap_or(0.0);
+        let ident_sig = SignalResult {
+            name: "identifier_rank",
+            score: ident_signal,
+            detail: format!("factor={:.3}, signal={:.3}", ident_factor, ident_signal),
+        };
+
         // Clamp to 0.0–1.0
-        let score = combined.clamp(0.0, 1.0);
+        let score = (combined * ident_factor).clamp(0.0, 1.0);
 
         let token_count = index
             .files
@@ -206,6 +236,7 @@ impl MultiSignalScorer {
                 recency_sig,
                 pr_sig,
                 emb_sig,
+                ident_sig,
             ],
             token_count,
         }
@@ -214,9 +245,10 @@ impl MultiSignalScorer {
 
 impl RelevanceScorer for MultiSignalScorer {
     fn score(&self, query: &str, file_path: &str, index: &CodebaseIndex) -> ScoredFile {
-        // Single-file scoring path: no cached embedding available.
-        // Use score_all for bulk scoring to share the query embedding across files.
-        self.score_with_embedding(query, file_path, index, None)
+        // Single-file scoring path: no cached embedding and no global identifier
+        // ranking available. Use score_all for bulk scoring to share the query
+        // embedding and the identifier-ranking pass across files.
+        self.score_with_embedding(query, file_path, index, None, None)
     }
 }
 
@@ -303,7 +335,9 @@ mod tests {
         let scorer = MultiSignalScorer::new();
         let result = scorer.score("api request handler", "src/api/mod.rs", &index);
         assert!(result.score >= 0.0 && result.score <= 1.0);
-        assert_eq!(result.signals.len(), 7);
+        // 7 weighted signals + the identifier_rank signal (C2).
+        assert_eq!(result.signals.len(), 8);
+        assert_eq!(result.signals.last().unwrap().name, "identifier_rank");
         assert_eq!(result.path, "src/api/mod.rs");
     }
 
