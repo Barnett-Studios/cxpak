@@ -14,6 +14,7 @@ pub mod onboarding;
 pub mod pagerank;
 pub mod predict;
 pub mod recent_changes;
+pub mod retrieval;
 pub mod risk;
 pub mod security;
 pub mod test_map;

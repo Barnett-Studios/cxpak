@@ -377,6 +377,39 @@ pub fn workspace_symbols(
     results
 }
 
+/// LSP methods that are strictly read-only: they only read the in-memory index
+/// and never mutate the workspace or index state. This is the `readOnly`
+/// annotation the C1 retrieval capabilities carry (ADR-0180): the standard
+/// `workspace/symbol`, the legacy `cxpak/search`, and the catalog-routed
+/// `cxpak/retrieval` (search/references/expand) are all read-only — as is every
+/// other cxpak analysis method, since cxpak never mutates code. Clients /
+/// surfaces that advertise capability metadata can use [`method_is_read_only`]
+/// to tag these safe.
+pub const READ_ONLY_METHODS: &[&str] = &[
+    "workspace/symbol",
+    "cxpak/health",
+    "cxpak/conventions",
+    "cxpak/blastRadius",
+    "cxpak/overview",
+    "cxpak/trace",
+    "cxpak/diff",
+    "cxpak/search",
+    "cxpak/apiSurface",
+    "cxpak/deadCode",
+    "cxpak/callGraph",
+    "cxpak/graph",
+    "cxpak/retrieval",
+    "cxpak/predict",
+    "cxpak/drift",
+    "cxpak/securitySurface",
+    "cxpak/dataFlow",
+];
+
+/// Whether `method` is a read-only cxpak LSP method (see [`READ_ONLY_METHODS`]).
+pub fn method_is_read_only(method: &str) -> bool {
+    READ_ONLY_METHODS.contains(&method)
+}
+
 pub fn handle_custom_method(
     method: &str,
     params: serde_json::Value,
@@ -603,6 +636,26 @@ pub fn handle_custom_method(
                 })?
                 .to_string();
             let result = crate::intelligence::graph_query::execute(&index.graph, &op, &params)
+                .map_err(|e| LspMethodError::Internal(e.to_string()))?;
+            Ok(Some(result))
+        }
+        // Deterministic iterative retrieval (cxpak 3.0.0 Task C1, ADR-0180).
+        // `params` is `{ "op": "search"|"references"|"expand", ... }`, passed
+        // straight to the single core `retrieval::execute`. This method is
+        // read-only (see `method_is_read_only`). A missing/invalid op or
+        // required param maps to JSON-RPC InternalError (-32603), matching the
+        // other required-param methods (trace/search/predict/dataFlow/graph).
+        "cxpak/retrieval" => {
+            let op = params
+                .get("op")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    LspMethodError::Internal(
+                        "cxpak/retrieval requires 'op' (search|references|expand) param".into(),
+                    )
+                })?
+                .to_string();
+            let result = crate::intelligence::retrieval::execute(index, &op, &params)
                 .map_err(|e| LspMethodError::Internal(e.to_string()))?;
             Ok(Some(result))
         }
@@ -1107,6 +1160,16 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_and_search_methods_are_annotated_read_only() {
+        // C1 readOnly annotation: the retrieval capabilities/LSP methods must
+        // carry the read-only annotation.
+        assert!(method_is_read_only("cxpak/retrieval"));
+        assert!(method_is_read_only("cxpak/search"));
+        assert!(method_is_read_only("workspace/symbol"));
+        assert!(!method_is_read_only("cxpak/nonexistent"));
+    }
+
+    #[test]
     fn all_registered_custom_methods_return_ok() {
         let index = make_test_index();
         let temp = make_git_tempdir();
@@ -1125,6 +1188,10 @@ mod tests {
             ("cxpak/apiSurface", serde_json::Value::Null),
             ("cxpak/deadCode", serde_json::Value::Null),
             ("cxpak/callGraph", serde_json::Value::Null),
+            (
+                "cxpak/retrieval",
+                serde_json::json!({"op": "search", "query": "main"}),
+            ),
             (
                 "cxpak/predict",
                 serde_json::json!({"files": ["src/main.rs"]}),
@@ -1157,6 +1224,8 @@ mod tests {
             ("cxpak/predict", serde_json::json!({"files": []})),
             ("cxpak/dataFlow", serde_json::Value::Null),
             ("cxpak/blastRadius", serde_json::Value::Null),
+            ("cxpak/retrieval", serde_json::Value::Null),
+            ("cxpak/retrieval", serde_json::json!({"op": "search"})),
         ];
         for (m, p) in cases {
             let r = handle_custom_method(m, p, &index, root);

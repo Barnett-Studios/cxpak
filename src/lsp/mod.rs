@@ -30,6 +30,7 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     .custom_method("cxpak/deadCode", CxpakLspBackend::custom_dead_code)
     .custom_method("cxpak/callGraph", CxpakLspBackend::custom_call_graph)
     .custom_method("cxpak/graph", CxpakLspBackend::custom_graph)
+    .custom_method("cxpak/retrieval", CxpakLspBackend::custom_retrieval)
     .custom_method("cxpak/predict", CxpakLspBackend::custom_predict)
     .custom_method("cxpak/drift", CxpakLspBackend::custom_drift)
     .custom_method(

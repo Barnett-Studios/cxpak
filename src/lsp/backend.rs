@@ -161,6 +161,15 @@ impl CxpakLspBackend {
         self.dispatch("cxpak/graph", params).await
     }
 
+    /// Deterministic iterative retrieval (search/references/expand) over
+    /// cxpak's own index — read-only (cxpak 3.0.0 Task C1, ADR-0180).
+    pub async fn custom_retrieval(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+        self.dispatch("cxpak/retrieval", params).await
+    }
+
     pub async fn custom_predict(
         &self,
         params: serde_json::Value,

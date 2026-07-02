@@ -197,6 +197,32 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Iterative retrieval over cxpak's own index: search, references, expand
+    Search {
+        /// Operation: search | references | expand
+        #[arg(long, default_value = "search")]
+        op: String,
+        /// Query text (`search`) or, when `--symbol` is absent, the symbol
+        /// name (`references`). Ignored by `expand`.
+        query: Option<String>,
+        /// Symbol name for `references` (overrides the positional query)
+        #[arg(long)]
+        symbol: Option<String>,
+        /// Seed node ids for `expand` (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        seeds: Vec<String>,
+        /// Hop depth for `expand`
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Maximum hits returned by `search`
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Monorepo workspace prefix (only index files under this path)
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Git integration: post-commit auto-rebuild + union-merge driver
     Hook {
         #[command(subcommand)]
@@ -650,6 +676,54 @@ mod tests {
                 assert_eq!(depth, 1);
             }
             _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn cli_search_defaults_to_search_op() {
+        let cli = Cli::try_parse_from(["cxpak", "search", "helper"])
+            .expect("should parse search with a query");
+        match cli.command {
+            Commands::Search {
+                op,
+                query,
+                limit,
+                depth,
+                path,
+                ..
+            } => {
+                assert_eq!(op, "search");
+                assert_eq!(query.as_deref(), Some("helper"));
+                assert_eq!(limit, 20);
+                assert_eq!(depth, 1);
+                assert_eq!(path, std::path::PathBuf::from("."));
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_search_expand_op_with_seeds() {
+        let cli = Cli::try_parse_from([
+            "cxpak",
+            "search",
+            "--op",
+            "expand",
+            "--seeds",
+            "src/a.rs,src/b.rs",
+            "--depth",
+            "2",
+        ])
+        .expect("should parse search expand");
+        match cli.command {
+            Commands::Search {
+                op, seeds, depth, ..
+            } => {
+                assert_eq!(op, "expand");
+                assert_eq!(seeds, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+                assert_eq!(depth, 2);
+            }
+            _ => panic!("expected Search command"),
         }
     }
 

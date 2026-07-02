@@ -571,6 +571,7 @@ fn build_v1_router(state: AppState) -> Router<AppState> {
         )
         .route("/v1/call_graph", axum::routing::post(v1_call_graph_handler))
         .route("/v1/graph", axum::routing::post(v1_graph_handler))
+        .route("/v1/retrieval", axum::routing::post(v1_retrieval_handler))
         .route("/v1/dead_code", axum::routing::post(v1_dead_code_handler))
         .route("/v1/predict", axum::routing::post(v1_predict_handler))
         .route("/v1/drift", axum::routing::post(v1_drift_handler))
@@ -1008,6 +1009,31 @@ async fn v1_graph_handler(
         )
     })?;
     crate::intelligence::graph_query::execute(&idx.graph, &op, &body)
+        .map(axum::Json)
+        .map_err(|e| v1_error(StatusCode::BAD_REQUEST, "invalid_request", e.to_string()))
+}
+
+/// Deterministic iterative retrieval over cxpak's own index (cxpak 3.0.0 Task
+/// C1, ADR-0180). Body: `{ "op": "search"|"references"|"expand", ... }`, passed
+/// straight to the single core `retrieval::execute` — the same byte-deterministic
+/// JSON the CLI/LSP/MCP surfaces return. Read-only.
+async fn v1_retrieval_handler(
+    axum::extract::State(index): axum::extract::State<SharedIndex>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let op = body
+        .get("op")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| v1_error(StatusCode::BAD_REQUEST, "missing_required_param", "op"))?
+        .to_string();
+    let idx = index.read().map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "lock poisoned",
+        )
+    })?;
+    crate::intelligence::retrieval::execute(&idx, &op, &body)
         .map(axum::Json)
         .map_err(|e| v1_error(StatusCode::BAD_REQUEST, "invalid_request", e.to_string()))
 }

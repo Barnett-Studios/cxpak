@@ -216,6 +216,7 @@ mod tests {
             intent: Intent::Context,
             inputs: &[],
             has_schema: false,
+            read_only: true,
             projections: SurfaceSet {
                 mcp: false,
                 lsp: false,

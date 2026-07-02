@@ -83,6 +83,14 @@ pub struct Capability {
     /// this capability id. When `true`, [`Capability::output_schema`] resolves
     /// it from the single source of truth.
     pub has_schema: bool,
+    /// Whether this capability is strictly read-only — it only reads and
+    /// analyses the index and never mutates the codebase or any external state.
+    /// Every cxpak capability is read-only by construction (cxpak is an analysis
+    /// tool, not a code mutator); this annotation lets surfaces that advertise
+    /// capability metadata mark them safe (e.g. the LSP retrieval methods carry
+    /// a matching read-only annotation — [`crate::lsp::methods::method_is_read_only`]).
+    /// Introduced with the C1 retrieval capability (ADR-0180).
+    pub read_only: bool,
     /// Which of the five surfaces expose this capability today.
     pub projections: SurfaceSet,
 }
@@ -168,6 +176,7 @@ fn build_catalog() -> Vec<Capability> {
         Capability {
             id: "context",
             summary: "Token-budgeted context bundle for a task (auto_context).",
+            read_only: true,
             intent: Intent::Context,
             inputs: &["task", "budget", "files"],
             has_schema: true,
@@ -184,8 +193,41 @@ fn build_catalog() -> Vec<Capability> {
             },
         },
         Capability {
+            id: "retrieval",
+            summary: "Iterative retrieval over cxpak's own index: search, references, expand.",
+            read_only: true,
+            // Retrieval rides under the Context intent (its natural home — it
+            // packs the raw material auto_context assembles). The single core
+            // `intelligence::retrieval::execute` (op ∈ search|references|expand)
+            // is projected to all four surfaces below — no re-derivation
+            // (ADR-0180; mirrors B1's `graph` capability):
+            //   * CLI  — `cxpak search <query> [--op ...]` (commands::search).
+            //   * HTTP — `POST /v1/retrieval` (serve.rs `v1_retrieval_handler`).
+            //   * LSP  — `cxpak/retrieval` custom method (lsp::methods), carrying
+            //     a read-only annotation (`method_is_read_only`).
+            //   * MCP  — selectable as `op=retrieval` under the `cxpak_context`
+            //     intent-tool emitted by the catalog adapter, keeping the budget
+            //     ≤8. The live serve.rs MCP server migrates onto the adapter in
+            //     C3 (26→8), out of scope here; the legacy regex `cxpak_search`
+            //     / `cxpak/search` / `/search` stay untouched for C3 to
+            //     reconcile.
+            // No schema yet (the retrieval contract is pinned by ADR-0180 + the
+            // determinism gate, not a 0.5 JSON schema); `visual` stays false.
+            intent: Intent::Context,
+            inputs: &["op", "query", "symbol", "seeds", "depth", "limit"],
+            has_schema: false,
+            projections: SurfaceSet {
+                mcp: true,
+                lsp: true,
+                cli: true,
+                http: true,
+                visual: false,
+            },
+        },
+        Capability {
             id: "graph",
             summary: "Query the typed dependency graph: node, neighbors, path, subgraph.",
+            read_only: true,
             intent: Intent::Graph,
             inputs: &["op", "id", "from", "to", "direction", "seeds", "depth"],
             has_schema: true,
@@ -213,6 +255,7 @@ fn build_catalog() -> Vec<Capability> {
         Capability {
             id: "data",
             summary: "Data-layer index: tables, views, ORM models, migrations.",
+            read_only: true,
             intent: Intent::Data,
             inputs: &["focus"],
             has_schema: true,
@@ -234,6 +277,7 @@ fn build_catalog() -> Vec<Capability> {
         Capability {
             id: "review",
             summary: "Review-aware diff delta (changed files, symbols, edges).",
+            read_only: true,
             intent: Intent::Review,
             inputs: &["base", "head"],
             has_schema: true,
@@ -254,6 +298,7 @@ fn build_catalog() -> Vec<Capability> {
         Capability {
             id: "health",
             summary: "Composite codebase health score across six dimensions.",
+            read_only: true,
             intent: Intent::Insight,
             inputs: &[],
             has_schema: false,
@@ -268,6 +313,7 @@ fn build_catalog() -> Vec<Capability> {
         Capability {
             id: "risks",
             summary: "Per-file risk ranking (churn × blast radius × coverage).",
+            read_only: true,
             intent: Intent::Insight,
             inputs: &[],
             has_schema: false,
@@ -282,6 +328,7 @@ fn build_catalog() -> Vec<Capability> {
         Capability {
             id: "architecture",
             summary: "Module map with circular-dependency detection.",
+            read_only: true,
             intent: Intent::Insight,
             inputs: &["module_depth"],
             has_schema: false,
@@ -364,6 +411,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_capability_is_read_only() {
+        // Invariant: cxpak is a read-only analysis tool — no capability mutates
+        // the codebase. The `read_only` annotation (added with C1, ADR-0180)
+        // must therefore be `true` for every catalog entry.
+        for cap in catalog() {
+            assert!(
+                cap.read_only,
+                "capability `{}` is not marked read_only; cxpak capabilities \
+                 must be read-only",
+                cap.id
+            );
+        }
+    }
+
+    #[test]
+    fn retrieval_capability_rides_context_on_four_surfaces() {
+        // C1: retrieval is a Context op reachable on MCP/LSP/CLI/HTTP (not
+        // visual), schema-less, and read-only.
+        let r = catalog()
+            .iter()
+            .find(|c| c.id == "retrieval")
+            .expect("retrieval capability present");
+        assert_eq!(r.intent, Intent::Context);
+        assert!(r.read_only);
+        assert!(!r.has_schema);
+        assert!(r.projections.mcp);
+        assert!(r.projections.lsp);
+        assert!(r.projections.cli);
+        assert!(r.projections.http);
+        assert!(!r.projections.visual);
+        assert_eq!(r.projections.count(), 4);
+    }
+
+    #[test]
+    fn retrieval_shares_context_intent_tool_without_growing_count() {
+        // Adding retrieval must NOT add a top-level MCP tool: it rides under
+        // the existing `cxpak_context` intent-tool as an `op`.
+        let tools = super::adapter::mcp_tools(catalog());
+        assert!(tools.len() <= 8);
+        let context_tool = tools
+            .iter()
+            .find(|t| t.name == "cxpak_context")
+            .expect("cxpak_context intent-tool present");
+        assert!(
+            context_tool.ops.iter().any(|op| op == "retrieval"),
+            "retrieval must be selectable as an op under cxpak_context; ops={:?}",
+            context_tool.ops
+        );
     }
 
     #[test]

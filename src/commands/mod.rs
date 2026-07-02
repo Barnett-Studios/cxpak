@@ -10,6 +10,7 @@ pub mod overview;
 #[cfg(feature = "plugins")]
 pub mod plugin;
 pub mod schema;
+pub mod search;
 #[cfg(feature = "daemon")]
 pub mod serve;
 pub mod trace;
