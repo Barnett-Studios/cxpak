@@ -14,7 +14,15 @@ use std::path::Path;
 /// would carry `Extracted` regardless of their true confidence.  Bumping the
 /// version forces a clean rebuild so every edge gets the correct value from
 /// `EdgeType::default_confidence()`.
-pub const CACHE_VERSION: u32 = 5;
+///
+/// Bumped 5→6 in Task B3d (ADR-0179) because `DerivedCache` gained a
+/// `base_commit: Option<String>` — the git HEAD SHA the cached derived
+/// analysis was built at.  A stale v5 derived.json would deserialize
+/// successfully (the field has `serde(default)` → `None`) but the post-commit
+/// edge-delta path treats a `None` base as "unverified" and falls back to a
+/// full rebuild anyway; bumping forces a clean rebuild once so every cache is
+/// re-stamped with a real base_commit (fail-closed).
+pub const CACHE_VERSION: u32 = 6;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileCache {
@@ -372,11 +380,30 @@ pub struct DerivedCache {
     pub pagerank: HashMap<String, f64>,
     pub conventions: crate::conventions::ConventionProfile,
     pub co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
+    /// Git HEAD SHA (full oid, hex) the cached derived analysis was built at,
+    /// or `None` when the build happened outside a git repo / on an unborn HEAD.
+    ///
+    /// This is the anchor for the SAFE post-commit edge-delta (ADR-0179): the
+    /// delta may be applied onto this cache's `graph` **only** if
+    /// `base_commit == parent(HEAD)` at post-commit time — i.e. the cache
+    /// reflects exactly the tree state before the new commit. Every other case
+    /// (absent/`None`, mismatched, >1 commit behind, or any load failure) falls
+    /// back to a full rebuild. `#[serde(default)]` so a pre-v6 cache
+    /// deserializes to `None` (which the delta path treats as unverified →
+    /// full rebuild); the `CACHE_VERSION` bump invalidates such caches anyway.
+    #[serde(default)]
+    pub base_commit: Option<String>,
 }
 
 impl DerivedCache {
     /// Construct a derived cache stamped with the current `CACHE_VERSION` and
     /// grammar hash, ready to [`save`](Self::save).
+    ///
+    /// `base_commit` is the git HEAD SHA the derived analysis was built at
+    /// (`None` outside a git repo / unborn HEAD). Stamping it at every write
+    /// site — including an interleaved `overview`/`serve` build between commits —
+    /// keeps the recorded base current, so the next post-commit's edge-delta can
+    /// still validate against it (see [`DerivedCache::base_commit`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         fingerprint: String,
@@ -385,6 +412,7 @@ impl DerivedCache {
         pagerank: HashMap<String, f64>,
         conventions: crate::conventions::ConventionProfile,
         co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
+        base_commit: Option<String>,
     ) -> Self {
         Self {
             version: CACHE_VERSION,
@@ -395,6 +423,7 @@ impl DerivedCache {
             pagerank,
             conventions,
             co_changes,
+            base_commit,
         }
     }
 
@@ -411,6 +440,29 @@ impl DerivedCache {
             && cache.grammar_hash == CURRENT_GRAMMAR_HASH
             && cache.fingerprint == fingerprint
         {
+            Some(cache)
+        } else {
+            None
+        }
+    }
+
+    /// Load the derived cache for use as an edge-delta BASE, validating only the
+    /// structural compatibility gates (`version` + `grammar_hash`) and **not**
+    /// the content `fingerprint`.
+    ///
+    /// The post-commit rebuild (ADR-0179) needs the graph as it stood *before*
+    /// the new commit, whose content fingerprint necessarily differs from the
+    /// post-commit tree — so the fingerprint gate must be skipped here. Safety
+    /// is instead enforced by the caller: apply the delta only if
+    /// `base_commit == parent(HEAD)`. Grammar/version are still validated so a
+    /// stale-schema graph is never deltaed onto (fail-closed → full rebuild).
+    /// Returns `None` on any error or version/grammar mismatch.
+    pub fn load_for_delta(cache_dir: &Path) -> Option<Self> {
+        let path = cache_dir.join("derived.json");
+        let _lock = lock_cache(cache_dir).ok();
+        let content = std::fs::read_to_string(&path).ok()?;
+        let cache: DerivedCache = serde_json::from_str(&content).ok()?;
+        if cache.version == CACHE_VERSION && cache.grammar_hash == CURRENT_GRAMMAR_HASH {
             Some(cache)
         } else {
             None
@@ -729,6 +781,7 @@ mod tests {
             pagerank,
             crate::conventions::ConventionProfile::default(),
             Vec::new(),
+            Some("base-commit-sha".to_string()),
         )
     }
 
@@ -814,6 +867,69 @@ mod tests {
         });
         std::fs::write(dir.path().join("derived.json"), stale.to_string()).unwrap();
         assert!(DerivedCache::load(dir.path(), "fp-abc").is_none());
+    }
+
+    #[test]
+    fn derived_cache_roundtrips_base_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_derived("fp-abc").save(dir.path()).unwrap();
+        let loaded = DerivedCache::load(dir.path(), "fp-abc").expect("hit");
+        assert_eq!(loaded.base_commit.as_deref(), Some("base-commit-sha"));
+    }
+
+    #[test]
+    fn load_for_delta_ignores_fingerprint_but_keeps_grammar_version() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_derived("fp-abc").save(dir.path()).unwrap();
+        // Fingerprint-gated load with a DIFFERENT fingerprint misses...
+        assert!(DerivedCache::load(dir.path(), "fp-does-not-match").is_none());
+        // ...but load_for_delta returns it regardless of fingerprint, carrying
+        // the base_commit the delta path validates against.
+        let delta =
+            DerivedCache::load_for_delta(dir.path()).expect("delta load ignores fingerprint");
+        assert_eq!(delta.base_commit.as_deref(), Some("base-commit-sha"));
+    }
+
+    #[test]
+    fn load_for_delta_fails_closed_on_grammar_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = serde_json::json!({
+            "version": CACHE_VERSION,
+            "grammar_hash": "stale-grammar",
+            "fingerprint": "fp-abc",
+            "graph": { "edges": {}, "reverse_edges": {} },
+            "call_graph": crate::intelligence::call_graph::CallGraph::default(),
+            "pagerank": {},
+            "conventions": crate::conventions::ConventionProfile::default(),
+            "co_changes": [],
+            "base_commit": "sha",
+        });
+        std::fs::write(dir.path().join("derived.json"), stale.to_string()).unwrap();
+        assert!(DerivedCache::load_for_delta(dir.path()).is_none());
+    }
+
+    #[test]
+    fn load_for_delta_missing_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(DerivedCache::load_for_delta(dir.path()).is_none());
+    }
+
+    #[test]
+    fn derived_cache_pre_v6_base_commit_defaults_to_none() {
+        // A cache JSON written before base_commit existed must deserialize
+        // (serde default → None) rather than error.
+        let json = serde_json::json!({
+            "version": CACHE_VERSION,
+            "grammar_hash": CURRENT_GRAMMAR_HASH,
+            "fingerprint": "fp-abc",
+            "graph": { "edges": {}, "reverse_edges": {} },
+            "call_graph": crate::intelligence::call_graph::CallGraph::default(),
+            "pagerank": {},
+            "conventions": crate::conventions::ConventionProfile::default(),
+            "co_changes": [],
+        });
+        let cache: DerivedCache = serde_json::from_str(&json.to_string()).unwrap();
+        assert!(cache.base_commit.is_none());
     }
 
     #[test]

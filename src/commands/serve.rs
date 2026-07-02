@@ -232,6 +232,14 @@ pub fn build_index_with_workspace(
         None => {
             index.conventions = crate::conventions::build_convention_profile(&index, path);
             index.co_changes = index.conventions.git_health.co_changes.clone();
+            // Stamp the HEAD SHA this analysis was built at so the next
+            // post-commit edge-delta can validate its base (ADR-0179). An
+            // empty oid (no git repo / unborn HEAD) is recorded as `None`.
+            let base_commit = if head_oid.is_empty() {
+                None
+            } else {
+                Some(head_oid.clone())
+            };
             let derived = crate::cache::DerivedCache::new(
                 fingerprint,
                 index.graph.clone(),
@@ -239,6 +247,7 @@ pub fn build_index_with_workspace(
                 index.pagerank.clone(),
                 index.conventions.clone(),
                 index.co_changes.clone(),
+                base_commit,
             );
             // Persisting is best-effort; a write failure must not fail indexing.
             let _ = derived.save(&cache_dir);
@@ -250,7 +259,11 @@ pub fn build_index_with_workspace(
 /// Current git HEAD commit oid as a hex string, or `""` when `path` is not a
 /// git repository / has no commits. Part of the derived-cache fingerprint so a
 /// HEAD move invalidates history-derived data (conventions, co-changes).
-fn git_head_oid(path: &Path) -> String {
+///
+/// Public so the post-commit rebuild (`commands::hook`) computes the SAME
+/// content fingerprint as `build_index`, keeping the shared derived cache it
+/// writes a valid warm hit for a later `overview` (ADR-0179).
+pub fn git_head_oid(path: &Path) -> String {
     let Ok(repo) = git2::Repository::discover(path) else {
         return String::new();
     };

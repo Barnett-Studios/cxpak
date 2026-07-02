@@ -167,23 +167,141 @@ pub fn changed_paths_in_head(
 // Artifact build + write
 // ---------------------------------------------------------------------------
 
-/// Build the canonical artifact string for the repo's current working tree.
+/// Which rebuild path produced the artifact — surfaced so tests can assert the
+/// SAFE edge-delta actually ran (or correctly fell back) rather than silently
+/// doing a full rebuild.
 ///
-/// Reuses the standard pipeline (scanner → `parse_with_cache` → `build_with_content`
-/// → `build_dependency_graph`). The persisted parse cache means only files
-/// changed since the last build are re-parsed, which is what keeps the
-/// post-commit path fast across processes.
-fn build_artifact(repo_path: &Path) -> Result<String, Box<dyn Error>> {
+/// `Delta` means the persisted derived cache's `base_commit` matched
+/// `parent(HEAD)`, so the commit's changed/removed set was applied onto the
+/// cached graph via `rebuild_graph_delta` + warm-started PageRank. `Full` means
+/// no such validated base existed and the freshly built full-tree graph stood.
+/// In BOTH cases the serialized artifact is byte-identical to a full rebuild —
+/// delta is purely a speed optimization (ADR-0179).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RebuildKind {
+    Delta,
+    Full,
+}
+
+/// The full oid of `parent(HEAD)` as a hex string, or `None` for the initial
+/// commit / unborn HEAD / any error. The edge-delta base validation compares
+/// the cache's `base_commit` against this.
+fn head_parent_oid(repo: &git2::Repository) -> Option<String> {
+    let head_commit = repo.head().ok()?.peel_to_commit().ok()?;
+    let parent = head_commit.parent(0).ok()?;
+    Some(parent.id().to_string())
+}
+
+/// Build the canonical artifact string for the repo's current working tree,
+/// using a SAFE base-SHA-validated edge-delta when possible (ADR-0179).
+///
+/// The working tree is parsed once (parse-cache accelerated) into a full HEAD
+/// index. If the persisted derived cache was built at exactly `parent(HEAD)`
+/// (`base_commit == parent(HEAD)`), the commit's changed/removed set is applied
+/// onto the cached prior graph via `rebuild_graph_delta` + warm-started
+/// PageRank — the SAME machinery `serve.rs`'s watcher uses — which is
+/// bit-identical to a full rebuild (ADR-0166) while doing work proportional to
+/// the change. In every other case (no prior, `base_commit` absent/`None`,
+/// mismatched base — i.e. the cache is >1 commit behind / on another branch /
+/// post-rebase — or a grammar/version bump) the freshly built full-tree graph
+/// stands. Either way the artifact is byte-identical to a full rebuild.
+///
+/// A fully-valid derived cache stamped `base_commit = HEAD` is then persisted so
+/// (a) a subsequent `cxpak overview` gets a warm cache hit and (b) the NEXT
+/// commit's post-commit has a validated delta base.
+fn build_artifact(repo_path: &Path) -> Result<(String, RebuildKind), Box<dyn Error>> {
     let counter = TokenCounter::new();
     let scanner = Scanner::new(repo_path)?;
     let files = scanner.scan()?;
     if files.is_empty() {
-        return Ok(String::new());
+        return Ok((String::new(), RebuildKind::Full));
     }
     let (parse_results, content_map) =
         crate::cache::parse::parse_with_cache(&files, repo_path, &counter, false);
-    let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
-    Ok(serialize_graph_canonical(&index.graph))
+    let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+
+    // Resolve the commit's changed/removed set and parent oid. A repo that
+    // won't open, or an unborn/parentless HEAD, yields no validated base → the
+    // full-tree graph already in `index` stands.
+    let repo = git2::Repository::open(repo_path).ok();
+    let (changed, removed, parent_oid) = match repo.as_ref() {
+        Some(r) => {
+            let (changed, removed) = changed_paths_in_head(r).unwrap_or_default();
+            (changed, removed, head_parent_oid(r))
+        }
+        None => (HashSet::new(), HashSet::new(), None),
+    };
+
+    let cache_dir = repo_path.join(crate::commands::serve::cache_namespace(repo_path, None));
+
+    // THE CORRECTNESS INVARIANT: apply the delta ONLY IF the cached graph was
+    // built at exactly `parent(HEAD)`. `load_for_delta` deliberately skips the
+    // content-fingerprint gate (the post-commit tree's fingerprint necessarily
+    // differs from the base's); base-SHA equality is what makes the delta safe.
+    let kind = match (
+        parent_oid.as_deref(),
+        crate::cache::DerivedCache::load_for_delta(&cache_dir),
+    ) {
+        (Some(parent), Some(prior)) if prior.base_commit.as_deref() == Some(parent) => {
+            // Reset the graph to the validated prior base and drive it forward
+            // by the commit's delta, warm-starting PageRank from the prior
+            // ranks (bit-identical to a cold recompute — tests/parity.rs).
+            // rebuild_graph_delta falls back internally to a full rebuild on a
+            // structural (add/remove) or schema change, so the result always
+            // equals a full rebuild of the HEAD tree.
+            let prior_pagerank = prior.pagerank;
+            index.graph = prior.graph;
+            index.rebuild_graph_delta(&changed, &removed);
+            index.pagerank = crate::intelligence::pagerank::compute_pagerank_seeded(
+                &index.graph,
+                0.85,
+                100,
+                &prior_pagerank,
+            );
+            RebuildKind::Delta
+        }
+        _ => RebuildKind::Full,
+    };
+
+    persist_derived_cache(repo_path, &cache_dir, &mut index);
+    Ok((serialize_graph_canonical(&index.graph), kind))
+}
+
+/// Persist a fully-valid shared derived cache (ADR-0167 schema) stamped with the
+/// current HEAD, so a later `overview` gets a warm hit and the next commit's
+/// post-commit has a validated edge-delta base.
+///
+/// Conventions + co-changes are mined here so the cache is a SAFE fingerprint
+/// hit for `overview` (a partial cache would serve empty conventions). The
+/// fingerprint is computed exactly as `build_index` does (content + HEAD oid),
+/// guaranteeing the hit. Best-effort: a write failure never fails the hook.
+fn persist_derived_cache(repo_path: &Path, cache_dir: &Path, index: &mut CodebaseIndex) {
+    index.conventions = crate::conventions::build_convention_profile(index, repo_path);
+    index.co_changes = index.conventions.git_health.co_changes.clone();
+
+    let head_oid = crate::commands::serve::git_head_oid(repo_path);
+    let fp_files: Vec<(String, String)> = index
+        .files
+        .iter()
+        .map(|f| (f.relative_path.clone(), f.content.clone()))
+        .collect();
+    let fingerprint = crate::cache::content_fingerprint(&fp_files, &head_oid);
+    let base_commit = if head_oid.is_empty() {
+        None
+    } else {
+        Some(head_oid)
+    };
+
+    let derived = crate::cache::DerivedCache::new(
+        fingerprint,
+        index.graph.clone(),
+        index.call_graph.clone(),
+        index.pagerank.clone(),
+        index.conventions.clone(),
+        index.co_changes.clone(),
+        base_commit,
+    );
+    let _ = derived.save(cache_dir);
 }
 
 /// Atomically write the canonical artifact under `.cxpak/` (write-tmp-then-rename
@@ -231,7 +349,7 @@ fn run_post_commit(path: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    let artifact = build_artifact(path)?;
+    let (artifact, _kind) = build_artifact(path)?;
     write_artifact(path, &artifact)?;
     eprintln!("cxpak: regenerated {ARTIFACT_REL}");
     Ok(())
@@ -373,8 +491,9 @@ mod tests {
     }
 
     /// Commit every current working-tree file under `dir` as a single commit,
-    /// returning the opened repo. LOCAL git2 only, explicit paths, no cwd use.
-    fn commit_all(repo: &git2::Repository) {
+    /// returning the new commit's full oid (hex). LOCAL git2 only, explicit
+    /// paths, no cwd use.
+    fn commit_all(repo: &git2::Repository) -> String {
         let mut index = repo.index().unwrap();
         index
             .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
@@ -390,7 +509,245 @@ mod tests {
             };
         let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parent_refs)
-            .unwrap();
+            .unwrap()
+            .to_string()
+    }
+
+    /// Repo-relative cache dir the post-commit derived cache is written to.
+    fn cache_dir_of(dir: &Path) -> std::path::PathBuf {
+        dir.join(crate::commands::serve::cache_namespace(dir, None))
+    }
+
+    /// Overwrite the persisted derived cache's `base_commit` in place (loads it
+    /// non-fingerprint-gated, mutates, re-saves) so tests can drive the exact
+    /// base-SHA the delta path validates against.
+    fn set_cache_base_commit(dir: &Path, base: Option<&str>) {
+        let cache_dir = cache_dir_of(dir);
+        let mut prior = crate::cache::DerivedCache::load_for_delta(&cache_dir)
+            .expect("a derived cache must already exist");
+        prior.base_commit = base.map(|s| s.to_string());
+        prior.save(&cache_dir).unwrap();
+    }
+
+    /// Content+HEAD fingerprint of the working tree, computed exactly as
+    /// `build_index` does, to prove the post-commit-warmed cache is a valid
+    /// fingerprint-gated hit.
+    fn head_fingerprint(dir: &Path) -> String {
+        let scanner = Scanner::new(dir).unwrap();
+        let files = scanner.scan().unwrap();
+        let pairs: Vec<(String, String)> = files
+            .iter()
+            .map(|f| {
+                (
+                    f.relative_path.clone(),
+                    std::fs::read_to_string(&f.absolute_path).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let head_oid = crate::commands::serve::git_head_oid(dir);
+        crate::cache::content_fingerprint(&pairs, &head_oid)
+    }
+
+    /// Initialise a two-file repo (a.rs imports b.rs) and commit it, returning
+    /// (repo, first-commit-oid). a.rs is a real graph node so the subsequent
+    /// per-file edge-delta exercises the true delta path (not the internal
+    /// structural fallback).
+    fn init_two_file_repo(dir: &Path) -> (git2::Repository, String) {
+        let repo = git2::Repository::init(dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "use crate::b;\npub fn a() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "pub fn b() {}\n").unwrap();
+        let c1 = commit_all(&repo);
+        (repo, c1)
+    }
+
+    // --- TDD: SAFE base-SHA-validated edge-delta (ADR-0179) -------------------
+
+    /// Base matches parent(HEAD) → the DELTA path runs AND the artifact is
+    /// byte-identical to a full rebuild.
+    #[test]
+    fn post_commit_delta_taken_when_base_matches_and_equals_full() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (repo, _c1) = init_two_file_repo(dir.path());
+
+        // Warm the cache at commit1 (Full — commit1 has no parent).
+        let (_a, kind1) = build_artifact(dir.path()).unwrap();
+        assert_eq!(kind1, RebuildKind::Full, "first build has no parent → Full");
+
+        // Content-only change to a.rs, keeping the import edge, then commit2.
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "use crate::b;\npub fn a() {}\npub fn a2() {}\n",
+        )
+        .unwrap();
+        commit_all(&repo);
+
+        // Cache base_commit (commit1) == parent(HEAD) (commit1) → DELTA.
+        let (artifact, kind) = build_artifact(dir.path()).unwrap();
+        assert_eq!(
+            kind,
+            RebuildKind::Delta,
+            "base matches parent(HEAD) → Delta"
+        );
+        assert_eq!(
+            artifact,
+            full_artifact(dir.path()),
+            "delta artifact must be byte-identical to a full rebuild"
+        );
+    }
+
+    /// No prior cache → full rebuild (still correct artifact).
+    #[test]
+    fn post_commit_falls_back_to_full_when_no_prior_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (repo, _c1) = init_two_file_repo(dir.path());
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "use crate::b;\npub fn a() {}\n// x\n",
+        )
+        .unwrap();
+        commit_all(&repo);
+
+        // No build_artifact ran before → no derived cache to delta from.
+        assert!(!cache_dir_of(dir.path()).join("derived.json").exists());
+        let (artifact, kind) = build_artifact(dir.path()).unwrap();
+        assert_eq!(kind, RebuildKind::Full, "no prior cache → Full");
+        assert_eq!(artifact, full_artifact(dir.path()));
+    }
+
+    /// Prior `base_commit == None` → full rebuild (never delta onto an
+    /// unverified base).
+    #[test]
+    fn post_commit_falls_back_to_full_when_base_is_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (repo, _c1) = init_two_file_repo(dir.path());
+        build_artifact(dir.path()).unwrap(); // warm cache at commit1
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "use crate::b;\npub fn a() {}\npub fn a2() {}\n",
+        )
+        .unwrap();
+        commit_all(&repo);
+
+        set_cache_base_commit(dir.path(), None); // erase the base
+
+        let (artifact, kind) = build_artifact(dir.path()).unwrap();
+        assert_eq!(kind, RebuildKind::Full, "base_commit None → Full");
+        assert_eq!(artifact, full_artifact(dir.path()));
+    }
+
+    /// CORRUPTION GUARD: prior cache is 2+ commits behind
+    /// (`base_commit != parent(HEAD)`) → full rebuild. Deltaing this commit's
+    /// changed set onto a graph two commits stale would silently corrupt the
+    /// artifact; this is the single most important safety case.
+    #[test]
+    fn post_commit_falls_back_to_full_when_base_is_two_commits_behind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (repo, _c1) = init_two_file_repo(dir.path());
+        build_artifact(dir.path()).unwrap(); // cache base = commit1
+
+        // Two further commits WITHOUT refreshing the cache.
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "use crate::b;\npub fn a() {}\n// c2\n",
+        )
+        .unwrap();
+        commit_all(&repo); // commit2
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "use crate::b;\npub fn a() {}\n// c3\n",
+        )
+        .unwrap();
+        commit_all(&repo); // commit3; parent(HEAD)=commit2, cache base=commit1
+
+        let (artifact, kind) = build_artifact(dir.path()).unwrap();
+        assert_eq!(
+            kind,
+            RebuildKind::Full,
+            "cache is 2 commits behind → base != parent(HEAD) → Full"
+        );
+        assert_eq!(
+            artifact,
+            full_artifact(dir.path()),
+            "corruption guard: stale-base fallback must still equal a full rebuild"
+        );
+    }
+
+    /// A version/grammar bump (old cache) → `load_for_delta` rejects it → full
+    /// rebuild.
+    #[test]
+    fn post_commit_falls_back_to_full_on_version_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (repo, _c1) = init_two_file_repo(dir.path());
+        build_artifact(dir.path()).unwrap(); // warm cache at commit1
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "use crate::b;\npub fn a() {}\npub fn a2() {}\n",
+        )
+        .unwrap();
+        commit_all(&repo);
+
+        // Downgrade the persisted cache version so load_for_delta rejects it.
+        let cache_dir = cache_dir_of(dir.path());
+        let path = cache_dir.join("derived.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["version"] = serde_json::json!(5);
+        std::fs::write(&path, v.to_string()).unwrap();
+
+        let (artifact, kind) = build_artifact(dir.path()).unwrap();
+        assert_eq!(kind, RebuildKind::Full, "stale cache version → Full");
+        assert_eq!(artifact, full_artifact(dir.path()));
+    }
+
+    /// After post_commit, the shared derived cache is a valid fingerprint-gated
+    /// HIT for the new tree — proving the cross-process cache warming a later
+    /// `overview` relies on.
+    #[test]
+    fn post_commit_warms_fingerprint_gated_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (repo, _c1) = init_two_file_repo(dir.path());
+        build_artifact(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "use crate::b;\npub fn a() {}\npub fn a2() {}\n",
+        )
+        .unwrap();
+        commit_all(&repo);
+
+        // Run the real entry point (best-effort) then assert a fingerprint hit.
+        post_commit(dir.path()).unwrap();
+        let fp = head_fingerprint(dir.path());
+        assert!(
+            crate::cache::DerivedCache::load(&cache_dir_of(dir.path()), &fp).is_some(),
+            "post_commit must warm a fingerprint-gated cache hit for the new tree"
+        );
+    }
+
+    /// Determinism: the DELTA artifact is byte-stable across repeated runs at the
+    /// same HEAD (and equals a full rebuild).
+    #[test]
+    fn post_commit_delta_artifact_is_deterministic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (repo, c1) = init_two_file_repo(dir.path());
+        build_artifact(dir.path()).unwrap(); // base = commit1
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "use crate::b;\npub fn a() {}\npub fn a2() {}\n",
+        )
+        .unwrap();
+        commit_all(&repo); // parent(HEAD) = commit1
+
+        let (artifact1, kind1) = build_artifact(dir.path()).unwrap();
+        assert_eq!(kind1, RebuildKind::Delta);
+
+        // build_artifact re-stamped base = commit2; reset it to commit1 so the
+        // second run also takes the delta path, then compare bytes.
+        set_cache_base_commit(dir.path(), Some(&c1));
+        let (artifact2, kind2) = build_artifact(dir.path()).unwrap();
+        assert_eq!(kind2, RebuildKind::Delta);
+
+        assert_eq!(artifact1, artifact2, "delta artifact must be byte-stable");
+        assert_eq!(artifact1, full_artifact(dir.path()));
     }
 
     // --- TDD headline test 1: post-commit incremental == full ----------------
