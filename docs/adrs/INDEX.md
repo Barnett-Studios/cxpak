@@ -1,6 +1,6 @@
 # ADR Index
 
-177 architecture decision records. 0001–0162 reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1); 0163 onward written at decision time. See [README](./README.md) for methodology.
+178 architecture decision records. 0001–0162 reconstructed retroactively from internal design docs and shipped code (v0.1.0 → v2.2.1); 0163 onward written at decision time. See [README](./README.md) for methodology.
 
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
@@ -181,3 +181,4 @@
 | [0175](0175-surface-edge-confidence-in-outputs.md) | Surface `EdgeConfidence`: tag only `Inferred` edges (`, inferred`) across overview/trace/auto_context renderings + an `INFORMATION` LSP diagnostic; canonical `EdgeType::label()` | ACCEPTED | 2026-06-30 |
 | [0176](0176-graph-query-capability-four-surfaces.md) | Deterministic graph-query (node/neighbors/path/subgraph) from one `intelligence::graph_query` core, projected to CLI/HTTP/LSP live + MCP via catalog adapter (≤8); lex-min shortest-path tiebreak | ACCEPTED | 2026-06-30 |
 | [0177](0177-cypher-graphml-graph-export.md) | Cypher + GraphML dependency-graph export: serialize `DependencyGraph` directly (honest `EdgeType`+`EdgeConfidence`), idempotent `MERGE` + fixed `:DEPENDS_ON`, reuse `xml_escape`, no new deps, no live Neo4j (validity via structural+escaping+determinism asserts) | ACCEPTED | 2026-06-30 |
+| [0178](0178-post-commit-rebuild-union-merge-driver.md) | Post-commit auto-rebuild + union-merge driver via `cxpak hook`: line-oriented committable `.cxpak/graph.edges`, best-effort non-fatal post-commit (exit 0, `CXPAK_NO_HOOK`), commutative union merge driver, idempotent install into target repo only; reuses parse cache + asserts incremental==full | ACCEPTED | 2026-06-30 |

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Post-commit wrapper: regenerate cxpak's canonical graph artifact after a
+# commit. BEST-EFFORT — this runs inside the user's git workflow and must NEVER
+# break it, so every failure (binary missing, rebuild error) is swallowed and
+# the script always exits 0.
+set -uo pipefail
+
+# Honour the opt-out used by the cxpak hook subcommand itself.
+if [ -n "${CXPAK_NO_HOOK:-}" ]; then
+    exit 0
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CXPAK="$("${SCRIPT_DIR}/ensure-cxpak" 2>/dev/null)" || exit 0
+[ -x "$CXPAK" ] || exit 0
+
+# The "." path resolves to the repo root via git inside the subcommand.
+# `|| true` is belt-and-braces; the subcommand already exits 0 on internal
+# failure.
+"$CXPAK" hook post-commit "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || true
+exit 0

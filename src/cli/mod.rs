@@ -197,6 +197,11 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Git integration: post-commit auto-rebuild + union-merge driver
+    Hook {
+        #[command(subcommand)]
+        subcommand: HookSubcommand,
+    },
     /// Trace from error/function, pack relevant code paths
     Trace {
         #[arg(long, default_value = "50k")]
@@ -221,6 +226,29 @@ pub enum Commands {
         target: String,
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HookSubcommand {
+    /// Wire the post-commit hook + union merge driver into the target repo (idempotent)
+    Install {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Regenerate the canonical graph artifact after a commit (best-effort, never fatal)
+    PostCommit {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// git merge driver: union-resolve a conflict in the canonical artifact (%O %A %B)
+    MergeDriver {
+        /// Common ancestor version (%O)
+        ancestor: PathBuf,
+        /// Current/ours version (%A) — the merged result is written here
+        current: PathBuf,
+        /// Other/theirs version (%B)
+        other: PathBuf,
     },
 }
 

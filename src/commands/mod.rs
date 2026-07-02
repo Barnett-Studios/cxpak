@@ -3,6 +3,7 @@ pub mod clean;
 pub mod conventions;
 pub mod diff;
 pub mod graph;
+pub mod hook;
 #[cfg(feature = "visual")]
 pub mod onboard;
 pub mod overview;

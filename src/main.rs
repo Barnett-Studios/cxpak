@@ -188,6 +188,15 @@ fn main() {
             *depth,
             workspace.as_deref(),
         ),
+        Commands::Hook { subcommand } => match subcommand {
+            cxpak::cli::HookSubcommand::Install { path } => commands::hook::install(path),
+            cxpak::cli::HookSubcommand::PostCommit { path } => commands::hook::post_commit(path),
+            cxpak::cli::HookSubcommand::MergeDriver {
+                ancestor,
+                current,
+                other,
+            } => commands::hook::merge_driver(ancestor, current, other),
+        },
         Commands::Trace {
             tokens,
             out,
