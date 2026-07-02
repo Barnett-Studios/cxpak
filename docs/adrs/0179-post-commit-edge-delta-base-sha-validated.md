@@ -89,6 +89,33 @@ default.
   exact base match and `RebuildKind::Full` in every other case. `RebuildKind` is
   returned so tests assert which path ran (a silent full is a test failure).
 
+### Amendment (2026-07-02): base SHA alone is insufficient — the tree must also be clean
+
+The original invariant reasoned about **commits** but the artifact is built from
+the **working tree**. `base_commit == parent(HEAD)` certifies the *commit*, not
+that the cached graph was built from the *clean committed tree*. Two silent-
+corruption holes followed, both now closed:
+
+- **Stamp truthfully.** `base_commit = Some(HEAD)` must mean "graph == committed
+  tree at this SHA". Since `overview`/`auto_context` routinely run on a **dirty**
+  tree (CLAUDE.md mandates `auto_context` before every edit), stamping HEAD there
+  would mislabel a graph built from uncommitted content as the clean base,
+  letting a later commit delta onto it. Every `DerivedCache` write site
+  (`serve::build_index_with_workspace` cache-miss, `hook::persist_derived_cache`)
+  now stamps `Some(HEAD)` **only when the working tree is clean vs HEAD**, else
+  `None`.
+- **Gate the delta on a clean tree.** `hook::build_artifact` takes the delta path
+  only when the working tree is clean vs HEAD **in addition to**
+  `base_commit == parent(HEAD)`. When clean, `index.files == HEAD` tree, so
+  `diff(parent, HEAD)` is exactly the set differing from a clean parent base →
+  delta == full. A partial commit that leaves *other* files dirty (their edges
+  changed but absent from this commit's diff) now falls back to Full.
+
+Cleanliness is `git status` with untracked + ignored excluded (only tracked
+modifications/staged/deletions count as dirty); any status error degrades to
+"dirty"/`None`/Full, never breaking the best-effort hook. `working_tree_clean`
+in `serve.rs` is the single helper both call sites use.
+
 ### The "delta never changes output" guarantee
 
 `rebuild_graph_delta` is bit-identical to a full `rebuild_graph` (ADR-0166) and

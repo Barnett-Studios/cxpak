@@ -233,12 +233,21 @@ pub fn build_index_with_workspace(
             index.conventions = crate::conventions::build_convention_profile(&index, path);
             index.co_changes = index.conventions.git_health.co_changes.clone();
             // Stamp the HEAD SHA this analysis was built at so the next
-            // post-commit edge-delta can validate its base (ADR-0179). An
-            // empty oid (no git repo / unborn HEAD) is recorded as `None`.
+            // post-commit edge-delta can validate its base (ADR-0179). The stamp
+            // means "graph == committed tree at this SHA", so it is recorded ONLY
+            // when the working tree is CLEAN vs HEAD. `overview`/`auto_context`
+            // routinely run on a dirty tree (uncommitted edits); stamping HEAD
+            // there would mislabel a graph built from uncommitted content as the
+            // clean base, letting a later commit delta onto it (silent
+            // corruption). An empty oid (no git repo / unborn HEAD), a dirty tree,
+            // or any status error → `None`.
             let base_commit = if head_oid.is_empty() {
                 None
             } else {
-                Some(head_oid.clone())
+                match git2::Repository::discover(path) {
+                    Ok(repo) if working_tree_clean(&repo) => Some(head_oid.clone()),
+                    _ => None,
+                }
             };
             let derived = crate::cache::DerivedCache::new(
                 fingerprint,
@@ -272,6 +281,27 @@ pub fn git_head_oid(path: &Path) -> String {
         .and_then(|head| head.target())
         .map(|oid| oid.to_string())
         .unwrap_or_default()
+}
+
+/// Whether the repo's working tree is CLEAN versus HEAD — i.e. no tracked-file
+/// modifications, staged changes, or deletions. Untracked and ignored files are
+/// deliberately excluded (a new scratch file does not make the committed tree
+/// stale). Any status error degrades to "dirty" (`false`), fail-closed.
+///
+/// This is the truth condition behind a `base_commit = Some(HEAD)` stamp: the
+/// stamp promises "graph == committed tree at this SHA", which only holds when
+/// the working tree the graph was built from equals HEAD's tree (ADR-0179).
+pub(crate) fn working_tree_clean(repo: &git2::Repository) -> bool {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    match repo.statuses(Some(&mut opts)) {
+        // With untracked + ignored excluded, any remaining entry is a tracked
+        // modification/staged/deleted change → the tree differs from HEAD.
+        Ok(statuses) => statuses.iter().all(|entry| entry.status().is_empty()),
+        Err(_) => false,
+    }
 }
 
 /// Returns a cache directory name scoped to the given workspace.

@@ -234,15 +234,31 @@ fn build_artifact(repo_path: &Path) -> Result<(String, RebuildKind), Box<dyn Err
 
     let cache_dir = repo_path.join(crate::commands::serve::cache_namespace(repo_path, None));
 
+    // The delta is applied from `diff(parent, HEAD)`, but the artifact is built
+    // from the WORKING TREE (`index`). Those only agree when the working tree is
+    // CLEAN vs HEAD: then `index.files == HEAD` tree and the commit's diff is
+    // exactly the set differing from a clean parent base → delta == full. If the
+    // tree is dirty (e.g. a partial commit left another file's edges changed but
+    // NOT in this commit's diff), the delta would keep the base graph's edges for
+    // that file while a full rebuild reflects the dirty content → the committed
+    // artifact would silently diverge. A status error degrades to "dirty" (Full).
+    let tree_clean = repo
+        .as_ref()
+        .map(crate::commands::serve::working_tree_clean)
+        .unwrap_or(false);
+
     // THE CORRECTNESS INVARIANT: apply the delta ONLY IF the cached graph was
-    // built at exactly `parent(HEAD)`. `load_for_delta` deliberately skips the
-    // content-fingerprint gate (the post-commit tree's fingerprint necessarily
-    // differs from the base's); base-SHA equality is what makes the delta safe.
+    // built at exactly `parent(HEAD)` AND the working tree is clean vs HEAD.
+    // `load_for_delta` deliberately skips the content-fingerprint gate (the
+    // post-commit tree's fingerprint necessarily differs from the base's);
+    // base-SHA equality plus a clean tree is what makes the delta safe.
     let kind = match (
         parent_oid.as_deref(),
         crate::cache::DerivedCache::load_for_delta(&cache_dir),
     ) {
-        (Some(parent), Some(prior)) if prior.base_commit.as_deref() == Some(parent) => {
+        (Some(parent), Some(prior))
+            if tree_clean && prior.base_commit.as_deref() == Some(parent) =>
+        {
             // Reset the graph to the validated prior base and drive it forward
             // by the commit's delta, warm-starting PageRank from the prior
             // ranks (bit-identical to a cold recompute — tests/parity.rs).
@@ -286,10 +302,19 @@ fn persist_derived_cache(repo_path: &Path, cache_dir: &Path, index: &mut Codebas
         .map(|f| (f.relative_path.clone(), f.content.clone()))
         .collect();
     let fingerprint = crate::cache::content_fingerprint(&fp_files, &head_oid);
+    // Stamp `base_commit = Some(HEAD)` ONLY when the working tree is CLEAN vs
+    // HEAD, so the stamp truthfully means "graph == committed tree at this SHA"
+    // (ADR-0179). A partial commit can leave OTHER files dirty (their edges not
+    // in this commit's diff); stamping HEAD then would let the next commit delta
+    // onto a base that never matched the clean committed tree. An empty oid, a
+    // dirty tree, or any status error → `None`.
     let base_commit = if head_oid.is_empty() {
         None
     } else {
-        Some(head_oid)
+        match git2::Repository::open(repo_path) {
+            Ok(repo) if crate::commands::serve::working_tree_clean(&repo) => Some(head_oid),
+            _ => None,
+        }
     };
 
     let derived = crate::cache::DerivedCache::new(
@@ -554,8 +579,38 @@ mod tests {
     /// structural fallback).
     fn init_two_file_repo(dir: &Path) -> (git2::Repository, String) {
         let repo = git2::Repository::init(dir).unwrap();
+        // Gitignore cxpak's own cache dir, mirroring real installs (ADR-0017):
+        // the derived/parse caches under `.cxpak/` are regenerated on every
+        // build and must NOT count toward working-tree cleanliness. Without this,
+        // `commit_all`'s `add_all("*")` would commit the cache, and the next
+        // build rewriting it would make the tree read as dirty.
+        std::fs::write(dir.join(".gitignore"), ".cxpak/\n").unwrap();
         std::fs::write(dir.join("a.rs"), "use crate::b;\npub fn a() {}\n").unwrap();
         std::fs::write(dir.join("b.rs"), "pub fn b() {}\n").unwrap();
+        let c1 = commit_all(&repo);
+        (repo, c1)
+    }
+
+    /// Three-file `src/`-layout repo (`src/a.rs` imports `crate::b`; `src/c.rs`
+    /// is an unreferenced node) with `.cxpak/` gitignored, committed as one
+    /// commit. Files live under `src/` so `crate::` imports actually resolve to
+    /// real Import edges (root-level `crate::X` never resolves — see
+    /// `resolve_rust_import`). Used by the edge-change delta-parity and
+    /// dirty-tree-fallback tests.
+    fn init_three_file_repo(dir: &Path) -> (git2::Repository, String) {
+        let repo = git2::Repository::init(dir).unwrap();
+        std::fs::write(dir.join(".gitignore"), ".cxpak/\n").unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        // `use crate::b::item;` (multi-segment) so the parser emits source
+        // "crate::b", which resolve_rust_import maps to src/b.rs — a REAL edge.
+        // (`use crate::b;` alone emits source "crate", which does not resolve.)
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "use crate::b::helper;\npub fn a() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/b.rs"), "pub fn helper() {}\n").unwrap();
+        std::fs::write(dir.join("src/c.rs"), "pub fn helper() {}\n").unwrap();
         let c1 = commit_all(&repo);
         (repo, c1)
     }
@@ -748,6 +803,135 @@ mod tests {
 
         assert_eq!(artifact1, artifact2, "delta artifact must be byte-stable");
         assert_eq!(artifact1, full_artifact(dir.path()));
+    }
+
+    /// EDGE-CHANGING DELTA PARITY: on a clean commit whose ONLY change rewrites
+    /// an import edge (a imports c instead of b — content-only, no file
+    /// add/remove), the DELTA path is taken AND produces the CORRECT artifact:
+    /// byte-identical to a full rebuild, containing the new `a→c` edge and NOT
+    /// the stale `a→b`. Proves the delta path yields correct output on a real
+    /// edge change when taken (the older delta-taken test kept the same import,
+    /// so it would pass even if the delta did nothing).
+    #[test]
+    fn post_commit_delta_produces_correct_artifact_on_edge_change() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (repo, _c1) = init_three_file_repo(dir.path());
+
+        // Warm the cache at commit1 (Full — no parent).
+        let (_a, kind1) = build_artifact(dir.path()).unwrap();
+        assert_eq!(kind1, RebuildKind::Full, "first build has no parent → Full");
+
+        // Content-only edit: a now imports c instead of b. No file add/remove.
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "use crate::c::helper;\npub fn a() {}\npub fn a2() {}\n",
+        )
+        .unwrap();
+        commit_all(&repo); // commit2, tree fully clean
+
+        let (artifact, kind) = build_artifact(dir.path()).unwrap();
+        assert_eq!(
+            kind,
+            RebuildKind::Delta,
+            "clean tree + base == parent(HEAD) → Delta"
+        );
+        assert_eq!(
+            artifact,
+            full_artifact(dir.path()),
+            "delta artifact must be byte-identical to a full rebuild"
+        );
+        assert!(
+            artifact.contains("src/a.rs\tsrc/c.rs\timport"),
+            "delta must reflect the new a→c edge, not just skip work"
+        );
+        assert!(
+            !artifact.contains("src/a.rs\tsrc/b.rs\timport"),
+            "delta must drop the stale a→b edge"
+        );
+    }
+
+    /// CRITICAL REPRO (dirty-tree fallback): commit2 cleanly rewrites a's import
+    /// (diff == {a.rs}, base == parent(HEAD)), but a DIFFERENT source file `b`
+    /// carries an UNCOMMITTED edit that changes ITS edges (b→c), NOT in commit2's
+    /// diff. A base-SHA-only delta would recompute only `a` and keep `b`'s stale
+    /// (edge-less) base graph — silently diverging from a full rebuild that scans
+    /// the dirty working tree and sees b→c. The clean-tree gate must force Full.
+    /// BEFORE the fix this FAILS (Delta taken → wrong artifact, missing b→c);
+    /// after, the dirty tree forces Full and the artifact matches a full rebuild.
+    #[test]
+    fn post_commit_falls_back_to_full_when_working_tree_dirty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (repo, _c1) = init_three_file_repo(dir.path());
+
+        build_artifact(dir.path()).unwrap(); // warm cache, base = commit1
+
+        // commit2: content-only edit to a (a now imports c). ONLY a.rs committed.
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "use crate::c::helper;\npub fn a() {}\npub fn a2() {}\n",
+        )
+        .unwrap();
+        commit_all(&repo); // parent(HEAD) == commit1 == cache base → would be Delta
+
+        // Uncommitted edit to a DIFFERENT tracked file, NOT in commit2's diff,
+        // that changes ITS edges: b now imports c (b→c). This is the silent-
+        // corruption trigger — the committed diff is {src/a.rs} only.
+        std::fs::write(
+            dir.path().join("src/b.rs"),
+            "use crate::c::helper;\npub fn b() {}\n",
+        )
+        .unwrap();
+
+        let (artifact, kind) = build_artifact(dir.path()).unwrap();
+        assert_eq!(
+            kind,
+            RebuildKind::Full,
+            "dirty working tree must force Full (base-SHA delta would corrupt the artifact)"
+        );
+        assert_eq!(
+            artifact,
+            full_artifact(dir.path()),
+            "Full fallback must reflect the uncommitted b→c edge"
+        );
+        assert!(
+            artifact.contains("src/b.rs\tsrc/c.rs\timport"),
+            "artifact must contain the uncommitted b→c edge a base-SHA delta would have missed"
+        );
+    }
+
+    /// ROUTE A (truthful stamp): a build on a CLEAN tree stamps
+    /// `base_commit = Some(HEAD)`; a build on a DIRTY tree (an uncommitted edit
+    /// to a tracked source file) stamps `base_commit = None`, so a later commit
+    /// never deltas onto a graph that was built from uncommitted content but
+    /// mislabeled as the clean HEAD base.
+    #[test]
+    fn build_stamps_base_commit_none_on_dirty_tree_and_head_on_clean() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_repo, c1) = init_two_file_repo(dir.path());
+
+        // Clean tree at commit1 → stamp Some(HEAD).
+        build_artifact(dir.path()).unwrap();
+        let clean = crate::cache::DerivedCache::load_for_delta(&cache_dir_of(dir.path()))
+            .expect("a derived cache must exist after build");
+        assert_eq!(
+            clean.base_commit.as_deref(),
+            Some(c1.as_str()),
+            "clean tree must stamp base_commit = Some(HEAD)"
+        );
+
+        // Uncommitted edit to a tracked source file → dirty tree → None.
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "use crate::b;\npub fn a() {}\npub fn dirty() {}\n",
+        )
+        .unwrap();
+        build_artifact(dir.path()).unwrap();
+        let dirty = crate::cache::DerivedCache::load_for_delta(&cache_dir_of(dir.path()))
+            .expect("a derived cache must exist after build");
+        assert!(
+            dirty.base_commit.is_none(),
+            "dirty tree must stamp base_commit = None (Route A: no mislabeled base)"
+        );
     }
 
     // --- TDD headline test 1: post-commit incremental == full ----------------
