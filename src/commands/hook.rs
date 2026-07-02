@@ -476,6 +476,15 @@ mod tests {
         post_commit(dir.path()).unwrap();
         let artifact = dir.path().join(ARTIFACT_REL);
         assert!(artifact.exists(), "post_commit must write {ARTIFACT_REL}");
+        // Lock the production artifact CONTENT, not just its existence: the file
+        // the user commits and the merge driver consumes must be byte-identical
+        // to a full canonical rebuild of the same tree.
+        let written = std::fs::read_to_string(&artifact).unwrap();
+        assert_eq!(
+            written,
+            full_artifact(dir.path()),
+            "post_commit artifact must be the canonical full-rebuild serialization"
+        );
     }
 
     // --- TDD headline test 2: union-merge driver -----------------------------
