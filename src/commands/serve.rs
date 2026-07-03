@@ -40,6 +40,44 @@ use subtle::ConstantTimeEq;
 pub type SharedIndex = Arc<RwLock<Arc<CodebaseIndex>>>;
 pub type SharedSnapshot = Arc<RwLock<Option<crate::auto_context::diff::ContextSnapshot>>>;
 
+/// Readiness of the MCP server's background index build (Task R0, ADR-0185).
+///
+/// `cxpak serve --mcp` answers the `initialize` handshake *immediately* and
+/// builds the index on a background `std::thread`, publishing the outcome into a
+/// [`SharedReadiness`] cell. A `tools/call` snapshots the cell: `Ready` runs
+/// against the base index exactly as a synchronous build would (byte-identical
+/// results); `Building`/`Failed` return a graceful JSON-RPC tool `result` — a
+/// retry hint or a failure status — never a session-killing protocol error.
+///
+/// Deliberately an enum, not a bare bool, so Phase R-E1 can append a *second*
+/// background phase (embedding enrichment layered on top of the ready base
+/// index) as an additional state — e.g. a `ReadyEnriched` variant — without
+/// reshaping the handshake path or the gating logic.
+#[derive(Clone)]
+pub enum IndexReadiness {
+    /// Background base-index build in progress; not yet queryable.
+    Building,
+    /// The base index is ready. Cloning bumps the inner `Arc` refcount (O(1)).
+    Ready(Arc<CodebaseIndex>),
+    /// The background build failed; the message is surfaced on tool calls.
+    Failed(String),
+}
+
+/// Shared, atomically-updated readiness cell for the background MCP index build.
+///
+/// Same double-Arc discipline as [`SharedIndex`]: readers clone the inner
+/// `Arc<CodebaseIndex>` under a brief read lock (O(1)) and drop the lock before
+/// running the tool handler; the background thread swaps the whole enum under a
+/// brief write lock once its locally-built index is ready.
+pub type SharedReadiness = Arc<RwLock<IndexReadiness>>;
+
+/// Status returned for a `tools/call` that arrives before the background index
+/// build has finished (Task R0). A normal tool `result` — not a protocol error —
+/// so the MCP session stays alive and the client can simply retry.
+const INDEXING_IN_PROGRESS_MESSAGE: &str =
+    "cxpak: indexing in progress — the codebase is still being analyzed in the \
+     background. Retry this call in a few seconds.";
+
 /// Maximum allowed regex pattern length in the search endpoint.
 /// Patterns beyond this limit risk catastrophic backtracking (ReDoS).
 const MAX_PATTERN_LEN: usize = 1000;
@@ -2141,38 +2179,146 @@ async fn cross_lang_handler(
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let index = match build_index(path) {
-        Ok(idx) => idx,
-        Err(e) => {
-            eprintln!("cxpak: warning: could not index {}: {e}", path.display());
-            eprintln!("cxpak: starting MCP server with empty index");
-            CodebaseIndex::empty()
-        }
-    };
-
+    // Non-blocking startup (Task R0, ADR-0185): the full index build is 13–34s
+    // on a large repo, which straddles Claude Code's ~30s MCP timeout when done
+    // synchronously before the `initialize` handshake. Instead, publish a
+    // `Building` readiness cell, kick the build onto a background thread (it
+    // loads the ADR-0167 derived cache on a fingerprint hit), and enter the
+    // stdio loop straight away so `initialize`/`tools/list` answer instantly.
+    let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
     eprintln!(
-        "cxpak: MCP server ready ({} files indexed, {} tokens)",
-        index.total_files, index.total_tokens
+        "cxpak: MCP server accepting connections; indexing {} in background",
+        path.display()
     );
+    let build_handle = spawn_mcp_index_build(path, Arc::clone(&readiness));
 
     let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
-    mcp_stdio_loop(path, &index, &snapshot)
+    let result = mcp_stdio_loop(path, &readiness, &snapshot);
+
+    // Reclaim the background thread before returning (stdin closed / EOF).
+    // Best-effort: a panicked build thread must not turn a clean shutdown into
+    // an error, so the join result is intentionally discarded.
+    let _ = build_handle.join();
+    result
 }
 
-/// Run the MCP stdio loop.
+/// Map the outcome of a [`std::panic::catch_unwind`]-wrapped [`build_index`]
+/// call to the appropriate [`IndexReadiness`] variant (Task R0 panic fix).
 ///
-/// NOTE: The index is built once at startup and not refreshed during the
-/// session. This is acceptable because MCP connections are typically
-/// short-lived (one task ≈ one connection). If long-lived sessions become
-/// common, consider rebuilding the index periodically.
+/// Extracted as a pure function so all three branches — success, build `Err`,
+/// and panic — can be unit-tested without spawning threads or triggering real
+/// panics in the test harness.
+///
+/// `path` is used only for the stderr diagnostic in the error/panic branches.
+fn classify_build_outcome(
+    path: &Path,
+    outcome: Result<
+        Result<CodebaseIndex, Box<dyn std::error::Error>>,
+        Box<dyn std::any::Any + Send>,
+    >,
+) -> IndexReadiness {
+    match outcome {
+        Ok(Ok(idx)) => {
+            eprintln!(
+                "cxpak: MCP index ready ({} files indexed, {} tokens)",
+                idx.total_files, idx.total_tokens
+            );
+            IndexReadiness::Ready(Arc::new(idx))
+        }
+        Ok(Err(e)) => {
+            eprintln!("cxpak: warning: could not index {}: {e}", path.display());
+            IndexReadiness::Failed(e.to_string())
+        }
+        Err(panic_payload) => {
+            let msg = panic_payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic_payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic payload");
+            eprintln!(
+                "cxpak: warning: could not index {}: indexing panicked: {msg}",
+                path.display()
+            );
+            IndexReadiness::Failed(format!("indexing panicked: {msg}"))
+        }
+    }
+}
+
+/// Spawn the background base-index build for the MCP server (Task R0).
+///
+/// Runs [`build_index`] off the handshake path and publishes the outcome into
+/// `readiness`. Snapshot-then-swap lock discipline: the long build runs in a
+/// thread-local `next`, and only the O(1) enum publish holds the write lock — so
+/// a concurrent `tools/call` never blocks on (nor is blocked by) the build. A
+/// build error **or panic** is captured as [`IndexReadiness::Failed`] via
+/// [`std::panic::catch_unwind`] + [`classify_build_outcome`] so the cell never
+/// stays `Building` forever — every tool call surfaces a clear status either way.
+///
+/// Extension point (Phase R-E1): after publishing `Ready`, a second background
+/// phase will enrich the *same* cell with embeddings (an added readiness state)
+/// without touching the handshake path or this function's contract.
+#[doc(hidden)]
+pub fn spawn_mcp_index_build(
+    path: &Path,
+    readiness: SharedReadiness,
+) -> std::thread::JoinHandle<()> {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_index(&path)));
+        let next = classify_build_outcome(&path, outcome);
+        // Brief write lock: `next` is already built, so this is an O(1) swap.
+        // Recover from a poisoned lock (a reader panicked) and still publish, so
+        // tool calls stop reporting "Building" once the build has completed.
+        match readiness.write() {
+            Ok(mut g) => *g = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
+        }
+    })
+}
+
+/// Snapshot the base index if the background build has finished, else return the
+/// human-readable status to surface as a tool `result` (Task R0).
+///
+/// Cloning the `Ready` `Arc` under a brief read lock is O(1); the lock is
+/// released before the (possibly long-running) tool handler runs, so tool calls
+/// never hold the readiness lock across a handler and never starve the
+/// background publish. A poisoned lock is recovered rather than propagated so a
+/// panicked reader cannot wedge the server.
+fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex>, String> {
+    let guard = match readiness.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match &*guard {
+        IndexReadiness::Ready(idx) => Ok(Arc::clone(idx)),
+        IndexReadiness::Building => Err(INDEXING_IN_PROGRESS_MESSAGE.to_string()),
+        IndexReadiness::Failed(msg) => Err(format!(
+            "cxpak: indexing failed and no context is available: {msg}. \
+             Check the cxpak server logs, then restart the MCP server to retry."
+        )),
+    }
+}
+
+/// Run the MCP stdio loop against a background-built index (Task R0).
+///
+/// The index is published asynchronously into `readiness` by
+/// [`spawn_mcp_index_build`]; the loop itself never blocks on the build.
+/// Connections are typically short-lived (one task ≈ one connection); a
+/// long-lived session would keep the first ready index (no periodic rebuild).
 fn mcp_stdio_loop(
     repo_path: &Path,
-    index: &CodebaseIndex,
+    readiness: &SharedReadiness,
     snapshot: &SharedSnapshot,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    mcp_stdio_loop_with_io(repo_path, index, snapshot, stdin.lock(), &mut stdout.lock())
+    mcp_stdio_loop_readiness(
+        repo_path,
+        readiness,
+        snapshot,
+        stdin.lock(),
+        &mut stdout.lock(),
+    )
 }
 
 /// Run the MCP JSON-RPC loop reading newline-delimited requests from
@@ -2185,6 +2331,28 @@ fn mcp_stdio_loop(
 pub fn mcp_stdio_loop_with_io(
     repo_path: &Path,
     index: &CodebaseIndex,
+    snapshot: &SharedSnapshot,
+    reader: impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Compatibility + test entry point: the caller already holds a fully built
+    // index, so publish it as `Ready` and drive the readiness-gated loop. The
+    // lazy/background path (`run_mcp`) constructs a `Building` cell instead and
+    // lets `spawn_mcp_index_build` publish `Ready` when the build finishes.
+    let readiness: SharedReadiness =
+        Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(index.clone()))));
+    mcp_stdio_loop_readiness(repo_path, &readiness, snapshot, reader, writer)
+}
+
+/// Readiness-gated MCP JSON-RPC loop (Task R0). Identical framing and dispatch
+/// to the pre-R0 loop, except `tools/call` first snapshots `readiness`:
+/// `initialize`, `tools/list`, and notifications always answer instantly
+/// regardless of index state, while a tool call before the base index is ready
+/// returns the graceful "indexing"/"failed" status via [`snapshot_ready_index`].
+#[doc(hidden)]
+pub fn mcp_stdio_loop_readiness(
+    repo_path: &Path,
+    readiness: &SharedReadiness,
     snapshot: &SharedSnapshot,
     reader: impl std::io::BufRead,
     writer: &mut impl std::io::Write,
@@ -2255,7 +2423,15 @@ pub fn mcp_stdio_loop_with_io(
                 let params = request.get("params").cloned().unwrap_or(json!({}));
                 let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                handle_tool_call(id, tool_name, &arguments, index, repo_path, snapshot)
+                // Gate on background-build readiness (Task R0): once ready, run
+                // against the base index exactly as before; before ready, return
+                // a graceful tool `result` (retry/failed status), never an error.
+                match snapshot_ready_index(readiness) {
+                    Ok(idx) => {
+                        handle_tool_call(id, tool_name, &arguments, &idx, repo_path, snapshot)
+                    }
+                    Err(status) => mcp_tool_result(id, &status),
+                }
             }
             _ => mcp_error_response(id, -32601, "Method not found"),
         };
@@ -4026,6 +4202,223 @@ mod tests {
 
     fn make_shared_snapshot() -> SharedSnapshot {
         Arc::new(RwLock::new(None))
+    }
+
+    // --- R0 panic fix: classify_build_outcome covers all three arms ---
+
+    /// Success arm: `Ok(Ok(idx))` → `Ready` carrying the built index.
+    #[test]
+    fn classify_build_outcome_ok_yields_ready() {
+        let idx = make_test_index();
+        let outcome: Result<
+            Result<CodebaseIndex, Box<dyn std::error::Error>>,
+            Box<dyn std::any::Any + Send>,
+        > = Ok(Ok(idx));
+        let result = classify_build_outcome(Path::new("/tmp"), outcome);
+        assert!(matches!(result, IndexReadiness::Ready(_)));
+    }
+
+    /// Error arm: `Ok(Err(e))` → `Failed` carrying the error message.
+    #[test]
+    fn classify_build_outcome_err_yields_failed() {
+        let e: Box<dyn std::error::Error> = "scanner failed".into();
+        let outcome: Result<
+            Result<CodebaseIndex, Box<dyn std::error::Error>>,
+            Box<dyn std::any::Any + Send>,
+        > = Ok(Err(e));
+        let result = classify_build_outcome(Path::new("/tmp"), outcome);
+        match result {
+            IndexReadiness::Failed(msg) => assert!(msg.contains("scanner failed"), "msg: {msg}"),
+            IndexReadiness::Building => panic!("expected Failed, got Building"),
+            IndexReadiness::Ready(_) => panic!("expected Failed, got Ready"),
+        }
+    }
+
+    /// Panic arm: `Err(payload)` → `Failed("indexing panicked: …")`.
+    ///
+    /// This is the R0 fix: a panicking `build_index` call must never leave the
+    /// shared readiness cell at `Building` forever. `classify_build_outcome`
+    /// is the single place that converts a panic payload to `Failed`.
+    #[test]
+    fn classify_build_outcome_panic_yields_failed() {
+        let panic_payload: Box<dyn std::any::Any + Send> = Box::new("tree-sitter exploded");
+        let outcome: Result<
+            Result<CodebaseIndex, Box<dyn std::error::Error>>,
+            Box<dyn std::any::Any + Send>,
+        > = Err(panic_payload);
+        let result = classify_build_outcome(Path::new("/tmp"), outcome);
+        match result {
+            IndexReadiness::Failed(msg) => {
+                assert!(msg.contains("indexing panicked"), "msg: {msg}");
+                assert!(msg.contains("tree-sitter exploded"), "msg: {msg}");
+            }
+            IndexReadiness::Building => panic!("expected Failed, got Building"),
+            IndexReadiness::Ready(_) => panic!("expected Failed, got Ready"),
+        }
+    }
+
+    /// Integration: a thread that panics during indexing publishes `Failed` into
+    /// the shared cell — the cell must never stay `Building`.
+    ///
+    /// Exercises the full `catch_unwind` + `classify_build_outcome` + write-lock
+    /// path that `spawn_mcp_index_build` uses in production.
+    #[test]
+    fn panicking_build_thread_publishes_failed_not_building() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let readiness_clone = Arc::clone(&readiness);
+
+        let handle = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
+                    panic!("deliberate panic in indexing thread");
+                },
+            ));
+            let next = classify_build_outcome(Path::new("/tmp"), outcome);
+            match readiness_clone.write() {
+                Ok(mut g) => *g = next,
+                Err(poisoned) => *poisoned.into_inner() = next,
+            }
+        });
+        handle.join().expect("thread must not propagate the panic");
+
+        let guard = readiness.read().unwrap();
+        match &*guard {
+            IndexReadiness::Failed(msg) => {
+                assert!(msg.contains("indexing panicked"), "msg: {msg}");
+                assert!(
+                    msg.contains("deliberate panic in indexing thread"),
+                    "msg: {msg}"
+                );
+            }
+            IndexReadiness::Building => {
+                panic!("cell must not stay Building after a panicking build")
+            }
+            IndexReadiness::Ready(_) => panic!("panicking build must not yield Ready"),
+        }
+    }
+
+    // --- R0: non-blocking MCP startup / readiness gating ---
+
+    /// `Ready` yields the base index (an O(1) Arc snapshot); the returned index
+    /// is the one published into the cell (same file count).
+    #[test]
+    fn readiness_ready_snapshots_the_index() {
+        let idx = Arc::new(make_test_index());
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(idx)));
+        let got = snapshot_ready_index(&readiness).expect("ready must yield the index");
+        assert_eq!(got.total_files, 2);
+    }
+
+    /// `Building` yields the graceful retry status — not an index, not an error.
+    #[test]
+    fn readiness_building_yields_retry_status() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let status =
+            snapshot_ready_index(&readiness).expect_err("building must not yield an index");
+        assert_eq!(status, INDEXING_IN_PROGRESS_MESSAGE);
+        assert!(status.contains("indexing in progress"));
+    }
+
+    /// `Failed` surfaces the build error text as a clear status.
+    #[test]
+    fn readiness_failed_yields_failure_status() {
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
+        let status = snapshot_ready_index(&readiness).expect_err("failed must not yield an index");
+        assert!(status.contains("indexing failed"));
+        assert!(status.contains("boom"));
+    }
+
+    /// A tool call BEFORE the index is ready returns a JSON-RPC `result`
+    /// (graceful status), never a session-killing `error`. `initialize` and
+    /// `tools/list` still answer instantly regardless of readiness.
+    #[test]
+    fn stdio_loop_before_ready_returns_status_not_error() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let start = std::time::Instant::now();
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "handshake path must not block on indexing (took {elapsed:?})"
+        );
+        let lines: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        // initialize: well-formed capabilities, index-independent.
+        assert_eq!(lines[0]["id"], 1);
+        assert_eq!(lines[0]["result"]["serverInfo"]["name"], "cxpak");
+        // tools/list: static catalog projection, answers while Building.
+        assert_eq!(lines[1]["id"], 2);
+        assert!(lines[1]["result"]["tools"].is_array());
+        // tools/call before ready: a `result` (not `error`) carrying the status.
+        assert_eq!(lines[2]["id"], 3);
+        assert!(
+            lines[2]["error"].is_null(),
+            "before-ready tool call must not be a protocol error"
+        );
+        let text = lines[2]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            text.contains("indexing in progress"),
+            "before-ready tool call must carry the retry status, got: {text}"
+        );
+    }
+
+    /// Once `Ready`, the same tool call returns normal results (no status text).
+    #[test]
+    fn stdio_loop_after_ready_returns_normal_results() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(resp["id"], 7);
+        assert!(resp["error"].is_null());
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            !text.contains("indexing in progress"),
+            "ready tool call must return real results, got status: {text}"
+        );
+        // `stats` reports the two indexed files — proves it ran against the index.
+        let parsed: Value = serde_json::from_str(text).expect("stats result is JSON");
+        assert_eq!(parsed["files"], 2, "stats should reflect 2 indexed files");
     }
 
     // --- Health handler ---

@@ -894,9 +894,13 @@ mod serve_tests {
         child.kill().ok();
         let output = child.wait_with_output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // R0 (ADR-0185): startup is non-blocking — the server prints an
+        // "accepting connections; indexing in background" line synchronously
+        // BEFORE the index build (the "MCP index ready" line follows only once
+        // the background build completes, which this test may kill before).
         assert!(
-            stderr.contains("MCP server ready"),
-            "should print MCP ready message, got: {stderr}"
+            stderr.contains("MCP server accepting connections"),
+            "should print the non-blocking startup message, got: {stderr}"
         );
     }
 
