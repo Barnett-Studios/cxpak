@@ -2193,383 +2193,11 @@ pub fn mcp_stdio_loop_with_io(
             "tools/list" => mcp_response(
                 id,
                 json!({
-                    "tools": [
-                        {
-                            "name": "cxpak_auto_context",
-                            "description": "One-call optimal context for any task. Automatically selects, ranks, filters, packs, and annotates the best context from the entire codebase. Start here — use other tools only if you need finer control.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "task": { "type": "string", "description": "Natural language task description" },
-                                    "tokens": { "type": "string", "description": "Token budget (default '50k')", "default": "50k" },
-                                    "focus": { "type": "string", "description": "Path prefix to scope" },
-                                    "include_tests": { "type": "boolean", "description": "Include mapped test files (default true)", "default": true },
-                                    "include_blast_radius": { "type": "boolean", "description": "Include blast radius analysis (default true)", "default": true },
-                                    "mode": { "type": "string", "description": "Context mode: 'full' (default) or 'briefing'", "enum": ["full", "briefing"] },
-                                    "cost_model": { "type": "string", "description": "Opt-in: model name (e.g. 'claude-opus-4-8') for a USD cost estimate in the efficiency report" }
-                                },
-                                "required": ["task"]
-                            }
-                        },
-                        {
-                            "name": "cxpak_context_diff",
-                            "description": "Show what changed since the last auto_context call. Lightweight delta for long sessions.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "since": { "type": "string", "description": "What to diff against: 'last_call' (default) or a git ref", "default": "last_call" },
-                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_overview",
-                            "description": "Get a structured overview of the codebase",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "tokens": {
-                                        "type": "string",
-                                        "description": "Token budget (e.g. '50k', '100k')",
-                                        "default": "50k"
-                                    },
-                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_trace",
-                            "description": "Trace a symbol through the codebase dependency graph",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "target": {
-                                        "type": "string",
-                                        "description": "Symbol or text to trace"
-                                    },
-                                    "tokens": {
-                                        "type": "string",
-                                        "description": "Token budget",
-                                        "default": "50k"
-                                    },
-                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
-                                },
-                                "required": ["target"]
-                            }
-                        },
-                        {
-                            "name": "cxpak_diff",
-                            "description": "Show changes with dependency context",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "git_ref": {
-                                        "type": "string",
-                                        "description": "Git ref to diff against (e.g. 'main', 'HEAD~1'). Omit to diff working tree vs HEAD."
-                                    },
-                                    "tokens": {
-                                        "type": "string",
-                                        "description": "Token budget",
-                                        "default": "50k"
-                                    },
-                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" },
-                                    "review": { "type": "boolean", "description": "Attach a change-impact review bundle: blast radius, impacted tests, convention + security deltas, and expected-but-absent changes (co-change omissions).", "default": false }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_stats",
-                            "description": "Get index statistics (file count, tokens, languages)",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_context_for_task",
-                            "description": "Score and rank codebase files by relevance to a task description",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "task": { "type": "string", "description": "Natural language task description" },
-                                    "limit": { "type": "number", "description": "Maximum number of candidates to return (default 15)" },
-                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
-                                },
-                                "required": ["task"]
-                            }
-                        },
-                        {
-                            "name": "cxpak_pack_context",
-                            "description": "Pack selected files into a token-budgeted context bundle with dependency context",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "files": { "type": "array", "items": { "type": "string" }, "description": "File paths to include" },
-                                    "tokens": { "type": "string", "description": "Token budget (e.g. '30k', '50k')", "default": "50k" },
-                                    "include_dependencies": { "type": "boolean", "description": "Include 1-hop dependencies", "default": false },
-                                    "include_tests": { "type": "boolean", "description": "Auto-include test files for packed source files (default true)", "default": true },
-                                    "focus": { "type": "string", "description": "Path prefix to scope results (e.g. 'src/', 'tests/')" }
-                                },
-                                "required": ["files"]
-                            }
-                        },
-                        {
-                            "name": "cxpak_search",
-                            "description": "Search codebase content with regex patterns. Returns matching lines with surrounding context.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "pattern": { "type": "string", "description": "Regex pattern to search for" },
-                                    "limit": { "type": "number", "description": "Maximum number of matches to return (default 20)", "default": 20 },
-                                    "focus": { "type": "string", "description": "Path prefix to scope search (e.g. 'src/api/')" },
-                                    "context_lines": { "type": "number", "description": "Lines of context before and after each match (default 2)", "default": 2 }
-                                },
-                                "required": ["pattern"]
-                            }
-                        },
-                        {
-                            "name": "cxpak_blast_radius",
-                            "description": "Analyze the impact of changing specified files. Returns affected files categorized by impact type with risk scores.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "files": { "type": "array", "items": { "type": "string" }, "description": "File paths that are changing" },
-                                    "depth": { "type": "number", "description": "Max dependency hops to follow (default 3)", "default": 3 },
-                                    "focus": { "type": "string", "description": "Path prefix to scope results" }
-                                },
-                                "required": ["files"]
-                            }
-                        },
-                        {
-                            "name": "cxpak_api_surface",
-                            "description": "Extract the public API surface: public symbols with signatures, HTTP routes, gRPC services, GraphQL types.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "focus": { "type": "string", "description": "Path prefix to scope" },
-                                    "include": { "type": "string", "description": "What to include: 'all', 'symbols', 'routes' (default 'all')", "default": "all" },
-                                    "tokens": { "type": "string", "description": "Token budget (default '20k')", "default": "20k" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_verify",
-                            "description": "Verify code changes against the codebase's observed conventions. Reports deviations with evidence, severity, and suggested fixes. Only flags violations in changed lines, not pre-existing debt.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "ref": { "type": "string", "description": "Git ref to diff against (default: auto-detect uncommitted changes vs HEAD)" },
-                                    "focus": { "type": "string", "description": "Path prefix to scope verification" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_conventions",
-                            "description": "Return the full convention profile for the codebase. Shows all detected patterns with counts, percentages, strength labels, and exceptions.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "category": { "type": "string", "description": "Filter: 'naming', 'imports', 'errors', 'dependencies', 'testing', 'visibility', 'functions', 'git_health', or 'all' (default 'all')", "default": "all" },
-                                    "strength": { "type": "string", "description": "Minimum strength: 'convention', 'trend', 'mixed', or 'all' (default 'all')", "default": "all" },
-                                    "focus": { "type": "string", "description": "Path prefix — recompute stats scoped to this directory" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_health",
-                            "description": "Returns the codebase health score — a composite metric across 6 dimensions: convention adherence, test coverage, churn stability, module coupling, circular dependencies, and dead code (null until v1.3.0). Use this to understand the overall quality state before making structural changes. Note: always computed repo-wide in v1.2.0; focus param reserved for future use.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "focus": {
-                                        "type": "string",
-                                        "description": "Reserved for future use — health score is computed repo-wide in v1.2.0"
-                                    }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_risks",
-                            "description": "Returns the top risky files ranked by a composite of churn rate, blast radius, and test coverage gap. Use this to identify where to focus refactoring or additional testing.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "limit": {
-                                        "type": "number",
-                                        "description": "Maximum number of risk entries to return (default 20)",
-                                        "default": 20
-                                    },
-                                    "focus": {
-                                        "type": "string",
-                                        "description": "Optional path prefix to scope the analysis (e.g. 'src/api/')"
-                                    }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_briefing",
-                            "description": "Returns a compact briefing: file manifest with scores and signals, health score, top risks, and architecture map — but no file content. Ideal for orientation at the start of a task when you need structure, not code.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "task": { "type": "string", "description": "Natural language task description" },
-                                    "tokens": { "type": "string", "description": "Token budget (default '50k')", "default": "50k" },
-                                    "focus": { "type": "string", "description": "Path prefix to scope" },
-                                    "cost_model": { "type": "string", "description": "Opt-in: model name (e.g. 'claude-opus-4-8') for a USD cost estimate in the efficiency report" }
-                                },
-                                "required": ["task"]
-                            }
-                        },
-                        {
-                            "name": "cxpak_call_graph",
-                            "description": "Returns the cross-file call graph for a file or symbol. Edges include confidence level (Exact = import-resolved, Approximate = name-matched).",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "target": { "type": "string", "description": "File path or symbol name to filter edges" },
-                                    "depth": { "type": "number", "description": "BFS depth (default 1)", "default": 1 },
-                                    "focus": { "type": "string", "description": "Path prefix to scope" },
-                                    "workspace": { "type": "string", "description": "Monorepo workspace prefix" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_dead_code",
-                            "description": "Returns dead symbol list sorted by liveness_score descending (most important dead symbols first). A symbol is dead when it has zero callers, is not an entry point, and is not referenced from test files.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "focus": { "type": "string", "description": "Path prefix to scope" },
-                                    "limit": { "type": "number", "description": "Max results (default 50)", "default": 50 },
-                                    "workspace": { "type": "string", "description": "Monorepo workspace prefix" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_architecture",
-                            "description": "Returns full architecture quality report. Each module includes 5 metrics: coupling, cohesion, circular_dep_count, boundary_violations, and god_files.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "focus": { "type": "string", "description": "Path prefix to scope" },
-                                    "workspace": { "type": "string", "description": "Monorepo workspace prefix" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_predict",
-                            "description": "Predict change impact for a set of files. Returns structural (blast radius), historical (co-change), and call-based impact predictions with test predictions ranked by confidence (0.3-0.9).",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "files": { "type": "array", "items": { "type": "string" }, "description": "List of changed file paths (required)" },
-                                    "depth": { "type": "number", "description": "BFS depth for structural impact (default 3)", "default": 3 },
-                                    "focus": { "type": "string", "description": "Path prefix to scope" }
-                                },
-                                "required": ["files"]
-                            }
-                        },
-                        {
-                            "name": "cxpak_drift",
-                            "description": "Detect architecture drift by comparing current snapshot against baseline and historical snapshots. Auto-saves snapshot on each call. Set save_baseline=true to establish a new baseline.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "save_baseline": { "type": "boolean", "description": "Save current state as baseline (default false)", "default": false },
-                                    "focus": { "type": "string", "description": "Path prefix to scope" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_security_surface",
-                            "description": "Analyze security surface: unprotected endpoints, input validation gaps, secret patterns (AWS, GitHub PAT, passwords, connection strings, Slack), SQL injection risks, and exposure scores.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "focus": { "type": "string", "description": "Path prefix to scope" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_data_flow",
-                            "description": "Trace how a value flows through the system from source to sink(s). Structural analysis — follows static call paths, not runtime dispatch. Paths crossing closures or trait objects are tagged Speculative.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "symbol": { "type": "string", "description": "Starting symbol to trace from (e.g. 'handle_request')" },
-                                    "sink": { "type": "string", "description": "Optional target symbol to stop at" },
-                                    "depth": { "type": "number", "description": "Max hops to follow (default 10, max 10)", "default": 10 },
-                                    "focus": { "type": "string", "description": "Path prefix to scope" }
-                                },
-                                "required": ["symbol"]
-                            }
-                        },
-                        {
-                            "name": "cxpak_cross_lang",
-                            "description": "List all detected cross-language boundaries: HTTP calls, FFI bindings, gRPC calls, GraphQL queries, shared DB schemas, and command exec bridges.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "file": { "type": "string", "description": "Filter to edges touching this file path" },
-                                    "focus": { "type": "string", "description": "Path prefix to scope results" }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_visual",
-                            "description": "Generate an interactive visual diagram of the codebase. Supports dashboard, architecture explorer, risk heatmap, data flow diagram, time machine, and diff views in HTML, Mermaid, SVG, C4, or JSON format.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "type": {
-                                        "type": "string",
-                                        "description": "Visualization type: 'dashboard' (default), 'architecture', 'risk', 'flow', 'timeline', 'diff'",
-                                        "default": "dashboard",
-                                        "enum": ["dashboard", "architecture", "risk", "flow", "timeline", "diff"]
-                                    },
-                                    "format": {
-                                        "type": "string",
-                                        "description": "Output format: 'html' (default), 'mermaid', 'svg', 'c4', 'json', 'cypher' (Neo4j import script), 'graphml' (XML graph)",
-                                        "default": "html",
-                                        "enum": ["html", "mermaid", "svg", "c4", "json", "cypher", "graphml"]
-                                    },
-                                    "focus": {
-                                        "type": "string",
-                                        "description": "Path prefix to scope the visualization (e.g. 'src/')"
-                                    },
-                                    "symbol": {
-                                        "type": "string",
-                                        "description": "Starting symbol for flow diagram (required when type='flow')"
-                                    },
-                                    "files": {
-                                        "type": "string",
-                                        "description": "Comma-separated file paths for diff view (required when type='diff')"
-                                    }
-                                }
-                            }
-                        },
-                        {
-                            "name": "cxpak_onboard",
-                            "description": "Generate a guided onboarding map for navigating the codebase. Returns a phase-by-phase reading plan with file prioritization, estimated reading time, and key symbols to focus on in each file.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "focus": {
-                                        "type": "string",
-                                        "description": "Path prefix to scope the onboarding map (e.g. 'src/')"
-                                    },
-                                    "format": {
-                                        "type": "string",
-                                        "description": "Output format: 'json' (default) or 'markdown'",
-                                        "default": "json",
-                                        "enum": ["json", "markdown"]
-                                    }
-                                }
-                            }
-                        }
-                    ]
+                    // C3 (ADR-0182): the live MCP surface is the capability
+                    // catalog's ≤8 intent-tool projection. The 26 hand-rolled
+                    // tool schemas were removed; every former tool is now an
+                    // `op` under one of the five `cxpak_<intent>` tools.
+                    "tools": crate::capability::adapter::mcp_tool_schemas()
                 }),
             ),
             "tools/call" => {
@@ -2589,10 +2217,18 @@ pub fn mcp_stdio_loop_with_io(
     Ok(())
 }
 
-/// MCP `tools/call` dispatch.  Public-with-doc-hidden so integration
-/// tests in `tests/cross_channel_consistency.rs` can drive the MCP
-/// channel directly and assert byte-identical parity with v1 / LSP /
-/// SPA.  Not part of the stable public API surface.
+/// MCP `tools/call` entry point — the public router (C3, ADR-0182).
+///
+/// The advertised MCP surface is the five `cxpak_<intent>` tools projected from
+/// the capability catalog (`tools/list` = [`crate::capability::adapter::mcp_tool_schemas`]);
+/// a capability is selected by the `op` argument. For backward compatibility the
+/// 26 removed tool NAMES are also accepted as deprecated aliases — they are not
+/// discoverable (absent from `tools/list`) but still route to the same
+/// capability core (removed in a future release; see `docs/MIGRATION-3.0.md`).
+///
+/// Public-with-`#[doc(hidden)]` so integration tests in
+/// `tests/cross_channel_consistency.rs` can drive the MCP channel directly and
+/// assert byte-identical parity with v1 / LSP / SPA. Not a stable public API.
 #[doc(hidden)]
 pub fn handle_tool_call(
     id: Option<Value>,
@@ -2602,8 +2238,246 @@ pub fn handle_tool_call(
     repo_path: &Path,
     snapshot: &SharedSnapshot,
 ) -> Value {
-    match tool_name {
-        "cxpak_auto_context" => {
+    let op = match resolve_capability_op(tool_name, args) {
+        Ok(op) => op,
+        Err(OpResolution::InvalidOp(msg)) => return mcp_tool_result(id, &msg),
+        Err(OpResolution::UnknownTool) => {
+            return mcp_error_response(id, -32601, &format!("Unknown tool: {tool_name}"))
+        }
+    };
+    dispatch_capability_op(id, &op, args, index, repo_path, snapshot)
+}
+
+/// Outcome of mapping a `tools/call` name (+ args) to a capability op.
+enum OpResolution {
+    /// The name is a known intent-tool but the `op` arg is missing/not hosted.
+    InvalidOp(String),
+    /// The name is neither an intent-tool nor a known legacy alias.
+    UnknownTool,
+}
+
+/// Resolve a `tools/call` name to a capability `op` id.
+///
+/// * An intent-tool (`cxpak_context`/`cxpak_graph`/`cxpak_data`/`cxpak_review`/
+///   `cxpak_insight`) requires an `op` arg the catalog hosts under it.
+/// * A legacy `cxpak_*` tool name maps to its capability id (deprecated alias).
+fn resolve_capability_op(tool_name: &str, args: &Value) -> Result<String, OpResolution> {
+    if let Some(ops) = intent_tool_ops(tool_name) {
+        return match args.get("op").and_then(|v| v.as_str()) {
+            Some(op) if ops.iter().any(|o| o == op) => Ok(op.to_string()),
+            Some(op) => Err(OpResolution::InvalidOp(format!(
+                "Error: op '{op}' is not valid for {tool_name}. Valid ops: {}",
+                ops.join(", ")
+            ))),
+            None => Err(OpResolution::InvalidOp(format!(
+                "Error: '{tool_name}' requires an 'op' argument. Valid ops: {}",
+                ops.join(", ")
+            ))),
+        };
+    }
+    match legacy_alias_to_op(tool_name) {
+        Some(op) => Ok(op.to_string()),
+        None => Err(OpResolution::UnknownTool),
+    }
+}
+
+/// The capability ops hosted by an intent-tool, from the catalog adapter, or
+/// `None` if `tool_name` is not one of the five intent-tools. Deterministic.
+fn intent_tool_ops(tool_name: &str) -> Option<Vec<String>> {
+    crate::capability::adapter::mcp_catalog_tools()
+        .into_iter()
+        .find(|t| t.name == tool_name)
+        .map(|t| t.ops)
+}
+
+/// Map a legacy `cxpak_*` MCP tool name to its capability `op` id (C3 deprecated
+/// alias). Only the 26 former tool names resolve; anything else is `None`.
+fn legacy_alias_to_op(tool_name: &str) -> Option<&'static str> {
+    Some(match tool_name {
+        "cxpak_auto_context" => "context",
+        "cxpak_context_diff" => "review",
+        "cxpak_overview" => "overview",
+        "cxpak_trace" => "trace",
+        "cxpak_diff" => "diff",
+        "cxpak_stats" => "stats",
+        "cxpak_context_for_task" => "context_for_task",
+        "cxpak_pack_context" => "pack_context",
+        "cxpak_search" => "search",
+        "cxpak_blast_radius" => "blast_radius",
+        "cxpak_api_surface" => "api_surface",
+        "cxpak_verify" => "verify",
+        "cxpak_conventions" => "conventions",
+        "cxpak_health" => "health",
+        "cxpak_risks" => "risks",
+        "cxpak_briefing" => "briefing",
+        "cxpak_call_graph" => "call_graph",
+        "cxpak_dead_code" => "dead_code",
+        "cxpak_architecture" => "architecture",
+        "cxpak_predict" => "predict",
+        "cxpak_drift" => "drift",
+        "cxpak_security_surface" => "security_surface",
+        "cxpak_data_flow" => "data_flow",
+        "cxpak_cross_lang" => "cross_lang",
+        "cxpak_visual" => "visual",
+        "cxpak_onboard" => "onboard",
+        _ => return None,
+    })
+}
+
+/// Build a deterministic JSON summary of the indexed data layer (`SchemaIndex`)
+/// for the `data` capability (C3 / B1 M2). Tables, views, ORM models and
+/// migration chains are emitted in sorted order so the output is byte-stable.
+fn build_data_summary(index: &CodebaseIndex, focus: Option<&str>) -> Value {
+    let in_focus = |path: &str| matches_focus(path, focus);
+    let schema = match index.schema.as_ref() {
+        None => {
+            return json!({
+                "indexed": false,
+                "tables": [],
+                "views": [],
+                "orm_models": [],
+                "migrations": [],
+            })
+        }
+        Some(s) => s,
+    };
+
+    let mut tables: Vec<&crate::schema::TableSchema> = schema
+        .tables
+        .values()
+        .filter(|t| in_focus(&t.file_path))
+        .collect();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    let tables_json: Vec<Value> = tables
+        .iter()
+        .map(|t| {
+            let columns: Vec<Value> = t
+                .columns
+                .iter()
+                .map(|c| {
+                    json!({
+                        "name": c.name,
+                        "data_type": c.data_type,
+                        "nullable": c.nullable,
+                        "foreign_key": c.foreign_key.as_ref().map(|fk| {
+                            json!({"target_table": fk.target_table, "target_column": fk.target_column})
+                        }),
+                    })
+                })
+                .collect();
+            json!({
+                "name": t.name,
+                "file_path": t.file_path,
+                "primary_key": t.primary_key,
+                "columns": columns,
+            })
+        })
+        .collect();
+
+    let mut views: Vec<&crate::schema::ViewSchema> = schema
+        .views
+        .values()
+        .filter(|v| in_focus(&v.file_path))
+        .collect();
+    views.sort_by(|a, b| a.name.cmp(&b.name));
+    let views_json: Vec<Value> = views
+        .iter()
+        .map(
+            |v| json!({"name": v.name, "file_path": v.file_path, "source_tables": v.source_tables}),
+        )
+        .collect();
+
+    let mut models: Vec<&crate::schema::OrmModelSchema> = schema
+        .orm_models
+        .values()
+        .filter(|m| in_focus(&m.file_path))
+        .collect();
+    models.sort_by(|a, b| {
+        a.class_name
+            .cmp(&b.class_name)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
+    let models_json: Vec<Value> = models
+        .iter()
+        .map(|m| {
+            json!({
+                "class_name": m.class_name,
+                "table_name": m.table_name,
+                "file_path": m.file_path,
+                "fields": m.fields.len(),
+            })
+        })
+        .collect();
+
+    let mut migrations: Vec<Value> = schema
+        .migrations
+        .iter()
+        .filter(|chain| in_focus(&chain.directory))
+        .map(|chain| json!({"directory": chain.directory, "steps": chain.migrations.len()}))
+        .collect();
+    migrations.sort_by(|a, b| {
+        a["directory"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["directory"].as_str().unwrap_or(""))
+    });
+
+    json!({
+        "indexed": true,
+        "tables": tables_json,
+        "views": views_json,
+        "orm_models": models_json,
+        "migrations": migrations,
+    })
+}
+
+/// Dispatch a resolved capability `op` to its core. Each arm below is the former
+/// `cxpak_*` tool body, re-keyed to the catalog capability id (C3, ADR-0182);
+/// `graph`/`retrieval`/`data` are the newly MCP-surfaced cores.
+fn dispatch_capability_op(
+    id: Option<Value>,
+    op: &str,
+    args: &Value,
+    index: &CodebaseIndex,
+    repo_path: &Path,
+    snapshot: &SharedSnapshot,
+) -> Value {
+    match op {
+        // ---- Newly MCP-surfaced cores (B1 graph, C1 retrieval, C3 data) -----
+        "graph" => {
+            // `graph_op` selects node/neighbors/path/subgraph — renamed so it
+            // does not collide with the intent-tool `op` discriminator. The
+            // neighbors/path/subgraph output carries per-edge `edge_type` +
+            // `confidence` (`inferred`) — A3 (ADR-0175) edge confidence.
+            let sub = args
+                .get("graph_op")
+                .or_else(|| args.get("query"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("node");
+            match crate::intelligence::graph_query::execute(&index.graph, sub, args) {
+                Ok(v) => mcp_tool_result(id, &serde_json::to_string_pretty(&v).unwrap_or_default()),
+                Err(e) => mcp_tool_result(id, &format!("Error: {e}")),
+            }
+        }
+        "retrieval" => {
+            // `retrieval_op` selects search|references|expand (C1, ADR-0180).
+            let sub = args
+                .get("retrieval_op")
+                .and_then(|v| v.as_str())
+                .unwrap_or("search");
+            match crate::intelligence::retrieval::execute(index, sub, args) {
+                Ok(v) => mcp_tool_result(id, &serde_json::to_string_pretty(&v).unwrap_or_default()),
+                Err(e) => mcp_tool_result(id, &format!("Error: {e}")),
+            }
+        }
+        "data" => {
+            let result = build_data_summary(index, args.get("focus").and_then(|f| f.as_str()));
+            mcp_tool_result(
+                id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
+        "context" => {
             let task = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
             if task.is_empty() {
                 return mcp_tool_result(
@@ -2652,7 +2526,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_context_diff" => {
+        "review" => {
             let snap_guard = snapshot.read();
             let delta = match snap_guard {
                 Ok(guard) => match guard.as_ref() {
@@ -2666,7 +2540,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&delta).unwrap_or_default(),
             )
         }
-        "cxpak_stats" => {
+        "stats" => {
             let focus = args.get("focus").and_then(|f| f.as_str());
 
             if focus.is_some() {
@@ -2721,7 +2595,7 @@ pub fn handle_tool_call(
                 )
             }
         }
-        "cxpak_overview" => {
+        "overview" => {
             let focus = args.get("focus").and_then(|f| f.as_str());
 
             if focus.is_some() {
@@ -2775,7 +2649,7 @@ pub fn handle_tool_call(
                 )
             }
         }
-        "cxpak_trace" => {
+        "trace" => {
             let target = args.get("target").and_then(|t| t.as_str()).unwrap_or("");
             if target.is_empty() {
                 return mcp_tool_result(id, "Error: 'target' argument is required");
@@ -2807,7 +2681,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_diff" => {
+        "diff" => {
             let git_ref = args.get("git_ref").and_then(|r| r.as_str());
             let focus = args.get("focus").and_then(|f| f.as_str());
             let review = args
@@ -2884,7 +2758,7 @@ pub fn handle_tool_call(
                 Err(e) => mcp_tool_result(id, &format!("Error: {e}")),
             }
         }
-        "cxpak_context_for_task" => {
+        "context_for_task" => {
             let task = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
             if task.is_empty() {
                 return mcp_tool_result(
@@ -2955,7 +2829,7 @@ pub fn handle_tool_call(
                 .unwrap_or_default(),
             )
         }
-        "cxpak_pack_context" => {
+        "pack_context" => {
             let files: Vec<String> = args
                 .get("files")
                 .and_then(|f| f.as_array())
@@ -3198,7 +3072,7 @@ pub fn handle_tool_call(
                 .unwrap_or_default(),
             )
         }
-        "cxpak_search" => {
+        "search" => {
             let pattern = args.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
             if pattern.is_empty() {
                 return mcp_tool_result(
@@ -3272,7 +3146,7 @@ pub fn handle_tool_call(
                 .unwrap_or_default(),
             )
         }
-        "cxpak_blast_radius" => {
+        "blast_radius" => {
             let files: Vec<&str> = args
                 .get("files")
                 .and_then(|v| v.as_array())
@@ -3299,7 +3173,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_api_surface" => {
+        "api_surface" => {
             let focus = args.get("focus").and_then(|f| f.as_str());
             let include = args
                 .get("include")
@@ -3317,7 +3191,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&surface).unwrap_or_default(),
             )
         }
-        "cxpak_verify" => {
+        "verify" => {
             let git_ref = args.get("ref").and_then(|r| r.as_str());
             let focus = args.get("focus").and_then(|f| f.as_str());
 
@@ -3348,7 +3222,7 @@ pub fn handle_tool_call(
                     .unwrap_or_default(),
             )
         }
-        "cxpak_conventions" => {
+        "conventions" => {
             let category = args
                 .get("category")
                 .and_then(|c| c.as_str())
@@ -3396,14 +3270,14 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_health" => {
+        "health" => {
             let health = crate::intelligence::health::compute_health(index);
             mcp_tool_result(
                 id,
                 &serde_json::to_string_pretty(&health).unwrap_or_default(),
             )
         }
-        "cxpak_risks" => {
+        "risks" => {
             let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
             let focus = args.get("focus").and_then(|f| f.as_str());
             let mut all_risks = crate::intelligence::risk::compute_risk_ranking(index);
@@ -3417,7 +3291,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&risks).unwrap_or_default(),
             )
         }
-        "cxpak_briefing" => {
+        "briefing" => {
             let task = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
             if task.is_empty() {
                 return mcp_tool_result(
@@ -3449,7 +3323,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_call_graph" => {
+        "call_graph" => {
             let target = args.get("target").and_then(|t| t.as_str());
             let focus = args.get("focus").and_then(|f| f.as_str());
             let depth = args.get("depth").and_then(|d| d.as_u64()).unwrap_or(1) as usize;
@@ -3546,7 +3420,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_dead_code" => {
+        "dead_code" => {
             let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
             let focus = args.get("focus").and_then(|f| f.as_str());
             let workspace = args.get("workspace").and_then(|w| w.as_str());
@@ -3578,7 +3452,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_architecture" => {
+        "architecture" => {
             let focus = args.get("focus").and_then(|f| f.as_str());
             let workspace = args.get("workspace").and_then(|w| w.as_str());
             // workspace acts as a module prefix filter when focus is not set
@@ -3601,7 +3475,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_predict" => {
+        "predict" => {
             let files: Vec<String> = args
                 .get("files")
                 .and_then(|f| f.as_array())
@@ -3648,7 +3522,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_drift" => {
+        "drift" => {
             let save_baseline = args
                 .get("save_baseline")
                 .and_then(|v| v.as_bool())
@@ -3660,7 +3534,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&report).unwrap_or_default(),
             )
         }
-        "cxpak_security_surface" => {
+        "security_surface" => {
             let focus = args.get("focus").and_then(|f| f.as_str());
             let surface = crate::intelligence::security::build_security_surface(
                 index,
@@ -3672,7 +3546,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&surface).unwrap_or_default(),
             )
         }
-        "cxpak_data_flow" => {
+        "data_flow" => {
             let symbol = args.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
             if symbol.is_empty() {
                 return mcp_tool_result(
@@ -3694,7 +3568,7 @@ pub fn handle_tool_call(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        "cxpak_cross_lang" => {
+        "cross_lang" => {
             let file_filter = args.get("file").and_then(|s| s.as_str());
             let focus = args.get("focus").and_then(|s| s.as_str());
             let filtered: Vec<&crate::intelligence::cross_lang::CrossLangEdge> = index
@@ -3718,7 +3592,7 @@ pub fn handle_tool_call(
                 .unwrap_or_default(),
             )
         }
-        "cxpak_visual" => {
+        "visual" => {
             let visual_type = args
                 .get("type")
                 .and_then(|v| v.as_str())
@@ -3891,7 +3765,7 @@ pub fn handle_tool_call(
                 )
             }
         }
-        "cxpak_onboard" => {
+        "onboard" => {
             let focus = args.get("focus").and_then(|v| v.as_str());
             let format = args
                 .get("format")
@@ -3917,7 +3791,10 @@ pub fn handle_tool_call(
                 )
             }
         }
-        _ => mcp_error_response(id, -32601, &format!("Unknown tool: {tool_name}")),
+        // Unreachable in practice: `resolve_capability_op` only yields ops that
+        // the catalog hosts (or the 26 legacy aliases), all of which have an arm
+        // above. Kept as a defensive fallback.
+        _ => mcp_error_response(id, -32601, &format!("Unknown capability op: {op}")),
     }
 }
 
@@ -4725,7 +4602,31 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 26);
+        // C3 (ADR-0182): the live MCP surface is the ≤8 intent-tool projection
+        // of the capability catalog, not the 26 legacy tools.
+        assert!(
+            tools.len() <= 8,
+            "MCP surface must be ≤8; got {}",
+            tools.len()
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "cxpak_context",
+                "cxpak_graph",
+                "cxpak_data",
+                "cxpak_review",
+                "cxpak_insight"
+            ],
+            "live tools/list must equal the deterministic catalog projection"
+        );
+        // Every intent-tool advertises read-only + a required `op` selector.
+        for t in tools {
+            assert_eq!(t["annotations"]["readOnlyHint"], serde_json::json!(true));
+            assert_eq!(t["inputSchema"]["required"][0], "op");
+            assert!(t["inputSchema"]["properties"]["op"]["enum"].is_array());
+        }
     }
 
     #[test]
@@ -5620,14 +5521,20 @@ mod tests {
         .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(
-            tools.len(),
-            26,
-            "should have 26 tools (13 existing + 3 v1.2.0 + 3 v1.3.0 + 3 v1.4.0 + 2 v1.5.0 + 2 v2.0.0)"
-        );
-        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(tool_names.contains(&"cxpak_context_for_task"));
-        assert!(tool_names.contains(&"cxpak_pack_context"));
+        // C3: context_for_task and pack_context are now `op`s under cxpak_context.
+        assert!(tools.len() <= 8);
+        let ctx = tools
+            .iter()
+            .find(|t| t["name"] == "cxpak_context")
+            .expect("cxpak_context intent-tool present");
+        let ops: Vec<&str> = ctx["inputSchema"]["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(ops.contains(&"context_for_task"), "ops={ops:?}");
+        assert!(ops.contains(&"pack_context"), "ops={ops:?}");
     }
 
     #[test]
@@ -6236,17 +6143,28 @@ mod tests {
         .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // C3: `search` is now an `op` under cxpak_context (legacy regex search
+        // preserved verbatim, distinct from the newer `retrieval` op).
+        let ctx = tools
+            .iter()
+            .find(|t| t["name"] == "cxpak_context")
+            .expect("cxpak_context intent-tool present");
+        let ops: Vec<&str> = ctx["inputSchema"]["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
         assert!(
-            tool_names.contains(&"cxpak_search"),
-            "tools/list should include cxpak_search"
+            ops.contains(&"search"),
+            "cxpak_context ops must include search: {ops:?}"
         );
-        // Verify all tools have focus property
+        // Every intent-tool exposes the `op` selector and additional per-op params.
         for tool in tools {
             let props = tool["inputSchema"]["properties"].as_object().unwrap();
             assert!(
-                props.contains_key("focus"),
-                "tool {} should have focus property",
+                props.contains_key("op"),
+                "tool {} should have op selector",
                 tool["name"]
             );
         }
@@ -7009,7 +6927,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mcp_auto_context_first_in_tools_list() {
+    fn test_mcp_context_intent_first_in_tools_list() {
         let index = make_test_index();
         let repo_path = std::path::Path::new("/tmp");
         let snap = make_shared_snapshot();
@@ -7019,9 +6937,15 @@ mod tests {
         mcp_stdio_loop_with_io(repo_path, &index, &snap, input.as_bytes(), &mut output).unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
+        // C3: cxpak_context (Intent::Context) is the first intent-tool, and the
+        // `context` (auto_context) op is its first op.
         assert_eq!(
-            tools[0]["name"], "cxpak_auto_context",
-            "cxpak_auto_context must be first in the tools list"
+            tools[0]["name"], "cxpak_context",
+            "cxpak_context must be first in the tools list"
+        );
+        assert_eq!(
+            tools[0]["inputSchema"]["properties"]["op"]["enum"][0], "context",
+            "context (auto_context) must be the first op under cxpak_context"
         );
     }
 
@@ -7091,16 +7015,23 @@ mod tests {
         mcp_stdio_loop_with_io(repo_path, &index, &snap, input.as_bytes(), &mut output).unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(
-            tool_names.contains(&"cxpak_auto_context"),
-            "tools/list should include cxpak_auto_context"
-        );
-        assert!(
-            tool_names.contains(&"cxpak_context_diff"),
-            "tools/list should include cxpak_context_diff"
-        );
-        assert_eq!(tools.len(), 26, "total tool count should be 26");
+        // C3: auto_context is `op=context` under cxpak_context; context_diff is
+        // `op=review` under cxpak_review.
+        let op_enum = |tool: &str| -> Vec<String> {
+            tools
+                .iter()
+                .find(|t| t["name"] == tool)
+                .and_then(|t| t["inputSchema"]["properties"]["op"]["enum"].as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(op_enum("cxpak_context").contains(&"context".to_string()));
+        assert!(op_enum("cxpak_review").contains(&"review".to_string()));
+        assert!(tools.len() <= 8, "total tool count must be ≤8");
     }
 
     // --- Task 11: cxpak_health MCP tool ---
@@ -7727,7 +7658,7 @@ mod tests {
     // --- Task 15: cxpak_visual MCP tool ---
 
     #[test]
-    fn test_mcp_tools_list_includes_visual_and_onboard() {
+    fn test_mcp_tools_list_hosts_visual_and_onboard_ops() {
         let index = make_test_index();
         let snap = make_shared_snapshot();
         let repo = std::path::Path::new("/tmp");
@@ -7736,76 +7667,24 @@ mod tests {
         mcp_stdio_loop_with_io(repo, &index, &snap, input.as_bytes(), &mut output).unwrap();
         let resp: Value = serde_json::from_slice(&output).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-        assert!(
-            tool_names.contains(&"cxpak_visual"),
-            "tools/list must include cxpak_visual, got: {tool_names:?}"
-        );
-        assert!(
-            tool_names.contains(&"cxpak_onboard"),
-            "tools/list must include cxpak_onboard, got: {tool_names:?}"
-        );
-    }
-
-    #[test]
-    fn test_mcp_visual_schema_has_expected_params() {
-        let index = make_test_index();
-        let snap = make_shared_snapshot();
-        let repo = std::path::Path::new("/tmp");
-        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
-        let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo, &index, &snap, input.as_bytes(), &mut output).unwrap();
-        let resp: Value = serde_json::from_slice(&output).unwrap();
-        let tools = resp["result"]["tools"].as_array().unwrap();
-        let visual_tool = tools
+        // C3: visual and onboard are `op`s under cxpak_insight.
+        let insight = tools
             .iter()
-            .find(|t| t["name"].as_str() == Some("cxpak_visual"))
-            .expect("cxpak_visual must be in the tool list");
-        let props = &visual_tool["inputSchema"]["properties"];
-        assert!(
-            props["type"].is_object(),
-            "cxpak_visual must have 'type' param"
-        );
-        assert!(
-            props["format"].is_object(),
-            "cxpak_visual must have 'format' param"
-        );
-        assert!(
-            props["focus"].is_object(),
-            "cxpak_visual must have 'focus' param"
-        );
-        assert!(
-            props["symbol"].is_object(),
-            "cxpak_visual must have 'symbol' param"
-        );
-        assert!(
-            props["files"].is_object(),
-            "cxpak_visual must have 'files' param"
-        );
-    }
-
-    #[test]
-    fn test_mcp_onboard_schema_has_expected_params() {
-        let index = make_test_index();
-        let snap = make_shared_snapshot();
-        let repo = std::path::Path::new("/tmp");
-        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
-        let mut output = Vec::new();
-        mcp_stdio_loop_with_io(repo, &index, &snap, input.as_bytes(), &mut output).unwrap();
-        let resp: Value = serde_json::from_slice(&output).unwrap();
-        let tools = resp["result"]["tools"].as_array().unwrap();
-        let onboard_tool = tools
+            .find(|t| t["name"] == "cxpak_insight")
+            .expect("cxpak_insight intent-tool present");
+        let ops: Vec<&str> = insight["inputSchema"]["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|t| t["name"].as_str() == Some("cxpak_onboard"))
-            .expect("cxpak_onboard must be in the tool list");
-        let props = &onboard_tool["inputSchema"]["properties"];
+            .map(|v| v.as_str().unwrap())
+            .collect();
         assert!(
-            props["focus"].is_object(),
-            "cxpak_onboard must have 'focus' param"
+            ops.contains(&"visual"),
+            "insight ops must include visual: {ops:?}"
         );
         assert!(
-            props["format"].is_object(),
-            "cxpak_onboard must have 'format' param"
+            ops.contains(&"onboard"),
+            "insight ops must include onboard: {ops:?}"
         );
     }
 

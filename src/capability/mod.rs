@@ -9,11 +9,12 @@
 //! (ADR-0153 single-source invariant; the conformance gate in
 //! `tests/surface_conformance.rs` enforces it).
 //!
-//! This module is a **parallel framework**, deliberately built ALONGSIDE the
-//! legacy 26-tool MCP handler in `src/commands/serve.rs`. Task 0.6 does NOT
-//! migrate, modify, or delete that handler — the 26→8 consolidation is a later
-//! task (C3). What 0.6 locks in are the two CI gates every future capability
-//! must pass:
+//! Originally (Task 0.6) this was a **parallel framework** built ALONGSIDE the
+//! legacy 26-tool MCP handler in `src/commands/serve.rs`. **Task C3 (ADR-0182)
+//! completed the migration**: the live `serve.rs` `tools/list` is now the
+//! [`adapter::mcp_tools`] projection of this catalog, and every one of the 26
+//! former MCP tools is reachable as an `op` under one of the five
+//! `cxpak_<intent>` tools. Two CI gates every capability must pass:
 //!
 //! * **MCP ≤ 8 tools** — [`adapter::mcp_tools`] groups capabilities into at most
 //!   eight intent-tools; a new capability rides as an `op` param under an
@@ -22,9 +23,9 @@
 //!   round-trips equal to the core result (`adapter::project` /
 //!   `adapter::recover_core`).
 //!
-//! The catalog is **honest**: it lists only capabilities that genuinely exist
-//! and are reachable today. It does not attempt to enumerate all 26 legacy MCP
-//! ops — that is C3's job.
+//! The catalog is **honest**: each capability lists only the surfaces that
+//! genuinely return its core result today (see the per-entry comments in
+//! `build_catalog`).
 
 pub mod adapter;
 
@@ -149,14 +150,10 @@ impl Intent {
     }
 }
 
-/// The initial capability catalog: capabilities that genuinely exist and are
-/// reachable today, each declaring its surfaces.
-///
-/// Anchored to Task 0.5's schema ids (`context`/`graph`/`data`/`review`) plus
-/// the core intelligence capabilities already cross-channel today
-/// (`health`/`risks`/`architecture` — see `tests/cross_channel_consistency.rs`,
-/// which proves they are SPA + v1 + MCP + LSP consistent). It does NOT
-/// enumerate all 26 legacy MCP ops; that is C3.
+/// The capability catalog: every capability cxpak exposes, each declaring its
+/// surfaces. Post-C3 (ADR-0182) this enumerates all 26 former MCP tools as
+/// `op`-selectable capabilities plus the schema-anchored `context`/`graph`/
+/// `data`/`review` ids from Task 0.5.
 ///
 /// Built once via `OnceLock` and returned as `&'static`, so catalog order is
 /// fixed and there is no per-call allocation. The slice order is the canonical
@@ -167,179 +164,341 @@ pub fn catalog() -> &'static [Capability] {
     CATALOG.get_or_init(build_catalog).as_slice()
 }
 
+/// Convenience constructor for a read-only [`Capability`] — every cxpak
+/// capability is read-only by construction, so the flag is not a per-call
+/// parameter here (the `every_capability_is_read_only` invariant test pins it).
+fn cap(
+    id: &'static str,
+    summary: &'static str,
+    intent: Intent,
+    inputs: &'static [&'static str],
+    has_schema: bool,
+    projections: SurfaceSet,
+) -> Capability {
+    Capability {
+        id,
+        summary,
+        intent,
+        inputs,
+        has_schema,
+        read_only: true,
+        projections,
+    }
+}
+
+/// Compact [`SurfaceSet`] literal: `(mcp, lsp, cli, http, visual)`.
+const fn s(mcp: bool, lsp: bool, cli: bool, http: bool, visual: bool) -> SurfaceSet {
+    SurfaceSet {
+        mcp,
+        lsp,
+        cli,
+        http,
+        visual,
+    }
+}
+
 fn build_catalog() -> Vec<Capability> {
-    // Surface declarations below are honest snapshots of where each capability
-    // is reachable today (cross-referenced against serve.rs MCP tools, the
-    // `/v1/*` routes, the `cxpak/*` LSP methods, the CLI subcommands, and the
-    // SPA dashboard). They are NOT aspirational.
+    // C3 (ADR-0182) consolidated the 26 hand-rolled `serve.rs` MCP tools into
+    // this catalog: every legacy MCP capability now rides as an `op` under one
+    // of the five `cxpak_<intent>` tools emitted by `adapter::mcp_tools`, and
+    // the live `serve.rs` `tools/list` is that adapter projection (≤8). Each
+    // capability id below is exactly the MCP `op` selector value.
+    //
+    // Surface declarations are honest snapshots of where each capability is
+    // reachable today, cross-referenced against the live MCP dispatch
+    // (`serve.rs` `dispatch_capability_op`), the `/v1/*` routes, the `cxpak/*`
+    // LSP methods (`lsp::methods`), and the CLI subcommands. `http` means an
+    // `/v1/*` route returns the capability's core; `visual` means a dashboard
+    // renders it. They are NOT aspirational.
     vec![
-        Capability {
-            id: "context",
-            summary: "Token-budgeted context bundle for a task (auto_context).",
-            read_only: true,
-            intent: Intent::Context,
-            inputs: &["task", "budget", "files"],
-            has_schema: true,
-            // Reachable today ONLY via the MCP `cxpak_auto_context` tool. There
-            // is no `cxpak context` CLI subcommand, no `/v1/context` route, no
-            // `cxpak/context` LSP method, and the SPA does not render the
-            // context bundle — so every other bit is honestly false.
-            projections: SurfaceSet {
-                mcp: true,
-                lsp: false,
-                cli: false,
-                http: false,
-                visual: false,
-            },
-        },
-        Capability {
-            id: "retrieval",
-            summary: "Iterative retrieval over cxpak's own index: search, references, expand.",
-            read_only: true,
-            // Retrieval rides under the Context intent (its natural home — it
-            // packs the raw material auto_context assembles). The single core
-            // `intelligence::retrieval::execute` (op ∈ search|references|expand)
-            // is projected to all four surfaces below — no re-derivation
-            // (ADR-0180; mirrors B1's `graph` capability):
-            //   * CLI  — `cxpak search <query> [--op ...]` (commands::search).
-            //   * HTTP — `POST /v1/retrieval` (serve.rs `v1_retrieval_handler`).
-            //   * LSP  — `cxpak/retrieval` custom method (lsp::methods), carrying
-            //     a read-only annotation (`method_is_read_only`).
-            //   * MCP  — selectable as `op=retrieval` under the `cxpak_context`
-            //     intent-tool emitted by the catalog adapter, keeping the budget
-            //     ≤8. The live serve.rs MCP server migrates onto the adapter in
-            //     C3 (26→8), out of scope here; the legacy regex `cxpak_search`
-            //     / `cxpak/search` / `/search` stay untouched for C3 to
-            //     reconcile.
-            // No schema yet (the retrieval contract is pinned by ADR-0180 + the
-            // determinism gate, not a 0.5 JSON schema); `visual` stays false.
-            intent: Intent::Context,
-            inputs: &["op", "query", "symbol", "seeds", "depth", "limit"],
-            has_schema: false,
-            projections: SurfaceSet {
-                mcp: true,
-                lsp: true,
-                cli: true,
-                http: true,
-                visual: false,
-            },
-        },
-        Capability {
-            id: "graph",
-            summary: "Query the typed dependency graph: node, neighbors, path, subgraph.",
-            read_only: true,
-            intent: Intent::Graph,
-            inputs: &["op", "id", "from", "to", "direction", "seeds", "depth"],
-            has_schema: true,
-            // B1 (graph-query) surfaces the typed graph as a retrievable result
-            // through the single core `intelligence::graph_query::execute`
-            // (node/neighbors/path/subgraph). All four surfaces below project
-            // that one core result — no re-derivation:
-            //   * CLI  — `cxpak graph <op> ...` (commands::graph).
-            //   * HTTP — `POST /v1/graph` (serve.rs `v1_graph_handler`).
-            //   * LSP  — `cxpak/graph` custom method (lsp::methods).
-            //   * MCP  — the `cxpak_graph` intent-tool, emitted by the catalog
-            //     adapter (`adapter::mcp_tools`), keeping the budget ≤8. The
-            //     live `serve.rs` MCP server is migrated onto the adapter in C3
-            //     (the 26→8 consolidation), which is out of scope here.
-            // `visual` stays false: the architecture/flow views draw the graph,
-            // they do not return the graph-query JSON contract.
-            projections: SurfaceSet {
-                mcp: true,
-                lsp: true,
-                cli: true,
-                http: true,
-                visual: false,
-            },
-        },
-        Capability {
-            id: "data",
-            summary: "Data-layer index: tables, views, ORM models, migrations.",
-            read_only: true,
-            intent: Intent::Data,
-            inputs: &["focus"],
-            has_schema: true,
-            // The `SchemaIndex` is indexed internally (consumed for query
-            // expansion / schema-aware edges) but is NOT yet surfaced as a
-            // retrievable result: there is no `/v1/data` route (`/v1/data_flow`
-            // is the distinct cross-language data-flow capability), no MCP tool
-            // emits the SchemaIndex, and `cxpak schema data` prints the schema
-            // CONTRACT, not the indexed tables. Kept to anchor its 0.5 schema;
-            // wired to a surface in A2/C3.
-            projections: SurfaceSet {
-                mcp: false,
-                lsp: false,
-                cli: false,
-                http: false,
-                visual: false,
-            },
-        },
-        Capability {
-            id: "review",
-            summary: "Review-aware diff delta (changed files, symbols, edges).",
-            read_only: true,
-            intent: Intent::Review,
-            inputs: &["base", "head"],
-            has_schema: true,
-            // The `ContextDelta` (Task 0.5 `review` schema) is returned today
-            // ONLY by the MCP `cxpak_context_diff` tool (= `compute_diff`). The
-            // CLI `cxpak diff --review` emits a markdown change-impact bundle
-            // (not ContextDelta JSON), `cxpak/diff` (LSP) returns raw git
-            // changes (not ContextDelta), there is no `/v1/` ContextDelta route,
-            // and the SPA inits its diff data to null. So MCP only.
-            projections: SurfaceSet {
-                mcp: true,
-                lsp: false,
-                cli: false,
-                http: false,
-                visual: false,
-            },
-        },
-        Capability {
-            id: "health",
-            summary: "Composite codebase health score across six dimensions.",
-            read_only: true,
-            intent: Intent::Insight,
-            inputs: &[],
-            has_schema: false,
-            projections: SurfaceSet {
-                mcp: true,
-                lsp: true,
-                cli: false,
-                http: true,
-                visual: true,
-            },
-        },
-        Capability {
-            id: "risks",
-            summary: "Per-file risk ranking (churn × blast radius × coverage).",
-            read_only: true,
-            intent: Intent::Insight,
-            inputs: &[],
-            has_schema: false,
-            projections: SurfaceSet {
-                mcp: true,
-                lsp: false,
-                cli: false,
-                http: true,
-                visual: true,
-            },
-        },
-        Capability {
-            id: "architecture",
-            summary: "Module map with circular-dependency detection.",
-            read_only: true,
-            intent: Intent::Insight,
-            inputs: &["module_depth"],
-            has_schema: false,
-            projections: SurfaceSet {
-                mcp: true,
-                lsp: false,
-                cli: false,
-                http: true,
-                visual: true,
-            },
-        },
+        // ---- Intent::Context — pack token-budgeted context -----------------
+        // `context` = auto_context, MCP only (no `/v1/context`, no CLI/LSP).
+        cap(
+            "context",
+            "Token-budgeted context bundle for a task (auto_context).",
+            Intent::Context,
+            &["task", "tokens", "focus", "mode", "cost_model"],
+            true,
+            s(true, false, false, false, false),
+        ),
+        // `retrieval` (C1, ADR-0180) — one core over four surfaces: CLI
+        // `cxpak search`, HTTP `/v1/retrieval`, LSP `cxpak/retrieval`, MCP op.
+        cap(
+            "retrieval",
+            "Iterative retrieval over cxpak's own index: search, references, expand.",
+            Intent::Context,
+            &["retrieval_op", "query", "symbol", "seeds", "depth", "limit"],
+            false,
+            // CLI `cxpak search`, HTTP `/v1/retrieval`, LSP `cxpak/retrieval`, MCP.
+            s(true, true, true, true, false),
+        ),
+        // `search` — the legacy regex content search (`find_content_matches`);
+        // preserved verbatim from the removed `cxpak_search` tool. Also on LSP
+        // (`cxpak/search`). Distinct from `retrieval` (the newer iterative core).
+        cap(
+            "search",
+            "Regex content search over indexed files with surrounding context.",
+            Intent::Context,
+            &["pattern", "limit", "focus", "context_lines"],
+            false,
+            s(true, true, false, false, false),
+        ),
+        // `overview` — repo/language summary; MCP + LSP (`cxpak/overview`).
+        cap(
+            "overview",
+            "Structured overview of the codebase (files, tokens, languages).",
+            Intent::Context,
+            &["tokens", "focus"],
+            false,
+            s(true, true, false, false, false),
+        ),
+        // `stats` — index statistics; MCP only.
+        cap(
+            "stats",
+            "Index statistics: file count, tokens, per-language breakdown.",
+            Intent::Context,
+            &["focus"],
+            false,
+            s(true, false, false, false, false),
+        ),
+        // `context_for_task` — relevance ranking of files for a task; MCP only.
+        cap(
+            "context_for_task",
+            "Score and rank codebase files by relevance to a task description.",
+            Intent::Context,
+            &["task", "limit", "focus"],
+            false,
+            s(true, false, false, false, false),
+        ),
+        // `pack_context` — pack explicit files into a budgeted bundle; MCP only.
+        cap(
+            "pack_context",
+            "Pack selected files into a token-budgeted bundle with dependencies.",
+            Intent::Context,
+            &[
+                "files",
+                "tokens",
+                "include_dependencies",
+                "include_tests",
+                "focus",
+            ],
+            false,
+            s(true, false, false, false, false),
+        ),
+        // `briefing` — compact orientation manifest; MCP + HTTP (`/v1/briefing`).
+        cap(
+            "briefing",
+            "Compact briefing: file manifest, health, risks, architecture (no code).",
+            Intent::Context,
+            &["task", "tokens", "focus", "cost_model"],
+            false,
+            s(true, false, false, true, false),
+        ),
+        // ---- Intent::Graph — query the dependency graph --------------------
+        // `graph` (B1, ADR-0176) — node/neighbors/path/subgraph over one core;
+        // CLI `cxpak graph`, HTTP `/v1/graph`, LSP `cxpak/graph`, MCP op. Its
+        // neighbors/path/subgraph output carries per-edge `edge_type` +
+        // `confidence` (`inferred`) — the A3 (ADR-0175) edge-confidence surface.
+        cap(
+            "graph",
+            "Query the typed dependency graph: node, neighbors, path, subgraph.",
+            Intent::Graph,
+            &[
+                "graph_op",
+                "id",
+                "from",
+                "to",
+                "direction",
+                "seeds",
+                "depth",
+            ],
+            true,
+            s(true, true, true, true, false),
+        ),
+        // `trace` — locate a symbol and report match counts; MCP + LSP.
+        cap(
+            "trace",
+            "Trace a symbol through the codebase dependency graph.",
+            Intent::Graph,
+            &["target", "tokens", "focus"],
+            false,
+            s(true, true, false, false, false),
+        ),
+        // `blast_radius` — impact of changing files; MCP + LSP (`cxpak/blastRadius`).
+        cap(
+            "blast_radius",
+            "Impact of changing files: dependents, tests, schema, with risk scores.",
+            Intent::Graph,
+            &["files", "depth", "focus"],
+            false,
+            s(true, true, false, false, false),
+        ),
+        // `call_graph` — cross-file call edges; MCP + LSP + HTTP (`/v1/call_graph`).
+        cap(
+            "call_graph",
+            "Cross-file call graph with per-edge confidence (exact vs approximate).",
+            Intent::Graph,
+            &["target", "depth", "focus", "workspace"],
+            false,
+            s(true, true, false, true, false),
+        ),
+        // `dead_code` — unreferenced symbols; MCP + LSP + HTTP (`/v1/dead_code`).
+        cap(
+            "dead_code",
+            "Dead symbols (zero callers, non-entry, untested) by liveness score.",
+            Intent::Graph,
+            &["focus", "limit", "workspace"],
+            false,
+            s(true, true, false, true, false),
+        ),
+        // `api_surface` — public symbols/routes/services; MCP + LSP (`cxpak/apiSurface`).
+        cap(
+            "api_surface",
+            "Public API surface: symbols, HTTP routes, gRPC services, GraphQL types.",
+            Intent::Graph,
+            &["focus", "include", "tokens"],
+            false,
+            s(true, true, false, false, false),
+        ),
+        // `data_flow` — source→sink value flow; MCP + LSP + HTTP (`/v1/data_flow`).
+        cap(
+            "data_flow",
+            "Trace how a value flows from source to sink through static call paths.",
+            Intent::Graph,
+            &["symbol", "sink", "depth", "focus"],
+            false,
+            s(true, true, false, true, false),
+        ),
+        // `cross_lang` — cross-language boundaries; MCP + HTTP (`/v1/cross_lang`).
+        cap(
+            "cross_lang",
+            "Cross-language boundaries: HTTP, FFI, gRPC, GraphQL, shared DB, exec.",
+            Intent::Graph,
+            &["file", "focus"],
+            false,
+            s(true, false, false, true, false),
+        ),
+        // `predict` — change-impact prediction; MCP + LSP + HTTP (`/v1/predict`).
+        cap(
+            "predict",
+            "Predict change impact (structural, historical, call-based) with tests.",
+            Intent::Graph,
+            &["files", "depth", "focus"],
+            false,
+            s(true, true, false, true, false),
+        ),
+        // ---- Intent::Data — inspect the data layer -------------------------
+        // `data` (B1 M2 / C3) — the `SchemaIndex` (tables/views/ORM/migrations)
+        // is now surfaced as a retrievable result via the MCP `cxpak_data` op
+        // (`dispatch_capability_op` "data"). Its 0.5 schema is anchored. Other
+        // surfaces do not yet return the SchemaIndex, so they stay false.
+        cap(
+            "data",
+            "Data-layer index: tables, views, ORM models, migrations.",
+            Intent::Data,
+            &["focus"],
+            true,
+            s(true, false, false, false, false),
+        ),
+        // ---- Intent::Review — analyze changes for review -------------------
+        // `review` = context_diff (`ContextDelta`, 0.5 review schema); MCP only.
+        cap(
+            "review",
+            "Review-aware diff delta (changed files, symbols, edges).",
+            Intent::Review,
+            &["since", "focus"],
+            true,
+            s(true, false, false, false, false),
+        ),
+        // `diff` — changes with dependency context (+ optional review bundle);
+        // MCP + LSP (`cxpak/diff`).
+        cap(
+            "diff",
+            "Show changes with dependency context; optional change-impact review.",
+            Intent::Review,
+            &["git_ref", "tokens", "focus", "review"],
+            false,
+            s(true, true, false, false, false),
+        ),
+        // `verify` — convention deviations on changed lines; MCP only.
+        cap(
+            "verify",
+            "Verify code changes against observed conventions (changed lines only).",
+            Intent::Review,
+            &["ref", "focus"],
+            false,
+            s(true, false, false, false, false),
+        ),
+        // ---- Intent::Insight — health, risk, architecture ------------------
+        cap(
+            "health",
+            "Composite codebase health score across six dimensions.",
+            Intent::Insight,
+            &["focus"],
+            false,
+            s(true, true, false, true, true),
+        ),
+        cap(
+            "risks",
+            "Per-file risk ranking (churn × blast radius × coverage).",
+            Intent::Insight,
+            &["limit", "focus"],
+            false,
+            s(true, false, false, true, true),
+        ),
+        cap(
+            "architecture",
+            "Module map with circular-dependency detection.",
+            Intent::Insight,
+            &["focus", "workspace"],
+            false,
+            s(true, false, false, true, true),
+        ),
+        // `conventions` — full convention profile; MCP + LSP + HTTP.
+        cap(
+            "conventions",
+            "Full convention profile: detected patterns with counts and strength.",
+            Intent::Insight,
+            &["category", "strength", "focus"],
+            false,
+            s(true, true, false, true, false),
+        ),
+        // `security_surface` — endpoints/secrets/injection; MCP + LSP + HTTP.
+        cap(
+            "security_surface",
+            "Security surface: unprotected endpoints, secrets, injection, exposure.",
+            Intent::Insight,
+            &["focus"],
+            false,
+            s(true, true, false, true, false),
+        ),
+        // `drift` — architecture drift vs baseline/snapshots; MCP + LSP + HTTP.
+        cap(
+            "drift",
+            "Architecture drift vs baseline and historical snapshots.",
+            Intent::Insight,
+            &["save_baseline", "focus"],
+            false,
+            s(true, true, false, true, false),
+        ),
+        // `visual` — interactive diagrams; MCP + CLI (`cxpak visual`) + visual.
+        cap(
+            "visual",
+            "Interactive visual diagram (dashboard, architecture, risk, flow, ...).",
+            Intent::Insight,
+            &["type", "format", "focus", "symbol", "files"],
+            false,
+            s(true, false, true, false, true),
+        ),
+        // `onboard` — guided reading map; MCP + CLI (`cxpak onboard`).
+        cap(
+            "onboard",
+            "Guided onboarding map: phased reading plan with reading time.",
+            Intent::Insight,
+            &["focus", "format"],
+            false,
+            s(true, false, true, false, false),
+        ),
     ]
 }
 

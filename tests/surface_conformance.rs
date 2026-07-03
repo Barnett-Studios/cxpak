@@ -142,3 +142,161 @@ fn projection_is_pure_no_recompute() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// C3 (ADR-0182) / B1 M2 extension: real-core reachability for the migrated
+// `graph` and `data` ops.
+//
+// The gate above proves the projection framework is *invertible* over stub
+// cores. This extension proves the stronger property the C3 migration requires
+// for `graph` and `data`: their MCP op now routes to a REAL `intelligence` /
+// `SchemaIndex` core on the live surface, and that real core still round-trips
+// bit-equal through every surface the capability declares.
+// ---------------------------------------------------------------------------
+
+use cxpak::budget::counter::TokenCounter;
+use cxpak::commands::serve::handle_tool_call;
+use cxpak::index::CodebaseIndex;
+use cxpak::parser::language::{Import, ParseResult, Symbol, SymbolKind, Visibility};
+use cxpak::scanner::ScannedFile;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+fn real_index() -> CodebaseIndex {
+    let counter = TokenCounter::new();
+    let files = vec![
+        ScannedFile {
+            relative_path: "src/a.rs".into(),
+            absolute_path: "/tmp/src/a.rs".into(),
+            language: Some("rust".into()),
+            size_bytes: 100,
+        },
+        ScannedFile {
+            relative_path: "src/b.rs".into(),
+            absolute_path: "/tmp/src/b.rs".into(),
+            language: Some("rust".into()),
+            size_bytes: 100,
+        },
+        ScannedFile {
+            relative_path: "db/t.sql".into(),
+            absolute_path: "/tmp/db/t.sql".into(),
+            language: Some("sql".into()),
+            size_bytes: 80,
+        },
+    ];
+    let mut pr = HashMap::new();
+    pr.insert(
+        "src/a.rs".to_string(),
+        ParseResult {
+            symbols: vec![Symbol {
+                name: "f".into(),
+                kind: SymbolKind::Function,
+                visibility: Visibility::Public,
+                signature: "pub fn f()".into(),
+                body: "{}".into(),
+                start_line: 1,
+                end_line: 2,
+            }],
+            imports: vec![],
+            exports: vec![],
+        },
+    );
+    pr.insert(
+        "src/b.rs".to_string(),
+        ParseResult {
+            symbols: vec![],
+            imports: vec![Import {
+                source: "crate::a".into(),
+                names: vec!["f".into()],
+            }],
+            exports: vec![],
+        },
+    );
+    let mut content = HashMap::new();
+    content.insert("src/a.rs".to_string(), "pub fn f(){}".into());
+    content.insert("src/b.rs".to_string(), "use crate::a::f;".into());
+    content.insert(
+        "db/t.sql".to_string(),
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);".into(),
+    );
+    CodebaseIndex::build_with_content(files, pr, &counter, content)
+}
+
+/// Extract the real capability core the live MCP op returned (unwrap the tool
+/// envelope's `result.content[0].text` back to JSON).
+fn live_core(idx: &CodebaseIndex, tool: &str, args: Value) -> Value {
+    let snap: cxpak::commands::serve::SharedSnapshot = Arc::new(RwLock::new(None));
+    let resp = handle_tool_call(
+        Some(json!(1)),
+        tool,
+        &args,
+        idx,
+        std::path::Path::new("/tmp"),
+        &snap,
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no core for {tool}: {resp}"));
+    serde_json::from_str(text).unwrap()
+}
+
+fn cap_for(id: &str) -> &'static Capability {
+    catalog().iter().find(|c| c.id == id).expect("present")
+}
+
+#[test]
+fn migrated_graph_op_real_core_round_trips_all_surfaces() {
+    let idx = real_index();
+    // Real graph-query core (not a stub) via the live MCP `graph` op.
+    let core = live_core(
+        &idx,
+        "cxpak_graph",
+        json!({"op": "graph", "graph_op": "neighbors", "id": "src/b.rs", "direction": "both"}),
+    );
+    let neighbors = core["neighbors"].as_array().expect("neighbors");
+    assert!(
+        !neighbors.is_empty(),
+        "b.rs imports a.rs — expected an edge"
+    );
+    // A3: the real core carries per-edge confidence.
+    assert!(neighbors[0]["confidence"].is_string());
+
+    // The real core round-trips bit-equal through every surface graph declares.
+    let cap = cap_for("graph");
+    for &surface in ALL_SURFACES {
+        if !declares(cap, surface) {
+            continue;
+        }
+        let projected = project(cap, surface, &core);
+        let recovered = recover_core(cap, surface, &projected);
+        assert!(
+            bit_equal(&core, &recovered),
+            "graph real core did not round-trip on {surface:?}"
+        );
+    }
+}
+
+#[test]
+fn migrated_data_op_real_core_round_trips_all_surfaces() {
+    let idx = real_index();
+    // Real SchemaIndex-derived core via the live MCP `data` op.
+    let core = live_core(&idx, "cxpak_data", json!({"op": "data"}));
+    assert!(
+        core["indexed"].is_boolean(),
+        "data core must be real: {core}"
+    );
+    assert!(core["tables"].is_array());
+
+    let cap = cap_for("data");
+    for &surface in ALL_SURFACES {
+        if !declares(cap, surface) {
+            continue;
+        }
+        let projected = project(cap, surface, &core);
+        let recovered = recover_core(cap, surface, &projected);
+        assert!(
+            bit_equal(&core, &recovered),
+            "data real core did not round-trip on {surface:?}"
+        );
+    }
+}

@@ -511,23 +511,57 @@ mod serve_tests {
 
         assert_eq!(response["id"], 2);
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 26);
-
+        // C3 (ADR-0182): the MCP surface is the ≤8 intent-tool projection; the
+        // former 26 tools are now `op`s under these five.
+        assert!(
+            tools.len() <= 8,
+            "MCP surface must be ≤8; got {}",
+            tools.len()
+        );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(tool_names.contains(&"cxpak_auto_context"));
-        assert!(tool_names.contains(&"cxpak_context_diff"));
-        assert!(tool_names.contains(&"cxpak_overview"));
-        assert!(tool_names.contains(&"cxpak_trace"));
-        assert!(tool_names.contains(&"cxpak_stats"));
-        assert!(tool_names.contains(&"cxpak_diff"));
-        assert!(tool_names.contains(&"cxpak_health"));
-        assert!(tool_names.contains(&"cxpak_risks"));
-        assert!(tool_names.contains(&"cxpak_briefing"));
-        assert!(tool_names.contains(&"cxpak_context_for_task"));
-        assert!(tool_names.contains(&"cxpak_pack_context"));
-        assert!(tool_names.contains(&"cxpak_search"));
-        assert!(tool_names.contains(&"cxpak_blast_radius"));
-        assert!(tool_names.contains(&"cxpak_api_surface"));
+        assert_eq!(
+            tool_names,
+            vec![
+                "cxpak_context",
+                "cxpak_graph",
+                "cxpak_data",
+                "cxpak_review",
+                "cxpak_insight"
+            ]
+        );
+        // Collect all ops advertised across the intent-tools and assert the
+        // former tool set is fully covered.
+        let all_ops: Vec<String> = tools
+            .iter()
+            .flat_map(|t| {
+                t["inputSchema"]["properties"]["op"]["enum"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        for op in [
+            "context",
+            "review",
+            "overview",
+            "trace",
+            "stats",
+            "diff",
+            "health",
+            "risks",
+            "briefing",
+            "context_for_task",
+            "pack_context",
+            "search",
+            "blast_radius",
+            "api_surface",
+        ] {
+            assert!(
+                all_ops.iter().any(|o| o == op),
+                "missing op {op} in {all_ops:?}"
+            );
+        }
 
         child.kill().ok();
         child.wait().ok();

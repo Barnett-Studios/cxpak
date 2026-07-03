@@ -93,6 +93,12 @@ pub struct McpTool {
     /// The capability ids selectable via this tool's `op` parameter, in catalog
     /// order. Deterministic.
     pub ops: Vec<String>,
+    /// Whether every capability fronted by this tool is read-only. cxpak is a
+    /// read-only analysis tool, so this is `true` for all intent-tools; the flag
+    /// drives the MCP `annotations.readOnlyHint` advertised in `tools/list`
+    /// (C1's `read_only` capability field wired into the MCP surface — C3,
+    /// ADR-0182). Computed as the AND of the hosted capabilities' `read_only`.
+    pub read_only: bool,
 }
 
 /// Build the MCP projection of the catalog: capabilities declaring the MCP
@@ -110,23 +116,67 @@ pub struct McpTool {
 pub fn mcp_tools(caps: &[Capability]) -> Vec<McpTool> {
     let mut tools = Vec::new();
     for &intent in Intent::ALL {
-        let ops: Vec<String> = caps
+        let hosted: Vec<&Capability> = caps
             .iter()
             .filter(|c| c.projections.mcp && c.intent == intent)
-            .map(|c| c.id.to_string())
             .collect();
         // Only emit a tool for intents that actually front an MCP capability —
         // an intent with no MCP-exposed capability would be a dead tool.
-        if ops.is_empty() {
+        if hosted.is_empty() {
             continue;
         }
+        let ops: Vec<String> = hosted.iter().map(|c| c.id.to_string()).collect();
+        // Read-only is the AND of hosted capabilities (all cxpak caps are
+        // read-only, so this is `true`, but computing it honestly means a future
+        // mutating capability would flip its intent-tool's hint automatically).
+        let read_only = hosted.iter().all(|c| c.read_only);
         tools.push(McpTool {
             name: intent.tool_name().to_string(),
             description: describe_intent(intent, &ops),
             ops,
+            read_only,
         });
     }
     tools
+}
+
+/// The full MCP `tools/list` JSON schema for one intent-tool, matching the MCP
+/// tool object shape: `name`, `description`, `annotations` (with `readOnlyHint`
+/// wired from the capability `read_only` bit — C1/C3, ADR-0182), and an
+/// `inputSchema` whose required `op` enumerates the tool's capability ops.
+///
+/// `additionalProperties` is `true` because each op accepts its own parameter
+/// set (documented per-op in `docs/MIGRATION-3.0.md`); the `op` enum is the
+/// discriminator the dispatch validates against.
+pub fn mcp_tool_schema(tool: &McpTool) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "annotations": {
+            "title": tool.name,
+            "readOnlyHint": tool.read_only,
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "description": "Capability selector — which analysis this intent-tool runs.",
+                    "enum": tool.ops,
+                },
+            },
+            "required": ["op"],
+            "additionalProperties": true,
+        }
+    })
+}
+
+/// The live MCP `tools/list` array: the catalog's ≤8 intent-tools rendered as
+/// MCP tool objects, in deterministic catalog order. This is the single source
+/// the `serve.rs` MCP server serves — the 26 hand-rolled schemas were removed in
+/// C3 (ADR-0182).
+pub fn mcp_tool_schemas() -> Vec<Value> {
+    mcp_catalog_tools().iter().map(mcp_tool_schema).collect()
 }
 
 /// Human-facing description for an intent-tool, listing its selectable ops.
