@@ -1,4 +1,302 @@
+use crate::budget::counter::TokenCounter;
 use crate::conventions::{ConventionProfile, PatternStrength};
+use serde_json::Value;
+
+// ── Token-budget constants ────────────────────────────────────────────────────
+
+/// Default MCP/LSP/HTTP output-token cap for the conventions surface.
+///
+/// Justified in ADR-0183: the full `ConventionProfile` on a large repo serialises
+/// to ~230 k tokens.  5 000 tokens is ≈ 46× smaller, enough to carry all
+/// Convention/Trend-strength observations plus a representative top-N of git-health
+/// data within one screenful of context — while staying well below a typical MCP
+/// client's per-message limit (~8 k tokens).  It is intentionally different from
+/// the 50 k default used by briefing/overview ops: those ops stream file content,
+/// which warrants a larger budget; the conventions op streams structured metadata,
+/// which is far denser but requires far less volume to be actionable.
+pub const MAX_MCP_CONVENTIONS_TOKENS: usize = 5_000;
+
+/// Headroom subtracted from `token_budget` for every "fits now?" check that
+/// *precedes* `_omitted` marker injection.
+///
+/// The marker costs roughly 120–250 tokens (JSON object with `applied_budget`,
+/// `original_tokens`, `steps_applied`, and `note`).  200 tokens is a
+/// conservative upper bound across all step counts, ensuring the *returned*
+/// output (value + marker) is always ≤ `token_budget`.
+const MARKER_RESERVE: usize = 200;
+
+/// Smallest `token_budget` for which the ≤-budget guarantee holds end-to-end.
+///
+/// Below this floor `render_budgeted_conventions` still returns a minimal
+/// skeleton (`{}` + `_omitted` marker ≈ 200–280 tokens), but that skeleton
+/// itself may marginally exceed the budget.  Callers that pass budgets below
+/// this value should treat the output as best-effort.
+pub const MIN_BUDGET_FLOOR: usize = 300;
+
+/// Fixed category order for deterministic terminal degradation (Steps 4 and 6–8).
+///
+/// Using a static slice avoids `HashMap` / `HashSet` iteration-order leaking
+/// into per-step log messages and keeps `render_budgeted_conventions` output
+/// byte-identical across repeated calls for the same input.
+const CATEGORIES: &[&str] = &[
+    "naming",
+    "imports",
+    "errors",
+    "dependencies",
+    "testing",
+    "visibility",
+    "functions",
+];
+
+// ── Budgeted render core ──────────────────────────────────────────────────────
+
+/// Navigate into a nested JSON object along `keys`, returning a mutable reference
+/// to the final value if every intermediate key exists and is an Object.
+fn get_nested_mut<'a>(value: &'a mut Value, keys: &[&str]) -> Option<&'a mut Value> {
+    if keys.is_empty() {
+        return Some(value);
+    }
+    value
+        .as_object_mut()
+        .and_then(|o| o.get_mut(keys[0]))
+        .and_then(|v| get_nested_mut(v, &keys[1..]))
+}
+
+/// Count tokens in a `Value` serialised as pretty JSON.
+fn token_count(counter: &TokenCounter, value: &Value) -> usize {
+    counter.count(&serde_json::to_string_pretty(value).unwrap_or_default())
+}
+
+/// Drop the array at `path` inside `value`, recording the action in `steps`.
+/// No-ops silently if the path does not exist or is already empty.
+fn drop_array_at(value: &mut Value, path: &[&str], steps: &mut Vec<String>) {
+    if let Some(v) = get_nested_mut(value, path) {
+        if let Some(arr) = v.as_array() {
+            let n = arr.len();
+            if n > 0 {
+                *v = Value::Array(vec![]);
+                steps.push(format!("dropped {} ({n} entries)", path.join(".")));
+            }
+        }
+    }
+}
+
+/// Truncate the array at `path` to `max` entries, recording the action in
+/// `steps`.  No-ops if the array is already ≤ max.
+fn truncate_array_at(value: &mut Value, path: &[&str], max: usize, steps: &mut Vec<String>) {
+    if let Some(v) = get_nested_mut(value, path) {
+        if let Some(arr) = v.as_array_mut() {
+            if arr.len() > max {
+                let dropped = arr.len() - max;
+                arr.truncate(max);
+                steps.push(format!(
+                    "truncated {} to {max} entries ({dropped} dropped)",
+                    path.join(".")
+                ));
+            }
+        }
+    }
+}
+
+/// Clear the object at `path` (replace with `{}`), recording the action in
+/// `steps`.  No-ops if the path does not exist or is already empty.
+fn clear_object_at(value: &mut Value, path: &[&str], steps: &mut Vec<String>) {
+    if let Some(v) = get_nested_mut(value, path) {
+        if let Some(obj) = v.as_object() {
+            let n = obj.len();
+            if n > 0 {
+                *v = Value::Object(serde_json::Map::new());
+                steps.push(format!("dropped {} ({n} entries)", path.join(".")));
+            }
+        }
+    }
+}
+
+/// Inject the `_omitted` metadata marker into the top-level JSON object.
+/// If `value` is not an Object, the marker is silently skipped.
+fn inject_omitted_marker(
+    value: &mut Value,
+    original_tokens: usize,
+    applied_budget: usize,
+    steps: Vec<String>,
+) {
+    if let Some(obj) = value.as_object_mut() {
+        let note = format!(
+            "Response trimmed from ~{original_tokens} to fit within the \
+             {applied_budget}-token budget. Pass a larger `tokens` value to \
+             retrieve more detail."
+        );
+        obj.insert(
+            "_omitted".to_string(),
+            serde_json::json!({
+                "applied_budget": applied_budget,
+                "original_tokens": original_tokens,
+                "steps_applied": steps,
+                "note": note,
+            }),
+        );
+    }
+}
+
+/// Render a budget-aware conventions response.
+///
+/// Applies progressive, **deterministic** degradation to `value` (already
+/// category / strength / focus filtered) until the serialised token count fits
+/// within `token_budget`.
+///
+/// Returns the (possibly pruned) JSON value.  When content was dropped an
+/// `"_omitted"` key is injected at the top level describing what was removed.
+/// If `value` already fits under the budget it is returned **unchanged and
+/// without** an `"_omitted"` key.
+///
+/// # Guarantee
+///
+/// For `token_budget >= MIN_BUDGET_FLOOR` (currently 300 tokens) the *returned*
+/// output — **including the `_omitted` marker** — is guaranteed to be
+/// ≤ `token_budget` tokens.  Below this floor the function still returns a
+/// minimal skeleton (see Minimal-skeleton backstop below), but the skeleton
+/// itself may marginally exceed the budget because the marker alone costs
+/// ≈ 120–250 tokens.
+///
+/// # Degradation order (most-impactful first, each step checks the budget)
+///
+/// Every "fits?" check uses `token_budget − MARKER_RESERVE` so that the
+/// injected `_omitted` marker does not push the final output over budget.
+///
+/// ## Main stages (Steps 1–5)
+///
+/// 1. Drop `git_health.co_changes` (O(N²) file-pairs on active repos)
+/// 2. Truncate `git_health.churn_30d` / `churn_180d` to 20 entries
+/// 3. Clear `git_health.bugfix_density` and `git_health.churn_trend`
+/// 4. Drop `additional` observation arrays from all categories (fixed order)
+/// 5. Clear `testing.coverage_by_dir`
+///
+/// ## Terminal stages (Steps 6–10; reached only on very tight budgets)
+///
+/// 6. Clear `functions.by_directory` (O(dirs) — second-largest bulk source)
+/// 7. Drop `dependencies.strict_layers` (O(layer-pairs))
+/// 8. Drop `dependencies.circular_deps` (O(detected cycles))
+/// 9. Truncate `git_health.churn_30d` / `churn_180d` further to 5; drop `reverts`
+/// 10. Clear all remaining churn arrays
+///
+/// ## Minimal-skeleton backstop
+///
+/// If all targeted steps are still insufficient, replace the entire value with
+/// `{}` and inject the `_omitted` marker.  Estimated output: ≤ 280 tokens.
+/// The guarantee holds for `token_budget >= MIN_BUDGET_FLOOR` (300 tokens).
+pub fn render_budgeted_conventions(mut value: Value, token_budget: usize) -> Value {
+    let counter = TokenCounter::new();
+
+    // Fast path — already fits, no marker needed.
+    if token_count(&counter, &value) <= token_budget {
+        return value;
+    }
+
+    let original_tokens = token_count(&counter, &value);
+    let mut steps: Vec<String> = Vec::new();
+
+    // Every "fits?" check reserves MARKER_RESERVE tokens for the `_omitted`
+    // marker that will be injected immediately after, so that the returned
+    // output (value + marker) stays ≤ token_budget.
+    let budget_with_headroom = token_budget.saturating_sub(MARKER_RESERVE);
+
+    // ── Main stages ──────────────────────────────────────────────────────────
+
+    // Step 1: drop git_health.co_changes (largest contributor for active repos).
+    drop_array_at(&mut value, &["git_health", "co_changes"], &mut steps);
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // Step 2: truncate churn arrays to 20 entries (already ordered by
+    // modifications desc in the Vec, so truncation is deterministic).
+    truncate_array_at(&mut value, &["git_health", "churn_30d"], 20, &mut steps);
+    truncate_array_at(&mut value, &["git_health", "churn_180d"], 20, &mut steps);
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // Step 3: clear bugfix_density and churn_trend (HashMap → non-deterministic
+    // iteration order; clearing is cheaper than sorting-then-truncating here).
+    clear_object_at(&mut value, &["git_health", "bugfix_density"], &mut steps);
+    clear_object_at(&mut value, &["git_health", "churn_trend"], &mut steps);
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // Step 4: drop `additional` arrays from every convention category.
+    // CATEGORIES is a fixed-order static slice — no HashMap iteration.
+    for category in CATEGORIES {
+        drop_array_at(&mut value, &[category, "additional"], &mut steps);
+    }
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // Step 5: clear testing.coverage_by_dir.
+    clear_object_at(&mut value, &["testing", "coverage_by_dir"], &mut steps);
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // ── Terminal stages (very tight budgets) ─────────────────────────────────
+
+    // Step 6: clear functions.by_directory — O(directories); the dominant bulk
+    // source on large repos outside of git_health.
+    clear_object_at(&mut value, &["functions", "by_directory"], &mut steps);
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // Step 7: drop dependencies.strict_layers — O(layer-pairs).
+    drop_array_at(&mut value, &["dependencies", "strict_layers"], &mut steps);
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // Step 8: drop dependencies.circular_deps — O(detected cycles).
+    drop_array_at(&mut value, &["dependencies", "circular_deps"], &mut steps);
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // Step 9: further truncate churn to 5 entries and drop reverts.
+    truncate_array_at(&mut value, &["git_health", "churn_30d"], 5, &mut steps);
+    truncate_array_at(&mut value, &["git_health", "churn_180d"], 5, &mut steps);
+    drop_array_at(&mut value, &["git_health", "reverts"], &mut steps);
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // Step 10: clear all remaining churn arrays entirely.
+    drop_array_at(&mut value, &["git_health", "churn_30d"], &mut steps);
+    drop_array_at(&mut value, &["git_health", "churn_180d"], &mut steps);
+    if token_count(&counter, &value) <= budget_with_headroom {
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        return value;
+    }
+
+    // ── Minimal-skeleton backstop ─────────────────────────────────────────────
+    // All targeted steps exhausted and value is still over budget.  Replace the
+    // entire value with an empty object and inject the marker.  Estimated output
+    // ≤ 280 tokens — the ≤-budget guarantee holds for token_budget ≥ MIN_BUDGET_FLOOR.
+    steps.push(
+        "minimal_skeleton: all category bodies cleared (budget below actionable threshold)"
+            .to_string(),
+    );
+    value = Value::Object(serde_json::Map::new());
+    inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+    value
+}
 
 /// Render the full DNA section (~800-1000 tokens).
 ///
@@ -314,6 +612,365 @@ mod tests {
     use super::*;
     use crate::budget::counter::TokenCounter;
     use crate::conventions::PatternObservation;
+
+    // ── render_budgeted_conventions unit tests ────────────────────────────────
+
+    /// Build a serde_json::Value with many co_changes entries so the serialised
+    /// size clearly exceeds `MAX_MCP_CONVENTIONS_TOKENS`.
+    fn make_large_conventions_value() -> Value {
+        use crate::conventions::git_health::{ChurnEntry, GitHealthProfile};
+        use crate::core_graph::intel::CoChangeEdge;
+        use std::collections::HashMap;
+
+        let profile = crate::conventions::ConventionProfile {
+            git_health: GitHealthProfile {
+                co_changes: (0..300u32)
+                    .map(|i| CoChangeEdge {
+                        file_a: format!(
+                            "src/subsystem/module_{i}/component_{i}/implementation_{i}.rs"
+                        ),
+                        file_b: format!("tests/subsystem/module_{}/tests_{i}.rs", (i + 1) % 300),
+                        count: (i % 20) + 1,
+                        recency_weight: 0.5 + (i % 10) as f64 * 0.05,
+                    })
+                    .collect(),
+                churn_30d: (0..100u32)
+                    .map(|i| ChurnEntry {
+                        path: format!("src/heavy_module_{i}/file_{i}.rs"),
+                        modifications: (100 - i) as usize,
+                        last_commit_epoch: None,
+                    })
+                    .collect(),
+                churn_180d: (0..100u32)
+                    .map(|i| ChurnEntry {
+                        path: format!("src/heavy_module_{i}/file_{i}.rs"),
+                        modifications: (200 - i) as usize,
+                        last_commit_epoch: None,
+                    })
+                    .collect(),
+                bugfix_density: (0..100u32)
+                    .map(|i| {
+                        (
+                            format!("src/heavy_module_{i}/file_{i}.rs"),
+                            0.05 * (i as f64 % 5.0) + 0.01,
+                        )
+                    })
+                    .collect::<HashMap<_, _>>(),
+                churn_trend: HashMap::new(),
+                reverts: vec![],
+                last_computed: None,
+            },
+            ..Default::default()
+        };
+        serde_json::to_value(&profile).unwrap()
+    }
+
+    #[test]
+    fn test_render_budgeted_conventions_small_profile_no_marker() {
+        // A default (empty) profile serialises to a handful of tokens — must
+        // return unchanged with NO _omitted marker.
+        let profile = crate::conventions::ConventionProfile::default();
+        let value = serde_json::to_value(&profile).unwrap();
+        let result = render_budgeted_conventions(value, MAX_MCP_CONVENTIONS_TOKENS);
+        assert!(
+            result.get("_omitted").is_none(),
+            "empty profile must fit under budget — no _omitted marker expected"
+        );
+    }
+
+    #[test]
+    fn test_render_budgeted_conventions_large_profile_under_cap() {
+        let value = make_large_conventions_value();
+        let counter = TokenCounter::new();
+
+        // Verify the input actually exceeds the default cap (test has teeth).
+        let raw_tokens = counter.count(&serde_json::to_string_pretty(&value).unwrap());
+        assert!(
+            raw_tokens > MAX_MCP_CONVENTIONS_TOKENS,
+            "test fixture must exceed {MAX_MCP_CONVENTIONS_TOKENS} tokens \
+             before budgeting, got {raw_tokens}"
+        );
+
+        let result = render_budgeted_conventions(value, MAX_MCP_CONVENTIONS_TOKENS);
+        let output = serde_json::to_string_pretty(&result).unwrap();
+        let output_tokens = counter.count(&output);
+
+        assert!(
+            output_tokens <= MAX_MCP_CONVENTIONS_TOKENS,
+            "budgeted output must be ≤ {MAX_MCP_CONVENTIONS_TOKENS} tokens, got {output_tokens}"
+        );
+    }
+
+    #[test]
+    fn test_render_budgeted_conventions_omission_marker_present() {
+        let value = make_large_conventions_value();
+        let result = render_budgeted_conventions(value, MAX_MCP_CONVENTIONS_TOKENS);
+        assert!(
+            result.get("_omitted").is_some(),
+            "_omitted must be present when content was dropped"
+        );
+        let omitted = &result["_omitted"];
+        assert!(omitted["applied_budget"].is_number());
+        assert!(omitted["steps_applied"].is_array());
+        assert!(
+            !omitted["steps_applied"].as_array().unwrap().is_empty(),
+            "steps_applied must list at least one degradation step"
+        );
+    }
+
+    #[test]
+    fn test_render_budgeted_conventions_larger_budget_more_content() {
+        let value = make_large_conventions_value();
+        let small = serde_json::to_string_pretty(&render_budgeted_conventions(
+            value.clone(),
+            MAX_MCP_CONVENTIONS_TOKENS,
+        ))
+        .unwrap();
+        let large =
+            serde_json::to_string_pretty(&render_budgeted_conventions(value, 200_000)).unwrap();
+        assert!(
+            large.len() > small.len(),
+            "larger budget must yield more content \
+             (small={} chars, large={} chars)",
+            small.len(),
+            large.len()
+        );
+    }
+
+    #[test]
+    fn test_render_budgeted_conventions_deterministic() {
+        let value = make_large_conventions_value();
+        let a = serde_json::to_string_pretty(&render_budgeted_conventions(
+            value.clone(),
+            MAX_MCP_CONVENTIONS_TOKENS,
+        ))
+        .unwrap();
+        let b = serde_json::to_string_pretty(&render_budgeted_conventions(
+            value,
+            MAX_MCP_CONVENTIONS_TOKENS,
+        ))
+        .unwrap();
+        assert_eq!(
+            a, b,
+            "render_budgeted_conventions must be byte-identical for the same input"
+        );
+    }
+
+    #[test]
+    fn test_render_budgeted_conventions_narrow_result_no_marker() {
+        // A narrow category=git_health with only a few entries fits under budget.
+        // Assert no spurious _omitted marker appears.
+        let small_profile = crate::conventions::ConventionProfile::default();
+        let value = serde_json::to_value(&small_profile.git_health).unwrap();
+        let result = render_budgeted_conventions(value, MAX_MCP_CONVENTIONS_TOKENS);
+        assert!(
+            result.get("_omitted").is_none(),
+            "narrow result under budget must not carry an _omitted marker"
+        );
+    }
+
+    // ── New ≤-budget guarantee tests (Steps 6-10 + marker headroom) ──────────
+
+    /// Build a serde_json::Value whose bulk is in `functions.by_directory` and
+    /// `dependencies.strict_layers` — NOT in `git_health`.  The original 5
+    /// degradation steps do not touch these fields, so pre-fix output exceeded
+    /// `MAX_MCP_CONVENTIONS_TOKENS` unconditionally.
+    fn make_large_non_git_health_value() -> Value {
+        use crate::conventions::deps::{DependencyConventions, DirectionPair};
+        use crate::conventions::functions::{DirectoryFunctionStats, FunctionConventions};
+        use std::collections::HashMap;
+
+        let profile = crate::conventions::ConventionProfile {
+            functions: FunctionConventions {
+                avg_length: Some(15.0),
+                median_length: Some(12.0),
+                by_directory: (0..500u32)
+                    .map(|i| {
+                        (
+                            format!("src/module_{i}/submodule_{i}/component_{i}"),
+                            DirectoryFunctionStats {
+                                avg_length: 15.0,
+                                median_length: 12.0,
+                                count: (i % 20 + 1) as usize,
+                            },
+                        )
+                    })
+                    .collect(),
+                additional: vec![],
+                file_contributions: HashMap::new(),
+            },
+            dependencies: DependencyConventions {
+                strict_layers: (0..200u32)
+                    .map(|i| DirectionPair {
+                        from: format!("src/domain_{i}/module_{i}"),
+                        to: format!("src/core/subsystem_{i}"),
+                        edge_count: (i % 10 + 1) as usize,
+                        reverse_count: (i % 3) as usize,
+                    })
+                    .collect(),
+                circular_deps: (0..50u32)
+                    .map(|i| {
+                        format!(
+                            "src/module_{i} → src/module_{} → src/module_{i}",
+                            (i + 1) % 50
+                        )
+                    })
+                    .collect(),
+                db_isolation: None,
+                additional: vec![],
+            },
+            ..Default::default()
+        };
+        serde_json::to_value(&profile).unwrap()
+    }
+
+    #[test]
+    fn test_render_budgeted_bulk_not_in_git_health_under_default_cap() {
+        // Regression: profile bulk is in functions.by_directory and
+        // dependencies.strict_layers (not git_health).  Steps 1–5 do not touch
+        // these fields; Steps 6–8 (terminal stage) must handle them.
+        // Pre-fix: output far exceeded MAX_MCP_CONVENTIONS_TOKENS.
+        let value = make_large_non_git_health_value();
+        let counter = TokenCounter::new();
+
+        let raw_tokens = counter.count(&serde_json::to_string_pretty(&value).unwrap());
+        assert!(
+            raw_tokens > MAX_MCP_CONVENTIONS_TOKENS,
+            "fixture must exceed {MAX_MCP_CONVENTIONS_TOKENS} tokens before budgeting, \
+             got {raw_tokens}"
+        );
+
+        let result = render_budgeted_conventions(value, MAX_MCP_CONVENTIONS_TOKENS);
+        let output_tokens = counter.count(&serde_json::to_string_pretty(&result).unwrap());
+        assert!(
+            output_tokens <= MAX_MCP_CONVENTIONS_TOKENS,
+            "output (marker included) must be ≤ {MAX_MCP_CONVENTIONS_TOKENS}, \
+             got {output_tokens}"
+        );
+        assert!(
+            result.get("_omitted").is_some(),
+            "_omitted marker must be present when content was dropped"
+        );
+    }
+
+    #[test]
+    fn test_render_budgeted_small_budget_override_honored() {
+        // Regression: a small token_budget override must be strictly honored.
+        // 500 tokens is above MIN_BUDGET_FLOOR (300) so the ≤-budget guarantee
+        // must hold end-to-end (marker included).
+        // Pre-fix: no terminal cap — output far exceeded 500 tokens.
+        let value = make_large_non_git_health_value();
+        let counter = TokenCounter::new();
+        let budget: usize = 500;
+
+        let raw_tokens = counter.count(&serde_json::to_string_pretty(&value).unwrap());
+        assert!(
+            raw_tokens > budget,
+            "fixture must exceed {budget} tokens before budgeting, got {raw_tokens}"
+        );
+
+        let result = render_budgeted_conventions(value, budget);
+        let output_tokens = counter.count(&serde_json::to_string_pretty(&result).unwrap());
+        assert!(
+            output_tokens <= budget,
+            "output (marker included) must be ≤ {budget}, got {output_tokens}"
+        );
+        assert!(
+            result.get("_omitted").is_some(),
+            "_omitted marker must be present when trimming occurred"
+        );
+    }
+
+    #[test]
+    fn test_render_budgeted_marker_headroom_included_in_budget() {
+        // The _omitted marker's own tokens must be counted against the budget.
+        //
+        // Construction: we compute what the value looks like after step 1
+        // (drop co_changes) using the same parameters as make_large_conventions_value(),
+        // then pick budget = after_step1_tokens + 50.  This places us squarely
+        // in the "value fits the old budget check but value+marker doesn't" zone.
+        //
+        // Pre-fix (old code): step 1 check passes (value ≤ budget), marker
+        //   is injected → output = value + marker_tokens > budget.  FAILS.
+        // Post-fix: headroom check (value ≤ budget − 200) fails, degradation
+        //   continues to step 2+ which brings value well below budget_with_headroom,
+        //   then marker is injected → output ≤ budget.  PASSES.
+        use crate::conventions::git_health::{ChurnEntry, GitHealthProfile};
+        use std::collections::HashMap;
+
+        // Compute the approximate size of the value-after-step-1 (co_changes dropped).
+        // We serialise the same profile without co_changes to get the exact count.
+        let profile_no_co_changes = crate::conventions::ConventionProfile {
+            git_health: GitHealthProfile {
+                co_changes: vec![],
+                churn_30d: (0..100u32)
+                    .map(|i| ChurnEntry {
+                        path: format!("src/heavy_module_{i}/file_{i}.rs"),
+                        modifications: (100 - i) as usize,
+                        last_commit_epoch: None,
+                    })
+                    .collect(),
+                churn_180d: (0..100u32)
+                    .map(|i| ChurnEntry {
+                        path: format!("src/heavy_module_{i}/file_{i}.rs"),
+                        modifications: (200 - i) as usize,
+                        last_commit_epoch: None,
+                    })
+                    .collect(),
+                bugfix_density: (0..100u32)
+                    .map(|i| {
+                        (
+                            format!("src/heavy_module_{i}/file_{i}.rs"),
+                            0.05 * (i as f64 % 5.0) + 0.01,
+                        )
+                    })
+                    .collect::<HashMap<_, _>>(),
+                churn_trend: HashMap::new(),
+                reverts: vec![],
+                last_computed: None,
+            },
+            ..Default::default()
+        };
+        let counter = TokenCounter::new();
+        let tokens_after_step1 = counter.count(
+            &serde_json::to_string_pretty(&serde_json::to_value(&profile_no_co_changes).unwrap())
+                .unwrap(),
+        );
+
+        // Pick a budget just above after_step1 — in the headroom danger zone.
+        // Pre-fix: old code would do step1 check (tokens ≤ budget → true),
+        //   inject marker → tokens + marker_size > budget. BUG.
+        // Post-fix: headroom check (tokens ≤ budget − 200 → false since
+        //   budget = tokens + 50 means budget − 200 = tokens − 150 < tokens),
+        //   continues; step 2 truncates churn → much smaller → fits. ✓
+        let budget = tokens_after_step1 + 50;
+
+        let large_value = make_large_conventions_value();
+        let raw_tokens = counter.count(&serde_json::to_string_pretty(&large_value).unwrap());
+        assert!(
+            raw_tokens > budget,
+            "fixture must exceed budget={budget}, got {raw_tokens}"
+        );
+        assert!(
+            tokens_after_step1 < budget,
+            "after-step-1 ({tokens_after_step1}) must be < budget ({budget}) \
+             for headroom to matter"
+        );
+
+        let result = render_budgeted_conventions(large_value, budget);
+        let output = serde_json::to_string_pretty(&result).unwrap();
+        let output_tokens = counter.count(&output);
+
+        assert!(
+            result.get("_omitted").is_some(),
+            "_omitted marker must be present (trimming occurred)"
+        );
+        assert!(
+            output_tokens <= budget,
+            "_omitted marker must be counted against budget: \
+             output={output_tokens} tokens, budget={budget}"
+        );
+    }
 
     #[test]
     fn test_render_dna_empty_profile() {

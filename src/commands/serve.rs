@@ -597,6 +597,22 @@ struct V1FocusParams {
     workspace: Option<String>,
 }
 
+/// Optional request body for `POST /v1/conventions`.
+/// All fields are optional; an empty `{}` body (or a body with unknown keys)
+/// deserialises without error, keeping backward compatibility.
+#[derive(Deserialize, Default)]
+struct V1ConventionsParams {
+    /// Token budget for the response; defaults to `MAX_MCP_CONVENTIONS_TOKENS`.
+    tokens: Option<usize>,
+    /// Category filter: "all" | "naming" | "imports" | "errors" | "dependencies"
+    ///                  | "testing" | "visibility" | "functions" | "git_health".
+    category: Option<String>,
+    /// Minimum pattern strength: "all" | "mixed" | "trend" | "convention".
+    strength: Option<String>,
+    /// Path prefix to filter `file_contributions` entries.
+    focus: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 struct V1PredictParams {
     files: Option<Vec<String>>,
@@ -744,13 +760,48 @@ async fn v1_health_handler(State(index): State<SharedIndex>) -> Result<Json<Valu
 
 async fn v1_conventions_handler(
     State(index): State<SharedIndex>,
+    Json(params): Json<V1ConventionsParams>,
 ) -> Result<Json<Value>, StatusCode> {
     let idx = index
         .read()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    serde_json::to_value(&idx.conventions)
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+
+    let profile = &idx.conventions;
+    let category = params.category.as_deref().unwrap_or("all");
+    let strength_filter = params.strength.as_deref().unwrap_or("all");
+    let focus = params.focus.as_deref();
+    let token_budget = params
+        .tokens
+        .unwrap_or(crate::conventions::render::MAX_MCP_CONVENTIONS_TOKENS);
+
+    let mut result = match category {
+        "naming" => serde_json::to_value(&profile.naming),
+        "imports" => serde_json::to_value(&profile.imports),
+        "errors" => serde_json::to_value(&profile.errors),
+        "dependencies" => serde_json::to_value(&profile.dependencies),
+        "testing" => serde_json::to_value(&profile.testing),
+        "visibility" => serde_json::to_value(&profile.visibility),
+        "functions" => serde_json::to_value(&profile.functions),
+        "git_health" => serde_json::to_value(&profile.git_health),
+        _ => serde_json::to_value(profile),
+    }
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let min_pct: f64 = match strength_filter {
+        "convention" => 90.0,
+        "trend" => 70.0,
+        "mixed" => 50.0,
+        _ => 0.0,
+    };
+    if min_pct > 0.0 {
+        filter_observations_by_strength(&mut result, min_pct);
+    }
+    if let Some(focus_prefix) = focus {
+        filter_contributions_by_focus(&mut result, focus_prefix);
+    }
+
+    let result = crate::conventions::render::render_budgeted_conventions(result, token_budget);
+    Ok(Json(result))
 }
 
 async fn v1_briefing_handler(
@@ -3232,6 +3283,16 @@ fn dispatch_capability_op(
                 .and_then(|s| s.as_str())
                 .unwrap_or("all");
             let focus = args.get("focus").and_then(|f| f.as_str());
+            let token_budget = args
+                .get("tokens")
+                .and_then(|t| t.as_str())
+                .and_then(|t| crate::cli::parse_token_count(t).ok())
+                .or_else(|| {
+                    args.get("tokens")
+                        .and_then(|t| t.as_u64())
+                        .map(|n| n as usize)
+                })
+                .unwrap_or(crate::conventions::render::MAX_MCP_CONVENTIONS_TOKENS);
 
             let profile = &index.conventions;
 
@@ -3264,6 +3325,11 @@ fn dispatch_capability_op(
             if let Some(focus_prefix) = focus {
                 filter_contributions_by_focus(&mut result, focus_prefix);
             }
+
+            // Apply token budget AFTER category/strength/focus filters.
+            // A narrow result already under budget returns in full with no omission marker.
+            let result =
+                crate::conventions::render::render_budgeted_conventions(result, token_budget);
 
             mcp_tool_result(
                 id,
@@ -7931,6 +7997,263 @@ mod tests {
         assert!(
             val["naming"]["file_contributions"]["tests/lib_test.rs"].is_null(),
             "tests/lib_test.rs must be removed by focus='src/' filter"
+        );
+    }
+
+    // ── C4: conventions surface token-budget acceptance gate ─────────────────
+
+    /// Build a CodebaseIndex whose `conventions.git_health` is large enough that
+    /// serialising `category=all` exceeds `MAX_MCP_CONVENTIONS_TOKENS` (5 000).
+    ///
+    /// 250 co_changes entries × ~35 tok/entry ≈ 8 750 tokens, well above 5 000.
+    /// 100 churn_30d / 100 churn_180d / 100 bugfix_density entries add ~4 000 more.
+    fn make_large_conventions_index() -> CodebaseIndex {
+        use crate::conventions::git_health::{ChurnEntry, GitHealthProfile};
+        use crate::core_graph::intel::CoChangeEdge;
+        use std::collections::HashMap;
+
+        let mut index = make_test_index();
+
+        let co_changes: Vec<CoChangeEdge> = (0..250u32)
+            .map(|i| CoChangeEdge {
+                file_a: format!(
+                    "src/subsystem_alpha/module_{i}/component_{i}/implementation_{i}.rs"
+                ),
+                file_b: format!(
+                    "tests/subsystem_alpha/module_{}/unit_tests_{i}.rs",
+                    (i + 1) % 250
+                ),
+                count: (i % 20) + 1,
+                recency_weight: 0.5 + (i % 10) as f64 * 0.05,
+            })
+            .collect();
+
+        let churn_30d: Vec<ChurnEntry> = (0..100u32)
+            .map(|i| ChurnEntry {
+                path: format!("src/subsystem_beta/module_{i}/heavy_file_{i}.rs"),
+                modifications: (100 - i) as usize,
+                last_commit_epoch: None,
+            })
+            .collect();
+        let churn_180d = churn_30d.clone();
+
+        let mut bugfix_density: HashMap<String, f64> = HashMap::new();
+        for i in 0..100u32 {
+            bugfix_density.insert(
+                format!("src/subsystem_beta/module_{i}/heavy_file_{i}.rs"),
+                0.1 + (i % 10) as f64 * 0.02,
+            );
+        }
+
+        index.conventions.git_health = GitHealthProfile {
+            churn_30d,
+            churn_180d,
+            bugfix_density,
+            reverts: vec![],
+            churn_trend: HashMap::new(),
+            co_changes,
+            last_computed: None,
+        };
+        index
+    }
+
+    /// Gate: large ConventionProfile → MCP op output ≤ MAX_MCP_CONVENTIONS_TOKENS.
+    #[test]
+    fn test_mcp_conventions_output_honors_default_token_cap() {
+        use crate::conventions::render::MAX_MCP_CONVENTIONS_TOKENS;
+
+        let index = make_large_conventions_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(10)),
+            "cxpak_conventions",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("conventions op must return text");
+
+        let counter = TokenCounter::new();
+        let token_count = counter.count(text);
+        assert!(
+            token_count <= MAX_MCP_CONVENTIONS_TOKENS,
+            "conventions op output must be ≤ {MAX_MCP_CONVENTIONS_TOKENS} tokens, \
+             but got {token_count} tokens"
+        );
+    }
+
+    /// Gate: `tokens` override expands the budget — a larger limit includes more
+    /// content than the default cap.
+    #[test]
+    fn test_mcp_conventions_tokens_override_expands_budget() {
+        let index = make_large_conventions_index();
+        let snap1 = make_shared_snapshot();
+        let snap2 = make_shared_snapshot();
+
+        // Response under the default cap (5 000 tokens).
+        let resp_default = handle_tool_call(
+            Some(json!(11)),
+            "cxpak_conventions",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap1,
+        );
+        let text_default = resp_default["result"]["content"][0]["text"]
+            .as_str()
+            .expect("conventions op must return text");
+        let len_default = text_default.len();
+
+        // Response with a generous override (200 000 tokens — no truncation expected).
+        let resp_large = handle_tool_call(
+            Some(json!(12)),
+            "cxpak_conventions",
+            &json!({"tokens": "200k"}),
+            &index,
+            Path::new("/tmp"),
+            &snap2,
+        );
+        let text_large = resp_large["result"]["content"][0]["text"]
+            .as_str()
+            .expect("conventions op must return text");
+        let len_large = text_large.len();
+
+        assert!(
+            len_large > len_default,
+            "a larger `tokens` budget must yield more content \
+             (default={len_default} chars, large={len_large} chars)"
+        );
+
+        // The large response must not contain an _omitted marker (no truncation).
+        let val_large: Value = serde_json::from_str(text_large).unwrap();
+        assert!(
+            val_large.get("_omitted").is_none(),
+            "no truncation expected with a 200k token budget; _omitted should be absent"
+        );
+
+        // The small (default) response must not exceed the default cap.
+        let counter = TokenCounter::new();
+        let tok_default = counter.count(text_default);
+        assert!(
+            tok_default <= crate::conventions::render::MAX_MCP_CONVENTIONS_TOKENS,
+            "default-cap response must be ≤ {} tokens, got {tok_default}",
+            crate::conventions::render::MAX_MCP_CONVENTIONS_TOKENS
+        );
+    }
+
+    /// Gate: `_omitted` marker is present when content was dropped.
+    #[test]
+    fn test_mcp_conventions_omission_marker_present_when_truncated() {
+        let index = make_large_conventions_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(13)),
+            "cxpak_conventions",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("conventions op must return text");
+        let val: Value = serde_json::from_str(text).unwrap();
+
+        assert!(
+            val.get("_omitted").is_some(),
+            "large profile with default cap must trigger omission — \
+             `_omitted` key must be present in the response"
+        );
+        // The _omitted object must carry the applied_budget and steps_applied fields.
+        let omitted = &val["_omitted"];
+        assert!(
+            omitted["applied_budget"].is_number(),
+            "_omitted.applied_budget must be a number"
+        );
+        assert!(
+            omitted["steps_applied"].is_array(),
+            "_omitted.steps_applied must be an array"
+        );
+        assert!(
+            !omitted["steps_applied"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .is_empty(),
+            "_omitted.steps_applied must not be empty when content was dropped"
+        );
+    }
+
+    /// Gate: `_omitted` marker is ABSENT when the profile fits under the budget.
+    #[test]
+    fn test_mcp_conventions_omission_marker_absent_when_fits() {
+        // Use the default (small) test index — its conventions profile is tiny.
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(14)),
+            "cxpak_conventions",
+            &json!({}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("conventions op must return text");
+        let val: Value = serde_json::from_str(text).unwrap();
+
+        assert!(
+            val.get("_omitted").is_none(),
+            "small profile must fit under default cap — \
+             `_omitted` must be ABSENT, got: {val}"
+        );
+    }
+
+    /// Gate: same profile + same budget → byte-identical output (no HashMap
+    /// iteration leak, no non-deterministic ordering).
+    #[test]
+    fn test_mcp_conventions_deterministic_output() {
+        let index = make_large_conventions_index();
+
+        let text_a = {
+            let snap = make_shared_snapshot();
+            let resp = handle_tool_call(
+                Some(json!(15)),
+                "cxpak_conventions",
+                &json!({}),
+                &index,
+                Path::new("/tmp"),
+                &snap,
+            );
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .expect("conventions op must return text")
+                .to_string()
+        };
+
+        let text_b = {
+            let snap = make_shared_snapshot();
+            let resp = handle_tool_call(
+                Some(json!(16)),
+                "cxpak_conventions",
+                &json!({}),
+                &index,
+                Path::new("/tmp"),
+                &snap,
+            );
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .expect("conventions op must return text")
+                .to_string()
+        };
+
+        assert_eq!(
+            text_a, text_b,
+            "conventions op output must be byte-identical across two calls \
+             with the same profile and budget (no HashMap iteration leak)"
         );
     }
 

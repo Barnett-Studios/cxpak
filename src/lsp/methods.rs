@@ -433,9 +433,28 @@ pub fn handle_custom_method(
                 },
             })))
         }
-        "cxpak/conventions" => serde_json::to_value(&index.conventions)
-            .map(Some)
-            .map_err(|e| LspMethodError::Internal(format!("serialization failed: {e}"))),
+        "cxpak/conventions" => {
+            // Accept `tokens` as either a plain u64 (JSON number) or a string
+            // in the same format as the MCP surface: "5000", "50k", "1m".
+            // This ensures LSP and MCP callers can use the same parameter form.
+            let token_budget = params
+                .get("tokens")
+                .and_then(|v| {
+                    v.as_u64().map(|n| n as usize).or_else(|| {
+                        v.as_str()
+                            .and_then(|s| crate::cli::parse_token_count(s).ok())
+                    })
+                })
+                .unwrap_or(crate::conventions::render::MAX_MCP_CONVENTIONS_TOKENS);
+            serde_json::to_value(&index.conventions)
+                .map(|v| {
+                    Some(crate::conventions::render::render_budgeted_conventions(
+                        v,
+                        token_budget,
+                    ))
+                })
+                .map_err(|e| LspMethodError::Internal(format!("serialization failed: {e}")))
+        }
         "cxpak/blastRadius" => {
             let files: Vec<String> = params
                 .get("files")
