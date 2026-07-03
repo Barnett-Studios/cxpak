@@ -192,6 +192,14 @@ data-introspect = [
 ]
 bench = ["dep:toml"]
 
+# Optional local reranker (D1, ADR-0184): a deterministic, no-LLM lexical
+# cross-encoder that re-orders the top-N fused candidates after RRF fusion.
+# NON-default and OFF by default — excluded from the determinism fixture; the
+# core ranking is fully deterministic without it. No new dependencies (a
+# model-backed cross-encoder would live behind THIS flag but needs a heavy
+# native runtime, deferred per ADR-0163 / the D1 stop-and-ask rule).
+reranker = []
+
 # `dev_maintenance` cfg is flipped on by the project-local .cargo/config.toml
 # via rustflags during maintainer builds.  Whitelist it so rustc's
 # unexpected_cfgs lint (default-warn since 1.80) doesn't fire on

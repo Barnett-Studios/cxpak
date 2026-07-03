@@ -1,9 +1,50 @@
 pub mod identifier;
+#[cfg(feature = "reranker")]
+pub mod reranker;
+pub mod rrf;
 pub mod seed;
 pub mod signals;
 
 use crate::index::CodebaseIndex;
 use std::collections::HashSet;
+
+/// A/B control for the D1 semantic upgrade (ADR-0184).
+///
+/// The RRF fusion + contextual retrieval are switchable so that `Inert`
+/// reproduces the pre-D1 weighted-sum ranking **byte-for-byte**, and `Active`
+/// enables the upgrade. Both must be reachable from a SINGLE index build so the
+/// D2 recall gate can be measured index-once (the C2 lesson: two-build harness
+/// runs get reaped). A harness constructs one scorer per mode over the same
+/// `CodebaseIndex` and scores both — no temporary measurement code required, the
+/// control ships in the product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RelevanceMode {
+    /// Weighted-sum combine (`Σ wᵢ·signalᵢ`) — the pre-D1 ranking, byte-identical.
+    #[default]
+    Inert,
+    /// RRF fusion over the per-signal sub-rankings (ADR-0184). At index time this
+    /// mode also enables the contextual-retrieval header on embedded text.
+    Active,
+}
+
+impl RelevanceMode {
+    /// Whether contextual-retrieval enrichment applies at index time in this
+    /// mode. `Active` prepends the deterministic graph-context header to the
+    /// embedded text; `Inert` embeds the bare signature (pre-D1, byte-identical).
+    pub fn contextual(self) -> bool {
+        matches!(self, RelevanceMode::Active)
+    }
+}
+
+/// The relevance mode the shipped product uses.
+///
+/// Held at [`RelevanceMode::Inert`] — the D1 upgrade is fully built and unit-
+/// tested, but shipping it ACTIVE is gated on the D2 recall A/B (inert vs active,
+/// index-once) validating `recall@budget(active) ≥ recall@budget(inert)` on the
+/// full corpus. That is a controller+user gate (the C2 precedent: ship the
+/// machinery inert, flip the default once the gate clears). Flip this to
+/// [`RelevanceMode::Active`] — and re-run the D2 A/B — to activate the upgrade.
+pub const DEFAULT_RELEVANCE_MODE: RelevanceMode = RelevanceMode::Inert;
 
 /// Result of scoring a single file against a query.
 #[derive(Debug, Clone)]
@@ -31,6 +72,8 @@ pub trait RelevanceScorer: Send + Sync {
 pub struct MultiSignalScorer {
     pub weights: SignalWeights,
     pub expanded_tokens: Option<HashSet<String>>,
+    /// A/B control: `Inert` = weighted sum (pre-D1), `Active` = RRF fusion.
+    pub mode: RelevanceMode,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +133,7 @@ impl MultiSignalScorer {
         Self {
             weights: SignalWeights::default(),
             expanded_tokens: None,
+            mode: DEFAULT_RELEVANCE_MODE,
         }
     }
 
@@ -103,6 +147,7 @@ impl MultiSignalScorer {
         Self {
             weights,
             expanded_tokens: None,
+            mode: DEFAULT_RELEVANCE_MODE,
         }
     }
 
@@ -110,11 +155,22 @@ impl MultiSignalScorer {
         Self {
             weights,
             expanded_tokens: None,
+            mode: DEFAULT_RELEVANCE_MODE,
         }
     }
 
     pub fn with_expansion(mut self, tokens: HashSet<String>) -> Self {
         self.expanded_tokens = Some(tokens);
+        self
+    }
+
+    /// Set the A/B mode (`Inert` weighted sum vs `Active` RRF fusion).
+    ///
+    /// The D2 recall harness uses this to score both modes from a SINGLE index
+    /// build: `MultiSignalScorer::new_for_index(idx).with_mode(Inert)` and
+    /// `…with_mode(Active)` over the same `idx`.
+    pub fn with_mode(mut self, mode: RelevanceMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -147,30 +203,78 @@ impl MultiSignalScorer {
             .unwrap_or_else(|| signals::tokenize(query));
         let ident_ranking = identifier::build_identifier_ranking(index, &query_tokens);
 
-        index
+        // Pass 1: compute the 7 raw per-file signal sets. Shared by both modes;
+        // RRF needs the WHOLE population to assign per-signal ranks, so signals
+        // are materialized before combining (unlike the inert per-file map).
+        let signal_sets: Vec<(String, [SignalResult; 7], usize)> = index
             .files
             .iter()
             .map(|f| {
-                self.score_with_embedding(
+                let (sigs, token_count) = self.compute_signals(
                     query,
                     &f.relative_path,
                     index,
                     query_embedding.as_deref(),
-                    Some(&ident_ranking),
-                )
+                );
+                (f.relative_path.clone(), sigs, token_count)
             })
-            .collect()
+            .collect();
+
+        // Pass 2: combine into a base score per mode.
+        //   Inert  → weighted sum (byte-identical to pre-D1).
+        //   Active → weighted, scale-normalized RRF over the per-signal ranks.
+        let base_scores: Vec<f64> = match self.mode {
+            RelevanceMode::Inert => signal_sets
+                .iter()
+                .map(|(_, sigs, _)| self.weighted_sum(sigs))
+                .collect(),
+            RelevanceMode::Active => {
+                let files: Vec<(String, [f64; rrf::N_SIGNALS])> = signal_sets
+                    .iter()
+                    .map(|(path, sigs, _)| {
+                        let mut arr = [0.0_f64; rrf::N_SIGNALS];
+                        for (i, s) in sigs.iter().enumerate() {
+                            arr[i] = s.score;
+                        }
+                        (path.clone(), arr)
+                    })
+                    .collect();
+                rrf::fuse(&files, self.weight_array(), rrf::RRF_K)
+            }
+        };
+
+        // Pass 3: finalize (apply the boost-only identifier factor + clamp).
+        // `mut` is only consumed by the feature-gated reranker below.
+        #[cfg_attr(not(feature = "reranker"), allow(unused_mut))]
+        let mut scored: Vec<ScoredFile> = signal_sets
+            .into_iter()
+            .zip(base_scores)
+            .map(|((path, sigs, token_count), base)| {
+                self.finalize(path, sigs, token_count, base, Some(&ident_ranking))
+            })
+            .collect();
+
+        // Optional local reranker (feature-gated, Active only): re-orders the
+        // top-N fused candidates. Excluded from the determinism fixture (default
+        // features + Inert mode never reach here). See ADR-0184.
+        #[cfg(feature = "reranker")]
+        if self.mode == RelevanceMode::Active {
+            reranker::rerank(query, &mut scored, index, reranker::DEFAULT_TOP_N);
+        }
+
+        scored
     }
 
-    fn score_with_embedding(
+    /// Compute the 7 raw signal results for one file, in the fixed order
+    /// `[path, symbol, import, tf, recency, pagerank, embedding]`, plus its token
+    /// count. No combining — that is mode-specific.
+    fn compute_signals(
         &self,
         query: &str,
         file_path: &str,
         index: &CodebaseIndex,
         query_embedding: Option<&[f32]>,
-        ident_ranking: Option<&identifier::IdentifierRanking>,
-    ) -> ScoredFile {
-        let w = &self.weights;
+    ) -> ([SignalResult; 7], usize) {
         let expanded = self.expanded_tokens.as_ref();
 
         let path_sig = signals::path_similarity(query, file_path);
@@ -193,31 +297,6 @@ impl MultiSignalScorer {
             }
         };
 
-        let combined = w.path_similarity * path_sig.score
-            + w.symbol_match * symbol_sig.score
-            + w.import_proximity * import_sig.score
-            + w.term_frequency * tf_sig.score
-            + w.recency_boost * recency_sig.score
-            + w.pagerank * pr_sig.score
-            + w.embedding_similarity * emb_sig.score;
-
-        // Signal 8: identifier-level ranking (C2, ADR-0181). Applied as a
-        // boost-only multiplier (factor >= 1.0) on the weighted-sum base so a
-        // file whose identifiers match the query and conform to the conventions
-        // DNA is lifted, while no file can be demoted — keeping the D2 recall
-        // gate monotone. The factor defaults to the neutral 1.0 on the
-        // single-file scoring path (no global ranking available).
-        let ident_factor = ident_ranking.map(|r| r.factor(file_path)).unwrap_or(1.0);
-        let ident_signal = ident_ranking.map(|r| r.signal(file_path)).unwrap_or(0.0);
-        let ident_sig = SignalResult {
-            name: "identifier_rank",
-            score: ident_signal,
-            detail: format!("factor={:.3}, signal={:.3}", ident_factor, ident_signal),
-        };
-
-        // Clamp to 0.0–1.0
-        let score = (combined * ident_factor).clamp(0.0, 1.0);
-
         let token_count = index
             .files
             .iter()
@@ -225,8 +304,78 @@ impl MultiSignalScorer {
             .map(|f| f.token_count)
             .unwrap_or(0);
 
+        (
+            [
+                path_sig,
+                symbol_sig,
+                import_sig,
+                tf_sig,
+                recency_sig,
+                pr_sig,
+                emb_sig,
+            ],
+            token_count,
+        )
+    }
+
+    /// The inert weighted sum `Σ wᵢ·signalᵢ` — byte-identical to the pre-D1
+    /// combine (same operand order). The RRF path never calls this.
+    fn weighted_sum(&self, sigs: &[SignalResult; 7]) -> f64 {
+        let w = &self.weights;
+        w.path_similarity * sigs[0].score
+            + w.symbol_match * sigs[1].score
+            + w.import_proximity * sigs[2].score
+            + w.term_frequency * sigs[3].score
+            + w.recency_boost * sigs[4].score
+            + w.pagerank * sigs[5].score
+            + w.embedding_similarity * sigs[6].score
+    }
+
+    /// The 7 signal weights as a fixed-order array, aligned with the signal order
+    /// [`compute_signals`] produces — the weight vector RRF fuses with.
+    fn weight_array(&self) -> [f64; rrf::N_SIGNALS] {
+        let w = &self.weights;
+        [
+            w.path_similarity,
+            w.symbol_match,
+            w.import_proximity,
+            w.term_frequency,
+            w.recency_boost,
+            w.pagerank,
+            w.embedding_similarity,
+        ]
+    }
+
+    /// Apply the boost-only identifier factor (C2, ADR-0181) to a base score,
+    /// clamp to `[0, 1]`, and assemble the `ScoredFile` with the 8-signal
+    /// breakdown (the 7 base signals + `identifier_rank`). Shared by both modes.
+    fn finalize(
+        &self,
+        file_path: String,
+        sigs: [SignalResult; 7],
+        token_count: usize,
+        base_score: f64,
+        ident_ranking: Option<&identifier::IdentifierRanking>,
+    ) -> ScoredFile {
+        // Signal 8: identifier-level ranking (C2, ADR-0181). Boost-only multiplier
+        // (factor >= 1.0) so a file whose identifiers match the query and conform
+        // to the conventions DNA is lifted while no file can be demoted — keeping
+        // the D2 recall gate monotone. Defaults to the neutral 1.0 on the
+        // single-file scoring path (no global ranking available).
+        let ident_factor = ident_ranking.map(|r| r.factor(&file_path)).unwrap_or(1.0);
+        let ident_signal = ident_ranking.map(|r| r.signal(&file_path)).unwrap_or(0.0);
+        let ident_sig = SignalResult {
+            name: "identifier_rank",
+            score: ident_signal,
+            detail: format!("factor={:.3}, signal={:.3}", ident_factor, ident_signal),
+        };
+
+        let score = (base_score * ident_factor).clamp(0.0, 1.0);
+
+        let [path_sig, symbol_sig, import_sig, tf_sig, recency_sig, pr_sig, emb_sig] = sigs;
+
         ScoredFile {
-            path: file_path.to_string(),
+            path: file_path,
             score,
             signals: vec![
                 path_sig,
@@ -240,6 +389,29 @@ impl MultiSignalScorer {
             ],
             token_count,
         }
+    }
+
+    /// Single-file scoring (the [`RelevanceScorer`] trait path): always the inert
+    /// weighted sum. RRF needs the whole population to assign ranks, so it is
+    /// only available via [`score_all`]; single-file scoring stays inert
+    /// (documented, mirroring C2's neutral identifier factor on this path).
+    fn score_with_embedding(
+        &self,
+        query: &str,
+        file_path: &str,
+        index: &CodebaseIndex,
+        query_embedding: Option<&[f32]>,
+        ident_ranking: Option<&identifier::IdentifierRanking>,
+    ) -> ScoredFile {
+        let (sigs, token_count) = self.compute_signals(query, file_path, index, query_embedding);
+        let base = self.weighted_sum(&sigs);
+        self.finalize(
+            file_path.to_string(),
+            sigs,
+            token_count,
+            base,
+            ident_ranking,
+        )
     }
 }
 
@@ -478,5 +650,123 @@ mod tests {
         let result = scorer.score("xyznonexistent", "src/config.rs", &index);
         // Should be low but valid
         assert!(result.score >= 0.0 && result.score <= 1.0);
+    }
+
+    // ── D1: A/B control (RelevanceMode) tests ──────────────────────────────
+
+    #[test]
+    fn default_mode_is_inert() {
+        // The shipped default must be Inert so score_all reproduces the pre-D1
+        // ranking byte-for-byte until the D2 gate flips it.
+        assert_eq!(DEFAULT_RELEVANCE_MODE, RelevanceMode::Inert);
+        let scorer = MultiSignalScorer::new();
+        assert_eq!(scorer.mode, RelevanceMode::Inert);
+    }
+
+    #[test]
+    fn inert_mode_reproduces_weighted_sum_byte_for_byte() {
+        // The Inert score_all path must produce the EXACT same f64 scores as the
+        // single-file weighted-sum path (score_with_embedding) — the pre-D1
+        // ranking, unperturbed. Bit-for-bit equality is the A/B guarantee.
+        let index = make_test_index();
+        let scorer = MultiSignalScorer::new_for_index(&index).with_mode(RelevanceMode::Inert);
+        let all = scorer.score_all("api request handler", &index);
+        for sf in &all {
+            let single = scorer.score("api request handler", &sf.path, &index);
+            assert_eq!(
+                sf.score.to_bits(),
+                single.score.to_bits(),
+                "inert score_all must byte-match the weighted sum for {}",
+                sf.path
+            );
+        }
+    }
+
+    #[test]
+    fn active_mode_enables_rrf_and_stays_in_unit_range() {
+        // Active mode must produce a valid [0,1] ranking and generally reorder
+        // vs inert (RRF fuses ranks, not magnitudes).
+        let index = make_test_index();
+        let inert = MultiSignalScorer::new_for_index(&index).with_mode(RelevanceMode::Inert);
+        let active = MultiSignalScorer::new_for_index(&index).with_mode(RelevanceMode::Active);
+
+        let inert_scores = inert.score_all("rate limit", &index);
+        let active_scores = active.score_all("rate limit", &index);
+        assert_eq!(inert_scores.len(), active_scores.len());
+        for sf in &active_scores {
+            assert!(
+                sf.score >= 0.0 && sf.score <= 1.0,
+                "active RRF score out of [0,1]: {} = {}",
+                sf.path,
+                sf.score
+            );
+            assert_eq!(sf.signals.len(), 8, "8-signal breakdown preserved");
+        }
+
+        // The relevant file should still outrank the irrelevant one under RRF.
+        let get = |v: &[ScoredFile], p: &str| v.iter().find(|s| s.path == p).unwrap().score;
+        assert!(
+            get(&active_scores, "src/api/middleware.rs") >= get(&active_scores, "src/config.rs"),
+            "RRF should keep the rate-limit file at or above config.rs"
+        );
+    }
+
+    #[test]
+    fn active_mode_is_deterministic() {
+        let index = make_test_index();
+        let scorer = MultiSignalScorer::new_for_index(&index).with_mode(RelevanceMode::Active);
+        let a = scorer.score_all("api request handler", &index);
+        let b = scorer.score_all("api request handler", &index);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.path, y.path);
+            assert_eq!(
+                x.score.to_bits(),
+                y.score.to_bits(),
+                "active mode must be byte-stable"
+            );
+        }
+    }
+
+    #[test]
+    fn relevance_mode_contextual_flag() {
+        assert!(!RelevanceMode::Inert.contextual());
+        assert!(RelevanceMode::Active.contextual());
+    }
+
+    #[cfg(not(feature = "reranker"))]
+    #[test]
+    fn active_ranking_equals_pre_reranker_when_feature_off() {
+        // With the reranker feature OFF (the default build), the active ranking
+        // IS the pure fused ranking — nothing re-orders it. This locks the
+        // "when off, ranking == pre-reranker" contract on the default surface.
+        let index = make_test_index();
+        let active = MultiSignalScorer::new_for_index(&index).with_mode(RelevanceMode::Active);
+        let scored = active.score_all("rate limit", &index);
+        // Recompute the fused base independently and confirm the finalize step
+        // (ident factor 0.0 gain ⇒ factor 1.0) leaves scores == fused base.
+        let signal_sets: Vec<(String, [f64; rrf::N_SIGNALS])> = index
+            .files
+            .iter()
+            .map(|f| {
+                let (sigs, _) =
+                    active.compute_signals("rate limit", &f.relative_path, &index, None);
+                let mut arr = [0.0; rrf::N_SIGNALS];
+                for (i, s) in sigs.iter().enumerate() {
+                    arr[i] = s.score;
+                }
+                (f.relative_path.clone(), arr)
+            })
+            .collect();
+        let fused = rrf::fuse(&signal_sets, active.weight_array(), rrf::RRF_K);
+        for (sf, (_, _arr)) in scored.iter().zip(signal_sets.iter()) {
+            let f = fused[signal_sets.iter().position(|(p, _)| p == &sf.path).unwrap()];
+            assert_eq!(
+                sf.score.to_bits(),
+                f.clamp(0.0, 1.0).to_bits(),
+                "no reranker ⇒ score == clamped fused base for {}",
+                sf.path
+            );
+        }
     }
 }

@@ -550,14 +550,76 @@ impl CodebaseIndex {
 // Embedding index construction (feature-gated)
 // ---------------------------------------------------------------------------
 
+/// Maximum number of dependency / dependent names listed in a contextual header,
+/// keeping the prepended prefix short and its token cost bounded.
+pub const CONTEXT_HEADER_MAX_NEIGHBORS: usize = 8;
+
+/// Build the deterministic graph-context header prepended to a file's embedded
+/// text under contextual retrieval (cxpak 3.0.0, Phase D — ADR-0184, Anthropic
+/// "contextual retrieval").
+///
+/// The header situates the symbol in the codebase before its signature so the
+/// embedding captures relational meaning, not just the local token bag:
+///
+/// ```text
+/// // file: src/api/mod.rs | depends on: config.rs, middleware.rs | used by: server.rs
+/// ```
+///
+/// Fully deterministic and LLM-free: dependency/dependent file basenames come
+/// straight from the prebuilt `DependencyGraph` (`dependencies` is a `BTreeSet`,
+/// `dependents` a set-backed vec), are de-duplicated, sorted, and capped at
+/// [`CONTEXT_HEADER_MAX_NEIGHBORS`]. The same index always yields the same
+/// header, so the enriched embedding input is reproducible.
+pub fn build_context_header(index: &CodebaseIndex, file_path: &str) -> String {
+    let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+
+    let mut deps: Vec<String> = index
+        .graph
+        .dependencies(file_path)
+        .map(|set| set.iter().map(|e| basename(&e.target)).collect())
+        .unwrap_or_default();
+    deps.sort();
+    deps.dedup();
+    deps.truncate(CONTEXT_HEADER_MAX_NEIGHBORS);
+
+    let mut used_by: Vec<String> = index
+        .graph
+        .dependents(file_path)
+        .iter()
+        .map(|e| basename(&e.target))
+        .collect();
+    used_by.sort();
+    used_by.dedup();
+    used_by.truncate(CONTEXT_HEADER_MAX_NEIGHBORS);
+
+    let deps_str = if deps.is_empty() {
+        "none".to_string()
+    } else {
+        deps.join(", ")
+    };
+    let used_by_str = if used_by.is_empty() {
+        "none".to_string()
+    } else {
+        used_by.join(", ")
+    };
+
+    format!("// file: {file_path} | depends on: {deps_str} | used by: {used_by_str}\n")
+}
+
 /// Attempt to build an embedding index for all public symbols in the codebase.
 ///
 /// Returns `None` on any error (missing API key, no network, etc.) so that
 /// the rest of the index build always succeeds.
+///
+/// When `mode` is [`RelevanceMode::Active`][crate::relevance::RelevanceMode] the
+/// embedded text for each symbol is prefixed with the deterministic
+/// [`build_context_header`] (contextual retrieval, ADR-0184); when `Inert` the
+/// bare signature is embedded, byte-identical to the pre-D1 behavior.
 #[cfg(feature = "embeddings")]
 pub fn build_embedding_index(
     index: &CodebaseIndex,
     repo_path: &std::path::Path,
+    mode: crate::relevance::RelevanceMode,
 ) -> Option<crate::embeddings::EmbeddingIndex> {
     use crate::embeddings::{create_provider, EmbeddingConfig, EmbeddingIndex};
 
@@ -567,6 +629,7 @@ pub fn build_embedding_index(
         Err(_) => return None,
     };
 
+    let contextual = mode.contextual();
     let symbols: Vec<(String, String)> = index
         .files
         .iter()
@@ -576,10 +639,17 @@ pub fn build_embedding_index(
                 .map(|pr| (f.relative_path.clone(), pr))
         })
         .flat_map(|(path, pr)| {
+            // Contextual retrieval prepends the file's graph-context header once
+            // per file; each symbol's embedded text becomes `header + signature`.
+            let header = if contextual {
+                build_context_header(index, &path)
+            } else {
+                String::new()
+            };
             pr.symbols
                 .iter()
                 .filter(|s| s.visibility == crate::parser::language::Visibility::Public)
-                .map(move |s| (path.clone(), s.signature.clone()))
+                .map(move |s| (path.clone(), format!("{header}{}", s.signature)))
         })
         .collect();
 
@@ -647,6 +717,38 @@ mod tests {
         idx.total_files = idx.files.len();
         idx.rebuild_graph();
         idx
+    }
+
+    #[test]
+    fn context_header_contains_deps_and_dependents_deterministically() {
+        // a → b, a → c ; so b/c are "used by a", and a "depends on b, c".
+        let idx = idx_with_imports(&[
+            ("src/a.rs", &["crate::b", "crate::c"]),
+            ("src/b.rs", &[]),
+            ("src/c.rs", &[]),
+        ]);
+
+        let h_a = build_context_header(&idx, "src/a.rs");
+        assert!(
+            h_a.contains("file: src/a.rs"),
+            "header names the file: {h_a}"
+        );
+        assert!(
+            h_a.contains("depends on: b.rs, c.rs"),
+            "a depends on b,c: {h_a}"
+        );
+        assert!(h_a.contains("used by: none"), "a has no dependents: {h_a}");
+
+        let h_b = build_context_header(&idx, "src/b.rs");
+        assert!(
+            h_b.contains("depends on: none"),
+            "b depends on nothing: {h_b}"
+        );
+        assert!(h_b.contains("used by: a.rs"), "b is used by a: {h_b}");
+
+        // Deterministic: same index ⇒ byte-identical header across calls.
+        assert_eq!(h_a, build_context_header(&idx, "src/a.rs"));
+        assert_eq!(h_b, build_context_header(&idx, "src/b.rs"));
     }
 
     #[test]
