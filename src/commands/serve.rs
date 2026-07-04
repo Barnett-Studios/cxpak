@@ -59,6 +59,13 @@ pub enum IndexReadiness {
     Building,
     /// The base index is ready. Cloning bumps the inner `Arc` refcount (O(1)).
     Ready(Arc<CodebaseIndex>),
+    /// The base index is ready **and** enriched with an embedding index
+    /// (similarity signal #7). Published by the R-E1 phase-2 background enrich
+    /// swap (opt-in via `.cxpak.json`; ADR-0186). Snapshotted identically to
+    /// [`Ready`][IndexReadiness::Ready] — the only difference is the attached
+    /// `embedding_index`, so tool calls transparently pick up the 7-signal
+    /// weight vector once the swap lands.
+    ReadyEnriched(Arc<CodebaseIndex>),
     /// The background build failed; the message is surfaced on tool calls.
     Failed(String),
 }
@@ -2266,6 +2273,13 @@ pub fn spawn_mcp_index_build(
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_index(&path)));
         let next = classify_build_outcome(&path, outcome);
+        // Capture the ready base *before* the move-consuming publish so phase 2
+        // can enrich it without re-reading the cell. Only `Ready` is enrichable.
+        #[cfg(feature = "embeddings")]
+        let ready_base = match &next {
+            IndexReadiness::Ready(idx) => Some(Arc::clone(idx)),
+            _ => None,
+        };
         // Brief write lock: `next` is already built, so this is an O(1) swap.
         // Recover from a poisoned lock (a reader panicked) and still publish, so
         // tool calls stop reporting "Building" once the build has completed.
@@ -2273,7 +2287,83 @@ pub fn spawn_mcp_index_build(
             Ok(mut g) => *g = next,
             Err(poisoned) => *poisoned.into_inner() = next,
         }
+        // Phase 2 (R-E1, ADR-0186): once the base index is published `Ready`,
+        // build the embedding index in this same background thread — off the
+        // handshake, off the base-ready path — and swap in `ReadyEnriched`. This
+        // is opt-in (only when `.cxpak.json` declares an `"embeddings"` section)
+        // and strictly non-fatal: any failure or panic leaves the already-ready
+        // base untouched (6-signal), never `Failed`, never a hang.
+        #[cfg(feature = "embeddings")]
+        if let Some(base) = ready_base {
+            enrich_ready_with_embeddings(&readiness, &base, &path);
+        }
     })
+}
+
+/// Phase 2 of the MCP background build (R-E1, ADR-0186): build the embedding
+/// index for an already-`Ready` base and publish `ReadyEnriched`.
+///
+/// Opt-in gate: returns early (leaving the base `Ready`, 6-signal) unless
+/// `.cxpak.json` declares an `"embeddings"` section — so the default no-config
+/// path never downloads the MiniLM model and stays byte-identical.
+///
+/// Runs `build_embedding_index` under [`std::panic::catch_unwind`] so a
+/// panicking provider or model loader can neither wedge the server nor downgrade
+/// the ready base — it just leaves the index un-enriched. The relevance mode is
+/// the current [`DEFAULT_RELEVANCE_MODE`][crate::relevance::DEFAULT_RELEVANCE_MODE]
+/// (presently `Inert`), *not* a hard-coded `Active`; the Inert→Active flip is a
+/// later task (R-D1) and embeddings are rebuilt on each serve start, so no stale
+/// embedding survives that flip.
+#[cfg(feature = "embeddings")]
+fn enrich_ready_with_embeddings(
+    readiness: &SharedReadiness,
+    base: &Arc<CodebaseIndex>,
+    path: &Path,
+) {
+    // Opt-in gate — no `.cxpak.json` embeddings section ⇒ no enrichment, no
+    // model download, no network. Base stays `Ready`; golden byte-identical.
+    if crate::embeddings::EmbeddingConfig::from_repo_root_if_configured(path).is_none() {
+        return;
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::index::build_embedding_index(base, path, crate::relevance::DEFAULT_RELEVANCE_MODE)
+    }));
+    match outcome {
+        Ok(Some(emb)) => publish_ready_enriched(readiness, base, emb),
+        Ok(None) => {
+            eprintln!(
+                "cxpak: embedding index unavailable (provider/network/model) — \
+                 serving on 6 signals"
+            );
+        }
+        Err(_) => {
+            eprintln!("cxpak: embedding build panicked — serving on 6 signals");
+        }
+    }
+}
+
+/// Swap an enriched `CodebaseIndex` (base + embedding index) into the readiness
+/// cell as [`IndexReadiness::ReadyEnriched`] (R-E1).
+///
+/// The enriched index is built into a local *before* the lock is taken, so the
+/// write lock is held only for the O(1) `Arc` swap — no lock is held across the
+/// clone/build. A `tools/call` racing this swap snapshots either the pre-swap
+/// `Ready` (6-signal) or the `ReadyEnriched` (7-signal), never a torn state.
+/// Poison recovery matches R0's discipline: a panicked reader cannot wedge the
+/// publish.
+#[cfg(feature = "embeddings")]
+fn publish_ready_enriched(
+    readiness: &SharedReadiness,
+    base: &Arc<CodebaseIndex>,
+    emb: crate::embeddings::EmbeddingIndex,
+) {
+    let mut enriched = (**base).clone();
+    enriched.embedding_index = Some(emb);
+    let next = IndexReadiness::ReadyEnriched(Arc::new(enriched));
+    match readiness.write() {
+        Ok(mut g) => *g = next,
+        Err(poisoned) => *poisoned.into_inner() = next,
+    }
 }
 
 /// Snapshot the base index if the background build has finished, else return the
@@ -2290,7 +2380,9 @@ fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex
         Err(poisoned) => poisoned.into_inner(),
     };
     match &*guard {
-        IndexReadiness::Ready(idx) => Ok(Arc::clone(idx)),
+        // `ReadyEnriched` (R-E1) serves exactly like `Ready`; the attached
+        // embedding index rides on the snapshotted `CodebaseIndex`.
+        IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => Ok(Arc::clone(idx)),
         IndexReadiness::Building => Err(INDEXING_IN_PROGRESS_MESSAGE.to_string()),
         IndexReadiness::Failed(msg) => Err(format!(
             "cxpak: indexing failed and no context is available: {msg}. \
@@ -4231,6 +4323,7 @@ mod tests {
             IndexReadiness::Failed(msg) => assert!(msg.contains("scanner failed"), "msg: {msg}"),
             IndexReadiness::Building => panic!("expected Failed, got Building"),
             IndexReadiness::Ready(_) => panic!("expected Failed, got Ready"),
+            IndexReadiness::ReadyEnriched(_) => panic!("expected Failed, got ReadyEnriched"),
         }
     }
 
@@ -4254,6 +4347,7 @@ mod tests {
             }
             IndexReadiness::Building => panic!("expected Failed, got Building"),
             IndexReadiness::Ready(_) => panic!("expected Failed, got Ready"),
+            IndexReadiness::ReadyEnriched(_) => panic!("expected Failed, got ReadyEnriched"),
         }
     }
 
@@ -4294,7 +4388,135 @@ mod tests {
                 panic!("cell must not stay Building after a panicking build")
             }
             IndexReadiness::Ready(_) => panic!("panicking build must not yield Ready"),
+            IndexReadiness::ReadyEnriched(_) => {
+                panic!("panicking build must not yield ReadyEnriched")
+            }
         }
+    }
+
+    // --- R-E1: background embedding enrichment (phase 2, opt-in) ---
+
+    /// `publish_ready_enriched` swaps the cell to `ReadyEnriched` carrying a
+    /// `CodebaseIndex` whose `embedding_index` is now `Some`. `snapshot_ready_index`
+    /// treats it exactly like `Ready` (returns the index), and the snapshot now
+    /// reports `has_embedding_index()` — the signal-#7 activation this task wires.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn publish_ready_enriched_attaches_embedding_index() {
+        let base = Arc::new(make_test_index());
+        assert!(
+            !base.has_embedding_index(),
+            "base must start without an embedding index"
+        );
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Ready(Arc::clone(&base))));
+
+        // A tiny in-crate embedding index — no provider, no network, no model.
+        let mut emb = crate::embeddings::EmbeddingIndex::new(3);
+        emb.add("src/main.rs".to_string(), vec![0.1, 0.2, 0.3]);
+        publish_ready_enriched(&readiness, &base, emb);
+
+        // Cell is now ReadyEnriched, and snapshots (Ready|ReadyEnriched) carry it.
+        assert!(matches!(
+            &*readiness.read().unwrap(),
+            IndexReadiness::ReadyEnriched(_)
+        ));
+        let snap = snapshot_ready_index(&readiness).expect("ReadyEnriched must yield the index");
+        assert_eq!(snap.total_files, 2);
+        assert!(
+            snap.has_embedding_index(),
+            "the enriched snapshot must expose the embedding index (signal #7)"
+        );
+    }
+
+    /// Opt-in gate at the serve layer: a repo with **no** `.cxpak.json` leaves the
+    /// base `Ready` (never `ReadyEnriched`), builds no embedding index, downloads
+    /// no model, and hits no network. This keeps the default path byte-identical.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn enrich_skips_and_stays_ready_when_not_configured() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = Arc::new(make_test_index());
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Ready(Arc::clone(&base))));
+
+        enrich_ready_with_embeddings(&readiness, &base, dir.path());
+
+        assert!(
+            matches!(&*readiness.read().unwrap(), IndexReadiness::Ready(_)),
+            "no .cxpak.json ⇒ cell must stay Ready (6-signal), never ReadyEnriched"
+        );
+        let snap = snapshot_ready_index(&readiness).expect("ready");
+        assert!(!snap.has_embedding_index());
+    }
+
+    /// Graceful fallback: a repo configured for a *remote* provider whose API-key
+    /// env var is unset fails provider construction (no network) — `build_embedding_index`
+    /// returns `None`, so the cell stays `Ready` (6-signal), never `Failed`, never
+    /// a hang, and `has_embedding_index()` stays false.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn enrich_falls_back_gracefully_on_failing_provider() {
+        let key_env = "CXPAK_TEST_UNSET_EMBED_KEY_R_E1";
+        std::env::remove_var(key_env);
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".cxpak.json"),
+            format!(r#"{{"embeddings": {{"provider": "openai", "api_key_env": "{key_env}"}}}}"#),
+        )
+        .unwrap();
+        let base = Arc::new(make_test_index());
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Ready(Arc::clone(&base))));
+
+        // Configured, but the provider cannot construct (unset key) — no network.
+        enrich_ready_with_embeddings(&readiness, &base, dir.path());
+
+        assert!(
+            matches!(&*readiness.read().unwrap(), IndexReadiness::Ready(_)),
+            "a failing provider must leave the base Ready (6-signal), not Failed"
+        );
+        let snap = snapshot_ready_index(&readiness).expect("base must still be queryable");
+        assert!(!snap.has_embedding_index());
+        assert_eq!(snap.total_files, 2);
+    }
+
+    /// Concurrency: while the phase-2 enrich swap runs on one thread, concurrent
+    /// snapshots on another always observe a valid, queryable index — either the
+    /// pre-swap `Ready` (6-signal) or the post-swap `ReadyEnriched` (7-signal) —
+    /// never a torn or panicking state. After the swap lands, the cell is enriched.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn enrich_swap_never_races_base_ready() {
+        let base = Arc::new(make_test_index());
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Ready(Arc::clone(&base))));
+
+        let reader = {
+            let readiness = Arc::clone(&readiness);
+            std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    let idx = snapshot_ready_index(&readiness)
+                        .expect("Ready|ReadyEnriched must always yield an index");
+                    // Never torn: the file count is stable across the swap.
+                    assert_eq!(idx.total_files, 2);
+                }
+            })
+        };
+
+        let mut emb = crate::embeddings::EmbeddingIndex::new(3);
+        emb.add("src/main.rs".to_string(), vec![0.4, 0.5, 0.6]);
+        publish_ready_enriched(&readiness, &base, emb);
+
+        reader
+            .join()
+            .expect("reader must not observe a torn/panicking state");
+        assert!(
+            snapshot_ready_index(&readiness)
+                .unwrap()
+                .has_embedding_index(),
+            "after the swap the cell must be enriched"
+        );
     }
 
     // --- R0: non-blocking MCP startup / readiness gating ---

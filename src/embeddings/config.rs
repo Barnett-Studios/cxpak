@@ -65,6 +65,33 @@ impl EmbeddingConfig {
         Self::from_json(&content)
     }
 
+    /// Opt-in variant of [`from_repo_root`] (Task R-E1, ADR-0186).
+    ///
+    /// Returns `Some` **only** when `.cxpak.json` exists in `path` *and* declares
+    /// an `"embeddings"` section; returns `None` otherwise. Unlike
+    /// [`from_repo_root`], there is **no** local-default fallback — a missing file
+    /// or a missing `"embeddings"` key yields `None`, not a local MiniLM config.
+    ///
+    /// This is the gate the MCP serve path uses so embeddings never activate (nor
+    /// trigger the ~30 MB MiniLM model download) for repos that never opted in:
+    /// `None` keeps the default 6-signal path byte-identical.
+    pub fn from_repo_root_if_configured(path: &Path) -> Option<Self> {
+        let config_path = path.join(".cxpak.json");
+        let content = std::fs::read_to_string(&config_path).ok()?;
+        Self::from_json_if_configured(&content)
+    }
+
+    /// Opt-in variant of [`from_json`] (Task R-E1, ADR-0186).
+    ///
+    /// Returns `Some` only when `json` parses *and* contains a top-level
+    /// `"embeddings"` value; returns `None` on a parse error or an absent
+    /// `"embeddings"` key — no local-default fallback.
+    pub fn from_json_if_configured(json: &str) -> Option<Self> {
+        let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+        value.get("embeddings")?;
+        Some(Self::from_json(json))
+    }
+
     /// Parse a JSON string. Expects `{"embeddings": {...}}` at the top level.
     /// Falls back to local defaults if the `embeddings` key is absent.
     pub fn from_json(json: &str) -> Self {
@@ -190,6 +217,46 @@ mod tests {
         assert_eq!(cfg.base_url, "https://api.voyageai.com/v1");
         assert_eq!(cfg.dimensions, 1024);
         assert_eq!(cfg.batch_size, 128);
+    }
+
+    #[test]
+    fn if_configured_none_without_file() {
+        let dir = TempDir::new().unwrap();
+        // No .cxpak.json → opt-in gate returns None (no local-default fallback).
+        assert!(EmbeddingConfig::from_repo_root_if_configured(dir.path()).is_none());
+    }
+
+    #[test]
+    fn if_configured_none_when_embeddings_key_absent() {
+        // File present but no `embeddings` section → None, not local default.
+        assert!(EmbeddingConfig::from_json_if_configured(r#"{"other": "data"}"#).is_none());
+    }
+
+    #[test]
+    fn if_configured_none_on_parse_error() {
+        assert!(EmbeddingConfig::from_json_if_configured("{not valid json").is_none());
+    }
+
+    #[test]
+    fn if_configured_some_when_embeddings_present() {
+        let cfg =
+            EmbeddingConfig::from_json_if_configured(r#"{"embeddings": {"provider": "openai"}}"#)
+                .expect("embeddings section present → Some");
+        assert_eq!(cfg.provider, "openai");
+        assert_eq!(cfg.model, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn if_configured_some_from_repo_root_with_file() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".cxpak.json"),
+            r#"{"embeddings": {"provider": "voyageai"}}"#,
+        )
+        .unwrap();
+        let cfg = EmbeddingConfig::from_repo_root_if_configured(dir.path())
+            .expect("configured repo → Some");
+        assert_eq!(cfg.provider, "voyageai");
     }
 
     #[test]
