@@ -84,9 +84,14 @@ Dependency/dependent basenames come from the prebuilt `DependencyGraph`
 and capped at `CONTEXT_HEADER_MAX_NEIGHBORS = 8`. No LLM; the same index yields
 byte-identical headers. In `Inert` mode the bare signature is embedded (pre-D1,
 byte-identical). Note: the D2 harness has no persisted embedding index (the
-embedding signal is neutral there), so contextual retrieval does not move the
-current D2 A/B — its recall impact is measured when embeddings are active (Phase
-R re-baseline). It is shipped and unit-tested for determinism.
+embedding signal is neutral there), so contextual retrieval did not move the
+D2 A/B. At the time of this ADR `build_embedding_index` had no production caller,
+so contextual retrieval (piece 2/3) shipped reachable-in-principle but unexercised
+and unmeasured. **UPDATE (R-E1, ADR-0186):** `build_embedding_index` is now wired
+as an opt-in background build, so contextual retrieval is reachable in production
+whenever embeddings are configured (`.cxpak.json`) AND mode is `Active`. Its recall
+impact remains unmeasured here (opt-in and correctness-gated per R-E1; not
+re-measured at the R-D1 flip). It is shipped and unit-tested for determinism.
 
 **Optional local reranker** (`relevance::reranker`, behind the NON-default
 `reranker` Cargo feature): a deterministic, no-LLM, no-new-dependency lexical
@@ -94,9 +99,12 @@ cross-encoder that re-orders the top-N (`DEFAULT_TOP_N = 20`) fused candidates b
 jointly featurizing the query against each file (query↔symbol-name/path token
 overlap, weighted by symbol importance). It re-orders the top-N *among
 themselves only* — never drops a candidate, never promotes from outside top-N,
-and reassigns the same multiset of top-N scores — so it cannot regress recall at
-any prefix ≥ N. OFF by default; only fires in `Active` mode; **excluded from the
-determinism fixture** (the fixture builds with default features + Inert). A
+and reassigns the same multiset of top-N scores — so it cannot regress the
+ranking *set* above any prefix ≥ N. (It does not guarantee recall under a smaller
+*budget* cut inside the top-N: a token budget admitting only the first k < N
+files can drop a file the reranker demoted within the top-N.) OFF by default;
+only fires in `Active` mode; **excluded from the determinism fixture** (the
+fixture builds with default features + Inert). A
 model-backed transformer cross-encoder would live behind this SAME flag but needs
 a heavy native runtime — deferred per ADR-0163 / the D1 stop-and-ask rule.
 
@@ -104,9 +112,12 @@ a heavy native runtime — deferred per ADR-0163 / the D1 stop-and-ask rule.
 `MultiSignalScorer` (`.with_mode()`) and the product-level `auto_context_with_mode`.
 `Inert` reproduces the pre-D1 ranking byte-for-byte; `Active` enables the upgrade.
 Both are reachable from ONE index build, so the D2 harness measures both modes
-index-once. **`DEFAULT_RELEVANCE_MODE = Inert`** ships: the machinery is built,
-tested, and measurable, but flipping the default to `Active` is gated on the
-full-corpus D2 A/B (controller + user), exactly as C2 shipped inert.
+index-once. **`DEFAULT_RELEVANCE_MODE = Inert`** shipped at D1: the machinery is
+built, tested, and measurable, but flipping the default to `Active` was gated on
+the full-corpus recall A/B (controller + user), exactly as C2 shipped inert.
+**UPDATE (R-D1, ADR-0187):** the full-corpus A/B cleared the gate (+164% recall)
+and the default is now `Active`; `Inert` remains available as a byte-stable
+control via `.with_mode()` / `auto_context_with_mode`.
 
 ## D2 recall A/B (measured)
 

@@ -35,11 +35,16 @@
 //!  2. **Scale normalization via `(K + 1)`.** A rank-1 file contributes exactly
 //!     `weights[j]` (since `(K+1)/(K+1) = 1`), so each term lands in `(0, 1]`.
 //!     With `Σ weights = 1` the fused score lands on the SAME `[0, 1]` scale as
-//!     the weighted sum. This is the recall-safety keystone: the downstream seed
-//!     threshold ([`crate::relevance::seed::SEED_THRESHOLD`] = 0.10) is
-//!     calibrated to that `[0, 1]` range, so RRF does not silently empty (or
-//!     flood) seed selection the way an un-normalized `Σ 1/(K+rank) ≈ 0.016`-max
-//!     score would.
+//!     the weighted sum. This keeps fused scores in-range so seed selection
+//!     cannot COLLAPSE — an un-normalized `Σ 1/(K+rank) ≈ 0.016`-max score would
+//!     fall entirely below [`crate::relevance::seed::SEED_THRESHOLD`] = 0.10 and
+//!     empty the seed set. Note the normalization does NOT preserve threshold
+//!     *discrimination*: the RRF worst-file floor `(K+1)/(K+n) ≈ 0.17–0.24` for
+//!     `n ≳ 200` exceeds `SEED_THRESHOLD`, so on large repos Active-mode
+//!     threshold filtering degenerates to the top-50 seed cap rather than the
+//!     0.10 cutoff. This degeneration is MEASURED and net-positive: the
+//!     full-corpus recall A/B (ADR-0187) puts Active at +164% recall over Inert
+//!     at both budgets, with only 2 isolated flask regressions.
 //!
 //! ## Determinism
 //!

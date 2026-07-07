@@ -38,13 +38,14 @@ impl RelevanceMode {
 
 /// The relevance mode the shipped product uses.
 ///
-/// Held at [`RelevanceMode::Inert`] — the D1 upgrade is fully built and unit-
-/// tested, but shipping it ACTIVE is gated on the D2 recall A/B (inert vs active,
-/// index-once) validating `recall@budget(active) ≥ recall@budget(inert)` on the
-/// full corpus. That is a controller+user gate (the C2 precedent: ship the
-/// machinery inert, flip the default once the gate clears). Flip this to
-/// [`RelevanceMode::Active`] — and re-run the D2 A/B — to activate the upgrade.
-pub const DEFAULT_RELEVANCE_MODE: RelevanceMode = RelevanceMode::Inert;
+/// Held at [`RelevanceMode::Active`] as of Phase R (ADR-0187): the full-corpus
+/// recall A/B (31 runnable PRs — ripgrep/flask/express) measured Active (RRF
+/// fusion) at +0.30 recall over Inert at both the 8k and 32k budgets (+164%
+/// overall; 17 wins / 12 ties / 2 losses), and the controller+user gate approved
+/// the flip. [`RelevanceMode::Inert`] remains available as a byte-stable control
+/// via [`crate::relevance::MultiSignalScorer::with_mode`] and
+/// [`crate::auto_context::auto_context_with_mode`].
+pub const DEFAULT_RELEVANCE_MODE: RelevanceMode = RelevanceMode::Active;
 
 /// Result of scoring a single file against a query.
 #[derive(Debug, Clone)]
@@ -655,19 +656,24 @@ mod tests {
     // ── D1: A/B control (RelevanceMode) tests ──────────────────────────────
 
     #[test]
-    fn default_mode_is_inert() {
-        // The shipped default must be Inert so score_all reproduces the pre-D1
-        // ranking byte-for-byte until the D2 gate flips it.
-        assert_eq!(DEFAULT_RELEVANCE_MODE, RelevanceMode::Inert);
+    fn default_mode_is_active() {
+        // Post-flip (ADR-0187): the shipped default is Active (RRF fusion), which
+        // the full-corpus recall A/B measured at +164% recall over Inert. The
+        // freshly-constructed scorer must reflect that default.
+        assert_eq!(DEFAULT_RELEVANCE_MODE, RelevanceMode::Active);
         let scorer = MultiSignalScorer::new();
-        assert_eq!(scorer.mode, RelevanceMode::Inert);
+        assert_eq!(scorer.mode, RelevanceMode::Active);
     }
 
     #[test]
-    fn inert_mode_reproduces_weighted_sum_byte_for_byte() {
+    fn inert_mode_score_all_agrees_with_single_score() {
         // The Inert score_all path must produce the EXACT same f64 scores as the
-        // single-file weighted-sum path (score_with_embedding) — the pre-D1
-        // ranking, unperturbed. Bit-for-bit equality is the A/B guarantee.
+        // single-file weighted-sum path (`score`) — i.e. the batch and per-file
+        // entry points agree bit-for-bit. This proves path-agreement within the
+        // Inert weighted sum. There is no separate frozen pre-D1 ranking baseline:
+        // Inert IS the pre-D1 weighted-sum ranking by construction (the D1 A/B
+        // control), and the spa golden covers the visual/PageRank path only — not
+        // the relevance scorer — so nothing here asserts against a pre-D1 snapshot.
         let index = make_test_index();
         let scorer = MultiSignalScorer::new_for_index(&index).with_mode(RelevanceMode::Inert);
         let all = scorer.score_all("api request handler", &index);

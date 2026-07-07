@@ -571,6 +571,14 @@ pub const CONTEXT_HEADER_MAX_NEIGHBORS: usize = 8;
 /// [`CONTEXT_HEADER_MAX_NEIGHBORS`]. The same index always yields the same
 /// header, so the enriched embedding input is reproducible.
 pub fn build_context_header(index: &CodebaseIndex, file_path: &str) -> String {
+    // Neighbors are listed by basename (not relative path) to keep the header
+    // short and its token cost bounded. Tradeoff: two distinct neighbors that
+    // share a basename — e.g. `a/config.rs` and `b/config.rs` — collapse to a
+    // single `config.rs` entry after `dedup()`, a minor semantic loss under the
+    // 8-neighbor cap. This is deterministic (BTreeSet-sourced, sorted) and only
+    // shapes the embedded text prefix, so it cannot desync the reproducible
+    // header; disambiguating by relative path would inflate the header's token
+    // cost, which the cap exists to bound. Accepted per ADR-0184 / ADR-0187.
     let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
 
     let mut deps: Vec<String> = index

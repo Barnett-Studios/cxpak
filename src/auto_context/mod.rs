@@ -431,22 +431,22 @@ mod tests {
     }
 
     #[test]
-    fn auto_context_default_equals_inert_mode() {
-        // The plain `auto_context` entrypoint must delegate to the inert mode —
-        // the D1 upgrade ships gated (ADR-0184), so the default product surface
-        // is byte-identical to the pre-D1 ranking. Assert the selected file sets
-        // match exactly.
+    fn auto_context_default_equals_active_mode() {
+        // Post-flip (ADR-0187): the plain `auto_context` entrypoint delegates to
+        // the Active (RRF) mode — the shipped default after the full-corpus recall
+        // A/B (+164%). Assert the default's selected file set matches the explicit
+        // Active call exactly.
         let (index, _dir) = make_index(&[
             ("src/api.rs", "pub fn handle_request() {}"),
             ("src/config.rs", "pub struct Config {}"),
         ]);
         let opts = default_opts(10_000);
         let default = auto_context("handle request", &index, &opts);
-        let inert = auto_context_with_mode(
+        let active = auto_context_with_mode(
             "handle request",
             &index,
             &opts,
-            crate::relevance::RelevanceMode::Inert,
+            crate::relevance::RelevanceMode::Active,
         );
         let paths = |r: &AutoContextResult| -> Vec<String> {
             r.sections
@@ -456,7 +456,27 @@ mod tests {
                 .map(|f| f.path.clone())
                 .collect()
         };
-        assert_eq!(paths(&default), paths(&inert));
+        assert_eq!(paths(&default), paths(&active));
+    }
+
+    #[test]
+    fn auto_context_inert_mode_remains_available_as_control() {
+        // The Inert (weighted-sum) path must remain a working, well-formed control
+        // after the default flipped to Active — the D1 A/B guarantee (ADR-0184)
+        // that both modes stay reproducible from a single index build.
+        let (index, _dir) = make_index(&[
+            ("src/api.rs", "pub fn handle_request() {}"),
+            ("src/config.rs", "pub struct Config {}"),
+        ]);
+        let opts = default_opts(10_000);
+        let inert = auto_context_with_mode(
+            "handle request",
+            &index,
+            &opts,
+            crate::relevance::RelevanceMode::Inert,
+        );
+        assert_eq!(inert.efficiency.repo_tokens, index.total_tokens);
+        assert!(inert.efficiency.selected_tokens <= inert.efficiency.repo_tokens);
     }
 
     #[test]

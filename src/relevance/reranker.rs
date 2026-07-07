@@ -33,6 +33,12 @@
 //! candidates the SAME multiset of scores they already held (the top-N scores in
 //! descending order), so they stay the top-N and remain above the seed
 //! threshold — only their internal order changes.
+//!
+//! Scope of the guarantee: it cannot regress the ranking *set* at any prefix
+//! ≥ N. It does NOT guarantee recall at a smaller *budget* cut inside the top-N —
+//! a downstream token budget that admits only the first k < N files can drop a
+//! file the reranker demoted within the top-N. The invariant is "no set change
+//! above the top-N boundary", not "no file loss under an arbitrary budget cut".
 
 use super::{signals, ScoredFile};
 use crate::index::CodebaseIndex;
