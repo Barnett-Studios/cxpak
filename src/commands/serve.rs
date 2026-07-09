@@ -89,6 +89,11 @@ const INDEXING_IN_PROGRESS_MESSAGE: &str =
 /// Patterns beyond this limit risk catastrophic backtracking (ReDoS).
 const MAX_PATTERN_LEN: usize = 1000;
 
+/// Upper bound on `context_lines` for the search endpoints. Clamped before any
+/// arithmetic so that unbounded external input (e.g. `context_lines: u64::MAX`)
+/// cannot overflow `i + context_lines + 1` into a reverse-range slice panic.
+const MAX_CONTEXT_LINES: usize = 1000;
+
 fn matches_focus(path: &str, focus: Option<&str>) -> bool {
     match focus {
         Some(f) => path.starts_with(f),
@@ -541,6 +546,26 @@ async fn security_headers_layer(
     response
 }
 
+/// Bearer-token auth middleware. Rejects with 401 unless the request carries a
+/// matching token; `check_auth(None, _)` is always true, so with no configured
+/// token every route stays open (the default local path is unchanged).
+async fn bearer_auth_layer(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let provided = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_bearer_token);
+    if check_auth(state.expected_token.as_deref(), provided) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
 fn build_router(shared: SharedIndex, repo_path: SharedPath, token: Option<String>) -> Router {
     let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
     let state = AppState {
@@ -550,8 +575,18 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath, token: Option<String
         expected_token: token,
         workspace_root: repo_path,
     };
-    Router::new()
-        .route("/health", get(health_handler))
+    // Unauthenticated liveness probe only — intentionally open so orchestrators
+    // can health-check without a credential.
+    let public = Router::new().route("/health", get(health_handler));
+
+    // Every data-bearing legacy route requires the bearer token when one is set.
+    // Auth is a `route_layer` applied directly to `.route()`-registered routes
+    // (no `.merge` in between), so it unambiguously guards each of them. This
+    // closes the gap where `validate_bind_security` promised a non-loopback
+    // listener is authenticated while these routes (e.g. `/diff`,
+    // `/auto_context`) leaked source content with no token. The v1 router keeps
+    // its own equivalent auth layer.
+    let protected_legacy = Router::new()
         .route("/stats", get(stats_handler))
         .route("/overview", get(overview_handler))
         .route("/trace", get(trace_handler))
@@ -574,6 +609,13 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath, token: Option<String
         )
         .route("/data_flow", axum::routing::post(data_flow_handler))
         .route("/cross_lang", get(cross_lang_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            bearer_auth_layer,
+        ));
+
+    public
+        .merge(protected_legacy)
         .merge(build_v1_router(state.clone()))
         // Security layer applied LAST so it wraps both legacy + v1 routes.
         // Tower layers wrap outside-in: layers added later sit at the
@@ -585,26 +627,7 @@ fn build_router(shared: SharedIndex, repo_path: SharedPath, token: Option<String
 }
 
 fn build_v1_router(state: AppState) -> Router<AppState> {
-    use axum::extract::Request;
-    use axum::middleware::{self, Next};
-    use axum::response::Response;
-
-    async fn auth_layer(
-        axum::extract::State(state): axum::extract::State<AppState>,
-        req: Request,
-        next: Next,
-    ) -> Result<Response, StatusCode> {
-        let provided = req
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(extract_bearer_token);
-        if check_auth(state.expected_token.as_deref(), provided) {
-            Ok(next.run(req).await)
-        } else {
-            Err(StatusCode::UNAUTHORIZED)
-        }
-    }
+    use axum::middleware;
 
     let repo_path = state.repo_path.clone();
     Router::new()
@@ -632,7 +655,10 @@ fn build_v1_router(state: AppState) -> Router<AppState> {
         )
         .route("/v1/briefing", axum::routing::post(v1_briefing_handler))
         .layer(axum::Extension(repo_path))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            bearer_auth_layer,
+        ))
         .with_state(state)
 }
 
@@ -1613,7 +1639,7 @@ async fn search_handler(
 
     let limit = params.limit.unwrap_or(20);
     let focus = params.focus.as_deref();
-    let context_lines = params.context_lines.unwrap_or(2);
+    let context_lines = params.context_lines.unwrap_or(2).min(MAX_CONTEXT_LINES);
 
     let mut matches_vec = vec![];
     let mut total_matches = 0usize;
@@ -3102,7 +3128,12 @@ fn dispatch_capability_op(
                     }
                 }
             }
-            let scorer = crate::relevance::MultiSignalScorer::new().with_expansion(expanded_tokens);
+            // `new_for_index` selects the 7-signal weights when the index carries
+            // an embedding index (opt-in), matching the `context` op path so
+            // opted-in repos get identical rankings across ops. Non-opted-in
+            // repos keep the 6-signal default (byte-identical to `new()`).
+            let scorer = crate::relevance::MultiSignalScorer::new_for_index(index)
+                .with_expansion(expanded_tokens);
             let all_scored = scorer.score_all(task, index);
             let seeds = crate::relevance::seed::select_seeds_with_graph(
                 &all_scored,
@@ -3409,10 +3440,11 @@ fn dispatch_capability_op(
             }
             let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
             let focus = args.get("focus").and_then(|f| f.as_str());
-            let context_lines = args
+            let context_lines = (args
                 .get("context_lines")
                 .and_then(|c| c.as_u64())
-                .unwrap_or(2) as usize;
+                .unwrap_or(2) as usize)
+                .min(MAX_CONTEXT_LINES);
 
             let re = match regex::Regex::new(pattern) {
                 Ok(r) => r,
@@ -5587,6 +5619,32 @@ mod tests {
     }
 
     #[test]
+    fn test_axum_search_huge_context_lines_does_not_panic() {
+        // Unauthenticated /search with `context_lines: usize::MAX` must not
+        // panic the connection handler (overflow → reverse-range slice). The
+        // clamp to MAX_CONTEXT_LINES keeps it a normal 200 response.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let app = build_router(shared, Arc::new(std::path::PathBuf::from("/tmp")), None);
+            let body =
+                serde_json::to_vec(&json!({"pattern": ".", "context_lines": u64::MAX})).unwrap();
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/search")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
     fn test_axum_blast_radius_empty_files_error() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -6547,6 +6605,31 @@ mod tests {
         assert!(matches[0]["path"].as_str().is_some());
         assert!(matches[0]["line"].as_u64().unwrap() > 0);
         assert!(matches[0]["content"].as_str().unwrap().contains("fn main"));
+    }
+
+    #[test]
+    fn test_mcp_search_huge_context_lines_does_not_panic() {
+        // `context_lines: u64::MAX` used to overflow `i + context_lines + 1`
+        // (debug panic) / produce a reverse-range slice `lines[(i+1)..end]`
+        // (release panic), killing the MCP server on a single request. The
+        // clamp to MAX_CONTEXT_LINES must make this return a normal result.
+        let index = make_test_index();
+        let repo_path = std::path::Path::new("/tmp");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_search","arguments":{"pattern":"fn main","context_lines":18446744073709551615}}}"#;
+        let input = format!("{request}\n");
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(
+            repo_path,
+            &index,
+            &make_shared_snapshot(),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        let content = response["result"]["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+        assert!(result["total_matches"].as_u64().unwrap() > 0);
     }
 
     #[test]
@@ -8282,6 +8365,90 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        });
+    }
+
+    #[test]
+    fn legacy_routes_require_token_when_set() {
+        // Regression for the auth-scope gap: with a token configured, the
+        // source-leaking legacy routes must reject unauthenticated requests
+        // (previously only `/v1/*` was guarded). `/health` stays open.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shared = make_shared_index();
+            let repo = Arc::new(std::path::PathBuf::from("/tmp"));
+            let mk = || build_router(shared.clone(), repo.clone(), Some("secret".to_string()));
+
+            // Legacy GET without token → 401.
+            let resp = mk()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/diff")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "/diff must require the token"
+            );
+
+            // Legacy POST without token → 401.
+            let body = serde_json::to_vec(&json!({"task": "x"})).unwrap();
+            let resp = mk()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/auto_context")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "/auto_context must require the token"
+            );
+
+            // Legacy GET WITH the token → not 401.
+            let resp = mk()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/diff")
+                        .header("authorization", "Bearer secret")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "/diff must be reachable with the token"
+            );
+
+            // Liveness probe stays open without a token.
+            let resp = mk()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/health")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "/health must stay unauthenticated"
+            );
         });
     }
 

@@ -119,22 +119,43 @@ fn inject_omitted_marker(
     original_tokens: usize,
     applied_budget: usize,
     steps: Vec<String>,
+    counter: &TokenCounter,
 ) {
-    if let Some(obj) = value.as_object_mut() {
-        let note = format!(
-            "Response trimmed from ~{original_tokens} to fit within the \
-             {applied_budget}-token budget. Pass a larger `tokens` value to \
-             retrieve more detail."
-        );
-        obj.insert(
-            "_omitted".to_string(),
-            serde_json::json!({
-                "applied_budget": applied_budget,
-                "original_tokens": original_tokens,
-                "steps_applied": steps,
-                "note": note,
-            }),
-        );
+    if value.as_object().is_none() {
+        return;
+    }
+    let note = format!(
+        "Response trimmed from ~{original_tokens} to fit within the \
+         {applied_budget}-token budget. Pass a larger `tokens` value to \
+         retrieve more detail."
+    );
+    // `steps_applied` grows with each degradation step; on deep degradation the
+    // full list can push the marker past MARKER_RESERVE and the output over
+    // budget. The list is purely informational, so shed trailing entries (noting
+    // how many were dropped) until the whole output fits — guaranteeing the
+    // ≤-budget invariant regardless of step count.
+    let mut kept = steps.len();
+    loop {
+        let mut shown: Vec<String> = steps[..kept].to_vec();
+        let dropped = steps.len() - kept;
+        if dropped > 0 {
+            shown.push(format!("… (+{dropped} more steps omitted to fit budget)"));
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "_omitted".to_string(),
+                serde_json::json!({
+                    "applied_budget": applied_budget,
+                    "original_tokens": original_tokens,
+                    "steps_applied": shown,
+                    "note": note,
+                }),
+            );
+        }
+        if kept == 0 || token_count(counter, value) <= applied_budget {
+            break;
+        }
+        kept -= 1;
     }
 }
 
@@ -205,7 +226,7 @@ pub fn render_budgeted_conventions(mut value: Value, token_budget: usize) -> Val
     // Step 1: drop git_health.co_changes (largest contributor for active repos).
     drop_array_at(&mut value, &["git_health", "co_changes"], &mut steps);
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
@@ -214,7 +235,7 @@ pub fn render_budgeted_conventions(mut value: Value, token_budget: usize) -> Val
     truncate_array_at(&mut value, &["git_health", "churn_30d"], 20, &mut steps);
     truncate_array_at(&mut value, &["git_health", "churn_180d"], 20, &mut steps);
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
@@ -223,7 +244,7 @@ pub fn render_budgeted_conventions(mut value: Value, token_budget: usize) -> Val
     clear_object_at(&mut value, &["git_health", "bugfix_density"], &mut steps);
     clear_object_at(&mut value, &["git_health", "churn_trend"], &mut steps);
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
@@ -233,14 +254,14 @@ pub fn render_budgeted_conventions(mut value: Value, token_budget: usize) -> Val
         drop_array_at(&mut value, &[category, "additional"], &mut steps);
     }
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
     // Step 5: clear testing.coverage_by_dir.
     clear_object_at(&mut value, &["testing", "coverage_by_dir"], &mut steps);
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
@@ -250,21 +271,21 @@ pub fn render_budgeted_conventions(mut value: Value, token_budget: usize) -> Val
     // source on large repos outside of git_health.
     clear_object_at(&mut value, &["functions", "by_directory"], &mut steps);
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
     // Step 7: drop dependencies.strict_layers — O(layer-pairs).
     drop_array_at(&mut value, &["dependencies", "strict_layers"], &mut steps);
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
     // Step 8: drop dependencies.circular_deps — O(detected cycles).
     drop_array_at(&mut value, &["dependencies", "circular_deps"], &mut steps);
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
@@ -273,7 +294,7 @@ pub fn render_budgeted_conventions(mut value: Value, token_budget: usize) -> Val
     truncate_array_at(&mut value, &["git_health", "churn_180d"], 5, &mut steps);
     drop_array_at(&mut value, &["git_health", "reverts"], &mut steps);
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
@@ -281,7 +302,7 @@ pub fn render_budgeted_conventions(mut value: Value, token_budget: usize) -> Val
     drop_array_at(&mut value, &["git_health", "churn_30d"], &mut steps);
     drop_array_at(&mut value, &["git_health", "churn_180d"], &mut steps);
     if token_count(&counter, &value) <= budget_with_headroom {
-        inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+        inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
         return value;
     }
 
@@ -294,7 +315,7 @@ pub fn render_budgeted_conventions(mut value: Value, token_budget: usize) -> Val
             .to_string(),
     );
     value = Value::Object(serde_json::Map::new());
-    inject_omitted_marker(&mut value, original_tokens, token_budget, steps);
+    inject_omitted_marker(&mut value, original_tokens, token_budget, steps, &counter);
     value
 }
 
@@ -878,6 +899,28 @@ mod tests {
         assert!(
             result.get("_omitted").is_some(),
             "_omitted marker must be present when trimming occurred"
+        );
+    }
+
+    #[test]
+    fn test_render_budgeted_deep_degradation_marker_stays_in_budget() {
+        // At MIN_BUDGET_FLOOR with a large profile, degradation runs to the
+        // minimal-skeleton backstop, accumulating many `steps_applied` entries.
+        // Pre-fix, that step list pushed the marker past MARKER_RESERVE and the
+        // output over budget; the marker-shedding loop must keep it ≤ budget.
+        let value = make_large_conventions_value();
+        let counter = TokenCounter::new();
+        let budget: usize = MIN_BUDGET_FLOOR;
+
+        let result = render_budgeted_conventions(value, budget);
+        let output_tokens = counter.count(&serde_json::to_string_pretty(&result).unwrap());
+        assert!(
+            output_tokens <= budget,
+            "deep-degradation output (marker included) must be ≤ {budget}, got {output_tokens}"
+        );
+        assert!(
+            result.get("_omitted").is_some(),
+            "_omitted marker must be present after deep degradation"
         );
     }
 

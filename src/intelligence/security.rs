@@ -254,12 +254,15 @@ pub fn scan_sql_injection(content: &str, file_path: &str) -> Vec<SqlInjectionRis
                 .filter(|&c| c == '\n')
                 .count()
                 + 1;
-            let snippet_len = sql_fragment.len().min(60);
+            // Truncate by Unicode scalar, not bytes — a multi-byte char
+            // straddling byte 60 would panic `&sql_fragment[..60]` on a
+            // char boundary (the same hazard fixed for secret snippets above).
+            let snippet: String = sql_fragment.chars().take(60).collect();
             results.push(SqlInjectionRisk {
                 file: file_path.to_string(),
                 line,
                 language: lang.to_string(),
-                snippet: sql_fragment[..snippet_len].to_string(),
+                snippet,
                 interpolation_type: interpolation_type.to_string(),
             });
         }
@@ -673,6 +676,21 @@ mod tests {
             "Java string concatenation SQL must be detected"
         );
         assert_eq!(risks[0].language, "java");
+    }
+
+    #[test]
+    fn test_sql_injection_multibyte_snippet_no_panic() {
+        // A multi-byte char straddling byte 60 of the captured fragment used
+        // to panic the byte-slice `sql_fragment[..60]` on a char boundary.
+        // Fragment = "SELECT " (7) + 51×'a' (58) + '€' (starts byte 58) + "{id}",
+        // so byte 60 lands inside the euro sign.
+        let content = format!(r#"q = f"SELECT {}€{{id}}""#, "a".repeat(51));
+        let risks = scan_sql_injection(&content, "src/repo.py");
+        assert_eq!(risks.len(), 1, "multibyte f-string SQL must be detected");
+        assert!(
+            risks[0].snippet.chars().count() <= 60,
+            "snippet must be truncated by scalar, not byte-sliced"
+        );
     }
 
     #[test]

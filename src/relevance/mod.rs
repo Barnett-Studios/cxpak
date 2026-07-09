@@ -180,13 +180,20 @@ impl MultiSignalScorer {
     /// The query embedding is computed once here and reused for every file,
     /// avoiding per-file provider creation and embed calls.
     pub fn score_all(&self, query: &str, index: &CodebaseIndex) -> Vec<ScoredFile> {
-        // Compute the query embedding a single time before the per-file loop.
+        // Compute the query embedding a single time before the per-file loop —
+        // but ONLY when the index actually carries embedding vectors (opt-in,
+        // ADR-0186). Without an embedding index the similarity signal weight is
+        // 0.0 and the query embedding is unused, so computing it would download
+        // the MiniLM model for repos that never opted in — the exact invariant
+        // the file-side `_if_configured` gate protects.
         #[cfg(feature = "embeddings")]
-        let query_embedding: Option<Vec<f32>> = {
+        let query_embedding: Option<Vec<f32>> = if index.has_embedding_index() {
             use crate::embeddings::{create_provider, EmbeddingConfig};
             create_provider(EmbeddingConfig::local_default())
                 .ok()
                 .and_then(|p| p.embed(query).ok())
+        } else {
+            None
         };
         #[cfg(not(feature = "embeddings"))]
         let query_embedding: Option<Vec<f32>> = None;

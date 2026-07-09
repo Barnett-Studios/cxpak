@@ -138,7 +138,7 @@ curl.exe http://localhost:3000/health
 docker run --rm -i -v ${PWD}:/repo ghcr.io/barnett-studios/cxpak serve --mcp .
 ```
 
-Replace `mysecret` with any non-empty secret of your choice. `/health` is open (GET); every `/v1/*` endpoint is a POST and requires the bearer token:
+Replace `mysecret` with any non-empty secret of your choice. `/health` is open (GET) as a liveness probe; every other endpoint requires the bearer token when one is set (with no `--token`, on a loopback bind, all routes are open):
 ```bash
 curl http://localhost:3000/health                                        # no auth required
 curl -X POST -H "Authorization: Bearer mysecret" http://localhost:3000/v1/conventions
@@ -348,7 +348,7 @@ v2.0.0 establishes semver for the MCP API. Tool names, parameters, and response 
 
 ## Architecture decisions
 
-Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution. Records 0001-0162 were reconstructed across v0.1.0 -> v2.2.1; 0163 onward are written at decision time, now through 0188 (v3.0.0). Start with [the index](docs/adrs/INDEX.md).
+Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution. Records 0001-0162 were reconstructed across v0.1.0 -> v2.2.1; 0163 onward are written at decision time, now through 0189 (v3.0.0). Start with [the index](docs/adrs/INDEX.md).
 
 ## License
 
