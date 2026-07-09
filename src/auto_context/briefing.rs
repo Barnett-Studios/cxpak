@@ -106,8 +106,16 @@ pub fn allocate_and_pack_with_cross_lang(
     let mut remaining = token_budget;
 
     // --- Section 1: Target files -------------------------------------------
-    // Sort descending by score so higher-priority files are packed first.
-    target_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort descending by score so higher-priority files are packed first, with a
+    // path-ascending secondary tiebreak (`.0` is the path). Without the tiebreak,
+    // equal-scored files keep their incoming order and the fill-then-overflow cut
+    // at the token budget packs a different file set across processes. The path
+    // tiebreak makes the packing order a strict total order and reproducible.
+    target_files.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let mut packed_targets: Vec<PackedFile> = Vec::new();
     let mut target_tokens = 0usize;
