@@ -83,7 +83,8 @@ publish** riding R0's readiness seam:
    returns the index for `Ready | ReadyEnriched` identically.
 
 `build_embedding_index` is passed the current `DEFAULT_RELEVANCE_MODE`
-(presently `Inert`) — **not** a hard-coded `Active`. Scope is **MCP serve
+(`Inert` when this ADR was written; flipped to `Active` in ADR-0187, read
+dynamically) — **not** a hard-coded value. Scope is **MCP serve
 only**; CLI keeps constructing `embedding_index: None`. All new serve wiring is
 `#[cfg(feature = "embeddings")]`; with the feature off, behavior is exactly
 today's. The whole path is opt-in and excluded from the determinism fixture.

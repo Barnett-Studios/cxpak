@@ -2311,9 +2311,9 @@ pub fn spawn_mcp_index_build(
 /// panicking provider or model loader can neither wedge the server nor downgrade
 /// the ready base — it just leaves the index un-enriched. The relevance mode is
 /// the current [`DEFAULT_RELEVANCE_MODE`][crate::relevance::DEFAULT_RELEVANCE_MODE]
-/// (presently `Inert`), *not* a hard-coded `Active`; the Inert→Active flip is a
-/// later task (R-D1) and embeddings are rebuilt on each serve start, so no stale
-/// embedding survives that flip.
+/// (`Active` as of 3.0.0, ADR-0187), read dynamically rather than hard-coded;
+/// embeddings are rebuilt on each serve start, so the embedded text always
+/// matches the shipped default and no stale embedding survives a mode change.
 #[cfg(feature = "embeddings")]
 fn enrich_ready_with_embeddings(
     readiness: &SharedReadiness,
