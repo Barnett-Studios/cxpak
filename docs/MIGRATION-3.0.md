@@ -94,6 +94,21 @@ does not collide with the top-level `op` discriminator:
 The `data` op (under `cxpak_data`) returns the indexed data layer (`SchemaIndex`:
 `tables`, `views`, `orm_models`, `migrations`) — newly surfaced on MCP in 3.0.0.
 
+## Notable non-breaking behavior changes in 3.0.0
+
+Two changes affect *output*, not the API — no client code changes are required,
+but you will notice different (better) results:
+
+- **Retrieval defaults to Active RRF ranking.** Relevance scoring now fuses its
+  signals with Reciprocal Rank Fusion instead of the prior weighted sum
+  (ADR-0187, ADR-0188). It is deterministic and measured a large recall gain, so
+  re-running cxpak returns different, better-ranked context for the same task.
+  The prior weighted-sum path is retained only as an internal `Inert` A/B control.
+- **Embeddings are opt-in.** The semantic similarity signal is now activated only
+  when `.cxpak.json` declares an `"embeddings"` section (ADR-0186). Previously the
+  signal existed in the code but was never built. With no config, cxpak uses its
+  6 deterministic signals and downloads no model.
+
 ## Not affected
 
 - **CLI** — all subcommands unchanged.
