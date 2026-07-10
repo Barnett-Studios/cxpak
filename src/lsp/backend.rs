@@ -55,11 +55,21 @@ impl CxpakLspBackend {
         }
     }
 
-    pub async fn custom_health(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+    // These three take no input. They still accept (and ignore) a `params`
+    // argument so a client sending `params: {}` / `null` isn't rejected by
+    // tower-lsp with -32602 while sibling no-arg methods (overview, apiSurface,
+    // …) accept it — the custom-method surface stays uniform.
+    pub async fn custom_health(
+        &self,
+        _params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
         self.dispatch("cxpak/health", serde_json::Value::Null).await
     }
 
-    pub async fn custom_conventions(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+    pub async fn custom_conventions(
+        &self,
+        _params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
         self.dispatch("cxpak/conventions", serde_json::Value::Null)
             .await
     }
@@ -71,7 +81,10 @@ impl CxpakLspBackend {
         self.dispatch("cxpak/blastRadius", params).await
     }
 
-    pub async fn custom_dead_code(&self) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
+    pub async fn custom_dead_code(
+        &self,
+        _params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<serde_json::Value> {
         self.dispatch("cxpak/deadCode", serde_json::Value::Null)
             .await
     }
