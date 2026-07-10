@@ -1,5 +1,5 @@
 use crate::conventions::{ConventionProfile, PatternStrength};
-use crate::index::CodebaseIndex;
+use crate::core_graph::CodebaseIndex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

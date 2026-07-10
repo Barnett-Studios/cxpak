@@ -178,11 +178,14 @@ fn lsp_custom_health_method_returns_payload() {
         .to_string(),
     );
 
-    // cxpak/health custom method.  tower-lsp rejects `params: {}` with
-    // -32602 (Invalid params) when the method handler signature is
-    // `fn() -> ...` (no arg) — it expects either `params: null` or the
-    // field omitted entirely.  Send a minimal valid envelope.
-    write_lsp_message(stdin, r#"{"jsonrpc":"2.0","id":2,"method":"cxpak/health"}"#);
+    // cxpak/health custom method.  Every custom method on this surface now
+    // takes its `params` argument (the 3 no-input methods — health,
+    // conventions, deadCode — included, for uniformity), so `params: {}` is
+    // the single client-safe call shape that works across all 16 methods.
+    write_lsp_message(
+        stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"cxpak/health","params":{}}"#,
+    );
 
     let resp = read_response_for_id(&mut reader, 2).expect("cxpak/health response");
     assert_eq!(resp["jsonrpc"], "2.0");
@@ -195,6 +198,63 @@ fn lsp_custom_health_method_returns_payload() {
         resp["result"].is_object(),
         "cxpak/health result must be an object; got: {resp}"
     );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// Regression: the three no-input custom methods (health, conventions,
+/// deadCode) must accept `params: {}` like every other custom method, rather
+/// than rejecting it with -32602 (which they did when registered without a
+/// `params` argument). `{}` is the uniform client-safe call shape across the
+/// whole custom surface; a client that sends it to one method and gets a
+/// result must get a result from all of them.
+#[test]
+fn lsp_no_input_custom_methods_accept_empty_params() {
+    let repo = make_test_repo();
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": format!("file://{}", repo.path().to_str().unwrap()),
+                "capabilities": {}
+            }
+        })
+        .to_string(),
+    );
+    let _ = read_response_for_id(&mut reader, 1).expect("initialize response");
+    write_lsp_message(
+        stdin,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    );
+
+    for (id, method) in [
+        (10u64, "cxpak/health"),
+        (11, "cxpak/conventions"),
+        (12, "cxpak/deadCode"),
+    ] {
+        let req = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{}}}}"#);
+        write_lsp_message(stdin, &req);
+        let resp = read_response_for_id(&mut reader, id).expect("response for no-input method");
+        assert!(
+            resp["error"].is_null(),
+            "{method} with params:{{}} must not error (regression: -32602); got: {resp}"
+        );
+        assert!(
+            resp["result"].is_object(),
+            "{method} with params:{{}} must return an object result; got: {resp}"
+        );
+    }
 
     child.kill().ok();
     child.wait().ok();

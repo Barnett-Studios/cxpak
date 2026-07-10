@@ -2,34 +2,25 @@
 //!
 //! Detects six types of cross-language boundaries and emits
 //! [`CrossLangEdge`] entries that get injected into the
-//! [`crate::index::graph::DependencyGraph`] as
-//! [`crate::index::graph::EdgeType::CrossLanguage`] edges.
+//! [`crate::core_graph::graph::DependencyGraph`] as
+//! [`crate::core_graph::graph::EdgeType::CrossLanguage`] edges.
 //!
 //! Detection is deterministic and regex-based. Each sub-detector reads the
 //! existing index (api_surface routes, schema edges, proto/graphql symbol
 //! extraction) plus raw file content and emits zero or more
 //! [`CrossLangEdge`] values.
 
-use crate::index::graph::{BridgeType, EdgeType};
-use crate::index::CodebaseIndex;
+use crate::core_graph::graph::{BridgeType, EdgeType};
+use crate::core_graph::CodebaseIndex;
 use crate::intelligence::api_surface::{
     detect_routes, extract_graphql_types, extract_grpc_services, RouteEndpoint,
 };
 use regex::Regex;
-use serde::Serialize;
 use std::collections::HashMap;
 
-/// A detected cross-language boundary between two files.
-#[derive(Debug, Clone, Serialize)]
-pub struct CrossLangEdge {
-    pub source_file: String,
-    pub source_symbol: String,
-    pub source_language: String,
-    pub target_file: String,
-    pub target_symbol: String,
-    pub target_language: String,
-    pub bridge_type: BridgeType,
-}
+// `CrossLangEdge` is a data-model type now in `core_graph` (cxpak 3.0.0 Phase 0
+// de-cycle); the detection logic below stays here.
+pub use crate::core_graph::intel::CrossLangEdge;
 
 // ---------------------------------------------------------------------------
 // Public entry point: chain every sub-detector.
@@ -601,7 +592,7 @@ pub fn detect_command_exec_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> 
 
 /// Walk the file's parsed symbols and return the name of the function that
 /// contains the given byte offset. Falls back to "<module>" if unknown.
-fn guess_containing_symbol(file: &crate::index::IndexedFile, offset: usize) -> String {
+fn guess_containing_symbol(file: &crate::core_graph::IndexedFile, offset: usize) -> String {
     let Some(pr) = &file.parse_result else {
         return "<module>".into();
     };
@@ -631,7 +622,7 @@ fn guess_containing_symbol(file: &crate::index::IndexedFile, offset: usize) -> S
 mod tests {
     use super::*;
     use crate::budget::counter::TokenCounter;
-    use crate::index::CodebaseIndex;
+    use crate::core_graph::CodebaseIndex;
     use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
     use crate::scanner::ScannedFile;
     use std::collections::HashMap;

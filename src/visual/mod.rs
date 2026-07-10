@@ -52,6 +52,10 @@ pub enum VisualFormat {
     C4,
     /// JSON representation for programmatic use
     Json,
+    /// Neo4j-importable Cypher script of the dependency graph
+    Cypher,
+    /// GraphML (XML) serialization of the dependency graph
+    Graphml,
 }
 
 /// The computed result of a visualization — before serialization to a format

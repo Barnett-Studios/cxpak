@@ -2,12 +2,15 @@ pub mod clean;
 #[cfg(feature = "daemon")]
 pub mod conventions;
 pub mod diff;
+pub mod graph;
+pub mod hook;
 #[cfg(feature = "visual")]
 pub mod onboard;
 pub mod overview;
 #[cfg(feature = "plugins")]
 pub mod plugin;
 pub mod schema;
+pub mod search;
 #[cfg(feature = "daemon")]
 pub mod serve;
 pub mod trace;

@@ -7,12 +7,14 @@ pub mod cross_lang;
 pub mod data_flow;
 pub mod dead_code;
 pub mod drift;
+pub mod graph_query;
 pub mod health;
 #[cfg(feature = "visual")]
 pub mod onboarding;
 pub mod pagerank;
 pub mod predict;
 pub mod recent_changes;
+pub mod retrieval;
 pub mod risk;
 pub mod security;
 pub mod test_map;

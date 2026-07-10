@@ -1,4 +1,5 @@
-use crate::index::graph::DependencyGraph;
+use crate::core_graph::graph::DependencyGraph;
+use crate::core_graph::index::normalize_identifier;
 use std::collections::{HashMap, HashSet};
 
 /// Compute PageRank scores for all files in the dependency graph.
@@ -55,6 +56,51 @@ pub fn compute_pagerank_seeded(
     max_iterations: usize,
     initial: &HashMap<String, f64>,
 ) -> HashMap<String, f64> {
+    power_iterate(graph, damping, max_iterations, initial, None)
+}
+
+/// Personalized (topic-sensitive) PageRank (ADR-0181, C2). Identical to
+/// [`compute_pagerank`] except the teleport mass — both the `(1 - d)` random-jump
+/// term and the redistribution of dangling-node rank — is steered by
+/// `personalization` (a weight per node) instead of the uniform `1/N`. This
+/// biases the stationary distribution toward the seed nodes (e.g. the files a
+/// query mentions), so ranking becomes query-relative rather than global.
+///
+/// `personalization` weights are normalized to a probability distribution over
+/// the node universe (weights on nodes absent from the graph are ignored). An
+/// all-zero or empty vector falls back to the uniform teleport, making this
+/// byte-identical to [`compute_pagerank`] — the safe cold-start default.
+pub fn compute_pagerank_personalized(
+    graph: &DependencyGraph,
+    damping: f64,
+    max_iterations: usize,
+    personalization: &HashMap<String, f64>,
+) -> HashMap<String, f64> {
+    power_iterate(
+        graph,
+        damping,
+        max_iterations,
+        &HashMap::new(),
+        Some(personalization),
+    )
+}
+
+/// Shared power-iteration core behind [`compute_pagerank`],
+/// [`compute_pagerank_seeded`], and [`compute_pagerank_personalized`].
+///
+/// - `initial` warm-starts each node's rank (empty ⇒ uniform `1/N`).
+/// - `personalization` steers the teleport / dangling distribution (`None` or
+///   all-zero ⇒ uniform `1/N`, i.e. classic PageRank).
+///
+/// When `personalization` is `None` this is byte-for-byte the classic algorithm,
+/// so every existing caller and the parity tests are unaffected.
+fn power_iterate(
+    graph: &DependencyGraph,
+    damping: f64,
+    max_iterations: usize,
+    initial: &HashMap<String, f64>,
+    personalization: Option<&HashMap<String, f64>>,
+) -> HashMap<String, f64> {
     // ── 1. Collect the universe of nodes ───────────────────────────────────
     // A node is any file that appears as a source *or* target of any edge.
     let mut nodes: HashSet<String> = HashSet::new();
@@ -103,20 +149,53 @@ pub fn compute_pagerank_seeded(
         })
         .collect();
 
-    let teleport = (1.0 - damping) / n as f64;
+    // Teleport distribution. The classic/uniform path (no personalization, or a
+    // zero-mass vector) uses the exact `(1-d)/N` and `d·dangling_sum/N` division
+    // arithmetic of the pre-refactor `compute_pagerank` — byte-identical, not the
+    // ULP-different `×(1/N)` form. Per-node teleport weights are built only for
+    // the personalized path, where the normalized vector steers both the random-
+    // jump term and the dangling redistribution. A zero-mass vector falls back to
+    // the classic/uniform arithmetic so the result matches classic PageRank
+    // exactly.
+    let mass: f64 = personalization
+        .map(|p| {
+            nodes
+                .iter()
+                .map(|node| p.get(node.as_str()).copied().unwrap_or(0.0).max(0.0))
+                .sum()
+        })
+        .unwrap_or(0.0);
+    let use_uniform = personalization.is_none() || mass <= 0.0;
+    let teleport_weight: HashMap<&str, f64> = if use_uniform {
+        HashMap::new()
+    } else {
+        nodes
+            .iter()
+            .map(|node| {
+                let w = personalization
+                    .and_then(|p| p.get(node.as_str()).copied())
+                    .unwrap_or(0.0)
+                    .max(0.0)
+                    / mass;
+                (node.as_str(), w)
+            })
+            .collect()
+    };
+    // Loop-invariant classic teleport term — computed once, exactly as the
+    // pre-refactor algorithm did (byte-identical uniform path).
+    let classic_teleport = (1.0 - damping) / n as f64;
     let convergence_threshold = 1e-6_f64;
 
     // ── 4. Power-iteration ─────────────────────────────────────────────────
     for _ in 0..max_iterations {
         // a) Sum of ranks belonging to dangling nodes (no outgoing edges).
-        //    Their rank is redistributed uniformly across all nodes.
+        //    Their rank is redistributed across all nodes following the
+        //    teleport distribution (uniform for classic PageRank).
         let dangling_sum: f64 = nodes
             .iter()
             .filter(|node| out_degree[node.as_str()] == 0)
             .map(|node| rank[node.as_str()])
             .sum();
-
-        let dangling_contrib = damping * dangling_sum / n as f64;
 
         // b) Compute new rank for every node.
         let mut new_rank: HashMap<&str, f64> = HashMap::with_capacity(n);
@@ -149,6 +228,15 @@ pub fn compute_pagerank_seeded(
                 })
                 .unwrap_or(0.0);
 
+            // Classic/uniform path uses the exact `/N` division (byte-identical
+            // to the pre-refactor compute_pagerank); the personalized path steers
+            // the teleport and dangling mass by the per-node weight p[node].
+            let (teleport, dangling_contrib) = if use_uniform {
+                (classic_teleport, damping * dangling_sum / n as f64)
+            } else {
+                let p = teleport_weight[node.as_str()];
+                ((1.0 - damping) * p, damping * dangling_sum * p)
+            };
             new_rank.insert(
                 node.as_str(),
                 teleport + dangling_contrib + damping * inbound,
@@ -219,9 +307,9 @@ pub fn symbol_importance(
     use crate::parser::language::Visibility;
     let weight = match symbol.visibility {
         Visibility::Public => {
-            let name_lower = symbol.name.to_lowercase();
+            let name_normalized = normalize_identifier(&symbol.name);
             let referenced_elsewhere = cross_refs
-                .get(&name_lower)
+                .get(&name_normalized)
                 .map(|files| files.iter().any(|f| f != file_path))
                 .unwrap_or(false);
             if referenced_elsewhere {
@@ -642,6 +730,60 @@ mod tests {
         assert!(
             (importance - 0.24).abs() < 1e-9,
             "private: expected 0.8 * 0.3 = 0.24, got {importance}"
+        );
+    }
+
+    // ── personalized PageRank (C2) ────────────────────────────────────────────
+
+    #[test]
+    fn test_personalized_empty_equals_classic() {
+        // An empty personalization vector must reproduce classic PageRank
+        // byte-for-byte — the safe cold-start default the identifier ranker
+        // relies on. Asserted with EXACT f64 equality (not an epsilon): the
+        // zero-mass path takes the identical `(1-d)/N` + `d·dangling_sum/N`
+        // division arithmetic as `compute_pagerank`, so any ULP drift (e.g. a
+        // regression to the `×(1/N)` form) fails this test.
+        let graph = make_graph(&[("a.rs", "b.rs"), ("b.rs", "c.rs"), ("c.rs", "a.rs")]);
+        let classic = compute_pagerank(&graph, DAMPING, MAX_ITER);
+        let personalized =
+            compute_pagerank_personalized(&graph, DAMPING, MAX_ITER, &HashMap::new());
+        for (k, v) in &classic {
+            assert!(
+                v.to_bits() == personalized[k].to_bits(),
+                "empty personalization must equal classic byte-for-byte for {k}: {v} vs {}",
+                personalized[k]
+            );
+        }
+    }
+
+    #[test]
+    fn test_personalized_biases_toward_seed() {
+        // Two disconnected components a→b and c→d are symmetric under classic
+        // PageRank (b == d). Seeding personalization on the a-component must lift
+        // it above the unseeded c-component — the defining property of
+        // topic-sensitive PageRank.
+        let graph = make_graph(&[("a.rs", "b.rs"), ("c.rs", "d.rs")]);
+        let classic = compute_pagerank(&graph, DAMPING, MAX_ITER);
+        assert!(
+            approx_eq(classic["b.rs"], classic["d.rs"], 1e-9),
+            "symmetric components should tie under classic PR"
+        );
+
+        let mut personalization = HashMap::new();
+        personalization.insert("a.rs".to_string(), 1.0);
+        let biased = compute_pagerank_personalized(&graph, DAMPING, MAX_ITER, &personalization);
+
+        assert!(
+            biased["a.rs"] > biased["c.rs"],
+            "seeded a.rs ({}) must outrank unseeded c.rs ({})",
+            biased["a.rs"],
+            biased["c.rs"]
+        );
+        assert!(
+            biased["b.rs"] > biased["d.rs"],
+            "the seed's dependency b.rs ({}) must outrank d.rs ({})",
+            biased["b.rs"],
+            biased["d.rs"]
         );
     }
 }

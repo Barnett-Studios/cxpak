@@ -9,7 +9,7 @@ fn main() {
 
     let result = match &cli.command {
         Commands::Clean { path } => commands::clean::run(path),
-        Commands::Schema => commands::schema::run(),
+        Commands::Schema { capability } => commands::schema::run(capability.as_deref()),
         #[cfg(feature = "daemon")]
         Commands::Serve {
             port,
@@ -167,6 +167,55 @@ fn main() {
                 workspace.as_deref(),
             )
         }
+        Commands::Graph {
+            op,
+            id,
+            from,
+            to,
+            direction,
+            seeds,
+            depth,
+            workspace,
+            path,
+        } => commands::graph::run(
+            path,
+            op,
+            id.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            direction,
+            seeds,
+            *depth,
+            workspace.as_deref(),
+        ),
+        Commands::Search {
+            op,
+            query,
+            symbol,
+            seeds,
+            depth,
+            limit,
+            workspace,
+            path,
+        } => commands::search::run(
+            path,
+            op,
+            query.as_deref(),
+            symbol.as_deref(),
+            seeds,
+            *depth,
+            *limit,
+            workspace.as_deref(),
+        ),
+        Commands::Hook { subcommand } => match subcommand {
+            cxpak::cli::HookSubcommand::Install { path } => commands::hook::install(path),
+            cxpak::cli::HookSubcommand::PostCommit { path } => commands::hook::post_commit(path),
+            cxpak::cli::HookSubcommand::MergeDriver {
+                ancestor,
+                current,
+                other,
+            } => commands::hook::merge_driver(ancestor, current, other),
+        },
         Commands::Trace {
             tokens,
             out,

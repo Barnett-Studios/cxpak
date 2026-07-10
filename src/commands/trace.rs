@@ -340,18 +340,10 @@ fn render_relevant_signatures(
 }
 
 fn edge_type_display(et: &EdgeType) -> String {
-    match et {
-        EdgeType::Import => "import".to_string(),
-        EdgeType::ForeignKey => "foreign_key".to_string(),
-        EdgeType::ViewReference => "view_reference".to_string(),
-        EdgeType::TriggerTarget => "trigger_target".to_string(),
-        EdgeType::IndexTarget => "index_target".to_string(),
-        EdgeType::FunctionReference => "function_reference".to_string(),
-        EdgeType::EmbeddedSql => "embedded_sql".to_string(),
-        EdgeType::OrmModel => "orm_model".to_string(),
-        EdgeType::MigrationSequence => "migration_sequence".to_string(),
-        EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
-    }
+    // Delegates to the canonical label so every edge-rendering surface
+    // (overview, trace, auto_context annotation, LSP diagnostic) spells edge
+    // types identically.
+    et.label()
 }
 
 /// Render the dependency edges for files in the relevant subgraph.
@@ -393,11 +385,15 @@ fn render_dependency_subgraph(
                     full.push_str(&format!("- `{}`\n", edge.target));
                 }
                 et => {
-                    full.push_str(&format!(
-                        "- `{}` (via: {})\n",
-                        edge.target,
+                    // Heuristically inferred edges carry a visible `inferred`
+                    // tag so the reader knows the dependency was pattern-matched,
+                    // not structurally extracted.
+                    let label = if edge.confidence.is_inferred() {
+                        format!("{}, inferred", edge_type_display(et))
+                    } else {
                         edge_type_display(et)
-                    ));
+                    };
+                    full.push_str(&format!("- `{}` (via: {})\n", edge.target, label));
                 }
             }
         }
@@ -597,6 +593,33 @@ mod tests {
     }
 
     #[test]
+    fn test_render_dependency_subgraph_tags_inferred_not_extracted() {
+        // Inferred edge (EmbeddedSql) carries `inferred`; Extracted non-import
+        // edge (ForeignKey) does not.
+        let counter = TokenCounter::new();
+        let index = make_trace_index();
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("src/main.rs", "src/lib.rs", EdgeType::EmbeddedSql);
+        graph.add_edge("src/main.rs", "src/util.rs", EdgeType::ForeignKey);
+        let relevant: HashSet<String> = [
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "src/util.rs".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let result = render_dependency_subgraph(&index, &graph, &relevant, 50000, &counter);
+        assert!(
+            result.contains("(via: embedded_sql, inferred)"),
+            "inferred edge must be tagged, got:\n{result}"
+        );
+        assert!(
+            result.contains("(via: foreign_key)") && !result.contains("foreign_key, inferred"),
+            "extracted edge must render its label untagged, got:\n{result}"
+        );
+    }
+
+    #[test]
     fn test_render_dependency_subgraph_no_edges_for_file() {
         let counter = TokenCounter::new();
         let index = make_trace_index();
@@ -649,36 +672,18 @@ mod tests {
         use crate::cli::OutputFormat;
         let dir = tempfile::TempDir::new().unwrap();
 
-        // Initialise a bare git repo so git::extract_git_context doesn't error out
-        // before we even reach the symbol lookup.
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .ok();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir.path())
-            .output()
-            .ok();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .ok();
+        // Initialise a git repo via git2 so git::extract_git_context doesn't
+        // error out before we even reach the symbol lookup.  Subprocess-based
+        // git init is prone to resource contention under high test parallelism.
+        let repo = git2::Repository::init(dir.path()).expect("git2 init");
 
-        // Write a Rust file and commit it so the scanner can find files.
+        // Write a Rust file and stage it so the scanner can find files.
         std::fs::write(dir.path().join("main.rs"), "fn hello() {}").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .ok();
-        std::process::Command::new("git")
-            .args(["commit", "--allow-empty-message", "-m", "init"])
-            .current_dir(dir.path())
-            .output()
-            .ok();
+        let mut index = repo.index().expect("repo index");
+        index
+            .add_path(std::path::Path::new("main.rs"))
+            .expect("git add main.rs");
+        index.write().expect("index write");
 
         let result = run(
             dir.path(),

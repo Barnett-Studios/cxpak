@@ -11,79 +11,24 @@ pub mod testing;
 pub mod verify;
 pub mod visibility;
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PatternStrength {
-    Convention, // ≥90%
-    Trend,      // 70-89%
-    Mixed,      // 50-69%
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PatternObservation {
-    pub name: String,
-    pub dominant: String,
-    pub count: usize,
-    pub total: usize,
-    pub percentage: f64,
-    pub strength: PatternStrength,
-    pub exceptions: Vec<String>,
-}
-
-impl PatternObservation {
-    pub fn new(name: &str, dominant: &str, count: usize, total: usize) -> Option<Self> {
-        if total == 0 {
-            return None;
-        }
-        let percentage = (count as f64 / total as f64) * 100.0;
-        if percentage < 50.0 {
-            return None;
-        }
-        let strength = if percentage >= 90.0 {
-            PatternStrength::Convention
-        } else if percentage >= 70.0 {
-            PatternStrength::Trend
-        } else {
-            PatternStrength::Mixed
-        };
-        Some(Self {
-            name: name.to_string(),
-            dominant: dominant.to_string(),
-            count,
-            total,
-            percentage,
-            strength,
-            exceptions: Vec::new(),
-        })
-    }
-
-    pub fn with_exceptions(mut self, exceptions: Vec<String>) -> Self {
-        self.exceptions = exceptions;
-        self
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ConventionProfile {
-    pub naming: naming::NamingConventions,
-    pub imports: imports::ImportConventions,
-    pub errors: errors::ErrorConventions,
-    pub dependencies: deps::DependencyConventions,
-    pub testing: testing::TestingConventions,
-    pub visibility: visibility::VisibilityConventions,
-    pub functions: functions::FunctionConventions,
-    pub git_health: git_health::GitHealthProfile,
-}
+// The convention data model (`ConventionProfile`, `PatternStrength`,
+// `PatternObservation`, `FileContribution`, and every per-aspect `*Conventions`
+// struct) lives in `core_graph` (cxpak 3.0.0 Phase 0 de-cycle, ADR-0007). The
+// `extract_*` / `update_*` / `remove_*` analysis logic stays in this module and
+// its sub-modules. Re-exported here at the historical `crate::conventions::{...}`
+// paths so every existing reference keeps resolving unchanged.
+pub use crate::core_graph::conventions::{
+    ConventionProfile, FileContribution, PatternObservation, PatternStrength,
+};
 
 /// Build the full convention profile from an already-constructed index.
 ///
 /// Called AFTER `CodebaseIndex::build()` — not inside it. The `repo_path`
 /// is needed for git_health extraction via git2.
 pub fn build_convention_profile(
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
     repo_path: &Path,
 ) -> ConventionProfile {
     ConventionProfile {
@@ -107,7 +52,7 @@ pub fn update_conventions_incremental(
     profile: &mut ConventionProfile,
     modified_paths: &[String],
     removed_paths: &[String],
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
 ) {
     // Remove contributions from deleted files
     for path in removed_paths {
@@ -144,16 +89,6 @@ pub fn update_conventions_incremental(
     profile.functions = functions::extract_functions(index);
 
     // Git health: NOT updated here — uses TTL cache
-}
-
-/// Per-file contribution tracking for incremental updates.
-///
-/// Each category stores a map of file path → contribution counts.
-/// When a file changes: subtract old, add new, recompute percentages.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FileContribution {
-    /// Counts keyed by pattern name (e.g., "snake_case" → 5, "camel_case" → 1)
-    pub counts: HashMap<String, usize>,
 }
 
 #[cfg(test)]
@@ -272,7 +207,7 @@ mod tests {
             },
         );
 
-        let index = crate::index::CodebaseIndex::build(files, parse_results, &counter);
+        let index = crate::core_graph::CodebaseIndex::build(files, parse_results, &counter);
         // dir.path() is not a git repo — git_health will gracefully return default
         let profile = build_convention_profile(&index, dir.path());
 
@@ -353,7 +288,7 @@ mod tests {
             },
         );
 
-        let index = crate::index::CodebaseIndex::build(files, parse_results, &counter);
+        let index = crate::core_graph::CodebaseIndex::build(files, parse_results, &counter);
         let full_profile = build_convention_profile(&index, dir.path());
 
         let mut incremental_profile = build_convention_profile(&index, dir.path());
@@ -447,7 +382,7 @@ mod tests {
             },
         );
 
-        let index = crate::index::CodebaseIndex::build(files, parse_results, &counter);
+        let index = crate::core_graph::CodebaseIndex::build(files, parse_results, &counter);
         // Build initial profile without a git repo (graceful default for git_health)
         let mut profile = build_convention_profile(&index, dir.path());
 
@@ -480,7 +415,7 @@ mod tests {
                 exports: vec![],
             },
         );
-        let index_after = crate::index::CodebaseIndex::build(files_after, pr_after, &counter);
+        let index_after = crate::core_graph::CodebaseIndex::build(files_after, pr_after, &counter);
 
         // Remove "src/a.rs", update "src/b.rs" — pass the post-removal index.
         update_conventions_incremental(

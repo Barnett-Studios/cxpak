@@ -1,6 +1,6 @@
 [package]
 name = "cxpak"
-version = "2.3.0"
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.91"
 description = "Spends CPU cycles so you don't spend tokens. The LLM gets a briefing packet instead of a flashlight in a dark room."
@@ -32,7 +32,6 @@ ignore = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1"
-quick-xml = { version = "0.36", features = ["serialize"] }
 tree-sitter-ruby = { version = "0.23", optional = true }
 tree-sitter-c-sharp = { version = "0.23", optional = true }
 tree-sitter-swift = { version = "0.7", optional = true }
@@ -68,6 +67,7 @@ tree-sitter-graphql = { version = "0.1", optional = true }
 tree-sitter-xml = { version = "0.7", optional = true }
 tree-sitter-sequel = { version = "0.3", optional = true }
 tree-sitter-prisma-io = { version = "1.6", optional = true }
+unicode-normalization = "0.1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 notify = { version = "7", optional = true }
@@ -83,10 +83,17 @@ tower-lsp = { version = "0.20", optional = true }
 fs2 = "0.4"
 sha2 = "0.10"
 subtle = "2"
+toml = { version = "0.8", optional = true }
 resvg = { version = "0.47", optional = true }
 petgraph = { version = "0.6", optional = true }
 thiserror = { version = "2", optional = true }
 wasmtime = { version = "43", optional = true }
+# Live DB introspection (feature `data-introspect`, off by default).  All TLS is
+# rustls — NO native-tls/openssl anywhere in the tree (ADR-0163, ADR-0173).
+tokio-postgres = { version = "0.7", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
+mysql_async = { version = "0.34", optional = true, default-features = false, features = ["minimal", "rustls-tls"] }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -176,6 +183,21 @@ embeddings = [
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
 e2e-browser = []
 plugins = ["dep:wasmtime"]
+# Live DB introspection: rustls-only Postgres + MySQL drivers + a scoped tokio
+# runtime.  Off by default — keeps the default build OpenSSL-free AND DB-free.
+data-introspect = [
+    "dep:tokio", "dep:tokio-postgres", "dep:tokio-postgres-rustls",
+    "dep:rustls", "dep:mysql_async",
+]
+bench = ["dep:toml"]
+
+# Optional local reranker (D1, ADR-0184): a deterministic, no-LLM lexical
+# cross-encoder that re-orders the top-N fused candidates after RRF fusion.
+# NON-default and OFF by default — excluded from the determinism fixture; the
+# core ranking is fully deterministic without it. No new dependencies (a
+# model-backed cross-encoder would live behind THIS flag but needs a heavy
+# native runtime, deferred per ADR-0163 / the D1 stop-and-ask rule).
+reranker = []
 
 # `dev_maintenance` cfg is flipped on by the project-local .cargo/config.toml
 # via rustflags during maintainer builds.  Whitelist it so rustc's

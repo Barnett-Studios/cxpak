@@ -1,4 +1,4 @@
-use crate::index::CodebaseIndex;
+use crate::core_graph::CodebaseIndex;
 use crate::parser::language::{SymbolKind, Visibility};
 use regex::Regex;
 use serde::Serialize;
@@ -105,7 +105,7 @@ pub fn extract_public_symbols(
     let mut token_count = 0usize;
 
     // Collect files with public symbols, sorted by pagerank descending.
-    let mut files_with_symbols: Vec<(&crate::index::IndexedFile, f64)> = index
+    let mut files_with_symbols: Vec<(&crate::core_graph::IndexedFile, f64)> = index
         .files
         .iter()
         .filter(|f| {
@@ -1000,7 +1000,7 @@ pub fn extract_api_surface(
 mod tests {
     use super::*;
     use crate::budget::counter::TokenCounter;
-    use crate::index::CodebaseIndex;
+    use crate::core_graph::CodebaseIndex;
     use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
     use crate::scanner::ScannedFile;
     use std::collections::HashMap;

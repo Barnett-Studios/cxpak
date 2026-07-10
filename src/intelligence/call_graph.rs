@@ -1,99 +1,16 @@
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 /// Compiled-once regex for identifier call patterns.
 static RE_CALL_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b([a-zA-Z_]\w*)\s*\(").expect("RE_CALL_PATTERN"));
 
-/// Confidence level for a resolved call edge.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CallConfidence {
-    /// Tree-sitter extracted call expression, import-resolved to a specific file.
-    Exact,
-    /// Regex-matched against known symbol names in Tier 2 or unresolvable Tier 1.
-    Approximate,
-}
-
-/// A resolved cross-file function call.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallEdge {
-    pub caller_file: String,
-    pub caller_symbol: String,
-    pub callee_file: String,
-    pub callee_symbol: String,
-    pub confidence: CallConfidence,
-    /// Present when this edge was resolved ambiguously. For example, when
-    /// multiple files export the same symbol the Approximate picker selects
-    /// the first exporter lexicographically — deterministic but arbitrary.
-    /// Consumers that require exact provenance should treat this edge as
-    /// low-confidence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution_note: Option<String>,
-}
-
-/// A call that could not be resolved to a specific file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnresolvedCall {
-    pub caller_file: String,
-    pub caller_symbol: String,
-    pub callee_name: String,
-}
-
-/// The full call graph for a codebase.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct CallGraph {
-    pub edges: Vec<CallEdge>,
-    pub unresolved: Vec<UnresolvedCall>,
-}
-
-impl CallGraph {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns all callers of a given symbol in a given file.
-    pub fn callers_of(&self, file: &str, symbol: &str) -> Vec<&CallEdge> {
-        self.edges
-            .iter()
-            .filter(|e| e.callee_file == file && e.callee_symbol == symbol)
-            .collect()
-    }
-
-    /// Returns all callees from a given symbol in a given file.
-    pub fn callees_from(&self, file: &str, symbol: &str) -> Vec<&CallEdge> {
-        self.edges
-            .iter()
-            .filter(|e| e.caller_file == file && e.caller_symbol == symbol)
-            .collect()
-    }
-
-    /// Returns true if a symbol has at least one caller — ANY confidence.
-    pub fn has_callers(&self, file: &str, symbol: &str) -> bool {
-        self.edges
-            .iter()
-            .any(|e| e.callee_file == file && e.callee_symbol == symbol)
-    }
-
-    /// Returns true only if the symbol has at least one EXACT caller — an
-    /// edge whose resolution is confirmed (either intra-file or imported
-    /// from this file via the dependency graph).
-    ///
-    /// `Approximate` edges are emitted when a call's name matches a public
-    /// symbol elsewhere but the caller does not explicitly import from the
-    /// definer. These are common-name ambiguity artifacts: a call to
-    /// `run()` in module A binds approximately to whoever exports `run`
-    /// even if A never imports that module. Dead-code detection must not
-    /// treat these as real callers, or every function named `run` / `new`
-    /// / `build` gets falsely marked alive.
-    pub fn has_exact_callers(&self, file: &str, symbol: &str) -> bool {
-        self.edges.iter().any(|e| {
-            e.callee_file == file
-                && e.callee_symbol == symbol
-                && e.confidence == CallConfidence::Exact
-        })
-    }
-}
+// The call-graph data model (`CallGraph`, `CallEdge`, `CallConfidence`,
+// `UnresolvedCall`) and its pure query methods now live in `core_graph`
+// (cxpak 3.0.0 Phase 0 de-cycle). Re-exported here so the historical
+// `crate::intelligence::call_graph::{...}` paths keep resolving; the call-site
+// extraction / graph construction logic below stays in this module.
+pub use crate::core_graph::intel::{CallConfidence, CallEdge, CallGraph, UnresolvedCall};
 
 // ---------------------------------------------------------------------------
 // Call-site extraction: per-language tree-sitter + regex fallback
@@ -687,7 +604,7 @@ fn extract_csharp_calls(source: &str, symbol_name: &str) -> Vec<String> {
 ///    If no import resolution is found but another file exports S, record as
 ///    Approximate (the call exists but we cannot prove it's this specific file).
 /// 3. Unresolvable calls (name not exported anywhere) go into `unresolved`.
-pub fn build_call_graph(index: &crate::index::CodebaseIndex) -> CallGraph {
+pub fn build_call_graph(index: &crate::core_graph::CodebaseIndex) -> CallGraph {
     // Build a lookup: symbol_name -> Vec<file_path> (files that export this symbol)
     let mut symbol_exports: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -1146,8 +1063,8 @@ fn helper(_y: i32) -> i32 { 0 }
     /// Build a minimal `CodebaseIndex` containing a single Rust file whose
     /// parse result has two symbols — `caller` and `helper` — and whose
     /// content text allows the tree-sitter extractor to find the call.
-    fn make_intra_file_index() -> crate::index::CodebaseIndex {
-        use crate::index::CodebaseIndex;
+    fn make_intra_file_index() -> crate::core_graph::CodebaseIndex {
+        use crate::core_graph::CodebaseIndex;
         use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
         use crate::scanner::ScannedFile;
         use std::collections::HashMap;

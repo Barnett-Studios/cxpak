@@ -1,10 +1,14 @@
 pub mod auto_context;
+#[cfg(feature = "bench")]
+pub mod bench;
 pub mod budget;
 pub mod cache;
+pub mod capability;
 pub mod cli;
 pub mod commands;
 pub mod context_quality;
 pub mod conventions;
+pub mod core_graph;
 #[cfg(feature = "daemon")]
 pub mod daemon;
 pub mod dev_maintenance;

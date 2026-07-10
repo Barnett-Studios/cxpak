@@ -95,7 +95,7 @@ fn classify_callee(symbol: &str) -> FlowNodeType {
 }
 
 /// Returns the language string for a file path by looking it up in the index.
-fn lookup_language(index: &crate::index::CodebaseIndex, file: &str) -> String {
+fn lookup_language(index: &crate::core_graph::CodebaseIndex, file: &str) -> String {
     index
         .files
         .iter()
@@ -164,7 +164,7 @@ pub fn trace_data_flow(
     symbol: &str,
     sink: Option<&str>,
     depth: usize,
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
 ) -> DataFlowResult {
     let max_depth = depth.min(MAX_DEPTH);
 
@@ -344,7 +344,7 @@ pub fn trace_data_flow(
 /// Heuristically locate the source symbol's file/language/parameter name.
 fn locate_source(
     symbol: &str,
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
 ) -> (String, String, Option<String>) {
     let matches = index.find_symbol(symbol);
     if let Some((path, sym)) = matches.first() {
@@ -436,7 +436,7 @@ fn build_path(
 /// Called once at the start of [`trace_data_flow`] and threaded through the
 /// BFS so each path's `touches_security_boundary` flag is a real signal
 /// rather than a placeholder.
-fn compute_security_file_set(index: &crate::index::CodebaseIndex) -> HashSet<String> {
+fn compute_security_file_set(index: &crate::core_graph::CodebaseIndex) -> HashSet<String> {
     let surface = build_security_surface(index, DEFAULT_AUTH_PATTERNS, None);
     let mut files: HashSet<String> = HashSet::new();
     for e in &surface.unprotected_endpoints {
@@ -520,7 +520,7 @@ pub struct DataFlowResult {
 mod tests {
     use super::*;
     use crate::budget::counter::TokenCounter;
-    use crate::index::CodebaseIndex;
+    use crate::core_graph::CodebaseIndex;
     use crate::intelligence::call_graph::{CallEdge, CallGraph};
     use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
     use crate::scanner::ScannedFile;

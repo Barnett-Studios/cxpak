@@ -39,7 +39,10 @@ pub fn parse_time_expression(expr: &str) -> Result<std::time::Duration, String> 
             if n == 0 {
                 return Some(Err("time expression must be > 0".to_string()));
             }
-            Some(Ok(std::time::Duration::from_secs(n * secs_per)))
+            match n.checked_mul(secs_per) {
+                Some(secs) => Some(Ok(std::time::Duration::from_secs(secs))),
+                None => Some(Err(format!("time expression too large: {expr}"))),
+            }
         };
 
     if let Some(result) = try_compact('d', 86400) {
@@ -69,7 +72,10 @@ pub fn parse_time_expression(expr: &str) -> Result<std::time::Duration, String> 
             "month" | "months" => 2592000,
             _ => return Err(format!("unknown time unit: {unit}")),
         };
-        return Ok(std::time::Duration::from_secs(n * secs_per));
+        let secs = n
+            .checked_mul(secs_per)
+            .ok_or_else(|| format!("time expression too large: {expr}"))?;
+        return Ok(std::time::Duration::from_secs(secs));
     }
 
     Err(format!("invalid time expression: {expr}"))
@@ -1969,5 +1975,21 @@ mod tests {
         let result = parse_time_expression("99999999999999999999999d");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid time expression"));
+    }
+
+    #[test]
+    fn test_parse_time_expression_mul_overflow_rejected() {
+        // Values that fit in u64 but overflow `n * secs_per` must be rejected,
+        // not panic (debug) or silently wrap (release).
+        let compact = parse_time_expression("18446744073709551615d"); // u64::MAX days
+        assert!(compact.is_err());
+        assert!(compact.unwrap_err().contains("too large"));
+
+        let long = parse_time_expression("100000000000000 weeks");
+        assert!(long.is_err());
+        assert!(long.unwrap_err().contains("too large"));
+
+        // A normal value still parses.
+        assert!(parse_time_expression("2 weeks").is_ok());
     }
 }

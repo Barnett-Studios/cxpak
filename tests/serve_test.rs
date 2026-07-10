@@ -49,13 +49,45 @@ mod serve_tests {
     }
 
     fn wait_for_server(port: u16) -> bool {
+        // Poll the real /health endpoint until it answers 200. A bare TCP
+        // connect succeeds as soon as the listener is bound — but the HTTP
+        // layer may not yet respond, which produced intermittent empty
+        // ("status 0") responses under the hook's parallel load. Polling the
+        // actual endpoint closes that readiness window for every serve test.
         for _ in 0..50 {
-            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            if try_health(port) == Some(200) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         false
+    }
+
+    fn try_health(port: u16) -> Option<u16> {
+        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).ok()?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .ok()?;
+        let request =
+            format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut response = String::new();
+        let mut reader = BufReader::new(&stream);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => response.push_str(&line),
+                Err(_) => break,
+            }
+        }
+        response
+            .lines()
+            .next()?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u16>()
+            .ok()
     }
 
     fn http_get(port: u16, path: &str) -> (u16, String) {
@@ -479,23 +511,57 @@ mod serve_tests {
 
         assert_eq!(response["id"], 2);
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 26);
-
+        // C3 (ADR-0182): the MCP surface is the ≤8 intent-tool projection; the
+        // former 26 tools are now `op`s under these five.
+        assert!(
+            tools.len() <= 8,
+            "MCP surface must be ≤8; got {}",
+            tools.len()
+        );
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(tool_names.contains(&"cxpak_auto_context"));
-        assert!(tool_names.contains(&"cxpak_context_diff"));
-        assert!(tool_names.contains(&"cxpak_overview"));
-        assert!(tool_names.contains(&"cxpak_trace"));
-        assert!(tool_names.contains(&"cxpak_stats"));
-        assert!(tool_names.contains(&"cxpak_diff"));
-        assert!(tool_names.contains(&"cxpak_health"));
-        assert!(tool_names.contains(&"cxpak_risks"));
-        assert!(tool_names.contains(&"cxpak_briefing"));
-        assert!(tool_names.contains(&"cxpak_context_for_task"));
-        assert!(tool_names.contains(&"cxpak_pack_context"));
-        assert!(tool_names.contains(&"cxpak_search"));
-        assert!(tool_names.contains(&"cxpak_blast_radius"));
-        assert!(tool_names.contains(&"cxpak_api_surface"));
+        assert_eq!(
+            tool_names,
+            vec![
+                "cxpak_context",
+                "cxpak_graph",
+                "cxpak_data",
+                "cxpak_review",
+                "cxpak_insight"
+            ]
+        );
+        // Collect all ops advertised across the intent-tools and assert the
+        // former tool set is fully covered.
+        let all_ops: Vec<String> = tools
+            .iter()
+            .flat_map(|t| {
+                t["inputSchema"]["properties"]["op"]["enum"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        for op in [
+            "context",
+            "review",
+            "overview",
+            "trace",
+            "stats",
+            "diff",
+            "health",
+            "risks",
+            "briefing",
+            "context_for_task",
+            "pack_context",
+            "search",
+            "blast_radius",
+            "api_surface",
+        ] {
+            assert!(
+                all_ops.iter().any(|o| o == op),
+                "missing op {op} in {all_ops:?}"
+            );
+        }
 
         child.kill().ok();
         child.wait().ok();
@@ -828,9 +894,13 @@ mod serve_tests {
         child.kill().ok();
         let output = child.wait_with_output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // R0 (ADR-0185): startup is non-blocking — the server prints an
+        // "accepting connections; indexing in background" line synchronously
+        // BEFORE the index build (the "MCP index ready" line follows only once
+        // the background build completes, which this test may kill before).
         assert!(
-            stderr.contains("MCP server ready"),
-            "should print MCP ready message, got: {stderr}"
+            stderr.contains("MCP server accepting connections"),
+            "should print the non-blocking startup message, got: {stderr}"
         );
     }
 

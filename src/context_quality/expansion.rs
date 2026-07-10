@@ -342,17 +342,12 @@ static CORE_SYNONYMS: LazyLock<HashMap<&'static str, &'static [&'static str]>> =
 // Domain enum
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Domain {
-    Web,
-    Database,
-    Auth,
-    Infra,
-    Testing,
-    Api,
-    Mobile,
-    ML,
-}
+// The `Domain` data enum lives in `core_graph` (cxpak 3.0.0 Phase 0 de-cycle):
+// it is stored on `CodebaseIndex.domains`, so keeping it here would make the
+// leaf `core_graph` depend on this higher layer. The detection heuristics and
+// synonym maps below stay in this module. Re-exported at the historical
+// `crate::context_quality::expansion::Domain` path so all callers are unchanged.
+pub use crate::core_graph::domain::Domain;
 
 // ---------------------------------------------------------------------------
 // Domain synonym maps

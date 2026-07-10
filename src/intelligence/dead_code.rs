@@ -1,21 +1,12 @@
-use crate::index::{CodebaseIndex, IndexedFile};
+use crate::core_graph::CodebaseIndex;
+use crate::core_graph::IndexedFile;
 use crate::intelligence::api_surface::detect_routes;
 use crate::parser::language::{SymbolKind, Visibility};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-/// A symbol classified as dead (zero callers, not an entry point).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeadSymbol {
-    pub file: String,
-    pub symbol: String,
-    pub kind: SymbolKind,
-    /// Sorting key: higher = more concerning dead symbol.
-    /// Formula: pagerank * (1.0 + test_file_count) * export_weight
-    /// where export_weight = 2.0 for pub exports, 1.0 otherwise.
-    pub liveness_score: f64,
-    pub reason: String,
-}
+// `DeadSymbol` is part of the data model and now lives in `core_graph`
+// (cxpak 3.0.0 Phase 0 de-cycle); the analysis logic below stays here.
+pub use crate::core_graph::intel::DeadSymbol;
 
 /// Compute liveness score for sorting dead symbols.
 /// Higher = more important dead symbol (pub export, has tests nearby, high pagerank).
@@ -781,7 +772,7 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
 mod tests {
     use super::*;
     use crate::budget::counter::TokenCounter;
-    use crate::index::CodebaseIndex;
+    use crate::core_graph::CodebaseIndex;
     use crate::parser::language::{ParseResult, Symbol};
     use crate::scanner::ScannedFile;
     use std::collections::HashMap;
@@ -1041,7 +1032,7 @@ mod tests {
         symbol_name: &str,
         def_content: &str,
         ref_content: Option<&str>,
-    ) -> crate::index::CodebaseIndex {
+    ) -> crate::core_graph::CodebaseIndex {
         let counter = crate::budget::counter::TokenCounter::new();
         let dir = tempfile::TempDir::new().unwrap();
         let def_path = dir.path().join("a.rs");
@@ -1082,7 +1073,12 @@ mod tests {
             });
             content_map.insert("b.rs".to_string(), ref_src.to_string());
         }
-        crate::index::CodebaseIndex::build_with_content(files, parse_results, &counter, content_map)
+        crate::core_graph::CodebaseIndex::build_with_content(
+            files,
+            parse_results,
+            &counter,
+            content_map,
+        )
     }
 
     #[test]
@@ -1144,7 +1140,7 @@ mod tests {
         );
         let mut content_map = HashMap::new();
         content_map.insert("util.rs".to_string(), "fn unused() {}".to_string());
-        let index = crate::index::CodebaseIndex::build_with_content(
+        let index = crate::core_graph::CodebaseIndex::build_with_content(
             files,
             parse_results,
             &counter,
@@ -1241,7 +1237,7 @@ mod tests {
         );
         let mut content_map = HashMap::new();
         content_map.insert("util.rs".to_string(), content.to_string());
-        let index = crate::index::CodebaseIndex::build_with_content(
+        let index = crate::core_graph::CodebaseIndex::build_with_content(
             files,
             parse_results,
             &counter,
@@ -1288,7 +1284,7 @@ mod tests {
         );
         let mut content_map = HashMap::new();
         content_map.insert("isolate.rs".to_string(), content.to_string());
-        let index = crate::index::CodebaseIndex::build_with_content(
+        let index = crate::core_graph::CodebaseIndex::build_with_content(
             files,
             parse_results,
             &counter,
@@ -1352,7 +1348,7 @@ mod tests {
         );
         let mut content_map = HashMap::new();
         content_map.insert("short.rs".to_string(), "pub struct T {}".to_string());
-        let index = crate::index::CodebaseIndex::build_with_content(
+        let index = crate::core_graph::CodebaseIndex::build_with_content(
             files,
             parse_results,
             &counter,

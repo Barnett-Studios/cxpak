@@ -44,8 +44,14 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Print the JSON Schema for the auto_context output contract (versioned, ADR-0169)
-    Schema,
+    /// Print the JSON Schema for a capability's output contract (versioned, ADR-0169).
+    /// Known capability ids: context, graph, data, review.
+    /// With no argument, prints the context (auto_context) schema for back-compat.
+    Schema {
+        /// Capability id to print schema for (context, graph, data, review).
+        /// Omit to print the context schema (back-compat).
+        capability: Option<String>,
+    },
     /// Show token-budgeted change summary with dependency context
     Diff {
         #[arg(long, default_value = "50k")]
@@ -123,7 +129,7 @@ pub enum Commands {
         /// all | dashboard | architecture | risk | flow | timeline | diff
         #[arg(long, default_value = "all")]
         visual_type: VisualTypeArg,
-        /// html | mermaid | svg | png | c4 | json
+        /// html | mermaid | svg | png | c4 | json | cypher | graphml
         #[arg(long, default_value = "html")]
         format: VisualFormatArg,
         #[arg(long)]
@@ -163,6 +169,65 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: PluginSubcommand,
     },
+    /// Query the dependency graph: node, neighbors, path, subgraph
+    Graph {
+        /// Operation: node | neighbors | path | subgraph
+        op: String,
+        /// Node id (for `node` and `neighbors`)
+        #[arg(long)]
+        id: Option<String>,
+        /// Source node (for `path`)
+        #[arg(long)]
+        from: Option<String>,
+        /// Target node (for `path`)
+        #[arg(long)]
+        to: Option<String>,
+        /// Neighbor direction: out | in | both
+        #[arg(long, default_value = "both")]
+        direction: String,
+        /// Seed nodes for `subgraph` (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        seeds: Vec<String>,
+        /// Hop depth for `subgraph`
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Monorepo workspace prefix (only index files under this path)
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Iterative retrieval over cxpak's own index: search, references, expand
+    Search {
+        /// Operation: search | references | expand
+        #[arg(long, default_value = "search")]
+        op: String,
+        /// Query text (`search`) or, when `--symbol` is absent, the symbol
+        /// name (`references`). Ignored by `expand`.
+        query: Option<String>,
+        /// Symbol name for `references` (overrides the positional query)
+        #[arg(long)]
+        symbol: Option<String>,
+        /// Seed node ids for `expand` (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        seeds: Vec<String>,
+        /// Hop depth for `expand`
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Maximum hits returned by `search`
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Monorepo workspace prefix (only index files under this path)
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Git integration: post-commit auto-rebuild + union-merge driver
+    Hook {
+        #[command(subcommand)]
+        subcommand: HookSubcommand,
+    },
     /// Trace from error/function, pack relevant code paths
     Trace {
         #[arg(long, default_value = "50k")]
@@ -187,6 +252,29 @@ pub enum Commands {
         target: String,
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HookSubcommand {
+    /// Wire the post-commit hook + union merge driver into the target repo (idempotent)
+    Install {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Regenerate the canonical graph artifact after a commit (best-effort, never fatal)
+    PostCommit {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// git merge driver: union-resolve a conflict in the canonical artifact (%O %A %B)
+    MergeDriver {
+        /// Common ancestor version (%O)
+        ancestor: PathBuf,
+        /// Current/ours version (%A) — the merged result is written here
+        current: PathBuf,
+        /// Other/theirs version (%B)
+        other: PathBuf,
     },
 }
 
@@ -254,6 +342,8 @@ pub enum VisualFormatArg {
     Png,
     C4,
     Json,
+    Cypher,
+    Graphml,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -540,6 +630,100 @@ mod tests {
                 assert_eq!(tokens, "100k");
             }
             _ => panic!("expected Overview"),
+        }
+    }
+
+    #[test]
+    fn cli_graph_parses_subgraph() {
+        let cli = Cli::try_parse_from([
+            "cxpak", "graph", "subgraph", "--seeds", "a,b", "--depth", "2", "src",
+        ])
+        .expect("should parse graph subgraph");
+        match cli.command {
+            Commands::Graph {
+                op,
+                seeds,
+                depth,
+                path,
+                ..
+            } => {
+                assert_eq!(op, "subgraph");
+                assert_eq!(seeds, vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(depth, 2);
+                assert_eq!(path, std::path::PathBuf::from("src"));
+            }
+            _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn cli_graph_path_and_direction_defaults() {
+        let cli = Cli::try_parse_from(["cxpak", "graph", "path", "--from", "a", "--to", "d"])
+            .expect("should parse graph path");
+        match cli.command {
+            Commands::Graph {
+                op,
+                from,
+                to,
+                direction,
+                depth,
+                ..
+            } => {
+                assert_eq!(op, "path");
+                assert_eq!(from.as_deref(), Some("a"));
+                assert_eq!(to.as_deref(), Some("d"));
+                assert_eq!(direction, "both");
+                assert_eq!(depth, 1);
+            }
+            _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn cli_search_defaults_to_search_op() {
+        let cli = Cli::try_parse_from(["cxpak", "search", "helper"])
+            .expect("should parse search with a query");
+        match cli.command {
+            Commands::Search {
+                op,
+                query,
+                limit,
+                depth,
+                path,
+                ..
+            } => {
+                assert_eq!(op, "search");
+                assert_eq!(query.as_deref(), Some("helper"));
+                assert_eq!(limit, 20);
+                assert_eq!(depth, 1);
+                assert_eq!(path, std::path::PathBuf::from("."));
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_search_expand_op_with_seeds() {
+        let cli = Cli::try_parse_from([
+            "cxpak",
+            "search",
+            "--op",
+            "expand",
+            "--seeds",
+            "src/a.rs,src/b.rs",
+            "--depth",
+            "2",
+        ])
+        .expect("should parse search expand");
+        match cli.command {
+            Commands::Search {
+                op, seeds, depth, ..
+            } => {
+                assert_eq!(op, "expand");
+                assert_eq!(seeds, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+                assert_eq!(depth, 2);
+            }
+            _ => panic!("expected Search command"),
         }
     }
 

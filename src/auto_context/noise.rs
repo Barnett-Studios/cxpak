@@ -118,9 +118,12 @@ pub fn jaccard_symbol_similarity(symbols_a: &HashSet<&str>, symbols_b: &HashSet<
 
 /// Deduplicates a list of scored file entries by symbol similarity.
 ///
-/// For each pair where Jaccard similarity exceeds 0.80 the file with the
-/// lower PageRank score is removed.  Iteration order of `entries` is
-/// preserved for the survivors.
+/// For each pair where Jaccard similarity exceeds 0.80 the lower-priority file
+/// is removed, priority being `(relevance score desc, PageRank desc, path asc)`.
+/// The path tiebreak makes the removed file a deterministic function of the
+/// inputs rather than the entries' Vec position, so the survivor set is
+/// reproducible across processes.  Iteration order of `entries` is preserved
+/// for the survivors.
 ///
 /// `symbols_by_path` maps a file's path to the set of symbol names it
 /// exports/defines.  `pagerank` maps a file's path to its PageRank value.
@@ -162,9 +165,22 @@ pub fn dedup_similar_files(
             if sim > 0.80 {
                 let pr_i = *pagerank.get(&entries[i].path).unwrap_or(&0.0);
                 let pr_j = *pagerank.get(&entries[j].path).unwrap_or(&0.0);
-                // Prefer higher relevance score; break ties by PageRank.
-                let keep_i = entries[i].score > entries[j].score
-                    || (entries[i].score == entries[j].score && pr_i >= pr_j);
+                // Prefer higher relevance score, then higher PageRank, then the
+                // lexicographically smaller path. The final path tiebreak makes
+                // the REMOVED file a pure function of the inputs (score, PageRank,
+                // path) rather than the entries' Vec position — which upstream may
+                // derive from HashMap iteration order — so the survivor set is
+                // reproducible across processes. `total_cmp` gives a strict total
+                // order over the f64 scores/ranks.
+                let keep_i = match entries[i].score.total_cmp(&entries[j].score) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Equal => match pr_i.total_cmp(&pr_j) {
+                        std::cmp::Ordering::Greater => true,
+                        std::cmp::Ordering::Less => false,
+                        std::cmp::Ordering::Equal => entries[i].path <= entries[j].path,
+                    },
+                };
                 if keep_i {
                     filter_reasons.push((entries[j].path.clone(), entries[i].path.clone()));
                     removed[j] = true;
@@ -593,6 +609,57 @@ mod tests {
         assert_eq!(reasons.len(), 1);
         assert_eq!(reasons[0].0, "src/low_rank.rs");
         assert_eq!(reasons[0].1, "src/high_rank.rs");
+    }
+
+    #[test]
+    fn test_dedup_tie_resolves_to_deterministic_path_survivor() {
+        // Determinism regression (task R-D1b): when two near-duplicate files tie
+        // on BOTH relevance score and PageRank, the survivor must be a function of
+        // the path (lexicographically smaller kept), not the entries' Vec position
+        // — which upstream may derive from HashMap iteration order. We feed the two
+        // orderings of the same pair and assert the SAME file survives both times.
+        let shared: HashSet<String> = ["foo", "bar", "baz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut symbols_by_path: HashMap<String, HashSet<String>> = HashMap::new();
+        symbols_by_path.insert("src/a.rs".to_string(), shared.clone());
+        symbols_by_path.insert("src/b.rs".to_string(), shared);
+
+        // Equal score AND equal PageRank → path tiebreak is load-bearing.
+        let mut pagerank: HashMap<String, f64> = HashMap::new();
+        pagerank.insert("src/a.rs".to_string(), 0.5);
+        pagerank.insert("src/b.rs".to_string(), 0.5);
+
+        let entry = |p: &str| ScoredFileEntry {
+            path: p.to_string(),
+            score: 0.5,
+            token_count: 100,
+        };
+
+        // Order 1: [a, b]
+        let (kept_ab, _) = dedup_similar_files(
+            vec![entry("src/a.rs"), entry("src/b.rs")],
+            &symbols_by_path,
+            &pagerank,
+        );
+        // Order 2: [b, a] (simulates a different upstream HashMap order)
+        let (kept_ba, _) = dedup_similar_files(
+            vec![entry("src/b.rs"), entry("src/a.rs")],
+            &symbols_by_path,
+            &pagerank,
+        );
+
+        assert_eq!(kept_ab.len(), 1);
+        assert_eq!(kept_ba.len(), 1);
+        assert_eq!(
+            kept_ab[0].path, "src/a.rs",
+            "smaller path must survive the full tie"
+        );
+        assert_eq!(
+            kept_ba[0].path, kept_ab[0].path,
+            "survivor must be identical regardless of input Vec order"
+        );
     }
 
     // -----------------------------------------------------------------------

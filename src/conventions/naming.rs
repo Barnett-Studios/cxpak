@@ -1,42 +1,12 @@
 use crate::conventions::{FileContribution, PatternObservation};
-use crate::index::{CodebaseIndex, IndexedFile};
+use crate::core_graph::{CodebaseIndex, IndexedFile};
 use crate::parser::language::SymbolKind;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NamingStyle {
-    SnakeCase,
-    CamelCase,
-    PascalCase,
-    ScreamingSnake,
-    KebabCase,
-    Other,
-}
-
-impl std::fmt::Display for NamingStyle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NamingStyle::SnakeCase => write!(f, "snake_case"),
-            NamingStyle::CamelCase => write!(f, "camelCase"),
-            NamingStyle::PascalCase => write!(f, "PascalCase"),
-            NamingStyle::ScreamingSnake => write!(f, "SCREAMING_SNAKE_CASE"),
-            NamingStyle::KebabCase => write!(f, "kebab-case"),
-            NamingStyle::Other => write!(f, "other"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NamingConventions {
-    pub function_style: Option<PatternObservation>,
-    pub type_style: Option<PatternObservation>,
-    pub file_style: Option<PatternObservation>,
-    pub constant_style: Option<PatternObservation>,
-    pub additional: Vec<PatternObservation>,
-    #[serde(skip)]
-    pub file_contributions: HashMap<String, FileContribution>,
-}
+// `NamingStyle` and `NamingConventions` are data-model types now in
+// `core_graph::conventions` (cxpak 3.0.0 Phase 0 de-cycle); the classification
+// and extraction logic stays here.
+pub use crate::core_graph::conventions::{NamingConventions, NamingStyle};
 
 /// Classify a name into a naming style based on character-class analysis.
 pub fn classify_name(name: &str) -> NamingStyle {

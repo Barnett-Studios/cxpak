@@ -7,7 +7,22 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::Path;
 
-pub const CACHE_VERSION: u32 = 3;
+/// Cache schema version.  Bumped 4→5 in Task 0.4 (cxpak 3.0.0 Phase 0)
+/// because `TypedEdge` gained a `confidence: EdgeConfidence` field that is
+/// serialized into `DerivedCache.graph`.  A stale v4 derived.json would
+/// deserialize successfully (the field has `serde(default)`) but all edges
+/// would carry `Extracted` regardless of their true confidence.  Bumping the
+/// version forces a clean rebuild so every edge gets the correct value from
+/// `EdgeType::default_confidence()`.
+///
+/// Bumped 5→6 in Task B3d (ADR-0179) because `DerivedCache` gained a
+/// `base_commit: Option<String>` — the git HEAD SHA the cached derived
+/// analysis was built at.  A stale v5 derived.json would deserialize
+/// successfully (the field has `serde(default)` → `None`) but the post-commit
+/// edge-delta path treats a `None` base as "unverified" and falls back to a
+/// full rebuild anyway; bumping forces a clean rebuild once so every cache is
+/// re-stamped with a real base_commit (fail-closed).
+pub const CACHE_VERSION: u32 = 6;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileCache {
@@ -27,6 +42,14 @@ pub struct CacheEntry {
     pub language: Option<String>,
     pub token_count: usize,
     pub parse_result: Option<ParseResult>,
+    /// Mtime in nanoseconds since UNIX epoch.  Added in CACHE_VERSION 4.
+    /// `None` for entries written by older code (treated as a stat-index miss).
+    #[serde(default)]
+    pub mtime_ns: Option<u64>,
+    /// SHA-256 of the file's content (after markdown frontmatter stripping).
+    /// Added in CACHE_VERSION 4; `None` means the hash has not been computed yet.
+    #[serde(default)]
+    pub content_sha256: Option<String>,
 }
 
 /// Grammar hash computed at compile time by build.rs.
@@ -98,6 +121,132 @@ impl Default for FileCache {
 }
 
 // ---------------------------------------------------------------------------
+// Stat-index: per-file (mtime_ns, size_bytes) → content_sha256 map that lets
+// `content_fingerprint` skip re-hashing files whose stat is unchanged.
+//
+// Design (ADR-0167 constraint): the fingerprint VALUE is content-based and
+// byte-identical across machines.  The stat-index is a *local computation
+// accelerator only*: a fresh clone with no stat-index recomputes all SHA-256 →
+// identical fingerprint.  A file whose (mtime_ns, size_bytes) changed is
+// always re-read + re-hashed + stat-index updated.  Fail-closed: any load
+// error → empty index → full re-hash.
+// ---------------------------------------------------------------------------
+
+/// A single entry in the stat-index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StatIndexEntry {
+    /// Mtime of the file in nanoseconds since UNIX epoch.
+    pub mtime_ns: u64,
+    /// File size in bytes.
+    pub size_bytes: u64,
+    /// SHA-256 of the file content (markdown frontmatter stripped before hashing).
+    pub content_sha256: String,
+}
+
+/// Persisted map of `relative_path → StatIndexEntry`.
+///
+/// Stored as `.cxpak/cache/<namespace>/stat_index.json`.  Invalidated on
+/// `CACHE_VERSION` mismatch (same lock/atomic-save infra as `FileCache`).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatIndex {
+    pub version: u32,
+    pub entries: HashMap<String, StatIndexEntry>,
+}
+
+impl Default for StatIndex {
+    fn default() -> Self {
+        Self {
+            version: CACHE_VERSION,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+/// Return the mtime of `path` as nanoseconds since UNIX epoch, or 0 on failure.
+/// Used to populate the stat-index key.
+pub fn file_mtime_ns(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+impl StatIndex {
+    /// Load the stat-index from `<cache_dir>/stat_index.json`.
+    /// Returns an empty index on any error or version mismatch (fail-closed).
+    pub fn load(cache_dir: &Path) -> Self {
+        let path = cache_dir.join("stat_index.json");
+        let _lock = lock_cache(cache_dir).ok();
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return Self::default(),
+        };
+        match serde_json::from_str::<StatIndex>(&content) {
+            Ok(idx) if idx.version == CACHE_VERSION => idx,
+            _ => Self::default(),
+        }
+    }
+
+    /// Atomically persist the stat-index (lock + temp-write + rename).
+    pub fn save(&self, cache_dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(cache_dir)?;
+        let _lock = lock_cache(cache_dir)?;
+        let json = serde_json::to_string(self)?;
+        let tmp = cache_dir.join("stat_index.json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(tmp, cache_dir.join("stat_index.json"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Markdown frontmatter stripping
+// ---------------------------------------------------------------------------
+
+/// Strip a leading YAML frontmatter block (`---\n...\n---\n`) from `content`
+/// before hashing, so frontmatter-only edits (e.g. updated dates) do not churn
+/// the derived cache.  Non-markdown content without a frontmatter delimiter is
+/// returned as-is.
+///
+/// Only a `---` on the very first line triggers stripping.  If there is no
+/// closing `---\n`, the full content is returned unchanged (conservative: a
+/// malformed frontmatter is treated as body content).
+pub fn strip_md_frontmatter(content: &str) -> &str {
+    // Must start with exactly `---\n`.
+    let after_open = match content.strip_prefix("---\n") {
+        Some(rest) => rest,
+        None => return content,
+    };
+    // Scan line by line to find the closing delimiter.  We advance one line at
+    // a time so body content — including horizontal rules (`---`) — is never
+    // mistaken for the frontmatter close.
+    let mut rest = after_open;
+    let mut consumed = 4_usize; // length of opening "---\n"
+    loop {
+        if rest.starts_with("---\n") {
+            // Closing `---` followed by a newline: body starts after it.
+            let body_start = consumed + 4;
+            return &content[body_start..];
+        }
+        if rest == "---" {
+            // Closing `---` at EOF with no trailing newline: no body.
+            return "";
+        }
+        match rest.find('\n') {
+            Some(nl) => {
+                consumed += nl + 1;
+                rest = &rest[nl + 1..];
+            }
+            None => {
+                // No closing `---` found; return original content unchanged.
+                return content;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Derived-index cache (ADR-0167): persist the expensive derived analysis
 // (dependency graph, call graph, PageRank, conventions, co-changes) keyed by a
 // **content** fingerprint so the cache survives `git checkout` / clone / CI and
@@ -110,15 +259,100 @@ impl Default for FileCache {
 /// file contents and HEAD produce the same fingerprint on any machine; a
 /// same-size content edit changes it (unlike `(mtime, size)`), and a HEAD move
 /// changes it (so history-derived data — conventions, co-changes — is rebuilt).
+///
+/// Markdown frontmatter is stripped before hashing so frontmatter-only edits
+/// (e.g. updated `date:` fields) do not churn the derived cache.
+///
+/// For builds where mtime_ns and size_bytes are available, prefer
+/// [`content_fingerprint_with_stat_index`] to skip re-hashing unchanged files.
 pub fn content_fingerprint(files: &[(String, String)], head_oid: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut pairs: Vec<(&str, String)> = files
         .iter()
         .map(|(path, content)| {
+            let body = strip_md_frontmatter(content);
             (
                 path.as_str(),
-                format!("{:x}", Sha256::digest(content.as_bytes())),
+                format!("{:x}", Sha256::digest(body.as_bytes())),
             )
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = Sha256::new();
+    for (path, content_hash) in &pairs {
+        hasher.update(path.as_bytes());
+        hasher.update(b":");
+        hasher.update(content_hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(b"HEAD:");
+    hasher.update(head_oid.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Stat-index-accelerated variant of [`content_fingerprint`].
+///
+/// For each file `(path, content, mtime_ns, size_bytes)`:
+/// - If `stat_index` has a matching `(mtime_ns, size_bytes)` entry, the stored
+///   `content_sha256` is reused — `hash_fn` is **not** called.
+/// - Otherwise `hash_fn(content)` is called (must return a hex SHA-256 of the
+///   content after frontmatter stripping, matching what `content_fingerprint`
+///   produces), and the stat-index entry is updated in place.
+///
+/// The fingerprint value is byte-identical to `content_fingerprint` for the
+/// same file contents: the stat-index is a local accelerator only, with no
+/// effect on portability or determinism (ADR-0167).
+///
+/// `hash_fn` receives the **full raw content** of the file; it is responsible
+/// for calling `strip_md_frontmatter` internally (the production hasher does
+/// this; the test counting hasher also delegates to the real SHA-256).
+///
+/// The `stat_index` is mutated in place to record updated entries so the
+/// caller can persist it after the call.
+pub fn content_fingerprint_with_stat_index<F>(
+    files: &[(String, String, u64, u64)],
+    head_oid: &str,
+    stat_index: &mut StatIndex,
+    hash_fn: F,
+) -> String
+where
+    F: Fn(&str) -> String,
+{
+    use sha2::{Digest, Sha256};
+    let mut pairs: Vec<(&str, String)> = files
+        .iter()
+        .map(|(path, content, mtime_ns, size_bytes)| {
+            let content_hash = if let Some(entry) = stat_index.entries.get(path.as_str()) {
+                if entry.mtime_ns == *mtime_ns && entry.size_bytes == *size_bytes {
+                    // Stat-index hit: reuse stored hash, skip re-hashing.
+                    entry.content_sha256.clone()
+                } else {
+                    // Stat changed: re-hash and update the index.
+                    let h = hash_fn(content);
+                    stat_index.entries.insert(
+                        path.clone(),
+                        StatIndexEntry {
+                            mtime_ns: *mtime_ns,
+                            size_bytes: *size_bytes,
+                            content_sha256: h.clone(),
+                        },
+                    );
+                    h
+                }
+            } else {
+                // New file: hash and record.
+                let h = hash_fn(content);
+                stat_index.entries.insert(
+                    path.clone(),
+                    StatIndexEntry {
+                        mtime_ns: *mtime_ns,
+                        size_bytes: *size_bytes,
+                        content_sha256: h.clone(),
+                    },
+                );
+                h
+            };
+            (path.as_str(), content_hash)
         })
         .collect();
     pairs.sort_by(|a, b| a.0.cmp(b.0));
@@ -146,11 +380,30 @@ pub struct DerivedCache {
     pub pagerank: HashMap<String, f64>,
     pub conventions: crate::conventions::ConventionProfile,
     pub co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
+    /// Git HEAD SHA (full oid, hex) the cached derived analysis was built at,
+    /// or `None` when the build happened outside a git repo / on an unborn HEAD.
+    ///
+    /// This is the anchor for the SAFE post-commit edge-delta (ADR-0179): the
+    /// delta may be applied onto this cache's `graph` **only** if
+    /// `base_commit == parent(HEAD)` at post-commit time — i.e. the cache
+    /// reflects exactly the tree state before the new commit. Every other case
+    /// (absent/`None`, mismatched, >1 commit behind, or any load failure) falls
+    /// back to a full rebuild. `#[serde(default)]` so a pre-v6 cache
+    /// deserializes to `None` (which the delta path treats as unverified →
+    /// full rebuild); the `CACHE_VERSION` bump invalidates such caches anyway.
+    #[serde(default)]
+    pub base_commit: Option<String>,
 }
 
 impl DerivedCache {
     /// Construct a derived cache stamped with the current `CACHE_VERSION` and
     /// grammar hash, ready to [`save`](Self::save).
+    ///
+    /// `base_commit` is the git HEAD SHA the derived analysis was built at
+    /// (`None` outside a git repo / unborn HEAD). Stamping it at every write
+    /// site — including an interleaved `overview`/`serve` build between commits —
+    /// keeps the recorded base current, so the next post-commit's edge-delta can
+    /// still validate against it (see [`DerivedCache::base_commit`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         fingerprint: String,
@@ -159,6 +412,7 @@ impl DerivedCache {
         pagerank: HashMap<String, f64>,
         conventions: crate::conventions::ConventionProfile,
         co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
+        base_commit: Option<String>,
     ) -> Self {
         Self {
             version: CACHE_VERSION,
@@ -169,6 +423,7 @@ impl DerivedCache {
             pagerank,
             conventions,
             co_changes,
+            base_commit,
         }
     }
 
@@ -185,6 +440,29 @@ impl DerivedCache {
             && cache.grammar_hash == CURRENT_GRAMMAR_HASH
             && cache.fingerprint == fingerprint
         {
+            Some(cache)
+        } else {
+            None
+        }
+    }
+
+    /// Load the derived cache for use as an edge-delta BASE, validating only the
+    /// structural compatibility gates (`version` + `grammar_hash`) and **not**
+    /// the content `fingerprint`.
+    ///
+    /// The post-commit rebuild (ADR-0179) needs the graph as it stood *before*
+    /// the new commit, whose content fingerprint necessarily differs from the
+    /// post-commit tree — so the fingerprint gate must be skipped here. Safety
+    /// is instead enforced by the caller: apply the delta only if
+    /// `base_commit == parent(HEAD)`. Grammar/version are still validated so a
+    /// stale-schema graph is never deltaed onto (fail-closed → full rebuild).
+    /// Returns `None` on any error or version/grammar mismatch.
+    pub fn load_for_delta(cache_dir: &Path) -> Option<Self> {
+        let path = cache_dir.join("derived.json");
+        let _lock = lock_cache(cache_dir).ok();
+        let content = std::fs::read_to_string(&path).ok()?;
+        let cache: DerivedCache = serde_json::from_str(&content).ok()?;
+        if cache.version == CACHE_VERSION && cache.grammar_hash == CURRENT_GRAMMAR_HASH {
             Some(cache)
         } else {
             None
@@ -216,6 +494,8 @@ mod tests {
             language: Some("rust".to_string()),
             token_count: 42,
             parse_result: None,
+            mtime_ns: None,
+            content_sha256: None,
         }
     }
 
@@ -501,6 +781,7 @@ mod tests {
             pagerank,
             crate::conventions::ConventionProfile::default(),
             Vec::new(),
+            Some("base-commit-sha".to_string()),
         )
     }
 
@@ -586,6 +867,69 @@ mod tests {
         });
         std::fs::write(dir.path().join("derived.json"), stale.to_string()).unwrap();
         assert!(DerivedCache::load(dir.path(), "fp-abc").is_none());
+    }
+
+    #[test]
+    fn derived_cache_roundtrips_base_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_derived("fp-abc").save(dir.path()).unwrap();
+        let loaded = DerivedCache::load(dir.path(), "fp-abc").expect("hit");
+        assert_eq!(loaded.base_commit.as_deref(), Some("base-commit-sha"));
+    }
+
+    #[test]
+    fn load_for_delta_ignores_fingerprint_but_keeps_grammar_version() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_derived("fp-abc").save(dir.path()).unwrap();
+        // Fingerprint-gated load with a DIFFERENT fingerprint misses...
+        assert!(DerivedCache::load(dir.path(), "fp-does-not-match").is_none());
+        // ...but load_for_delta returns it regardless of fingerprint, carrying
+        // the base_commit the delta path validates against.
+        let delta =
+            DerivedCache::load_for_delta(dir.path()).expect("delta load ignores fingerprint");
+        assert_eq!(delta.base_commit.as_deref(), Some("base-commit-sha"));
+    }
+
+    #[test]
+    fn load_for_delta_fails_closed_on_grammar_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = serde_json::json!({
+            "version": CACHE_VERSION,
+            "grammar_hash": "stale-grammar",
+            "fingerprint": "fp-abc",
+            "graph": { "edges": {}, "reverse_edges": {} },
+            "call_graph": crate::intelligence::call_graph::CallGraph::default(),
+            "pagerank": {},
+            "conventions": crate::conventions::ConventionProfile::default(),
+            "co_changes": [],
+            "base_commit": "sha",
+        });
+        std::fs::write(dir.path().join("derived.json"), stale.to_string()).unwrap();
+        assert!(DerivedCache::load_for_delta(dir.path()).is_none());
+    }
+
+    #[test]
+    fn load_for_delta_missing_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(DerivedCache::load_for_delta(dir.path()).is_none());
+    }
+
+    #[test]
+    fn derived_cache_pre_v6_base_commit_defaults_to_none() {
+        // A cache JSON written before base_commit existed must deserialize
+        // (serde default → None) rather than error.
+        let json = serde_json::json!({
+            "version": CACHE_VERSION,
+            "grammar_hash": CURRENT_GRAMMAR_HASH,
+            "fingerprint": "fp-abc",
+            "graph": { "edges": {}, "reverse_edges": {} },
+            "call_graph": crate::intelligence::call_graph::CallGraph::default(),
+            "pagerank": {},
+            "conventions": crate::conventions::ConventionProfile::default(),
+            "co_changes": [],
+        });
+        let cache: DerivedCache = serde_json::from_str(&json.to_string()).unwrap();
+        assert!(cache.base_commit.is_none());
     }
 
     #[test]

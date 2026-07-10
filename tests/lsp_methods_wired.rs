@@ -28,32 +28,25 @@ fn is_stub(v: &serde_json::Value) -> bool {
 /// Create a throwaway directory with `git init` so drift/diff can run.
 fn git_tempdir() -> tempfile::TempDir {
     let temp = tempfile::TempDir::new().unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(temp.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.email", "t@t"])
-        .current_dir(temp.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.name", "t"])
-        .current_dir(temp.path())
-        .output();
-    std::fs::write(temp.path().join("README.md"), "init\n").unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(temp.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["commit", "-m", "init", "--quiet"])
-        .current_dir(temp.path())
-        .output();
+    {
+        let repo = git2::Repository::init(temp.path()).expect("git2 init");
+        std::fs::write(temp.path().join("README.md"), "init\n").unwrap();
+        let mut index = repo.index().expect("repo index");
+        index
+            .add_path(std::path::Path::new("README.md"))
+            .expect("git add");
+        index.write().expect("index write");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("t", "t@t").expect("sig");
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .expect("initial commit");
+    }
     temp
 }
 
 #[test]
-fn all_14_lsp_methods_return_non_stub() {
+fn all_15_lsp_methods_return_non_stub() {
     let idx = make_idx();
     let temp = git_tempdir();
     let root = temp.path();
@@ -74,6 +67,8 @@ fn all_14_lsp_methods_return_non_stub() {
         "cxpak/drift",
         "cxpak/securitySurface",
         "cxpak/dataFlow",
+        // graph-query (cxpak 3.0.0 Task B1):
+        "cxpak/graph",
     ];
     for m in methods {
         let params = match m {
@@ -82,6 +77,7 @@ fn all_14_lsp_methods_return_non_stub() {
             "cxpak/predict" => serde_json::json!({"files": ["src/main.rs"]}),
             "cxpak/dataFlow" => serde_json::json!({"symbol": "main"}),
             "cxpak/blastRadius" => serde_json::json!({"file": "src/main.rs"}),
+            "cxpak/graph" => serde_json::json!({"op": "node", "id": "src/main.rs"}),
             _ => serde_json::Value::Null,
         };
         let result = cxpak::lsp::methods::handle_custom_method(m, params, &idx, root).expect(m);

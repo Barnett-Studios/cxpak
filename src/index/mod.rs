@@ -3,62 +3,24 @@ pub mod ranking;
 pub mod symbols;
 
 use crate::budget::counter::TokenCounter;
-use crate::context_quality::expansion::Domain;
-use crate::conventions::ConventionProfile;
-use crate::index::graph::DependencyGraph;
-use crate::intelligence::call_graph::CallGraph;
-use crate::intelligence::dead_code::DeadSymbol;
-use crate::intelligence::health::HealthScore;
-use crate::intelligence::test_map::TestFileRef;
-use crate::parser::language::{Import, ParseResult, Symbol, Visibility};
+use crate::core_graph::conventions::ConventionProfile;
+use crate::core_graph::graph::DependencyGraph;
+use crate::core_graph::intel::CallGraph;
+use crate::core_graph::intel::DeadSymbol;
+use crate::core_graph::intel::HealthScore;
+use crate::parser::language::ParseResult;
 use crate::scanner::ScannedFile;
-use crate::schema::SchemaIndex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-#[derive(Debug, Clone)]
-pub struct CodebaseIndex {
-    pub files: Vec<IndexedFile>,
-    pub language_stats: HashMap<String, LanguageStats>,
-    pub total_files: usize,
-    pub total_bytes: u64,
-    pub total_tokens: usize,
-    pub term_frequencies: HashMap<String, HashMap<String, u32>>,
-    pub domains: HashSet<Domain>,
-    pub schema: Option<SchemaIndex>,
-    pub graph: DependencyGraph,
-    pub pagerank: HashMap<String, f64>,
-    pub test_map: HashMap<String, Vec<TestFileRef>>,
-    pub conventions: ConventionProfile,
-    pub call_graph: CallGraph,
-    pub co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
-    /// Cross-language boundary edges detected during index build (v1.5.0).
-    ///
-    /// Each edge is also injected into `graph` as an
-    /// [`crate::index::graph::EdgeType::CrossLanguage`] edge so existing
-    /// blast-radius / PageRank / auto_context pipelines pick them up.
-    pub cross_lang_edges: Vec<crate::intelligence::cross_lang::CrossLangEdge>,
-    #[cfg(feature = "embeddings")]
-    pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
-    /// Memoized `detect_dead_code(self, None)` result. Populated lazily on
-    /// first call to [`Self::dead_code_cached`]. Shared across clones via
-    /// `Arc`, so any clone that triggers computation benefits all clones.
-    ///
-    /// Invalidation contract: callers that mutate the index in-place (e.g.,
-    /// `commands::serve::process_watcher_changes` after
-    /// `apply_incremental_update`) MUST reset this with
-    /// `idx.dead_code_cache = Arc::new(OnceLock::new())` so the next read
-    /// recomputes against the new state. Constructors (`build`,
-    /// `build_with_content`, `empty`) initialise it fresh, so a full
-    /// replace via `*shared.write() = new_index` is also correct.
-    #[doc(hidden)]
-    pub dead_code_cache: Arc<OnceLock<Vec<DeadSymbol>>>,
-    /// Memoized full HealthScore.  Same lazy-fill / Arc-shared / reset-on-
-    /// watcher-update contract as `dead_code_cache`.  Without this, every
-    /// `GET /v1/health` poll redoes O(F) convention/coupling/cycles work.
-    #[doc(hidden)]
-    pub health_cache: Arc<OnceLock<HealthScore>>,
-}
+// The index data model (`CodebaseIndex`, `IndexedFile`, `LanguageStats`) and
+// its pure query methods now live in `core_graph` (cxpak 3.0.0 Phase 0
+// de-cycle, ADR-0007). Re-exported here so the historical
+// `crate::index::{CodebaseIndex, IndexedFile, LanguageStats}` paths — used
+// crate-wide and by external tests — keep resolving unchanged. The pure helper
+// free functions are also re-exported for the in-crate callers below.
+pub(crate) use crate::core_graph::index::{compute_term_frequencies, split_identifier};
+pub use crate::core_graph::index::{CodebaseIndex, IndexedFile, LanguageStats};
 
 impl CodebaseIndex {
     /// Return the cached HealthScore, computing it lazily on first call.
@@ -85,63 +47,6 @@ impl CodebaseIndex {
         self.dead_code_cache
             .get_or_init(|| crate::intelligence::dead_code::detect_dead_code(self, None))
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexedFile {
-    pub relative_path: String,
-    pub language: Option<String>,
-    pub size_bytes: u64,
-    pub token_count: usize,
-    pub parse_result: Option<ParseResult>,
-    pub content: String,
-    pub mtime_secs: Option<u64>, // Unix epoch seconds, None if unavailable
-}
-
-#[derive(Debug, Clone)]
-pub struct LanguageStats {
-    pub file_count: usize,
-    pub total_bytes: u64,
-    pub total_tokens: usize,
-}
-
-pub(crate) fn compute_term_frequencies(content: &str) -> HashMap<String, u32> {
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    for word in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if word.len() < 2 {
-            continue;
-        }
-        for part in split_identifier(word) {
-            if part.len() >= 2 {
-                *counts.entry(part).or_insert(0) += 1;
-            }
-        }
-    }
-    counts
-}
-
-pub(crate) fn split_identifier(s: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    for segment in s.split('_') {
-        if segment.is_empty() {
-            continue;
-        }
-        let mut current = String::new();
-        let chars: Vec<char> = segment.chars().collect();
-        for (i, &ch) in chars.iter().enumerate() {
-            if i > 0 && ch.is_uppercase() {
-                if !current.is_empty() {
-                    parts.push(current.to_lowercase());
-                }
-                current = String::new();
-            }
-            current.push(ch);
-        }
-        if !current.is_empty() {
-            parts.push(current.to_lowercase());
-        }
-    }
-    parts
 }
 
 impl CodebaseIndex {
@@ -251,66 +156,10 @@ impl CodebaseIndex {
         index
     }
 
-    pub fn all_public_symbols(&self) -> Vec<(&str, &Symbol)> {
-        self.files
-            .iter()
-            .filter_map(|f| {
-                f.parse_result.as_ref().map(|pr| {
-                    pr.symbols
-                        .iter()
-                        .filter(|s| s.visibility == Visibility::Public)
-                        .map(move |s| (f.relative_path.as_str(), s))
-                })
-            })
-            .flatten()
-            .collect()
-    }
-
-    pub fn all_imports(&self) -> Vec<(&str, &Import)> {
-        self.files
-            .iter()
-            .filter_map(|f| {
-                f.parse_result.as_ref().map(|pr| {
-                    pr.imports
-                        .iter()
-                        .map(move |i| (f.relative_path.as_str(), i))
-                })
-            })
-            .flatten()
-            .collect()
-    }
-
-    /// Find all symbols whose name matches `target` (case-insensitive).
-    ///
-    /// Returns `(relative_path, symbol)` pairs across all indexed files.
-    pub fn find_symbol<'a>(&'a self, target: &str) -> Vec<(&'a str, &'a Symbol)> {
-        let target_lower = target.to_lowercase();
-        self.files
-            .iter()
-            .filter_map(|f| {
-                let tl = &target_lower;
-                f.parse_result.as_ref().map(|pr| {
-                    pr.symbols
-                        .iter()
-                        .filter(move |s| s.name.to_lowercase() == *tl)
-                        .map(move |s| (f.relative_path.as_str(), s))
-                })
-            })
-            .flatten()
-            .collect()
-    }
-
-    /// Find all files whose content contains `target` as a substring (case-insensitive).
-    ///
-    /// Returns the relative paths of matching files.
-    pub fn find_content_matches<'a>(&'a self, target: &str) -> Vec<&'a str> {
-        let target_lower = target.to_lowercase();
-        self.files
-            .iter()
-            .filter(|f| f.content.to_lowercase().contains(&target_lower))
-            .map(|f| f.relative_path.as_str())
-            .collect()
-    }
+    // `all_public_symbols`, `all_imports`, `find_symbol`, `find_content_matches`
+    // are pure queries over the data model and now live in `core_graph::index`
+    // (cxpak 3.0.0 Phase 0 de-cycle). The orchestration constructors below stay
+    // here.
 
     /// Build a `CodebaseIndex` using pre-read file content instead of reading from disk.
     ///
@@ -693,75 +542,92 @@ impl CodebaseIndex {
         }
     }
 
-    /// Create an empty index with no files. Used when the MCP server
-    /// starts in a non-git directory (graceful degradation).
-    pub fn empty() -> Self {
-        Self {
-            files: Vec::new(),
-            language_stats: HashMap::new(),
-            total_files: 0,
-            total_bytes: 0,
-            total_tokens: 0,
-            term_frequencies: HashMap::new(),
-            domains: HashSet::new(),
-            schema: None,
-            graph: DependencyGraph::new(),
-            pagerank: HashMap::new(),
-            test_map: HashMap::new(),
-            call_graph: CallGraph::default(),
-            conventions: ConventionProfile::default(),
-            co_changes: Vec::new(),
-            cross_lang_edges: Vec::new(),
-            #[cfg(feature = "embeddings")]
-            embedding_index: None,
-            dead_code_cache: Arc::new(OnceLock::new()),
-            health_cache: Arc::new(OnceLock::new()),
-        }
-    }
-
-    pub fn is_key_file(path: &str) -> bool {
-        let lower = path.to_lowercase();
-        let filename = lower.rsplit('/').next().unwrap_or(&lower);
-        matches!(
-            filename,
-            "readme.md"
-                | "readme"
-                | "cargo.toml"
-                | "package.json"
-                | "pom.xml"
-                | "build.gradle"
-                | "build.gradle.kts"
-                | "go.mod"
-                | "pyproject.toml"
-                | "setup.py"
-                | "setup.cfg"
-                | "makefile"
-                | "dockerfile"
-                | "docker-compose.yml"
-                | "docker-compose.yaml"
-                | ".env.example"
-        ) || lower.ends_with("main.rs")
-            || lower.ends_with("main.go")
-            || lower.ends_with("main.py")
-            || lower.ends_with("main.java")
-            || lower.ends_with("app.py")
-            || lower.ends_with("index.ts")
-            || lower.ends_with("index.js")
-    }
+    // `empty` and `is_key_file` are pure constructors/queries over the data
+    // model and now live in `core_graph::index` (cxpak 3.0.0 Phase 0 de-cycle).
 }
 
 // ---------------------------------------------------------------------------
 // Embedding index construction (feature-gated)
 // ---------------------------------------------------------------------------
 
+/// Maximum number of dependency / dependent names listed in a contextual header,
+/// keeping the prepended prefix short and its token cost bounded.
+pub const CONTEXT_HEADER_MAX_NEIGHBORS: usize = 8;
+
+/// Build the deterministic graph-context header prepended to a file's embedded
+/// text under contextual retrieval (cxpak 3.0.0, Phase D — ADR-0184, Anthropic
+/// "contextual retrieval").
+///
+/// The header situates the symbol in the codebase before its signature so the
+/// embedding captures relational meaning, not just the local token bag:
+///
+/// ```text
+/// // file: src/api/mod.rs | depends on: config.rs, middleware.rs | used by: server.rs
+/// ```
+///
+/// Fully deterministic and LLM-free: dependency/dependent file basenames come
+/// straight from the prebuilt `DependencyGraph` (`dependencies` is a `BTreeSet`,
+/// `dependents` a set-backed vec), are de-duplicated, sorted, and capped at
+/// [`CONTEXT_HEADER_MAX_NEIGHBORS`]. The same index always yields the same
+/// header, so the enriched embedding input is reproducible.
+pub fn build_context_header(index: &CodebaseIndex, file_path: &str) -> String {
+    // Neighbors are listed by basename (not relative path) to keep the header
+    // short and its token cost bounded. Tradeoff: two distinct neighbors that
+    // share a basename — e.g. `a/config.rs` and `b/config.rs` — collapse to a
+    // single `config.rs` entry after `dedup()`, a minor semantic loss under the
+    // 8-neighbor cap. This is deterministic (BTreeSet-sourced, sorted) and only
+    // shapes the embedded text prefix, so it cannot desync the reproducible
+    // header; disambiguating by relative path would inflate the header's token
+    // cost, which the cap exists to bound. Accepted per ADR-0184 / ADR-0187.
+    let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+
+    let mut deps: Vec<String> = index
+        .graph
+        .dependencies(file_path)
+        .map(|set| set.iter().map(|e| basename(&e.target)).collect())
+        .unwrap_or_default();
+    deps.sort();
+    deps.dedup();
+    deps.truncate(CONTEXT_HEADER_MAX_NEIGHBORS);
+
+    let mut used_by: Vec<String> = index
+        .graph
+        .dependents(file_path)
+        .iter()
+        .map(|e| basename(&e.target))
+        .collect();
+    used_by.sort();
+    used_by.dedup();
+    used_by.truncate(CONTEXT_HEADER_MAX_NEIGHBORS);
+
+    let deps_str = if deps.is_empty() {
+        "none".to_string()
+    } else {
+        deps.join(", ")
+    };
+    let used_by_str = if used_by.is_empty() {
+        "none".to_string()
+    } else {
+        used_by.join(", ")
+    };
+
+    format!("// file: {file_path} | depends on: {deps_str} | used by: {used_by_str}\n")
+}
+
 /// Attempt to build an embedding index for all public symbols in the codebase.
 ///
 /// Returns `None` on any error (missing API key, no network, etc.) so that
 /// the rest of the index build always succeeds.
+///
+/// When `mode` is [`RelevanceMode::Active`][crate::relevance::RelevanceMode] the
+/// embedded text for each symbol is prefixed with the deterministic
+/// [`build_context_header`] (contextual retrieval, ADR-0184); when `Inert` the
+/// bare signature is embedded, byte-identical to the pre-D1 behavior.
 #[cfg(feature = "embeddings")]
 pub fn build_embedding_index(
     index: &CodebaseIndex,
     repo_path: &std::path::Path,
+    mode: crate::relevance::RelevanceMode,
 ) -> Option<crate::embeddings::EmbeddingIndex> {
     use crate::embeddings::{create_provider, EmbeddingConfig, EmbeddingIndex};
 
@@ -771,6 +637,7 @@ pub fn build_embedding_index(
         Err(_) => return None,
     };
 
+    let contextual = mode.contextual();
     let symbols: Vec<(String, String)> = index
         .files
         .iter()
@@ -780,10 +647,17 @@ pub fn build_embedding_index(
                 .map(|pr| (f.relative_path.clone(), pr))
         })
         .flat_map(|(path, pr)| {
+            // Contextual retrieval prepends the file's graph-context header once
+            // per file; each symbol's embedded text becomes `header + signature`.
+            let header = if contextual {
+                build_context_header(index, &path)
+            } else {
+                String::new()
+            };
             pr.symbols
                 .iter()
                 .filter(|s| s.visibility == crate::parser::language::Visibility::Public)
-                .map(move |s| (path.clone(), s.signature.clone()))
+                .map(move |s| (path.clone(), format!("{header}{}", s.signature)))
         })
         .collect();
 
@@ -819,11 +693,12 @@ pub fn build_embedding_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::language::{Import, Symbol, Visibility};
 
     /// Build an index from `(path, imports)` specs (Rust files under `src/`,
     /// imports as `crate::X` strings), with a full graph.
     fn idx_with_imports(spec: &[(&str, &[&str])]) -> CodebaseIndex {
-        use crate::parser::language::{Import, ParseResult};
+        use crate::parser::language::ParseResult;
         let mut idx = CodebaseIndex::empty();
         idx.files = spec
             .iter()
@@ -850,6 +725,38 @@ mod tests {
         idx.total_files = idx.files.len();
         idx.rebuild_graph();
         idx
+    }
+
+    #[test]
+    fn context_header_contains_deps_and_dependents_deterministically() {
+        // a → b, a → c ; so b/c are "used by a", and a "depends on b, c".
+        let idx = idx_with_imports(&[
+            ("src/a.rs", &["crate::b", "crate::c"]),
+            ("src/b.rs", &[]),
+            ("src/c.rs", &[]),
+        ]);
+
+        let h_a = build_context_header(&idx, "src/a.rs");
+        assert!(
+            h_a.contains("file: src/a.rs"),
+            "header names the file: {h_a}"
+        );
+        assert!(
+            h_a.contains("depends on: b.rs, c.rs"),
+            "a depends on b,c: {h_a}"
+        );
+        assert!(h_a.contains("used by: none"), "a has no dependents: {h_a}");
+
+        let h_b = build_context_header(&idx, "src/b.rs");
+        assert!(
+            h_b.contains("depends on: none"),
+            "b depends on nothing: {h_b}"
+        );
+        assert!(h_b.contains("used by: a.rs"), "b is used by a: {h_b}");
+
+        // Deterministic: same index ⇒ byte-identical header across calls.
+        assert_eq!(h_a, build_context_header(&idx, "src/a.rs"));
+        assert_eq!(h_b, build_context_header(&idx, "src/b.rs"));
     }
 
     #[test]

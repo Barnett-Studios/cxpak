@@ -1,4 +1,4 @@
-use crate::index::graph::DependencyGraph;
+use crate::core_graph::graph::DependencyGraph;
 use crate::intelligence::test_map::TestFileRef;
 use crate::schema::EdgeType;
 use serde::Serialize;
@@ -78,6 +78,11 @@ pub fn compute_blast_impact(
 
     let edge_weight = match edge_type {
         EdgeType::Import | EdgeType::ForeignKey | EdgeType::OrmModel => 1.0,
+        // A column reference is a precise, named-column lineage edge: a change
+        // to that column propagates strongly to the referencing file. Weighted
+        // just below the structural Import/FK/ORM grade because column refs are
+        // most often surfaced from heuristic embedded-SQL parsing.
+        EdgeType::ColumnReference => 0.9,
         EdgeType::EmbeddedSql | EdgeType::ViewReference | EdgeType::FunctionReference => 0.8,
         EdgeType::TriggerTarget | EdgeType::IndexTarget => 0.6,
         EdgeType::MigrationSequence => 0.5,
@@ -136,6 +141,7 @@ fn is_schema_edge(edge_type: &EdgeType) -> bool {
             | EdgeType::ViewReference
             | EdgeType::TriggerTarget
             | EdgeType::IndexTarget
+            | EdgeType::ColumnReference
     )
 }
 
@@ -212,6 +218,18 @@ pub fn compute_blast_radius(
 
     while let Some((path, hops, edge_type)) = queue.pop_front() {
         if hops > depth {
+            continue;
+        }
+
+        // Synthetic column nodes (Task A2, `col:{table}.{column}`) are an internal
+        // lineage construct reachable via the `col:→table_file` anchor edge. They
+        // must never surface as `AffectedFile` entries nor be traversed by the
+        // file/table blast path — skipping on dequeue keeps that path identical to
+        // pre-A2 behaviour. Column blast (`compute_column_blast_radius`) seeds at a
+        // `col:` node, but its real-file dependents are enqueued directly, so this
+        // guard only ever drops phantom column nodes, never legitimate results.
+        // (`col:` is reserved; no real file path starts with it.)
+        if path.starts_with("col:") {
             continue;
         }
 
@@ -360,6 +378,39 @@ pub fn compute_blast_radius(
     }
 }
 
+/// Compute the blast radius for a single **column** (cxpak 3.0.0 Task A2).
+///
+/// Seeds the BFS at the synthetic column node `col:{table}.{column}` (see
+/// [`crate::schema::column_node_id`]) and reuses [`compute_blast_radius`]
+/// verbatim. Because column-reference edges point *from* a source file *to*
+/// the column node, the reverse-edge BFS surfaces exactly the queries, ORM
+/// models, endpoints, and tests that reference THAT column — not the whole
+/// table. A change to `users.email` therefore excludes files that only touch
+/// `users.name`.
+///
+/// The seed column node itself is excluded from the results (it is a synthetic
+/// node, not a file). The column→table anchor edge is a *forward* dependency of
+/// the column node, so the table-definition file is not reported as a dependent
+/// here — table-level fan-out remains the job of the file/table-level
+/// [`compute_blast_radius`], which is unchanged.
+pub fn compute_column_blast_radius(
+    table: &str,
+    column: &str,
+    graph: &DependencyGraph,
+    pagerank: &HashMap<String, f64>,
+    test_map: &HashMap<String, Vec<TestFileRef>>,
+    depth: usize,
+    focus: Option<&str>,
+) -> BlastRadiusResult {
+    let node = crate::schema::column_node_id(table, column);
+    let mut result =
+        compute_blast_radius(&[node.as_str()], graph, pagerank, test_map, depth, focus);
+    // Report the human-readable `table.column` seed rather than the synthetic
+    // `col:` node id, so callers see what they asked about.
+    result.changed_files = vec![format!("{table}.{column}")];
+    result
+}
+
 fn edge_type_label(et: &EdgeType) -> String {
     match et {
         EdgeType::Import => "import".to_string(),
@@ -372,6 +423,7 @@ fn edge_type_label(et: &EdgeType) -> String {
         EdgeType::OrmModel => "orm_model".to_string(),
         EdgeType::MigrationSequence => "migration_sequence".to_string(),
         EdgeType::CrossLanguage(bt) => format!("cross_language:{bt:?}"),
+        EdgeType::ColumnReference => "column_reference".to_string(),
     }
 }
 

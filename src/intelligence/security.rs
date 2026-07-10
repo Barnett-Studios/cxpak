@@ -254,12 +254,15 @@ pub fn scan_sql_injection(content: &str, file_path: &str) -> Vec<SqlInjectionRis
                 .filter(|&c| c == '\n')
                 .count()
                 + 1;
-            let snippet_len = sql_fragment.len().min(60);
+            // Truncate by Unicode scalar, not bytes — a multi-byte char
+            // straddling byte 60 would panic `&sql_fragment[..60]` on a
+            // char boundary (the same hazard fixed for secret snippets above).
+            let snippet: String = sql_fragment.chars().take(60).collect();
             results.push(SqlInjectionRisk {
                 file: file_path.to_string(),
                 line,
                 language: lang.to_string(),
-                snippet: sql_fragment[..snippet_len].to_string(),
+                snippet,
                 interpolation_type: interpolation_type.to_string(),
             });
         }
@@ -397,8 +400,19 @@ pub fn endpoint_is_protected(content: &str, handler: &str, auth_patterns: &[&str
     }
 
     let handler_pos = content.find(handler).unwrap_or(0);
-    let start = handler_pos.saturating_sub(200);
-    let end = (handler_pos + 2000).min(content.len());
+    // Expand the byte-offset window to char boundaries before slicing — raw
+    // offsets can split a multibyte UTF-8 char and panic `&content[start..end]`
+    // (the same hazard fixed for the secret/SQLi snippets above; this window was
+    // the missed instance). Both loops terminate: 0 and content.len() are always
+    // char boundaries.
+    let mut start = handler_pos.saturating_sub(200);
+    while start > 0 && !content.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (handler_pos + 2000).min(content.len());
+    while end < content.len() && !content.is_char_boundary(end) {
+        end += 1;
+    }
     let window = &content[start..end];
     let lower = window.to_lowercase();
     auth_patterns.iter().any(|p| lower.contains(p))
@@ -409,7 +423,7 @@ pub fn endpoint_is_protected(content: &str, handler: &str, auth_patterns: &[&str
 // ---------------------------------------------------------------------------
 
 pub fn build_security_surface(
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
     auth_patterns: &[&str],
     focus: Option<&str>,
 ) -> SecuritySurface {
@@ -676,6 +690,21 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_injection_multibyte_snippet_no_panic() {
+        // A multi-byte char straddling byte 60 of the captured fragment used
+        // to panic the byte-slice `sql_fragment[..60]` on a char boundary.
+        // Fragment = "SELECT " (7) + 51×'a' (58) + '€' (starts byte 58) + "{id}",
+        // so byte 60 lands inside the euro sign.
+        let content = format!(r#"q = f"SELECT {}€{{id}}""#, "a".repeat(51));
+        let risks = scan_sql_injection(&content, "src/repo.py");
+        assert_eq!(risks.len(), 1, "multibyte f-string SQL must be detected");
+        assert!(
+            risks[0].snippet.chars().count() <= 60,
+            "snippet must be truncated by scalar, not byte-sliced"
+        );
+    }
+
+    #[test]
     fn test_sql_injection_parameterized_safe() {
         let content = r#"db.query("SELECT * FROM users WHERE id = $1", [userId])"#;
         let risks = scan_sql_injection(content, "src/repo.js");
@@ -829,6 +858,19 @@ pub fn process_input(data: String) {
         );
     }
 
+    #[test]
+    fn test_endpoint_protected_multibyte_window_no_panic() {
+        // The ±window around the handler is a byte-offset slice; a multibyte
+        // char straddling a boundary used to panic `&content[start..end]`.
+        // Pad with euro signs so both the start (handler_pos-200) and end
+        // (handler_pos+2000) boundaries land inside a multibyte char.
+        let pad = "€".repeat(120); // 360 bytes before the handler
+        let tail = "€".repeat(800); // multibyte run after, past +2000-ish
+        let content = format!("{pad} app.get('/x', myHandler); {tail}");
+        // Must not panic; return value is irrelevant to the regression.
+        let _ = endpoint_is_protected(&content, "myHandler", DEFAULT_AUTH_PATTERNS);
+    }
+
     // -----------------------------------------------------------------------
     // build_security_surface orchestrator tests
     // -----------------------------------------------------------------------
@@ -837,8 +879,8 @@ pub fn process_input(data: String) {
         path: &str,
         content: &str,
         symbols: Vec<crate::parser::language::Symbol>,
-    ) -> crate::index::IndexedFile {
-        crate::index::IndexedFile {
+    ) -> crate::core_graph::IndexedFile {
+        crate::core_graph::IndexedFile {
             relative_path: path.to_string(),
             language: Some("rust".into()),
             size_bytes: content.len() as u64,
@@ -867,7 +909,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_empty_index() {
-        let index = crate::index::CodebaseIndex::empty();
+        let index = crate::core_graph::CodebaseIndex::empty();
         let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
         assert!(surface.secret_patterns.is_empty());
         assert!(surface.sql_injection_surface.is_empty());
@@ -878,7 +920,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_detects_secrets() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let content = "const KEY = \"AKIAIOSFODNN7EXAMPLE123\";";
         index
             .files
@@ -894,7 +936,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_detects_sql_injection() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let content = r#"let q = format!("SELECT * FROM users WHERE id = '{}'", id);"#;
         index
             .files
@@ -910,7 +952,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_detects_validation_gaps() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let content = "pub fn create_user(name: String) {\n    db.insert(name);\n}\n";
         index
             .files
@@ -927,7 +969,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_detects_unprotected_endpoints() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         // Express-style route that detect_routes can find — must include an express import
         // so the framework-import gate allows route detection.
         let content = "const express = require('express');\napp.get('/api/users', listUsers);";
@@ -949,7 +991,7 @@ pub fn process_input(data: String) {
     fn test_build_security_surface_exposure_scores_with_pub_symbols() {
         use crate::schema::EdgeType;
 
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let symbols = vec![make_pub_symbol("handle_request"), make_pub_symbol("serve")];
         index.files.push(make_indexed_file(
             "src/api.rs",
@@ -976,7 +1018,7 @@ pub fn process_input(data: String) {
 
     #[test]
     fn test_build_security_surface_focus_filters_files() {
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let secret_content = "const KEY = \"AKIAIOSFODNN7EXAMPLE123\";";
         index
             .files
@@ -999,7 +1041,7 @@ pub fn process_input(data: String) {
     fn test_build_security_surface_exposure_sorted_descending() {
         use crate::schema::EdgeType;
 
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
 
         // File A: 1 pub symbol, 1 inbound edge
         index.files.push(make_indexed_file(
@@ -1048,7 +1090,7 @@ pub fn process_input(data: String) {
         // Secrets and SQL patterns inside #[cfg(test)] mod tests { ... } must
         // NOT generate security findings — they are test fixtures, not real
         // credentials or injection vectors.
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let content = r#"
 pub fn real_function() {}
 
@@ -1083,7 +1125,7 @@ mod tests {
     fn test_build_security_surface_tested_file_zero_exposure() {
         use crate::intelligence::test_map::{TestConfidence, TestFileRef};
 
-        let mut index = crate::index::CodebaseIndex::empty();
+        let mut index = crate::core_graph::CodebaseIndex::empty();
         let symbols = vec![make_pub_symbol("handle")];
         index.files.push(make_indexed_file(
             "src/api.rs",

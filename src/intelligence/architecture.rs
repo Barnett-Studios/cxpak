@@ -1,4 +1,4 @@
-use crate::index::CodebaseIndex;
+use crate::core_graph::CodebaseIndex;
 use crate::intelligence::health::module_prefix;
 use crate::schema::EdgeType;
 use serde::Serialize;

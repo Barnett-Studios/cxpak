@@ -131,8 +131,24 @@ mod mcp_visual_onboard_tests {
     // tools/list — both tools must be present
     // -------------------------------------------------------------------------
 
+    /// Ops enum for an intent-tool in a `tools/list` response.
+    fn intent_ops(tools: &[Value], name: &str) -> Vec<String> {
+        tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .and_then(|t| t["inputSchema"]["properties"]["op"]["enum"].as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn mcp_tools_list_includes_visual_and_onboard() {
+    fn mcp_tools_list_hosts_visual_and_onboard_ops() {
+        // C3 (ADR-0182): visual and onboard are `op`s under cxpak_insight; the
+        // live surface is ≤8 intent-tools.
         let repo = make_test_repo();
         let mut srv = McpServer::spawn(&repo);
         srv.initialize();
@@ -147,84 +163,66 @@ mod mcp_visual_onboard_tests {
         let tools = resp["result"]["tools"]
             .as_array()
             .expect("result.tools must be an array");
-
+        assert!(
+            tools.len() <= 8,
+            "MCP surface must be ≤8; got {}",
+            tools.len()
+        );
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-
         assert!(
-            names.contains(&"cxpak_visual"),
-            "tools/list must include cxpak_visual; got: {names:?}"
+            names.contains(&"cxpak_insight"),
+            "tools/list must include cxpak_insight; got: {names:?}"
         );
-        assert!(
-            names.contains(&"cxpak_onboard"),
-            "tools/list must include cxpak_onboard; got: {names:?}"
-        );
+        let ops = intent_ops(tools, "cxpak_insight");
+        assert!(ops.iter().any(|o| o == "visual"), "insight ops: {ops:?}");
+        assert!(ops.iter().any(|o| o == "onboard"), "insight ops: {ops:?}");
     }
 
     #[test]
-    fn mcp_tools_list_visual_has_required_params() {
+    fn mcp_visual_op_reachable_via_intent_form() {
+        // The new intent form: cxpak_insight { op: visual, ... } routes to the
+        // visual capability core over the subprocess MCP surface.
         let repo = make_test_repo();
         let mut srv = McpServer::spawn(&repo);
         srv.initialize();
 
         let resp = srv.exchange(&json!({
             "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "cxpak_insight",
+                "arguments": { "op": "visual", "type": "dashboard", "format": "mermaid" }
+            }
         }));
-
-        let tools = resp["result"]["tools"].as_array().unwrap();
-        let visual_tool = tools
-            .iter()
-            .find(|t| t["name"].as_str() == Some("cxpak_visual"))
-            .expect("cxpak_visual must be present");
-
-        let props = &visual_tool["inputSchema"]["properties"];
+        assert_eq!(resp["id"], 2);
+        assert_ne!(resp["result"]["isError"], json!(true), "got: {resp}");
         assert!(
-            props.get("type").is_some(),
-            "cxpak_visual must have 'type' param, got: {props}"
-        );
-        assert!(
-            props.get("format").is_some(),
-            "cxpak_visual must have 'format' param, got: {props}"
-        );
-        assert!(
-            props.get("symbol").is_some(),
-            "cxpak_visual must have 'symbol' param, got: {props}"
-        );
-        assert!(
-            props.get("files").is_some(),
-            "cxpak_visual must have 'files' param, got: {props}"
+            resp["result"]["content"][0]["text"].is_string(),
+            "visual op must return content: {resp}"
         );
     }
 
     #[test]
-    fn mcp_tools_list_onboard_has_required_params() {
+    fn mcp_onboard_op_reachable_via_intent_form() {
         let repo = make_test_repo();
         let mut srv = McpServer::spawn(&repo);
         srv.initialize();
 
         let resp = srv.exchange(&json!({
             "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "cxpak_insight",
+                "arguments": { "op": "onboard", "format": "json" }
+            }
         }));
-
-        let tools = resp["result"]["tools"].as_array().unwrap();
-        let onboard_tool = tools
-            .iter()
-            .find(|t| t["name"].as_str() == Some("cxpak_onboard"))
-            .expect("cxpak_onboard must be present");
-
-        let props = &onboard_tool["inputSchema"]["properties"];
+        assert_eq!(resp["id"], 3);
+        assert_ne!(resp["result"]["isError"], json!(true), "got: {resp}");
         assert!(
-            props.get("format").is_some(),
-            "cxpak_onboard must have 'format' param, got: {props}"
-        );
-        assert!(
-            props.get("focus").is_some(),
-            "cxpak_onboard must have 'focus' param, got: {props}"
+            resp["result"]["content"][0]["text"].is_string(),
+            "onboard op must return content: {resp}"
         );
     }
 

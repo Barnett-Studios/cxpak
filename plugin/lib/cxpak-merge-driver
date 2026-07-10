@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Union merge-driver wrapper for cxpak's canonical graph artifact. git invokes
+# this with the ancestor (%O), current/ours (%A), and other/theirs (%B) temp
+# files; the merged result is written back to %A. Unlike the post-commit hook
+# this MUST fail loudly if it cannot resolve, so git falls back to a normal
+# conflict rather than silently dropping edges.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CXPAK="$("${SCRIPT_DIR}/ensure-cxpak")" || {
+    echo "cxpak: failed to locate or install the cxpak binary for merge-driver." >&2
+    exit 1
+}
+
+if [ ! -x "$CXPAK" ]; then
+    echo "cxpak: binary at '$CXPAK' is not executable." >&2
+    exit 1
+fi
+
+# Pass git's %O %A %B through unchanged; the subcommand writes the union to %A.
+exec "$CXPAK" hook merge-driver "$@"

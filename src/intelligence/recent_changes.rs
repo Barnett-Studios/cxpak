@@ -1,4 +1,4 @@
-use crate::index::CodebaseIndex;
+use crate::core_graph::CodebaseIndex;
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 

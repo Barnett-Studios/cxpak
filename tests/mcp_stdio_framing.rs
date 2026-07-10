@@ -88,10 +88,28 @@ fn tools_list_returns_tool_array() {
         !tools.is_empty(),
         "at least one cxpak_* tool must be registered"
     );
+    // C3 (ADR-0182): the surface is the ≤8 intent-tools; `health` is now an `op`
+    // under cxpak_insight.
+    assert!(
+        tools.len() <= 8,
+        "MCP surface must be ≤8; got {}",
+        tools.len()
+    );
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(
-        names.contains(&"cxpak_health"),
-        "cxpak_health must be in the tools list"
+        names.contains(&"cxpak_insight"),
+        "cxpak_insight must be in the tools list, got: {names:?}"
+    );
+    let insight = tools.iter().find(|t| t["name"] == "cxpak_insight").unwrap();
+    let ops: Vec<&str> = insight["inputSchema"]["properties"]["op"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        ops.contains(&"health"),
+        "health must be an op under cxpak_insight: {ops:?}"
     );
 }
 
