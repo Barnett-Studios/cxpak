@@ -400,8 +400,19 @@ pub fn endpoint_is_protected(content: &str, handler: &str, auth_patterns: &[&str
     }
 
     let handler_pos = content.find(handler).unwrap_or(0);
-    let start = handler_pos.saturating_sub(200);
-    let end = (handler_pos + 2000).min(content.len());
+    // Expand the byte-offset window to char boundaries before slicing — raw
+    // offsets can split a multibyte UTF-8 char and panic `&content[start..end]`
+    // (the same hazard fixed for the secret/SQLi snippets above; this window was
+    // the missed instance). Both loops terminate: 0 and content.len() are always
+    // char boundaries.
+    let mut start = handler_pos.saturating_sub(200);
+    while start > 0 && !content.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (handler_pos + 2000).min(content.len());
+    while end < content.len() && !content.is_char_boundary(end) {
+        end += 1;
+    }
     let window = &content[start..end];
     let lower = window.to_lowercase();
     auth_patterns.iter().any(|p| lower.contains(p))
@@ -845,6 +856,19 @@ pub fn process_input(data: String) {
             !endpoint_is_protected(content, "publicHandler", DEFAULT_AUTH_PATTERNS),
             "file with no auth keywords must be unprotected"
         );
+    }
+
+    #[test]
+    fn test_endpoint_protected_multibyte_window_no_panic() {
+        // The ±window around the handler is a byte-offset slice; a multibyte
+        // char straddling a boundary used to panic `&content[start..end]`.
+        // Pad with euro signs so both the start (handler_pos-200) and end
+        // (handler_pos+2000) boundaries land inside a multibyte char.
+        let pad = "€".repeat(120); // 360 bytes before the handler
+        let tail = "€".repeat(800); // multibyte run after, past +2000-ish
+        let content = format!("{pad} app.get('/x', myHandler); {tail}");
+        // Must not panic; return value is irrelevant to the regression.
+        let _ = endpoint_is_protected(&content, "myHandler", DEFAULT_AUTH_PATTERNS);
     }
 
     // -----------------------------------------------------------------------

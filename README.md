@@ -217,7 +217,7 @@ cxpak watch .                          # file watcher with hot index
 cxpak lsp .                            # stdio, works with any LSP client
 ```
 
-CodeLens, hover, diagnostics, workspace symbols, plus 14 custom `cxpak/*` methods. Supports `didOpen`/`didChange`/`didClose` for in-editor reactivity.
+CodeLens, hover, diagnostics, workspace symbols, plus 16 custom `cxpak/*` methods. Supports `didOpen`/`didChange`/`didClose` for in-editor reactivity.
 
 ## Core capabilities
 

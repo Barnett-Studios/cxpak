@@ -2585,7 +2585,7 @@ pub fn handle_tool_call(
 ) -> Value {
     let op = match resolve_capability_op(tool_name, args) {
         Ok(op) => op,
-        Err(OpResolution::InvalidOp(msg)) => return mcp_tool_result(id, &msg),
+        Err(OpResolution::InvalidOp(msg)) => return mcp_tool_error(id, &msg),
         Err(OpResolution::UnknownTool) => {
             return mcp_error_response(id, -32601, &format!("Unknown tool: {tool_name}"))
         }
@@ -2801,7 +2801,7 @@ fn dispatch_capability_op(
                 .unwrap_or("node");
             match crate::intelligence::graph_query::execute(&index.graph, sub, args) {
                 Ok(v) => mcp_tool_result(id, &serde_json::to_string_pretty(&v).unwrap_or_default()),
-                Err(e) => mcp_tool_result(id, &format!("Error: {e}")),
+                Err(e) => mcp_tool_error(id, &format!("Error: {e}")),
             }
         }
         "retrieval" => {
@@ -2812,7 +2812,7 @@ fn dispatch_capability_op(
                 .unwrap_or("search");
             match crate::intelligence::retrieval::execute(index, sub, args) {
                 Ok(v) => mcp_tool_result(id, &serde_json::to_string_pretty(&v).unwrap_or_default()),
-                Err(e) => mcp_tool_result(id, &format!("Error: {e}")),
+                Err(e) => mcp_tool_error(id, &format!("Error: {e}")),
             }
         }
         "data" => {
@@ -2997,7 +2997,7 @@ fn dispatch_capability_op(
         "trace" => {
             let target = args.get("target").and_then(|t| t.as_str()).unwrap_or("");
             if target.is_empty() {
-                return mcp_tool_result(id, "Error: 'target' argument is required");
+                return mcp_tool_error(id, "Error: 'target' argument is required");
             }
             let focus = args.get("focus").and_then(|f| f.as_str());
 
@@ -3100,7 +3100,7 @@ fn dispatch_capability_op(
                         &serde_json::to_string_pretty(&result).unwrap_or_default(),
                     )
                 }
-                Err(e) => mcp_tool_result(id, &format!("Error: {e}")),
+                Err(e) => mcp_tool_error(id, &format!("Error: {e}")),
             }
         }
         "context_for_task" => {
@@ -3448,7 +3448,7 @@ fn dispatch_capability_op(
 
             let re = match regex::Regex::new(pattern) {
                 Ok(r) => r,
-                Err(e) => return mcp_tool_result(id, &format!("Error: invalid regex: {e}")),
+                Err(e) => return mcp_tool_error(id, &format!("Error: invalid regex: {e}")),
             };
 
             let mut matches_vec = vec![];
@@ -3549,7 +3549,7 @@ fn dispatch_capability_op(
             let changed =
                 match crate::conventions::verify::get_changed_lines(repo_path, git_ref, focus) {
                     Ok(c) => c,
-                    Err(e) => return mcp_tool_result(id, &format!("Error: {e}")),
+                    Err(e) => return mcp_tool_error(id, &format!("Error: {e}")),
                 };
 
             if changed.is_empty() {
@@ -3975,10 +3975,10 @@ fn dispatch_capability_op(
             // Per MCP spec, tool parameter errors use mcp_tool_result with isError,
             // not the JSON-RPC error response used for protocol-level errors.
             if visual_type == "flow" && symbol.is_none() {
-                return mcp_tool_result(id, "Error: symbol is required when type=flow");
+                return mcp_tool_error(id, "Error: symbol is required when type=flow");
             }
             if visual_type == "diff" && files_arg.is_none() {
-                return mcp_tool_result(id, "Error: files is required when type=diff");
+                return mcp_tool_error(id, "Error: files is required when type=diff");
             }
 
             #[cfg(feature = "visual")]
@@ -4033,7 +4033,7 @@ fn dispatch_capability_op(
 
                 let html = match html_result {
                     Ok(h) => h,
-                    Err(e) => return mcp_tool_result(id, &format!("Error: {e}")),
+                    Err(e) => return mcp_tool_error(id, &format!("Error: {e}")),
                 };
 
                 let content =
@@ -4091,7 +4091,7 @@ fn dispatch_capability_op(
                 if format == "html" && content.len() > MCP_INLINE_LIMIT {
                     let validated_slug = match validate_visual_type_slug(visual_type) {
                         Ok(s) => s,
-                        Err(e) => return mcp_tool_result(id, &format!("Error: {e}")),
+                        Err(e) => return mcp_tool_error(id, &format!("Error: {e}")),
                     };
                     let visual_dir = repo_path.join(".cxpak/visual");
                     std::fs::create_dir_all(&visual_dir).ok();
@@ -4105,7 +4105,7 @@ fn dispatch_capability_op(
                         Err(e) => return mcp_tool_result(id, &format!("canonicalize failed: {e}")),
                     };
                     if !canon_file.starts_with(&canon_dir) {
-                        return mcp_tool_result(id, "Error: path escape detected");
+                        return mcp_tool_error(id, "Error: path escape detected");
                     }
                     match std::fs::write(&filepath, &content) {
                         Ok(()) => mcp_tool_result(
@@ -4116,7 +4116,7 @@ fn dispatch_capability_op(
                                 content.len()
                             ),
                         ),
-                        Err(e) => mcp_tool_result(id, &format!("Error writing output: {e}")),
+                        Err(e) => mcp_tool_error(id, &format!("Error writing output: {e}")),
                     }
                 } else {
                     mcp_tool_result(id, &content)
@@ -4178,6 +4178,22 @@ fn mcp_tool_result(id: Option<Value>, text: &str) -> Value {
         "id": id,
         "result": {
             "content": [{"type": "text", "text": text}]
+        }
+    })
+}
+
+/// Tool-execution error result. Per the MCP spec, a tool that fails returns a
+/// normal result with `isError: true` (NOT a JSON-RPC error, which is reserved
+/// for protocol-level failures) so the client/LLM can distinguish a failed call
+/// from a valid textual answer. Used for parameter-validation and capability
+/// errors surfaced through `tools/call`.
+fn mcp_tool_error(id: Option<Value>, text: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": true
         }
     })
 }
@@ -5139,6 +5155,35 @@ mod tests {
         );
         let msg = resp["error"]["message"].as_str().unwrap();
         assert!(msg.contains("Unknown tool"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_handle_tool_call_invalid_op_sets_is_error() {
+        // A KNOWN tool with an INVALID op is a tool-execution error: per the MCP
+        // spec it returns a normal result with `isError: true` (NOT a JSON-RPC
+        // protocol error), so the client/LLM can tell it apart from an answer.
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(7)),
+            "cxpak_graph",
+            &json!({"op": "bogus_op"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert!(
+            resp.get("error").is_none(),
+            "tool error must not be a JSON-RPC protocol error: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "invalid op must set isError:true: {resp}"
+        );
+        assert!(
+            resp["result"]["content"][0]["text"].as_str().is_some(),
+            "error result must carry text content"
+        );
     }
 
     // --- v1.5.0: data_flow and cross_lang MCP tools ---
