@@ -9,9 +9,10 @@
 //!
 //! ## Formula
 //!
-//! For file `i` and signal `j`, let `rank_ij` be `i`'s 1-based position when the
-//! files are ordered by signal `j` descending (path-ascending tiebreak). The
-//! fused score is
+//! For file `i` and signal `j`, let `rank_ij` be `i`'s **competition rank** when
+//! the files are ordered by signal `j` descending: `1 + (files with a strictly
+//! greater score)`, so all files tied on a signal share one rank. The fused
+//! score is
 //!
 //! ```text
 //! rrf_i = Σ_j  weights[j] · (K + 1) / (K + rank_ij)
@@ -46,15 +47,25 @@
 //!     full-corpus recall A/B (ADR-0187) puts Active at +164% recall over Inert
 //!     at both budgets, with only 2 isolated flask regressions.
 //!
-//! ## Determinism
+//! ## Determinism and tie handling
 //!
 //! Rank assignment sorts file indices by `(signal_score desc via
-//! `f64::total_cmp`, path asc)` — a strict total order with a path tiebreak, no
-//! `HashMap`/`HashSet` iteration feeding the ranks. A weight-0 signal is skipped
-//! entirely (it cannot change the fusion), which also keeps the embeddings-off
-//! path (embedding weight 0.0) free of any path-order noise from the constant
-//! neutral embedding scores. Ties within a signal fall back to path order, as
-//! the brief prescribes.
+//! `f64::total_cmp`, path asc)`, then assigns **competition ranks** so files
+//! tied on a signal share a rank. The path-asc key fixes only a deterministic
+//! iteration order; it does NOT feed the rank, so the fused score is fully
+//! path-independent. A weight-0 signal is skipped entirely (it cannot change the
+//! fusion), which keeps the embeddings-off path (embedding weight 0.0) free of
+//! any noise from the constant neutral embedding scores.
+//!
+//! Competition ranking (not ordinal) is what makes a *uniform* signal inert: if
+//! every file scores the same on signal `j`, all files get rank 1 and each
+//! receives the identical constant `w_j·(K+1)/(K+1) = w_j`, so signal `j` cannot
+//! reorder anything. The earlier ordinal scheme (distinct rank per sorted
+//! position) instead spread a uniform signal's files across ranks `1..n` by path
+//! and leaked its full weight `w_j` as an alphabetical gradient — enough to
+//! overturn a genuinely informative signal (ADR-0190). The deterministic
+//! path-asc tiebreak that resolves equal *fused* scores now lives solely in seed
+//! selection (`(score desc, path asc)`, ADR-0188), not in the fusion itself.
 
 /// The RRF constant `K`. Standard value from the RRF paper; larger `K` flattens
 /// the reciprocal-rank curve (top ranks matter less), smaller `K` sharpens it.
@@ -88,8 +99,10 @@ pub fn fuse(files: &[(String, [f64; N_SIGNALS])], weights: [f64; N_SIGNALS], k: 
             continue;
         }
 
-        // Order file indices by this signal's score descending, path ascending
-        // as the deterministic tiebreak.
+        // Order file indices by this signal's score descending. The path-asc
+        // secondary key fixes only a deterministic *iteration* order; it does
+        // NOT influence the rank a file receives (ties share a rank below), so a
+        // uniform signal cannot leak alphabetical path bias into the fused score.
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| {
             files[b].1[j]
@@ -97,9 +110,26 @@ pub fn fuse(files: &[(String, [f64; N_SIGNALS])], weights: [f64; N_SIGNALS], k: 
                 .then_with(|| files[a].0.cmp(&files[b].0))
         });
 
-        for (pos, &idx) in order.iter().enumerate() {
-            let rank = pos as f64 + 1.0; // 1-based rank
-            rrf[idx] += w * (k + 1.0) / (k + rank);
+        // Competition ("1224") ranking: every file tied on this signal's score
+        // shares the rank `1 + (files with a strictly greater score)`, which for
+        // the first member of a tie group at sorted position `i` is `i + 1`. A
+        // signal uniform across all files therefore gives every file rank 1 and
+        // contributes `w · (K+1)/(K+1) = w` to each — a constant that cannot
+        // reorder anything. Ordinal ranking (distinct rank per position) instead
+        // leaked a uniform signal's full weight as a path-order gradient.
+        let mut i = 0;
+        while i < n {
+            let score = files[order[i]].1[j];
+            let mut end = i;
+            while end < n && files[order[end]].1[j].total_cmp(&score) == std::cmp::Ordering::Equal {
+                end += 1;
+            }
+            let rank = i as f64 + 1.0; // competition rank shared by the tie group
+            let contribution = w * (k + 1.0) / (k + rank);
+            for &idx in &order[i..end] {
+                rrf[idx] += contribution;
+            }
+            i = end;
         }
     }
 
@@ -206,9 +236,8 @@ mod tests {
         w_with[0] = 1.0; // only signal 0 matters
         let scores_a = fuse(&files, w_with, RRF_K);
 
-        // Adding weight to the tied signal 6 must NOT change relative order,
-        // because the tie is broken by path and both are neutral — but crucially
-        // the weight-0 case is identical to omitting signal 6.
+        // The weight-0 case must be identical to omitting signal 6 entirely:
+        // a skipped signal contributes nothing, so only signal 0 shapes the order.
         let mut w_zero6 = [0.0; N_SIGNALS];
         w_zero6[0] = 1.0;
         w_zero6[6] = 0.0;
@@ -217,10 +246,13 @@ mod tests {
         assert!(eq(scores_a[1], scores_b[1]));
     }
 
-    /// Deterministic tiebreak: two files with byte-identical signal vectors are
-    /// ranked by path ascending, and the fusion is reproducible across runs.
+    /// Path-independent fusion: two files with byte-identical signal vectors
+    /// receive the SAME fused score (competition ranking → both share rank 1),
+    /// regardless of path order, and the fusion is reproducible across runs. The
+    /// deterministic path-asc tiebreak that resolves equal fused scores lives in
+    /// seed selection (ADR-0188), not in the fusion.
     #[test]
-    fn deterministic_tiebreak_by_path() {
+    fn identical_vectors_get_equal_scores() {
         let mk = || {
             let mut v = [0.0; N_SIGNALS];
             v[0] = 0.5;
@@ -233,14 +265,43 @@ mod tests {
         let run1 = fuse(&files, weights, RRF_K);
         let run2 = fuse(&files, weights, RRF_K);
         assert_eq!(run1, run2, "fusion must be reproducible");
-
-        // "a.rs" sorts before "b.rs" ⇒ rank 1 ⇒ strictly higher fused score,
-        // even though the two signal vectors are identical.
-        // files[1] is "a.rs".
         assert!(
-            run1[1] > run1[0],
-            "a.rs (path-first, rank 1) should score above b.rs: {:?}",
-            run1
+            eq(run1[0], run1[1]),
+            "identical signal vectors must fuse to equal scores (no path bias): {run1:?}"
+        );
+    }
+
+    /// The C1 defect (ADR-0190): a uniform (non-discriminating) weighted signal
+    /// must not overturn a genuinely informative one. Under the old ordinal
+    /// ranking the all-zero signal below spread files by path and exactly
+    /// canceled signal 0, tying the strictly-better file with the worse one (and,
+    /// with more uniform weight, letting the worse file win by filename).
+    /// Competition ranking gives every file rank 1 on a uniform signal, so it
+    /// adds an identical constant and cannot reorder.
+    #[test]
+    fn uniform_signal_cannot_overturn_informative_signal() {
+        // signal 0 is informative (zzz strictly beats aaa); signal 1 is uniform.
+        let mk = |s0: f64| {
+            let mut v = [0.0; N_SIGNALS];
+            v[0] = s0;
+            v[1] = 0.0; // uniform across both files
+            v
+        };
+        // "zzz_winner" sorts AFTER "aaa_loser" — the worst case for path bias.
+        let files = vec![
+            ("zzz_winner".to_string(), mk(0.9)),
+            ("aaa_loser".to_string(), mk(0.1)),
+        ];
+        let mut weights = [0.0; N_SIGNALS];
+        weights[0] = 0.5;
+        weights[1] = 0.5; // equal weight to the uniform signal — the cancellation case
+
+        let scores = fuse(&files, weights, RRF_K);
+        assert!(
+            scores[0] > scores[1],
+            "informative winner ({}) must strictly beat the path-favored loser ({})",
+            scores[0],
+            scores[1]
         );
     }
 

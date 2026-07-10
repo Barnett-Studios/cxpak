@@ -348,7 +348,7 @@ v2.0.0 establishes semver for the MCP API. Tool names, parameters, and response 
 
 ## Architecture decisions
 
-Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution. Records 0001-0162 were reconstructed across v0.1.0 -> v2.2.1; 0163 onward are written at decision time, now through 0189 (v3.0.0). Start with [the index](docs/adrs/INDEX.md).
+Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution. Records 0001-0162 were reconstructed across v0.1.0 -> v2.2.1; 0163 onward are written at decision time, now through 0190 (v3.0.0). Start with [the index](docs/adrs/INDEX.md).
 
 ## License
 
