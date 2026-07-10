@@ -3,9 +3,10 @@
 //!
 //! This counts the NEW capability catalog → MCP adapter (intent-tools grouped
 //! from `catalog()`), NOT the legacy 26-tool array hand-declared in
-//! `src/commands/serve.rs`. The 26→8 consolidation of the legacy handler is a
-//! later task (C3); this gate locks the ceiling in *now* so every capability
-//! added to the catalog later rides as an op/param under an existing
+//! `src/commands/serve.rs`. The 26→8 consolidation is delivered (the served
+//! surface is the intent-tool set; the 26 legacy names resolve as aliases and
+//! are not listed as top-level tools); this gate locks the ceiling in so every
+//! capability added to the catalog later rides as an op/param under an existing
 //! intent-tool rather than as a new top-level MCP tool.
 
 use cxpak::capability::adapter::mcp_tools;

@@ -73,8 +73,19 @@ pub fn to_mermaid(layout: &ComputedLayout) -> String {
 }
 
 /// Escapes special XML characters in attribute values and text content.
+///
+/// C0 control bytes that are illegal in XML 1.0 (everything below U+0020 except
+/// tab/LF/CR) have no valid representation — not even a numeric char ref — so
+/// they are dropped before escaping. Node labels and repo names come from
+/// git-tracked paths/symbols, which on Unix may legally contain such bytes; a
+/// stray one would otherwise emit XML no conformant parser can load.
+/// ponytail: strips C0 only — U+FFFE/U+FFFF and other Unicode noncharacters
+/// (astronomically unlikely in a path) are left to the caller.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
+    s.chars()
+        .filter(|&c| c == '\t' || c == '\n' || c == '\r' || c >= '\u{20}')
+        .collect::<String>()
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
@@ -1096,6 +1107,32 @@ mod tests {
         assert!(
             !xml.contains("a<b>&\"c.rs"),
             "raw unescaped chars leaked into XML:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn test_to_graphml_strips_xml_illegal_control_chars() {
+        // A git-tracked path can legally contain C0 control bytes on Unix.
+        // They are illegal in XML 1.0 and must not reach the output; tab/LF/CR
+        // are legal and must survive.
+        let mut g = DependencyGraph::new();
+        g.add_edge(
+            "src/a\u{01}b\u{0B}c\u{1F}\td.rs",
+            "src/db.rs",
+            EdgeType::Import,
+        );
+        let xml = to_graphml(&g, "r");
+        for illegal in ['\u{01}', '\u{0B}', '\u{1F}'] {
+            assert!(
+                !xml.contains(illegal),
+                "XML-illegal control char {:#04x} leaked into graphml output",
+                illegal as u32
+            );
+        }
+        // The three C0 controls are removed; the legal tab survives.
+        assert!(
+            xml.contains("<node id=\"src/abc\td.rs\">"),
+            "control chars not stripped as expected:\n{xml}"
         );
     }
 

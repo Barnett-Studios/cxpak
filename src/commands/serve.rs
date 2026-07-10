@@ -1104,7 +1104,13 @@ async fn v1_predict_handler(
         &idx.test_map,
         depth,
     );
-    Ok(axum::Json(serde_json::to_value(result).unwrap()))
+    Ok(axum::Json(serde_json::to_value(result).map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization_failed",
+            "could not serialize response",
+        )
+    })?))
 }
 
 /// `POST /v1/graph` — deterministic graph-query (cxpak 3.0.0 Task B1).
@@ -1187,7 +1193,13 @@ async fn v1_drift_handler(
     if let Some(ref prefix) = focus {
         report.hotspots.retain(|h| h.module.starts_with(prefix));
     }
-    Ok(axum::Json(serde_json::to_value(report).unwrap()))
+    Ok(axum::Json(serde_json::to_value(report).map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization_failed",
+            "could not serialize response",
+        )
+    })?))
 }
 
 async fn v1_security_surface_handler(
@@ -1218,7 +1230,13 @@ async fn v1_security_surface_handler(
         crate::intelligence::security::DEFAULT_AUTH_PATTERNS,
         focus_owned.as_deref(),
     );
-    Ok(axum::Json(serde_json::to_value(result).unwrap()))
+    Ok(axum::Json(serde_json::to_value(result).map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization_failed",
+            "could not serialize response",
+        )
+    })?))
 }
 
 async fn v1_data_flow_handler(
@@ -1252,7 +1270,13 @@ async fn v1_data_flow_handler(
         )
     })?;
     let result = crate::intelligence::data_flow::trace_data_flow(&symbol, None, depth, &idx);
-    Ok(axum::Json(serde_json::to_value(result).unwrap()))
+    Ok(axum::Json(serde_json::to_value(result).map_err(|_| {
+        v1_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization_failed",
+            "could not serialize response",
+        )
+    })?))
 }
 
 async fn v1_cross_lang_handler(
@@ -2825,7 +2849,7 @@ fn dispatch_capability_op(
         "context" => {
             let task = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
             if task.is_empty() {
-                return mcp_tool_result(
+                return mcp_tool_error(
                     id,
                     "Error: 'task' argument is required and must not be empty",
                 );
@@ -3106,7 +3130,7 @@ fn dispatch_capability_op(
         "context_for_task" => {
             let task = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
             if task.is_empty() {
-                return mcp_tool_result(
+                return mcp_tool_error(
                     id,
                     "Error: 'task' argument is required and must not be empty",
                 );
@@ -3191,7 +3215,7 @@ fn dispatch_capability_op(
                 .unwrap_or_default();
 
             if files.is_empty() {
-                return mcp_tool_result(
+                return mcp_tool_error(
                     id,
                     "Error: 'files' argument is required and must not be empty",
                 );
@@ -3425,13 +3449,13 @@ fn dispatch_capability_op(
         "search" => {
             let pattern = args.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
             if pattern.is_empty() {
-                return mcp_tool_result(
+                return mcp_tool_error(
                     id,
                     "Error: 'pattern' argument is required and must not be empty",
                 );
             }
             if pattern.len() > MAX_PATTERN_LEN {
-                return mcp_tool_result(
+                return mcp_tool_error(
                     id,
                     &format!(
                         "Error: pattern exceeds maximum length of {MAX_PATTERN_LEN} characters"
@@ -3504,7 +3528,7 @@ fn dispatch_capability_op(
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
             if files.is_empty() {
-                return mcp_tool_result(
+                return mcp_tool_error(
                     id,
                     "Error: 'files' argument is required and must not be empty",
                 );
@@ -3660,7 +3684,7 @@ fn dispatch_capability_op(
         "briefing" => {
             let task = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
             if task.is_empty() {
-                return mcp_tool_result(
+                return mcp_tool_error(
                     id,
                     "Error: 'task' argument is required and must not be empty",
                 );
@@ -3852,7 +3876,7 @@ fn dispatch_capability_op(
                 })
                 .unwrap_or_default();
             if files.is_empty() {
-                return mcp_tool_result(
+                return mcp_tool_error(
                     id,
                     "Error: 'files' argument is required and must not be empty",
                 );
@@ -3915,7 +3939,7 @@ fn dispatch_capability_op(
         "data_flow" => {
             let symbol = args.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
             if symbol.is_empty() {
-                return mcp_tool_result(
+                return mcp_tool_error(
                     id,
                     "Error: 'symbol' argument is required and must not be empty",
                 );
@@ -4098,11 +4122,11 @@ fn dispatch_capability_op(
                     let filepath = visual_dir.join(format!("cxpak-{validated_slug}.html"));
                     let canon_dir = match visual_dir.canonicalize() {
                         Ok(d) => d,
-                        Err(e) => return mcp_tool_result(id, &format!("canonicalize failed: {e}")),
+                        Err(e) => return mcp_tool_error(id, &format!("canonicalize failed: {e}")),
                     };
                     let canon_file = match filepath.parent().unwrap().canonicalize() {
                         Ok(p) => p,
-                        Err(e) => return mcp_tool_result(id, &format!("canonicalize failed: {e}")),
+                        Err(e) => return mcp_tool_error(id, &format!("canonicalize failed: {e}")),
                     };
                     if !canon_file.starts_with(&canon_dir) {
                         return mcp_tool_error(id, "Error: path escape detected");
@@ -4125,7 +4149,7 @@ fn dispatch_capability_op(
             #[cfg(not(feature = "visual"))]
             {
                 let _ = (visual_type, format, focus, symbol, files_arg);
-                mcp_tool_result(
+                mcp_tool_error(
                     id,
                     "Error: cxpak_visual requires the 'visual' feature flag. Rebuild with: cargo build --features visual",
                 )
@@ -4151,7 +4175,7 @@ fn dispatch_capability_op(
             #[cfg(not(feature = "visual"))]
             {
                 let _ = (focus, format);
-                mcp_tool_result(
+                mcp_tool_error(
                     id,
                     "Error: cxpak_onboard requires the 'visual' feature flag. Rebuild with: cargo build --features visual",
                 )
@@ -5183,6 +5207,31 @@ mod tests {
         assert!(
             resp["result"]["content"][0]["text"].as_str().is_some(),
             "error result must carry text content"
+        );
+    }
+
+    #[test]
+    fn test_handle_tool_call_missing_required_arg_sets_is_error() {
+        // A missing/empty required argument is a tool-execution error, not a
+        // valid answer: it must return `isError: true` (same contract as an
+        // invalid op) so the client/LLM can't mistake the message for content.
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(8)),
+            "cxpak_context",
+            &json!({}), // no "task" → empty → argument-validation error
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        assert!(
+            resp.get("error").is_none(),
+            "arg-validation error must not be a JSON-RPC protocol error: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "missing required arg must set isError:true: {resp}"
         );
     }
 

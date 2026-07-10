@@ -112,9 +112,10 @@ pub fn allocate_and_pack_with_cross_lang(
     // at the token budget packs a different file set across processes. The path
     // tiebreak makes the packing order a strict total order and reproducible.
     target_files.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
+        // `total_cmp` (not `partial_cmp`) for a strict total order consistent
+        // with the seed/noise/reranker sorts — a stray NaN can't collapse to
+        // Equal and leak incoming (HashMap) order into the packed set.
+        b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
     });
 
     let mut packed_targets: Vec<PackedFile> = Vec::new();

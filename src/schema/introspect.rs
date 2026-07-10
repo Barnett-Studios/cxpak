@@ -292,14 +292,19 @@ async fn reflect_postgres(dsn: &str) -> Result<ReflectedSchema, IntrospectError>
         .await
         .map_err(|_| IntrospectError::Query("column reflection query failed"))?;
 
+    // `try_get` (not the panicking `get`) so a non-standard catalog row shape
+    // from a Postgres-wire-compatible engine surfaces as a clean, DSN-free
+    // IntrospectError instead of unwinding the reflection task.
+    const COL_SHAPE: IntrospectError =
+        IntrospectError::Query("column reflection returned an unexpected row shape");
     let mut columns = Vec::with_capacity(column_rows.len());
     for row in &column_rows {
-        let table: String = row.get(0);
-        let column: String = row.get(1);
-        let data_type: String = row.get(2);
-        let is_nullable: String = row.get(3);
-        let default: Option<String> = row.get(4);
-        let is_pk: bool = row.get(5);
+        let table: String = row.try_get(0).map_err(|_| COL_SHAPE)?;
+        let column: String = row.try_get(1).map_err(|_| COL_SHAPE)?;
+        let data_type: String = row.try_get(2).map_err(|_| COL_SHAPE)?;
+        let is_nullable: String = row.try_get(3).map_err(|_| COL_SHAPE)?;
+        let default: Option<String> = row.try_get(4).map_err(|_| COL_SHAPE)?;
+        let is_pk: bool = row.try_get(5).map_err(|_| COL_SHAPE)?;
         columns.push(ReflectedColumn {
             table,
             column,
@@ -315,13 +320,15 @@ async fn reflect_postgres(dsn: &str) -> Result<ReflectedSchema, IntrospectError>
         .await
         .map_err(|_| IntrospectError::Query("foreign-key reflection query failed"))?;
 
+    const FK_SHAPE: IntrospectError =
+        IntrospectError::Query("foreign-key reflection returned an unexpected row shape");
     let mut foreign_keys = Vec::with_capacity(fk_rows.len());
     for row in &fk_rows {
         foreign_keys.push(ReflectedForeignKey {
-            table: row.get(0),
-            column: row.get(1),
-            target_table: row.get(2),
-            target_column: row.get(3),
+            table: row.try_get(0).map_err(|_| FK_SHAPE)?,
+            column: row.try_get(1).map_err(|_| FK_SHAPE)?,
+            target_table: row.try_get(2).map_err(|_| FK_SHAPE)?,
+            target_column: row.try_get(3).map_err(|_| FK_SHAPE)?,
         });
     }
 
