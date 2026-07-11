@@ -18,13 +18,13 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
     const CAP: usize = 20_000;
     let mut entries: Vec<SearchEntry> = Vec::new();
 
-    // 1. Views (6 fixed navigation entries). Lexicographically "view" > "symbol" > "module" > "file",
-    // so views will sort to the END of the final list after step 5. The cap branch at step 6 filters
-    // views explicitly to ensure they are always retained regardless of sort position.
+    // 1. Views (5 fixed navigation entries; Architecture + Risk merged into
+    // Explore per ADR-0173). Lexicographically "view" > "symbol" > "module" >
+    // "file", so views sort to the END after step 5. The cap branch at step 6
+    // filters views explicitly to ensure they are always retained.
     for (label, hash) in [
         ("Dashboard", "#dashboard"),
-        ("Architecture Explorer", "#architecture"),
-        ("Risk Heatmap", "#risk"),
+        ("Explore", "#explore"),
         ("Flow Diagram", "#flow"),
         ("Time Machine", "#timeline"),
         ("Diff View", "#diff"),
@@ -228,10 +228,15 @@ mod tests {
     }
 
     #[test]
-    fn includes_all_six_views() {
+    fn includes_all_five_views() {
         let index = make_test_index();
         let entries = build_search_index(&index);
-        assert_eq!(entries.iter().filter(|e| e.kind == "view").count(), 6);
+        // Architecture + Risk merged into Explore (ADR-0173).
+        assert_eq!(entries.iter().filter(|e| e.kind == "view").count(), 5);
+        assert!(entries
+            .iter()
+            .any(|e| e.kind == "view" && e.label == "Explore"));
+        assert!(!entries.iter().any(|e| e.target == "#architecture"));
     }
 
     #[test]

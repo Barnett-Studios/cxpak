@@ -56,18 +56,21 @@ fn contains_doctype_and_html_close() {
 }
 
 #[test]
-fn contains_all_six_view_containers() {
+fn contains_all_view_containers() {
+    // Architecture + Risk merged into Explore (ADR-0173).
     let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
     for id in [
         "view-dashboard",
-        "view-architecture",
-        "view-risk",
+        "view-explore",
         "view-flow",
         "view-timeline",
         "view-diff",
     ] {
         assert!(html.contains(&format!(r#"id="{id}""#)), "missing {id}");
     }
+    // Explore hosts both lens panels.
+    assert!(html.contains(r#"id="explore-deps""#));
+    assert!(html.contains(r#"id="explore-risk""#));
 }
 
 #[test]

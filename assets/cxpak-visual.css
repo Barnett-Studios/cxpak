@@ -497,6 +497,36 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
 
 .cxpak-minimap svg { width: 100%; height: 100%; }
 
+/* ── Explore lens toggle (Dependencies | Risk) ───────────────────── */
+
+#view-explore { display: flex; flex-direction: column; height: 100%; }
+.cxpak-lens-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+.cxpak-lens-toggle {
+  display: flex;
+  gap: 4px;
+  padding: 8px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.cxpak-lens-btn {
+  padding: 4px 14px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.cxpak-lens-btn:hover { color: var(--text-primary); border-color: var(--accent-blue); }
+.cxpak-lens-btn.active {
+  color: var(--bg-primary);
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+
 /* ── Breadcrumbs (Architecture Explorer) ─────────────────────────── */
 
 .cxpak-breadcrumbs {

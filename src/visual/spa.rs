@@ -1,4 +1,6 @@
-//! SPA renderer — composes all six views into one HTML file.
+//! SPA renderer — composes all views (Dashboard, Explore, Flow, Timeline,
+//! Diff) into one HTML file. Explore merges the former Architecture + Risk
+//! views under a lens toggle (ADR-0173).
 
 use crate::index::CodebaseIndex;
 use crate::visual::layout::{LayoutConfig, LayoutError};
@@ -11,6 +13,29 @@ static SPA_CONTROLLER: &str = include_str!("../../assets/cxpak-spa-controller.js
 /// Client-side palette registry + picker (ADR-0172). Applies CSS custom
 /// properties at runtime, so the emitted bytes never change with selection.
 static PALETTE_JS: &str = include_str!("../../assets/cxpak-palette.js");
+
+/// Wires the Explore lens toggle: swaps panel visibility and picks the initial
+/// lens (Risk by default; Dependencies when a drill-down param is present).
+static EXPLORE_LENS_JS: &str = r#"
+function _cxSetLens(lens) {
+  var isDeps = lens === 'deps';
+  var d = document.getElementById('explore-deps');
+  var r = document.getElementById('explore-risk');
+  if (d) d.hidden = !isDeps;
+  if (r) r.hidden = isDeps;
+  _exSection.querySelectorAll('.cxpak-lens-btn').forEach(function(b) {
+    var on = b.getAttribute('data-lens') === lens;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  var live = document.getElementById('cxpak-live');
+  if (live) live.textContent = isDeps ? 'Dependencies lens' : 'Risk lens';
+}
+_exSection.querySelectorAll('.cxpak-lens-btn').forEach(function(b) {
+  b.onclick = function() { _cxSetLens(b.getAttribute('data-lens')); };
+});
+_cxSetLens((CX.state.lens === 'deps' || CX.state.file || CX.state.module) ? 'deps' : 'risk');
+"#;
 
 /// Delegates to `render::escape_script_tag` — the single canonical
 /// implementation — so SPA and standalone renders always produce identical
@@ -51,8 +76,8 @@ pub fn render_spa_with_timeline(
     let dashboard_data = render::build_dashboard_data(index);
     // An empty index produces LayoutError::Empty from the module layout step.
     // That is not a bug — it simply means there are no files to visualise.
-    // The SPA must still render all six view containers so the controller can
-    // boot cleanly; the architecture view will display an empty graph.
+    // The SPA must still render every view container so the controller can
+    // boot cleanly; the Explore graph lens will display an empty graph.
     let arch_data = match render::build_architecture_explorer_data(index, &cfg) {
         Ok(d) => d,
         Err(LayoutError::Empty) => render::ArchitectureExplorerData {
@@ -160,8 +185,10 @@ pub fn render_spa_with_timeline(
     // reach a non-dashboard view.
     html.push_str("      <nav class=\"cxpak-nav\" role=\"tablist\" aria-label=\"Views\">\n");
     html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"dashboard\" href=\"#dashboard\" role=\"tab\" aria-selected=\"true\" tabindex=\"0\">Dashboard</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"architecture\" href=\"#architecture\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Architecture</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"risk\" href=\"#risk\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Risk</a>\n");
+    // Explore merges the former Architecture + Risk tabs under one mode with a
+    // Dependencies|Risk lens toggle (ADR-0173). Legacy #architecture / #risk
+    // hashes redirect here (see the controller's parseHash).
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"explore\" href=\"#explore\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Explore</a>\n");
     html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"flow\" href=\"#flow\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Flow</a>\n");
     html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"timeline\" href=\"#timeline\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Timeline</a>\n");
     html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"diff\" href=\"#diff\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Diff</a>\n");
@@ -173,17 +200,26 @@ pub fn render_spa_with_timeline(
     html.push_str("    </header>\n");
     html.push_str("    <noscript>\n");
     html.push_str("      <div style=\"padding:24px 32px;border:1px solid var(--accent-yellow);border-radius:8px;margin:16px;color:var(--text-primary);background:var(--bg-card)\">\n");
-    html.push_str("        <strong>JavaScript required.</strong> The cxpak dashboard is a single-page app that renders six interactive views (Dashboard, Architecture, Risk, Flow, Timeline, Diff) entirely in the browser. Without JavaScript the views below remain empty.\n");
+    html.push_str("        <strong>JavaScript required.</strong> The cxpak dashboard is a single-page app that renders five interactive views (Dashboard, Explore, Flow, Timeline, Diff) entirely in the browser. Without JavaScript the views below remain empty.\n");
     html.push_str("        <br><br>\n");
     html.push_str("        For a JS-free overview of this codebase, run <code>cxpak overview</code> on the command line, which produces a token-budgeted text/markdown report with the same intelligence (PageRank, blast radius, dead code, conventions) backing this dashboard.\n");
     html.push_str("      </div>\n");
     html.push_str("    </noscript>\n");
     html.push_str("    <main id=\"cxpak-main\">\n");
     html.push_str("      <section id=\"view-dashboard\" class=\"cxpak-view\"></section>\n");
+    // Explore hosts both lenses. The Risk panel is visible by default so the
+    // treemap's clientWidth measurement is non-zero at render time; the init
+    // flips to the Dependencies lens when a drill-down param is present.
+    html.push_str("      <section id=\"view-explore\" class=\"cxpak-view\" hidden>\n");
     html.push_str(
-        "      <section id=\"view-architecture\" class=\"cxpak-view\" hidden></section>\n",
+        "        <div class=\"cxpak-lens-toggle\" role=\"tablist\" aria-label=\"Explore lens\">\n",
     );
-    html.push_str("      <section id=\"view-risk\" class=\"cxpak-view\" hidden></section>\n");
+    html.push_str("          <button class=\"cxpak-lens-btn\" data-lens=\"deps\" role=\"tab\" aria-selected=\"false\">Dependencies</button>\n");
+    html.push_str("          <button class=\"cxpak-lens-btn active\" data-lens=\"risk\" role=\"tab\" aria-selected=\"true\">Risk</button>\n");
+    html.push_str("        </div>\n");
+    html.push_str("        <div id=\"explore-deps\" class=\"cxpak-lens-panel\" hidden></div>\n");
+    html.push_str("        <div id=\"explore-risk\" class=\"cxpak-lens-panel\"></div>\n");
+    html.push_str("      </section>\n");
     html.push_str("      <section id=\"view-flow\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("      <section id=\"view-timeline\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("      <section id=\"view-diff\" class=\"cxpak-view\" hidden></section>\n");
@@ -218,7 +254,7 @@ pub fn render_spa_with_timeline(
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Cmd/Ctrl+K</kbd> or <kbd>/</kbd></span><span class=\"cxpak-inspector-value\">Open command palette</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>\u{2191}</kbd> <kbd>\u{2193}</kbd></span><span class=\"cxpak-inspector-value\">Navigate palette items</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Enter</kbd></span><span class=\"cxpak-inspector-value\">Select palette item</span></div>\n");
-    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>1</kbd>\u{2013}<kbd>6</kbd></span><span class=\"cxpak-inspector-value\">Switch to Dashboard / Architecture / Risk / Flow / Timeline / Diff</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>1</kbd>\u{2013}<kbd>5</kbd></span><span class=\"cxpak-inspector-value\">Switch to Dashboard / Explore / Flow / Timeline / Diff</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>t</kbd></span><span class=\"cxpak-inspector-value\">Toggle dark / light theme</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>?</kbd></span><span class=\"cxpak-inspector-value\">This help overlay</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Esc</kbd></span><span class=\"cxpak-inspector-value\">Close palette / inspector / help overlay</span></div>\n");
@@ -324,8 +360,6 @@ pub fn render_spa_with_timeline(
 
     for (key, js) in [
         ("dashboard", render::dashboard_js()),
-        ("architecture", render::architecture_js()),
-        ("risk", render::risk_js()),
         ("flow", render::flow_js()),
         ("timeline", render::timeline_js()),
         ("diff", render::diff_js()),
@@ -336,6 +370,25 @@ pub fn render_spa_with_timeline(
         html.push_str(js);
         html.push_str("\n}); };\n</script>\n");
     }
+
+    // Explore mode: renders both lenses into their panels, reusing the
+    // architecture (Dependencies) and risk (Risk) renderers verbatim, each
+    // scoped to its own panel via CX.app. A lens toggle swaps visibility
+    // (encoding-only; both stay in the DOM). Default lens = Risk, unless a
+    // drill-down param (file/module) or ?lens=deps selects Dependencies.
+    html.push_str(
+        "  <script>\nCX.init['explore'] = function() { _cxpakRunView('explore', function() {\n",
+    );
+    html.push_str("var _exSection = document.getElementById('view-explore');\n");
+    html.push_str("CX.app = document.getElementById('explore-deps');\n(function() {\n");
+    html.push_str(render::architecture_js());
+    html.push_str("\n})();\n");
+    html.push_str("CX.app = document.getElementById('explore-risk');\n(function() {\n");
+    html.push_str(render::risk_js());
+    html.push_str("\n})();\n");
+    html.push_str("CX.app = _exSection;\n");
+    html.push_str(EXPLORE_LENS_JS);
+    html.push_str("\n}); };\n</script>\n");
 
     html.push_str("</body>\n");
     html.push_str("</html>\n");

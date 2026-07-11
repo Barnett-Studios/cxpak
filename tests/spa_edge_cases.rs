@@ -26,8 +26,7 @@ fn spa_renders_with_zero_files_index() {
     assert!(html.starts_with("<!DOCTYPE html>"));
     for id in [
         "view-dashboard",
-        "view-architecture",
-        "view-risk",
+        "view-explore",
         "view-flow",
         "view-timeline",
         "view-diff",

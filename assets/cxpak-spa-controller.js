@@ -62,7 +62,7 @@
   // =============================================================================
   // 2) ROUTER
   // =============================================================================
-  var VIEWS = ['dashboard','architecture','risk','flow','timeline','diff'];
+  var VIEWS = ['dashboard','explore','flow','timeline','diff'];
   var initialized = {};
   CX._initialized = initialized; // expose for toggleTheme re-render
 
@@ -81,6 +81,10 @@
         }
       });
     }
+    // Legacy deep-links (#architecture / #risk, incl. palette file/module
+    // targets) redirect to the merged Explore mode; the lens param survives.
+    if (name === 'architecture') { name = 'explore'; if (!params.lens) params.lens = 'deps'; }
+    else if (name === 'risk') { name = 'explore'; if (!params.lens) params.lens = 'risk'; }
     if (VIEWS.indexOf(name) < 0) name = 'dashboard';
     return { name: name, params: params };
   }
@@ -115,6 +119,7 @@
     CX.state.module = parsed.params.module || null;
     CX.state.file = parsed.params.file || null;
     CX.state.symbol = parsed.params.symbol || null;
+    CX.state.lens = parsed.params.lens || null;
 
     // Interrupt old, close inspector
     if (CX.state.view && CX.state.view !== newView) {
@@ -147,8 +152,7 @@
     if (live) {
       var hint = {
         dashboard: 'Dashboard view with health, risks, and alerts',
-        architecture: 'Architecture view with module graph',
-        risk: 'Risk heatmap view',
+        explore: 'Explore view with Dependencies and Risk lenses',
         flow: 'Flow diagram view',
         timeline: 'Timeline view',
         diff: 'Diff view',
@@ -593,7 +597,7 @@
       if (CX.state.inspector) { closeInspector(); return; }
       if (CX.state.helpOverlayOpen) { closeHelp(); return; }
     }
-    if (['1','2','3','4','5','6'].indexOf(ev.key) >= 0 && !CX.state.paletteOpen) {
+    if (['1','2','3','4','5'].indexOf(ev.key) >= 0 && !CX.state.paletteOpen) {
       var v = VIEWS[parseInt(ev.key) - 1];
       if (v) { CX.pushHash('#' + v); navigate(); }
     }
