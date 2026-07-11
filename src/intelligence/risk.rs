@@ -9,6 +9,7 @@ pub struct RiskEntry {
     pub blast_radius: usize,
     pub test_coverage: f64,
     pub risk_score: f64,
+    pub risk_percentile: f64,
 }
 
 /// Compute standing risk per file, sorted descending by risk_score.
@@ -114,6 +115,7 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
                 blast_radius: blast_count,
                 test_coverage,
                 risk_score,
+                risk_percentile: 0.0,
             }
         })
         .collect();
@@ -124,6 +126,14 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.path.cmp(&b.path))
     });
+    let n = entries.len();
+    for (i, e) in entries.iter_mut().enumerate() {
+        e.risk_percentile = if n <= 1 {
+            1.0
+        } else {
+            (n - 1 - i) as f64 / (n - 1) as f64
+        };
+    }
     entries
 }
 
@@ -194,6 +204,7 @@ mod tests {
             blast_radius: 10,
             test_coverage: 0.0,
             risk_score: 0.42,
+            risk_percentile: 0.5,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"path\":\"src/main.rs\""));
