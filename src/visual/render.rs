@@ -343,18 +343,23 @@ function navTo(view) {
    (ADR-0174). No-op outside SPA context (standalone views lack CX.openInspector). */
 function proveRisk(r) {
   if (!(window.CX && typeof window.CX.openInspector === 'function')) return;
-  var deriv = r.risk_score.toFixed(4) + ' = churn(' + r.churn_term.toFixed(2)
-    + ') × blast(' + r.blast_term.toFixed(3)
-    + ') × test_penalty(' + r.test_penalty_term.toFixed(1) + ')';
+  // 3 significant figures per factor so the shown product actually reproduces
+  // the score: a tested file's test-penalty is ~0.01 and toFixed(1) would render
+  // it as "0.0", making the derivation read as × 0 (a false, self-contradicting
+  // proof). toPrecision keeps enough digits without exponential notation here.
+  function pterm(x) { return x.toPrecision(3); }
+  var deriv = r.risk_score.toFixed(4) + ' = churn(' + pterm(r.churn_term)
+    + ') × blast(' + pterm(r.blast_term)
+    + ') × test_penalty(' + pterm(r.test_penalty_term) + ')';
   window.CX.openInspector(
     { id: r.path, label: r.path, metadata: { risk_score: r.risk_score } },
     { fields: [
         ['Derivation', deriv],
         ['Risk percentile', Math.round(r.risk_percentile * 100) + 'th'],
         ['Risk score (absolute)', r.risk_score.toFixed(4)],
-        ['Churn term', r.churn_term.toFixed(2)],
-        ['Blast term', r.blast_term.toFixed(3)],
-        ['Test penalty', r.test_penalty_term.toFixed(1)],
+        ['Churn term', pterm(r.churn_term)],
+        ['Blast term', pterm(r.blast_term)],
+        ['Test penalty', pterm(r.test_penalty_term)],
       ] }
   );
 }
@@ -366,7 +371,7 @@ CX.app.appendChild(grid);
 /* Q1: Health gauge */
 var q1 = document.createElement('div');
 q1.className = 'cxpak-quadrant cxpak-clickable';
-q1.title = 'View architecture explorer';
+q1.title = 'Open Explore (Dependencies)';
 q1.onclick = function() { navTo('architecture'); };
 q1.innerHTML = '<div class="cxpak-quadrant-title">Health Score</div>';
 var gw = document.createElement('div'); gw.className = 'cxpak-gauge-wrap';
@@ -476,7 +481,7 @@ grid.appendChild(q2);
 /* Q3: Architecture mini-map */
 var q3 = document.createElement('div');
 q3.className = 'cxpak-quadrant cxpak-clickable';
-q3.title = 'Open architecture explorer';
+q3.title = 'Open Explore (Dependencies)';
 q3.onclick = function() { navTo('architecture'); };
 q3.appendChild(CX.h('div', {class: 'cxpak-quadrant-title'}, [
   'Architecture (',
@@ -510,9 +515,13 @@ if (alerts.length === 0) {
     var sev = a.severity || 'Low';
     var icon = sev === 'High' ? '!!' : sev === 'Medium' ? '!' : 'i';
     var link = (a.link_view || 'Dashboard');
+    // Architecture + Risk collapsed into Explore (ADR-0173): navTo still uses the
+    // legacy hash so parseHash redirects to the right lens, but the human label
+    // must name the view the user actually lands on.
+    var linkLabel = (link === 'Architecture' || link === 'Risk') ? 'Explore' : link;
     var item = document.createElement('div');
     item.className = 'cxpak-alert-item sev-' + sev + ' cxpak-clickable';
-    item.title = 'View details in ' + link + ' view';
+    item.title = 'View details in ' + linkLabel + ' view';
     item.onclick = (function(target) {
       return function() { navTo(target.toLowerCase()); };
     })(link);
@@ -721,7 +730,7 @@ groups.filter(function(d) { return !d.children; })
         fields: [
           ['Path', t.path || d.data.label],
           ['Risk percentile', Math.round(d.data.risk_percentile * 100) + 'th'],
-          ['Risk score (absolute)', CX.format.score(d.data.risk_score * 100)],
+          ['Risk score (absolute)', d.data.risk_score.toFixed(4)],
           ['Severity', d.data.severity],
           ['Churn (30d)', t.churn_30d || 0],
           ['Blast radius', t.blast_radius || 0],
@@ -742,7 +751,7 @@ groups.filter(function(d) { return !d.children; })
         fields: [
           ['Path', t.path || d.data.label],
           ['Risk percentile', Math.round(d.data.risk_percentile * 100) + 'th'],
-          ['Risk score (absolute)', CX.format.score(d.data.risk_score * 100)],
+          ['Risk score (absolute)', d.data.risk_score.toFixed(4)],
           ['Severity', d.data.severity],
           ['Churn (30d)', t.churn_30d || 0],
           ['Blast radius', t.blast_radius || 0],
@@ -766,6 +775,11 @@ groups.filter(function(d) { return !d.children; })
 
 window.addEventListener('resize', function() {
   var nw = wrap.clientWidth, nh = wrap.clientHeight;
+  // When the treemap's panel is hidden (e.g. the Explore Dependencies lens is
+  // active) clientWidth/Height are 0. Re-laying out at 0×0 permanently collapses
+  // every cell with no recovery on re-show, so ignore resizes while hidden — the
+  // lens toggle re-dispatches resize once the panel is visible again.
+  if (nw <= 0 || nh <= 0) return;
   svg.attr('width', nw).attr('height', nh);
   d3.treemap().size([nw, nh]).padding(2).paddingTop(18).round(true)(root);
   groups.attr('transform', function(d) { return 'translate(' + d.x0 + ',' + d.y0 + ')'; });
@@ -781,9 +795,17 @@ function riskLegItem(bg, label) {
     label,
   ]);
 }
-leg.appendChild(riskLegItem('#06d6a0', 'Low risk (<0.4)'));
-leg.appendChild(riskLegItem('#ffd166', 'Medium (0.4\u20130.7)'));
-leg.appendChild(riskLegItem('#ef476f', 'High risk (>0.7)'));
+/* Colour encodes within-repo risk PERCENTILE (ADR-0179), not the absolute
+   score \u2014 so the legend must name the relative scale. On a small repo this is
+   what keeps a trivial file from reading as "high risk" just because it ranks
+   top of a low-risk pack. */
+var legNote = document.createElement('span');
+legNote.className = 'cxpak-legend-note';
+legNote.textContent = 'Risk percentile (within repo):';
+leg.appendChild(legNote);
+leg.appendChild(riskLegItem('#06d6a0', 'lower'));
+leg.appendChild(riskLegItem('#ffd166', 'median'));
+leg.appendChild(riskLegItem('#ef476f', 'higher'));
 wrap.appendChild(leg);
 "#
 }

@@ -30,11 +30,30 @@ function _cxSetLens(lens) {
   });
   var live = document.getElementById('cxpak-live');
   if (live) live.textContent = isDeps ? 'Dependencies lens' : 'Risk lens';
+  // Showing the Risk treemap: re-fit it to the now-visible panel. Its resize
+  // handler ignores zero-size (hidden) events, so a window resize that happened
+  // while this lens was hidden left the treemap un-fitted — heal it on show.
+  if (!isDeps) { try { window.dispatchEvent(new Event('resize')); } catch (e) {} }
 }
 _exSection.querySelectorAll('.cxpak-lens-btn').forEach(function(b) {
   b.onclick = function() { _cxSetLens(b.getAttribute('data-lens')); };
 });
-_cxSetLens((CX.state.lens === 'deps' || CX.state.file || CX.state.module) ? 'deps' : 'risk');
+// The route selects the lens: an explicit ?lens=deps or a file/module drill →
+// Dependencies; ?lens=risk → Risk; a plain #explore names nothing.
+function _cxLensFromRoute() {
+  if (CX.state.lens === 'deps' || CX.state.file || CX.state.module) return 'deps';
+  if (CX.state.lens === 'risk') return 'risk';
+  return null;
+}
+_cxSetLens(_cxLensFromRoute() || 'risk');
+// Explore inits once, so re-apply the lens on RE-navigation — otherwise a later
+// #architecture / #risk / palette deep-link would keep the stale lens. Only
+// override when the route names one; a plain #explore preserves the user's toggle.
+CX.update = CX.update || {};
+CX.update['explore'] = function() {
+  var want = _cxLensFromRoute();
+  if (want) _cxSetLens(want);
+};
 "#;
 
 /// Delegates to `render::escape_script_tag` — the single canonical
@@ -109,9 +128,20 @@ pub fn render_spa_with_timeline(
     // search_index::SearchIndex).  None contains a custom `Serialize` impl that
     // could fail.  An infallible-fallback `unwrap_or_else(|_| "null".into())`
     // would only mask a corrupted build, not handle a real runtime failure.
+    // timeline_js consumes the {steps, current_index, health_sparkline} view-model
+    // (TimeMachineData), NOT a raw Vec<TimelineSnapshot> — injecting the snapshots
+    // verbatim leaves `tl.steps` undefined and the view falls back to its
+    // "insufficient git history" empty state. Build the same view-model the
+    // standalone Time Machine renderer uses (render::build_time_machine_data).
     let timeline_json = match timeline {
         Some(snaps) if !snaps.is_empty() => {
-            serde_json::to_string(snaps).expect("TimelineSnapshot serialization is infallible")
+            match render::build_time_machine_data(snaps.to_vec(), &cfg) {
+                Ok(tm) => {
+                    serde_json::to_string(&tm).expect("TimeMachineData serialization is infallible")
+                }
+                // Empty/degenerate history → null → the view's own empty state.
+                Err(_) => "null".into(),
+            }
         }
         _ => "null".into(),
     };
@@ -255,6 +285,7 @@ pub fn render_spa_with_timeline(
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>\u{2191}</kbd> <kbd>\u{2193}</kbd></span><span class=\"cxpak-inspector-value\">Navigate palette items</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Enter</kbd></span><span class=\"cxpak-inspector-value\">Select palette item</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>1</kbd>\u{2013}<kbd>5</kbd></span><span class=\"cxpak-inspector-value\">Switch to Dashboard / Explore / Flow / Timeline / Diff</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>p</kbd></span><span class=\"cxpak-inspector-value\">Prove the focused risk score (Overview)</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>t</kbd></span><span class=\"cxpak-inspector-value\">Toggle dark / light theme</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>?</kbd></span><span class=\"cxpak-inspector-value\">This help overlay</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Esc</kbd></span><span class=\"cxpak-inspector-value\">Close palette / inspector / help overlay</span></div>\n");

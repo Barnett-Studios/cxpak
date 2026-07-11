@@ -100,6 +100,20 @@ fn render_embeds_injected_timeline_and_defaults_to_null() {
         with.contains("abc123"),
         "injected timeline snapshot is embedded"
     );
+    // The renderer (timeline_js) consumes the {steps, current_index,
+    // health_sparkline} view-model, NOT a raw snapshot array. Assert the injected
+    // JSON carries that shape, so a raw-array regression (which shows the empty
+    // state despite embedded snapshots) fails here instead of only in the browser.
+    let tag = with
+        .split("id=\"cxpak-timeline\" type=\"application/json\">")
+        .nth(1)
+        .and_then(|s| s.split("</script>").next())
+        .expect("timeline data tag present");
+    assert!(
+        tag.contains("\"steps\"") && tag.contains("\"health_sparkline\""),
+        "timeline injected as the TimeMachineData view-model, not a raw snapshot array; got: {}",
+        &tag[..tag.len().min(120)]
+    );
 
     let without = cxpak::visual::spa::render_spa(&idx, &meta()).unwrap();
     assert!(

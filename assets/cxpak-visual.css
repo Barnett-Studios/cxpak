@@ -486,6 +486,13 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
   flex-shrink: 0;
 }
 
+.cxpak-legend-note {
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  margin-bottom: 2px;
+}
+
 /* Architecture mini-map (inside dashboard quadrant) */
 .cxpak-minimap {
   flex: 1;
