@@ -24,9 +24,32 @@ pub struct SurprisingLink {
 /// **no** Import edge in `index.graph` (in either direction), scored by the
 /// edge's `recency_weight`, sorted by descending score then `(a, b)`.
 pub fn surprising_connections(index: &CodebaseIndex) -> Vec<SurprisingLink> {
-    // RED baseline (node N1): the real filter is delegated to the local
-    // cascade. Returns an empty set so the acceptance test fails on the
-    // "unimported pair must surface" assertion until the body is filled.
-    let _ = index;
-    Vec::new()
+    let mut links: Vec<SurprisingLink> = index
+        .co_changes
+        .iter()
+        .filter(|e| {
+            let a_imports_b = index
+                .graph
+                .dependencies(&e.file_a)
+                .is_some_and(|deps| deps.iter().any(|t| t.target == e.file_b));
+            let b_imports_a = index
+                .graph
+                .dependencies(&e.file_b)
+                .is_some_and(|deps| deps.iter().any(|t| t.target == e.file_a));
+            !(a_imports_b || b_imports_a)
+        })
+        .map(|e| SurprisingLink {
+            a: e.file_a.clone(),
+            b: e.file_b.clone(),
+            co_change_score: e.recency_weight,
+        })
+        .collect();
+    links.sort_by(|l, r| {
+        r.co_change_score
+            .partial_cmp(&l.co_change_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| l.a.cmp(&r.a))
+            .then_with(|| l.b.cmp(&r.b))
+    });
+    links
 }

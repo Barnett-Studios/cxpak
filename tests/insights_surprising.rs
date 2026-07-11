@@ -39,7 +39,10 @@ fn surprising_connections_is_deterministic() {
         .co_change("C", "D", 0.8)
         .co_change("E", "F", 0.8)
         .build();
-    assert_eq!(surprising_connections(&index), surprising_connections(&index));
+    assert_eq!(
+        surprising_connections(&index),
+        surprising_connections(&index)
+    );
 }
 
 #[test]
@@ -50,5 +53,8 @@ fn surprising_connection_score_is_the_cochange_recency_weight() {
         .iter()
         .find(|l| unordered_eq(l, "C", "D"))
         .expect("C-D surfaces");
-    assert!((cd.co_change_score - 0.8).abs() < 1e-9, "score is recency_weight");
+    assert!(
+        (cd.co_change_score - 0.8).abs() < 1e-9,
+        "score is recency_weight"
+    );
 }
