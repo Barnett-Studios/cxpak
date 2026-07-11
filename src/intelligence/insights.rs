@@ -2,9 +2,10 @@
 //! LLM-narrated codebase, computed from existing signals with zero inference.
 //!
 //! The flagship is [`surprising_connections`]: file pairs that change together
-//! but have no direct import edge — computed today by no renderer, surfaced
-//! here for the Overview. Correlational, so honestly labelled `~ estimated` at
-//! the UI layer (the proof-tick contract, ADR-0193).
+//! but have no direct dependency edge (of ANY type — Import, ForeignKey, etc.)
+//! linking them — computed today by no renderer, surfaced here for the Overview.
+//! Correlational, so honestly labelled `~ estimated` at the UI layer (the
+//! proof-tick contract, ADR-0193).
 
 use crate::index::CodebaseIndex;
 use serde::Serialize;
@@ -21,8 +22,13 @@ pub struct SurprisingLink {
 }
 
 /// Return every `index.co_changes` pair whose unordered `(file_a, file_b)` has
-/// **no** Import edge in `index.graph` (in either direction), scored by the
-/// edge's `recency_weight`, sorted by descending score then `(a, b)`.
+/// **no** direct dependency edge in `index.graph` in either direction, scored by
+/// the edge's `recency_weight`, sorted by descending score then `(a, b)`.
+///
+/// The exclusion spans EVERY edge type (`graph.dependencies()` returns all
+/// `TypedEdge`s, not just `Import`): a co-change pair joined by, say, a schema
+/// foreign-key edge is a known structural relationship and so is not
+/// "surprising". Imports are the common case, not the only one.
 pub fn surprising_connections(index: &CodebaseIndex) -> Vec<SurprisingLink> {
     let mut links: Vec<SurprisingLink> = index
         .co_changes

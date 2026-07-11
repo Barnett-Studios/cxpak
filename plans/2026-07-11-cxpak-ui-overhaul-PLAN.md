@@ -19,7 +19,7 @@ Full-overhaul of the `visual/` surface delivered in three phases. **MVP is 6 sli
 
 | Gate | Rule |
 |---|---|
-| Determinism | Generated HTML byte-identical within a platform; golden fixture `tests/spa_determinism.rs` (macOS-gated) stays green. New Rust float geometry rounds to a fixed grid before serialization (ADR-0177). |
+| Determinism | Generated HTML byte-identical within a platform; golden fixture `tests/spa_determinism.rs` (macOS-gated) stays green. New Rust float geometry rounds to a fixed grid before serialization (ADR-0196). |
 | No external origin | `!html.contains("cdn.jsdelivr.net")` (+ unpkg/cdnjs) must hold — asserted at `render.rs:3215`, `tests/spa_render.rs:93`, `tests/visual_cli.rs:405`. No webfont link. |
 | No LLM | Every surfaced value is a proven computation (ADR-0097). No inference path. |
 | No new deps | Reuse inlined D3 v7 (`assets/d3-bundle.min.js`), existing crates. |
@@ -64,7 +64,7 @@ Order is dependency-sorted: **N0 (test scaffolding) lands first — it gates eve
 History scrubber (Timeline+Diff merge) + default embedded diff; Coverage/Churn/Security lenses; adjacency-matrix toggle; repo-DNA barcode; bounded Flow-as-inspector-action. Depends on: N4 (timeline wired), N9 (Explore canvas), N6 (palette).
 
 ### Phase 3 (re-plan to nodes when reached)
-Live toggle + new `/v1/diff` (bearer-gated); full provenance coverage across every score; containment-as-overview; edge-bundling + semantic-zoom (Rust precompute, fixed-grid rounding per ADR-0177).
+Live toggle + new `/v1/diff` (bearer-gated); full provenance coverage across every score; containment-as-overview; edge-bundling + semantic-zoom (Rust precompute, fixed-grid rounding per ADR-0196).
 
 ---
 
@@ -296,7 +296,7 @@ fn index_with_builds_graph_cochanges_and_rankable_risk() {
 
 - **Unit (Rust):** the 6 RED tests above + per-node deterministic assertions; ≥90% on new code.
 - **SPA render tests:** extend `tests/spa_render.rs` / `spa_determinism.rs` for palette-determinism, percentile emission, no-dead-nav, provenance markup.
-- **Conformance:** broaden `cross_channel_consistency.rs` Visual arm from health-only to risk/pagerank/insight payloads (ADR-0180) — this is a Phase-2 test-debt item, tracked now.
+- **Conformance:** broaden `cross_channel_consistency.rs` Visual arm from health-only to risk/pagerank/insight payloads (ADR-0199) — this is a Phase-2 test-debt item, tracked now.
 - **A11y:** grayscale-survival of the risk ramp (new assertion alongside `spa_a11y.rs`); keyboard reach of prove/drawer/palette.
 - **Runner:** all execution via the `test-runner` subagent (captures full output).
 
@@ -304,10 +304,10 @@ fn index_with_builds_graph_cochanges_and_rankable_risk() {
 
 | Risk | Sev | Mitigation |
 |---|---|---|
-| New Rust float geometry breaks cross-platform determinism | Med | Fixed-grid coordinate rounding before serialization (ADR-0177); geometry is Phase 3 — MVP adds none. |
+| New Rust float geometry breaks cross-platform determinism | Med | Fixed-grid coordinate rounding before serialization (ADR-0196); geometry is Phase 3 — MVP adds none. |
 | Palette port bloats artifact / breaks golden | Low | Client-side only; determinism test in N6; ~19 token sets are small. |
 | Timeline persistence introduces a stale-cache bug | Med | Compute-on-miss fallback; bounded last-N; cache is git-ignorable, never a source artifact (N4). |
-| Provenance plumbing balloons the payload | Med | MVP scopes drawer to Overview risk+alerts only; long tail deferred to Live channel (ADR-0174/0178). |
+| Provenance plumbing balloons the payload | Med | MVP scopes drawer to Overview risk+alerts only; long tail deferred to Live channel (ADR-0193/0178). |
 | IA restructure breaks deep-links / muscle memory | Low | Acceptable for a major visual release; URL-hash addressing preserved. |
 
 ## Rollout

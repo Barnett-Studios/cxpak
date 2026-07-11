@@ -526,7 +526,7 @@ CX.renderGraph(cv.g, pl, {
   }
 });
 
-/* Q4: Signals (ADR-0191/0174). Restyle of the real detections — the chip is a
+/* Q4: Signals (ADR-0191/0193). Restyle of the real detections — the chip is a
    presentation label for a.kind, never a new or fabricated number. */
 var q4 = document.createElement('div'); q4.className = 'cxpak-quadrant';
 q4.innerHTML = '<div class="cxpak-quadrant-title">Signals<span class="cxpak-sheet">RANKED · PROVEN</span></div>';

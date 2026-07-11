@@ -25,16 +25,35 @@ fn git(dir: &Path, args: &[&str]) {
     assert!(ok, "git {args:?} failed");
 }
 
+/// Two commits with *divergent* structure so the test can prove each snapshot
+/// reflects its OWN tree, not the current (checked-out) one:
+/// - c1: `src/a.rs` ↔ `src/b.rs` form an import cycle (`use crate::b;` /
+///   `use crate::a;`), which the file-level SCC detector reports as one cycle.
+/// - c2: `src/b.rs` drops its `use crate::a;`, breaking the cycle.
+///
+/// The working tree ends on c2 (acyclic); a regression that stamped the
+/// current tree on every snapshot would show 0 cycles for BOTH commits.
 fn tiny_repo() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().unwrap();
     let p = dir.path();
     git(p, &["init", "--quiet"]);
     git(p, &["config", "user.email", "t@example.com"]);
     git(p, &["config", "user.name", "t"]);
-    std::fs::write(p.join("a.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::create_dir_all(p.join("src")).unwrap();
+    std::fs::write(
+        p.join("src/a.rs"),
+        "use crate::b::thing_b;\npub fn thing_a() { thing_b(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("src/b.rs"),
+        "use crate::a::thing_a;\npub fn thing_b() { thing_a(); }\n",
+    )
+    .unwrap();
     git(p, &["add", "."]);
     git(p, &["commit", "-q", "-m", "c1"]);
-    std::fs::write(p.join("b.rs"), "pub fn b() {}\n").unwrap();
+    // c2: break the cycle — b no longer imports a.
+    std::fs::write(p.join("src/b.rs"), "pub fn thing_b() {}\n").unwrap();
     git(p, &["add", "."]);
     git(p, &["commit", "-q", "-m", "c2"]);
     dir
@@ -53,8 +72,27 @@ fn enrich_populates_per_commit_health_and_cycles() {
         snaps.iter().all(|s| s.health_composite.is_some()),
         "every snapshot carries its own per-commit health after backfill"
     );
-    // Acyclic fixture → zero cycles, but the field is populated deterministically.
-    assert!(snaps.iter().all(|s| s.circular_dep_count == 0));
+    // Per-commit divergence is the real guard: c1's tree has an a↔b cycle,
+    // c2's does not. This fails a regression that reconstructs the wrong tree
+    // (e.g. stamps the current checked-out tree on every snapshot → 0 cycles
+    // everywhere), which the previous trivial-acyclic fixture could not detect.
+    let c1 = snaps
+        .iter()
+        .find(|s| s.commit_message.trim() == "c1")
+        .expect("c1 snapshot present");
+    let c2 = snaps
+        .iter()
+        .find(|s| s.commit_message.trim() == "c2")
+        .expect("c2 snapshot present");
+    assert!(
+        c1.circular_dep_count > 0,
+        "c1's tree has an a<->b import cycle; got {}",
+        c1.circular_dep_count
+    );
+    assert_eq!(
+        c2.circular_dep_count, 0,
+        "c2's tree broke the cycle, so it must report zero"
+    );
 }
 
 fn tiny_index() -> CodebaseIndex {

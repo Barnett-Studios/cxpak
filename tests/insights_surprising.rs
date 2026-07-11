@@ -1,5 +1,6 @@
 //! N1 acceptance (RED until the cascade fills `surprising_connections`):
-//! surprising connections = co-change pairs with no import edge.
+//! surprising connections = co-change pairs with no direct dependency edge
+//! (any type, either direction).
 
 use cxpak::intelligence::insights::{surprising_connections, SurprisingLink};
 use cxpak::test_support::index_with;
@@ -30,6 +31,48 @@ fn surprising_connections_excludes_imported_pairs_and_keeps_unimported() {
     assert!(
         links.iter().any(|l| unordered_eq(l, "C", "D")),
         "co-changed-without-import pair must surface"
+    );
+}
+
+#[test]
+fn surprising_connections_excludes_reverse_imported_pairs() {
+    // Only B imports A (the *reverse* direction) AND they co-change → still NOT
+    // surprising. Covers the `b_imports_a` filter branch specifically: with only
+    // the `a_imports_b` clause, this pair would leak through.
+    let index = index_with()
+        .file("B")
+        .imports("A")
+        .co_change("A", "B", 0.9)
+        .build();
+    let links = surprising_connections(&index);
+    assert!(
+        links.iter().all(|l| !unordered_eq(l, "A", "B")),
+        "a pair where only B imports A must still be filtered out"
+    );
+}
+
+#[test]
+fn surprising_connections_sorted_by_score_desc_then_pair_asc() {
+    // Real ordering guard (not a self-comparison): distinct scores sort by
+    // descending score; ties break by (a, b) ascending. E-F and A-B tie at 0.9,
+    // so A-B precedes E-F; C-D (0.5) sorts last.
+    let index = index_with()
+        .co_change("C", "D", 0.5)
+        .co_change("E", "F", 0.9)
+        .co_change("A", "B", 0.9)
+        .build();
+    let order: Vec<(String, String)> = surprising_connections(&index)
+        .into_iter()
+        .map(|l| (l.a, l.b))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            ("A".into(), "B".into()),
+            ("E".into(), "F".into()),
+            ("C".into(), "D".into()),
+        ],
+        "descending co_change_score, then (a, b) ascending on ties"
     );
 }
 

@@ -1,13 +1,13 @@
 ---
 id: '0192'
-title: Collapse 6 tabs into 3 modes; Flow becomes an inspector action
+title: Collapse 6 tabs into 3 modes (Overview/Explore/History); Flow/Diff removed from the SPA
 status: ACCEPTED
 date: 2026-07-11
 triggered_by: cxpak UI overhaul (3.1.0) — visual surface redesign
 loop: planning
 ---
 
-# ADR-0192: Collapse 6 tabs into 3 modes; Flow becomes an inspector action
+# ADR-0192: Collapse 6 tabs into 3 modes (Overview/Explore/History); Flow/Diff removed from the SPA
 
 **Context.** Today's SPA has 6 nav tabs. Three (Flow/Timeline/Diff) render CLI-nag empty states because the page can only show data the generating CLI embedded (`spa.rs:77-78` hardwire `flow_json`/`diff_json` to `null`; empty-state markup at `spa.rs:282-293`). The three "good" tabs overlap conceptually (Dashboard = readout, Architecture + Risk = the same spatial view with different color).
 
