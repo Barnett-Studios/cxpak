@@ -213,7 +213,7 @@ pub fn save_baseline(
 // ---------------------------------------------------------------------------
 
 pub fn snapshot_from_index(
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
     timestamp: &str,
 ) -> ArchitectureSnapshot {
     use std::collections::HashMap;
@@ -314,7 +314,7 @@ fn module_prefix(path: &str, depth: usize) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn build_drift_report(
-    index: &crate::index::CodebaseIndex,
+    index: &crate::core_graph::CodebaseIndex,
     repo_root: &Path,
     save_baseline_flag: bool,
 ) -> DriftReport {
@@ -357,6 +357,139 @@ pub fn build_drift_report(
         trend,
         hotspots,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Schema drift: live database vs. code (descriptive only — ADR-0097, ADR-0173)
+// ---------------------------------------------------------------------------
+//
+// "Code" = the static `SchemaIndex` built from migrations / ORM / SQL.
+// "Live" = the `SchemaIndex` reflected from a running database.
+//
+// Drift is the divergence between the two. It is reported descriptively; cxpak
+// never mutates either side. Three kinds of divergence are surfaced:
+//   - CodeOnly:    present in code, absent live  (e.g. a migration not applied)
+//   - LiveOnly:    present live, absent in code  (e.g. a hand-made column)
+//   - TypeMismatch: present in both, but the column's data_type differs.
+
+use crate::core_graph::schema::SchemaIndex;
+
+/// Where a piece of schema exists but its counterpart does not, or differs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SchemaDriftKind {
+    /// A table exists in code but not in the live database.
+    CodeOnlyTable { table: String },
+    /// A table exists live but not in code.
+    LiveOnlyTable { table: String },
+    /// A column exists in code but not live (table present on both sides).
+    CodeOnlyColumn { table: String, column: String },
+    /// A column exists live but not in code (table present on both sides).
+    LiveOnlyColumn { table: String, column: String },
+    /// A column exists on both sides but its declared type differs.
+    TypeMismatch {
+        table: String,
+        column: String,
+        code_type: String,
+        live_type: String,
+    },
+}
+
+/// The full descriptive schema-drift report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaDriftReport {
+    /// All divergences, in a deterministic order.
+    pub findings: Vec<SchemaDriftKind>,
+}
+
+impl SchemaDriftReport {
+    /// True when code and live schemas are identical in the dimensions compared.
+    pub fn is_empty(&self) -> bool {
+        self.findings.is_empty()
+    }
+}
+
+/// Compare the `code` schema against the `live` schema and report divergences.
+///
+/// Pure and deterministic: no database access, no I/O. Findings are emitted in a
+/// stable order (tables sorted, then columns sorted, then a fixed per-kind
+/// ordering) so the report is byte-identical across runs on equal input.
+///
+/// Type comparison is case-insensitive on the trimmed `data_type` string —
+/// `INTEGER` and `integer` are considered the same — because dialects and
+/// reflection normalize casing differently while meaning the same type.
+pub fn build_schema_drift_report(live: &SchemaIndex, code: &SchemaIndex) -> SchemaDriftReport {
+    use std::collections::BTreeSet;
+
+    let mut findings: Vec<SchemaDriftKind> = Vec::new();
+
+    let code_tables: BTreeSet<&String> = code.tables.keys().collect();
+    let live_tables: BTreeSet<&String> = live.tables.keys().collect();
+
+    // Tables only in code, or only live. BTreeSet iteration is sorted.
+    for table in code_tables.difference(&live_tables) {
+        findings.push(SchemaDriftKind::CodeOnlyTable {
+            table: (*table).clone(),
+        });
+    }
+    for table in live_tables.difference(&code_tables) {
+        findings.push(SchemaDriftKind::LiveOnlyTable {
+            table: (*table).clone(),
+        });
+    }
+
+    // Column-level comparison for tables present on both sides.
+    for table in code_tables.intersection(&live_tables) {
+        let code_table = &code.tables[*table];
+        let live_table = &live.tables[*table];
+
+        // Map column name -> data_type for each side (sorted via BTreeMap).
+        let code_cols: std::collections::BTreeMap<&str, &str> = code_table
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.data_type.as_str()))
+            .collect();
+        let live_cols: std::collections::BTreeMap<&str, &str> = live_table
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.data_type.as_str()))
+            .collect();
+
+        for (col, code_type) in &code_cols {
+            match live_cols.get(col) {
+                None => findings.push(SchemaDriftKind::CodeOnlyColumn {
+                    table: (*table).clone(),
+                    column: (*col).to_string(),
+                }),
+                Some(live_type) => {
+                    if !types_equivalent(code_type, live_type) {
+                        findings.push(SchemaDriftKind::TypeMismatch {
+                            table: (*table).clone(),
+                            column: (*col).to_string(),
+                            code_type: (*code_type).to_string(),
+                            live_type: (*live_type).to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        for col in live_cols.keys() {
+            if !code_cols.contains_key(col) {
+                findings.push(SchemaDriftKind::LiveOnlyColumn {
+                    table: (*table).clone(),
+                    column: (*col).to_string(),
+                });
+            }
+        }
+    }
+
+    SchemaDriftReport { findings }
+}
+
+/// Case-insensitive, trimmed type-name equivalence.
+fn types_equivalent(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 #[cfg(test)]
@@ -512,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_from_index_empty() {
-        let index = crate::index::CodebaseIndex::empty();
+        let index = crate::core_graph::CodebaseIndex::empty();
         let snap = snapshot_from_index(&index, "2026-04-01T00:00:00Z");
         assert_eq!(snap.timestamp, "2026-04-01T00:00:00Z");
         assert_eq!(snap.metrics.module_count, 0);
@@ -523,7 +656,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_from_index_with_files_and_edges() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
         use crate::schema::EdgeType;
 
         let mut index = CodebaseIndex::empty();
@@ -570,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_from_index_module_below_min_files_skipped() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
 
         let mut index = CodebaseIndex::empty();
 
@@ -604,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_from_index_no_edges_zero_coupling() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
 
         let mut index = CodebaseIndex::empty();
 
@@ -631,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_build_drift_report_with_empty_index() {
-        let index = crate::index::CodebaseIndex::empty();
+        let index = crate::core_graph::CodebaseIndex::empty();
         let dir = tempfile::TempDir::new().unwrap();
         let report = build_drift_report(&index, dir.path(), false);
         // No baseline saved before -> baseline comparison is None
@@ -643,7 +776,7 @@ mod tests {
 
     #[test]
     fn test_build_drift_report_saves_baseline_when_flagged() {
-        let index = crate::index::CodebaseIndex::empty();
+        let index = crate::core_graph::CodebaseIndex::empty();
         let dir = tempfile::TempDir::new().unwrap();
         let _report = build_drift_report(&index, dir.path(), true);
         // Baseline file should now exist
@@ -656,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_build_drift_report_hotspots_from_high_coupling() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
         use crate::schema::EdgeType;
 
         let mut index = CodebaseIndex::empty();
@@ -698,7 +831,7 @@ mod tests {
 
     #[test]
     fn test_build_drift_report_with_existing_baseline() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
 
         let dir = tempfile::TempDir::new().unwrap();
 
@@ -788,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_module_count_matches_mean_coupling_denominator() {
-        use crate::index::{CodebaseIndex, IndexedFile};
+        use crate::core_graph::{CodebaseIndex, IndexedFile};
         use crate::schema::EdgeType;
 
         let mut index = CodebaseIndex::empty();
@@ -844,5 +977,183 @@ mod tests {
             (snap.metrics.mean_coupling - m.coupling).abs() < 1e-9,
             "mean_coupling must equal the single qualifying module's coupling"
         );
+    }
+
+    // ---- Schema-drift tests (pure, no live database) ----
+
+    use crate::core_graph::schema::{ColumnSchema, SchemaIndex, TableSchema};
+
+    fn col(name: &str, ty: &str) -> ColumnSchema {
+        ColumnSchema {
+            name: name.into(),
+            data_type: ty.into(),
+            nullable: false,
+            default: None,
+            constraints: vec![],
+            foreign_key: None,
+        }
+    }
+
+    fn schema_with(tables: &[(&str, Vec<ColumnSchema>)]) -> SchemaIndex {
+        let mut idx = SchemaIndex::empty();
+        for (name, columns) in tables {
+            idx.tables.insert(
+                (*name).to_string(),
+                TableSchema {
+                    name: (*name).to_string(),
+                    columns: columns.clone(),
+                    primary_key: None,
+                    indexes: vec![],
+                    file_path: "<test>".into(),
+                    start_line: 0,
+                },
+            );
+        }
+        idx
+    }
+
+    #[test]
+    fn schema_drift_identical_reports_none() {
+        let code = schema_with(&[("users", vec![col("id", "int"), col("email", "text")])]);
+        let live = schema_with(&[("users", vec![col("id", "int"), col("email", "text")])]);
+        let report = build_schema_drift_report(&live, &code);
+        assert!(report.is_empty(), "identical schemas must report no drift");
+    }
+
+    #[test]
+    fn schema_drift_flags_code_only_column() {
+        // Code has an `email` column that the live DB is missing (migration not
+        // applied). Must be flagged as CodeOnlyColumn.
+        let code = schema_with(&[("users", vec![col("id", "int"), col("email", "text")])]);
+        let live = schema_with(&[("users", vec![col("id", "int")])]);
+        let report = build_schema_drift_report(&live, &code);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(
+            report.findings[0],
+            SchemaDriftKind::CodeOnlyColumn {
+                table: "users".into(),
+                column: "email".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn schema_drift_flags_live_only_column() {
+        // Live DB has an extra `legacy_flag` column that code doesn't know about.
+        let code = schema_with(&[("users", vec![col("id", "int")])]);
+        let live = schema_with(&[("users", vec![col("id", "int"), col("legacy_flag", "bool")])]);
+        let report = build_schema_drift_report(&live, &code);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(
+            report.findings[0],
+            SchemaDriftKind::LiveOnlyColumn {
+                table: "users".into(),
+                column: "legacy_flag".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn schema_drift_flags_type_mismatch() {
+        let code = schema_with(&[("users", vec![col("id", "bigint")])]);
+        let live = schema_with(&[("users", vec![col("id", "integer")])]);
+        let report = build_schema_drift_report(&live, &code);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(
+            report.findings[0],
+            SchemaDriftKind::TypeMismatch {
+                table: "users".into(),
+                column: "id".into(),
+                code_type: "bigint".into(),
+                live_type: "integer".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn schema_drift_type_compare_is_case_insensitive() {
+        let code = schema_with(&[("t", vec![col("c", "INTEGER")])]);
+        let live = schema_with(&[("t", vec![col("c", "integer")])]);
+        let report = build_schema_drift_report(&live, &code);
+        assert!(
+            report.is_empty(),
+            "INTEGER and integer must be treated as equivalent"
+        );
+    }
+
+    #[test]
+    fn schema_drift_flags_code_only_table() {
+        let code = schema_with(&[("audit_log", vec![col("id", "int")])]);
+        let live = SchemaIndex::empty();
+        let report = build_schema_drift_report(&live, &code);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(
+            report.findings[0],
+            SchemaDriftKind::CodeOnlyTable {
+                table: "audit_log".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn schema_drift_flags_live_only_table() {
+        let code = SchemaIndex::empty();
+        let live = schema_with(&[("temp_scratch", vec![col("id", "int")])]);
+        let report = build_schema_drift_report(&live, &code);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(
+            report.findings[0],
+            SchemaDriftKind::LiveOnlyTable {
+                table: "temp_scratch".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn schema_drift_is_deterministic() {
+        // Build the same logical drift twice with columns inserted in different
+        // orders; the serialized report must be identical.
+        let code = schema_with(&[
+            ("b", vec![col("y", "int"), col("x", "int")]),
+            ("a", vec![col("id", "int")]),
+        ]);
+        let live = schema_with(&[("a", vec![col("id", "int")])]);
+        let r1 = build_schema_drift_report(&live, &code);
+        let r2 = build_schema_drift_report(&live, &code);
+        assert_eq!(
+            serde_json::to_string(&r1).unwrap(),
+            serde_json::to_string(&r2).unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_drift_combined_divergences() {
+        // users: type mismatch on id + code-only email; orders code-only table;
+        // sessions live-only table.
+        let code = schema_with(&[
+            ("users", vec![col("id", "bigint"), col("email", "text")]),
+            ("orders", vec![col("id", "int")]),
+        ]);
+        let live = schema_with(&[
+            ("users", vec![col("id", "integer")]),
+            ("sessions", vec![col("token", "text")]),
+        ]);
+        let report = build_schema_drift_report(&live, &code);
+        assert!(report.findings.contains(&SchemaDriftKind::CodeOnlyTable {
+            table: "orders".into()
+        }));
+        assert!(report.findings.contains(&SchemaDriftKind::LiveOnlyTable {
+            table: "sessions".into()
+        }));
+        assert!(report.findings.contains(&SchemaDriftKind::CodeOnlyColumn {
+            table: "users".into(),
+            column: "email".into()
+        }));
+        assert!(report.findings.contains(&SchemaDriftKind::TypeMismatch {
+            table: "users".into(),
+            column: "id".into(),
+            code_type: "bigint".into(),
+            live_type: "integer".into(),
+        }));
     }
 }

@@ -1,20 +1,11 @@
 use crate::conventions::PatternObservation;
-use crate::index::CodebaseIndex;
+use crate::core_graph::CodebaseIndex;
 use crate::parser::language::SymbolKind;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TestingConventions {
-    pub coverage_by_dir: HashMap<String, f64>,
-    pub mock_usage: Option<PatternObservation>,
-    pub test_naming: Option<PatternObservation>,
-    pub density: Option<PatternObservation>,
-    /// Whether the codebase uses inline tests (e.g. `#[cfg(test)]` in Rust,
-    /// `def test_` in Python, `describe(`/`it(` in JS/TS, `func Test` in Go).
-    pub has_inline_tests: Option<PatternObservation>,
-    pub additional: Vec<PatternObservation>,
-}
+// `TestingConventions` is a data-model type now in `core_graph::conventions`
+// (cxpak 3.0.0 Phase 0 de-cycle); the extraction logic stays here.
+pub use crate::core_graph::conventions::TestingConventions;
 
 /// Returns true when content contains inline test patterns for the given language.
 fn file_has_inline_tests(content: &str, language: Option<&str>) -> bool {

@@ -1,12 +1,6 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoChangeEdge {
-    pub file_a: String,
-    pub file_b: String,
-    pub count: u32,
-    pub recency_weight: f64,
-}
+// `CoChangeEdge` is a data-model type now in `core_graph` (cxpak 3.0.0 Phase 0
+// de-cycle); the git-mining logic below stays here.
+pub use crate::core_graph::intel::CoChangeEdge;
 
 /// Decay weight for a commit `days_ago` days old (180d window).
 /// Returns 1.0 for days_ago <= 30, linearly decays to 0.3 at days_ago == 180.

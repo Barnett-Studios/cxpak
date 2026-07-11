@@ -1,4 +1,4 @@
-//! N8 acceptance: the prove-it drawer (ADR-0174). Overview risk rows and alerts
+//! N8 acceptance: the prove-it drawer (ADR-0193). Overview risk rows and alerts
 //! expose a `prove` affordance that opens the inspector showing the literal
 //! derivation of the risk score from N7's churn/blast/test-penalty terms.
 #![cfg(feature = "visual")]

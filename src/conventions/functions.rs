@@ -1,25 +1,12 @@
-use crate::conventions::{FileContribution, PatternObservation};
-use crate::index::{CodebaseIndex, IndexedFile};
+use crate::conventions::FileContribution;
+use crate::core_graph::{CodebaseIndex, IndexedFile};
 use crate::parser::language::SymbolKind;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FunctionConventions {
-    pub avg_length: Option<f64>,
-    pub median_length: Option<f64>,
-    pub by_directory: HashMap<String, DirectoryFunctionStats>,
-    pub additional: Vec<PatternObservation>,
-    #[serde(skip)]
-    pub file_contributions: HashMap<String, FileContribution>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectoryFunctionStats {
-    pub avg_length: f64,
-    pub median_length: f64,
-    pub count: usize,
-}
+// `FunctionConventions` and `DirectoryFunctionStats` are data-model types now in
+// `core_graph::conventions` (cxpak 3.0.0 Phase 0 de-cycle); the extraction logic
+// stays here.
+pub use crate::core_graph::conventions::{DirectoryFunctionStats, FunctionConventions};
 
 /// Extract function length conventions from the codebase index.
 pub fn extract_functions(index: &CodebaseIndex) -> FunctionConventions {

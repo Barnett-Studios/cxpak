@@ -74,6 +74,24 @@ pub fn auto_context(
     index: &CodebaseIndex,
     opts: &AutoContextOpts,
 ) -> AutoContextResult {
+    // Ships with the inert (pre-D1) ranking; the D1 semantic upgrade is gated on
+    // the D2 recall A/B (ADR-0184). `auto_context_with_mode` exposes the control.
+    auto_context_with_mode(task, index, opts, crate::relevance::DEFAULT_RELEVANCE_MODE)
+}
+
+/// Like [`auto_context`], but with an explicit [`RelevanceMode`] — the
+/// product-level half of the D1 A/B control (ADR-0184). `Inert` reproduces the
+/// pre-D1 ranking byte-for-byte; `Active` enables RRF fusion. The D2 recall
+/// harness calls this with both modes over a SINGLE index build so the semantic
+/// upgrade is measurable index-once (the C2 reaping lesson).
+///
+/// [`RelevanceMode`]: crate::relevance::RelevanceMode
+pub fn auto_context_with_mode(
+    task: &str,
+    index: &CodebaseIndex,
+    opts: &AutoContextOpts,
+    mode: crate::relevance::RelevanceMode,
+) -> AutoContextResult {
     // Step 0: DNA section — render convention profile, deduct from budget.
     // If the DNA cost meets or exceeds the total budget, fall back to empty
     // DNA so that all budget tiers can still produce content sections.
@@ -103,7 +121,9 @@ pub fn auto_context(
     let expanded = crate::context_quality::expansion::expand_query(task, &index.domains);
 
     // Step 2: Relevance scoring — select weights based on index capabilities.
-    let scorer = crate::relevance::MultiSignalScorer::new_for_index(index).with_expansion(expanded);
+    let scorer = crate::relevance::MultiSignalScorer::new_for_index(index)
+        .with_expansion(expanded)
+        .with_mode(mode);
     let all_scored = scorer.score_all(task, index);
 
     // Step 3: Seed selection + fan-out via prebuilt graph.
@@ -408,6 +428,74 @@ mod tests {
         // Default opts must not request a cost estimate (cost is strictly opt-in).
         let opts = default_opts(10_000);
         assert!(opts.cost_model.is_none());
+    }
+
+    #[test]
+    fn auto_context_default_equals_active_mode() {
+        // Post-flip (ADR-0187): the plain `auto_context` entrypoint delegates to
+        // the Active (RRF) mode — the shipped default after the full-corpus recall
+        // A/B (+164%). Assert the default's selected file set matches the explicit
+        // Active call exactly.
+        let (index, _dir) = make_index(&[
+            ("src/api.rs", "pub fn handle_request() {}"),
+            ("src/config.rs", "pub struct Config {}"),
+        ]);
+        let opts = default_opts(10_000);
+        let default = auto_context("handle request", &index, &opts);
+        let active = auto_context_with_mode(
+            "handle request",
+            &index,
+            &opts,
+            crate::relevance::RelevanceMode::Active,
+        );
+        let paths = |r: &AutoContextResult| -> Vec<String> {
+            r.sections
+                .target_files
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect()
+        };
+        assert_eq!(paths(&default), paths(&active));
+    }
+
+    #[test]
+    fn auto_context_inert_mode_remains_available_as_control() {
+        // The Inert (weighted-sum) path must remain a working, well-formed control
+        // after the default flipped to Active — the D1 A/B guarantee (ADR-0184)
+        // that both modes stay reproducible from a single index build.
+        let (index, _dir) = make_index(&[
+            ("src/api.rs", "pub fn handle_request() {}"),
+            ("src/config.rs", "pub struct Config {}"),
+        ]);
+        let opts = default_opts(10_000);
+        let inert = auto_context_with_mode(
+            "handle request",
+            &index,
+            &opts,
+            crate::relevance::RelevanceMode::Inert,
+        );
+        assert_eq!(inert.efficiency.repo_tokens, index.total_tokens);
+        assert!(inert.efficiency.selected_tokens <= inert.efficiency.repo_tokens);
+    }
+
+    #[test]
+    fn auto_context_active_mode_runs_and_produces_valid_result() {
+        // The Active (RRF) mode must run end-to-end and produce a well-formed
+        // result — the measurable half of the D1 A/B control.
+        let (index, _dir) = make_index(&[
+            ("src/api.rs", "pub fn handle_request() {}"),
+            ("src/config.rs", "pub struct Config {}"),
+        ]);
+        let opts = default_opts(10_000);
+        let active = auto_context_with_mode(
+            "handle request",
+            &index,
+            &opts,
+            crate::relevance::RelevanceMode::Active,
+        );
+        assert_eq!(active.efficiency.repo_tokens, index.total_tokens);
+        assert!(active.efficiency.selected_tokens <= active.efficiency.repo_tokens);
     }
 
     #[test]

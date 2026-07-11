@@ -86,6 +86,20 @@ docker build -t cxpak .
 
 Builds the full default feature set from your local checkout. First build is slow (candle ML deps); subsequent builds reuse a cached dependency layer.
 
+### Self-hosted / air-gapped
+
+[`Dockerfile.standalone`](Dockerfile.standalone) fetches the pre-built release binary, verifies its SHA-256 checksum, and packages it into an `ubuntu:24.04` runtime — no source checkout or Rust toolchain required. All base images and the downloaded binary are digest-pinned for reproducible builds.
+
+All three build-args are **required** — the build fails immediately if any is omitted, so you can never accidentally produce a stale or mismatched image. Checksums are available on the [releases page](https://github.com/Barnett-Studios/cxpak/releases).
+
+```bash
+docker build -f Dockerfile.standalone \
+  --build-arg VERSION=2.3.0 \
+  --build-arg SHA256_AMD64=c98d142aec62a70bb5ecccdf44120aaa55641a26b27d5a52821a093c79dd8cac \
+  --build-arg SHA256_ARM64=2f7cc078446a65bdb8f2cbcc81b2e1932431b066d560fe99e90519c7afd3d580 \
+  -t cxpak:2.3.0 .
+```
+
 ### Usage
 
 The container runs as a non-root user; the embedding model weights (~30 MB, downloaded on first use) live under `/home/cxpak/.cxpak` — mount a named volume there to persist them across runs.
@@ -124,7 +138,7 @@ curl.exe http://localhost:3000/health
 docker run --rm -i -v ${PWD}:/repo ghcr.io/barnett-studios/cxpak serve --mcp .
 ```
 
-Replace `mysecret` with any non-empty secret of your choice. `/health` is open (GET); every `/v1/*` endpoint is a POST and requires the bearer token:
+Replace `mysecret` with any non-empty secret of your choice. `/health` is open (GET) as a liveness probe; every other endpoint requires the bearer token when one is set (with no `--token`, on a loopback bind, all routes are open):
 ```bash
 curl http://localhost:3000/health                                        # no auth required
 curl -X POST -H "Authorization: Bearer mysecret" http://localhost:3000/v1/conventions
@@ -167,16 +181,19 @@ Add to `.mcp.json` in your project root:
 }
 ```
 
-Your AI tool gets 26 codebase intelligence tools -- `cxpak_auto_context` is the main entry point. One call, optimal context:
+Your AI tool gets five intent-parameterized tools; each selects a capability via a required `op` argument. `cxpak_context` (`op: "context"`) is the main entry point -- one call, optimal context:
 
-| Category | Tools |
+| Intent tool | Capabilities (via `op`) |
 |----------|-------|
-| **Context** | `auto_context`, `overview`, `trace`, `diff`, `search`, `context_for_task`, `pack_context`, `context_diff` |
-| **Intelligence** | `health`, `risks`, `architecture`, `blast_radius`, `predict`, `drift`, `dead_code`, `call_graph` |
-| **Security** | `security_surface`, `data_flow`, `cross_lang` |
-| **Conventions** | `conventions`, `verify`, `briefing` |
-| **Visual** | `visual`, `onboard` |
-| **Surface** | `api_surface`, `stats` |
+| **`cxpak_context`** | `context`, `retrieval`, `search`, `overview`, `stats`, `briefing`, `pack_context`, `context_for_task` |
+| **`cxpak_graph`** | `graph` (`node`/`neighbors`/`path`/`subgraph`), `trace`, `blast_radius`, `call_graph`, `dead_code`, `api_surface`, `data_flow`, `cross_lang`, `predict` |
+| **`cxpak_data`** | `data` (indexed / live schema) |
+| **`cxpak_review`** | `review`, `diff`, `verify` |
+| **`cxpak_insight`** | `health`, `risks`, `architecture`, `conventions`, `security_surface`, `drift`, `visual`, `onboard` |
+
+The v2.x per-tool names (`cxpak_auto_context`, `cxpak_health`, ...) remain callable as deprecated aliases for one release. See [`docs/MIGRATION-3.0.md`](docs/MIGRATION-3.0.md).
+
+On large repositories, `cxpak serve --mcp` answers the MCP `initialize` handshake immediately and builds the index in the background -- fixing the startup timeout. Tool calls that arrive before the index is ready get a graceful retry status, then byte-identical results once it is built.
 
 ### Claude Code Plugin
 
@@ -200,7 +217,7 @@ cxpak watch .                          # file watcher with hot index
 cxpak lsp .                            # stdio, works with any LSP client
 ```
 
-CodeLens, hover, diagnostics, workspace symbols, plus 14 custom `cxpak/*` methods. Supports `didOpen`/`didChange`/`didClose` for in-editor reactivity.
+CodeLens, hover, diagnostics, workspace symbols, plus 16 custom `cxpak/*` methods. Supports `didOpen`/`didChange`/`didClose` for in-editor reactivity.
 
 ## Core capabilities
 
@@ -208,7 +225,7 @@ CodeLens, hover, diagnostics, workspace symbols, plus 14 custom `cxpak/*` method
 
 `cxpak_auto_context` is the primary entry point. Give it a task and token budget; it returns exactly what the LLM needs.
 
-The pipeline: query expansion with domain-specific synonyms, 7-signal relevance scoring (keyword, symbol, path, domain, import proximity, PageRank, embeddings), seed selection, noise filtering, test/schema/blast-radius enrichment, progressive degradation (Full > Trimmed > Documented > Signature > Stub), and per-file annotations explaining why each file was included.
+The pipeline: query expansion with domain-specific synonyms, relevance scoring over **6 deterministic signals** (keyword, symbol, path, domain, import proximity, PageRank) fused with **Reciprocal Rank Fusion (RRF)** -- the default ranking as of 3.0.0, measured +164% recall over the prior weighted-sum on a 31-PR benchmark and deterministic across processes -- then seed selection, noise filtering, test/schema/blast-radius enrichment, progressive degradation (Full > Trimmed > Documented > Signature > Stub), and per-file annotations explaining why each file was included. Embeddings are an optional 7th signal (see [Embeddings](#embeddings)).
 
 Every response starts with a Repository DNA section -- a ~1000 token convention summary so the LLM knows how your team writes code before it sees any.
 
@@ -276,11 +293,36 @@ cxpak understands your data layer and uses it to build a richer dependency graph
 - **Schema detection** -- SQL DDL, Prisma, Django, SQLAlchemy, TypeORM, ActiveRecord
 - **Migration sequences** -- Rails, Alembic, Flyway, Django, Knex, Prisma, Drizzle
 - **Embedded SQL linking** -- inline SQL in application code creates edges to table definitions
-- **10 typed edge types** -- Import, ForeignKey, ViewReference, EmbeddedSql, OrmModel, MigrationSequence, CrossLanguage, and more
+- **Column-level lineage** -- impact traced at column granularity: "alter `users.email`" resolves to the specific queries, ORM models, endpoints, and tests that reference that column, and a different column's blast excludes the email-only files
+- **Live database introspection** -- connect to a running Postgres or MySQL and index the live schema, then compute drift against the schema the code declares. Pure-Rust rustls drivers (no OpenSSL), **read-only**, and the DSN is **never logged or persisted**. Off by default; enabled with the `data-introspect` build feature
+- **Typed edge types** -- Import, ForeignKey, ViewReference, EmbeddedSql, OrmModel, MigrationSequence, ColumnReference, CrossLanguage, and more. Each edge carries a confidence marker; heuristic (inferred) edges are labeled so a regex guess is never mistaken for a structurally proven dependency
+
+## Graph query and export
+
+Query the typed dependency graph directly -- four primitives (`node`, `neighbors`, `path`, `subgraph`), identical across MCP, HTTP, LSP, and CLI. Edges carry a typed `edge_type` and a confidence marker; inferred (heuristic) edges are surfaced as such.
+
+```bash
+cxpak graph neighbors --id src/index/graph.rs .
+cxpak graph path --from src/main.rs --to src/output/mod.rs .
+cxpak graph subgraph --seeds src/scanner/mod.rs,src/parser/mod.rs --depth 2 .
+```
+
+Export the graph to **Cypher** (Neo4j) or **GraphML** (Gephi, yEd, NetworkX) with the same honest typed edges and per-edge confidence:
+
+```bash
+cxpak visual --format cypher .
+cxpak visual --format graphml .
+```
 
 ## Embeddings
 
-Semantic similarity as the 7th scoring signal. Local inference with all-MiniLM-L6-v2 (zero config, ~30 MB), or bring your own key for OpenAI, Voyage AI, or Cohere via `.cxpak.json`. Falls back gracefully to 6 deterministic signals on any failure.
+Semantic similarity is an **optional** 7th scoring signal, **opt-in** via `.cxpak.json`. Without that config the default 6 deterministic signals are used and **no model is downloaded**. When configured, cxpak uses either local inference with all-MiniLM-L6-v2 (~30 MB, downloaded on first use) or a remote provider -- OpenAI, Voyage AI, or Cohere with your own key. On `cxpak serve --mcp` the embedding index is built in the background, off the startup path, so it never delays the MCP handshake; if it fails, cxpak falls back to the 6 deterministic signals.
+
+Minimal local config:
+
+```json
+{ "embeddings": { "provider": "local" } }
+```
 
 ## WASM Plugin SDK
 
@@ -302,9 +344,11 @@ Parse results cached in `.cxpak/cache/` keyed on file mtime and size. Cache inva
 
 v2.0.0 establishes semver for the MCP API. Tool names, parameters, and response structures are stable across 2.x.
 
+3.0.0 **consolidates the 26 MCP tools into 5 intent-parameterized tools** (`cxpak_context`, `cxpak_graph`, `cxpak_data`, `cxpak_review`, `cxpak_insight`), each selecting a capability via a required `op` argument. This is the one breaking change in 3.0.0 and affects **MCP clients only** -- the CLI, the HTTP `/v1/*` API, and the LSP `cxpak/*` methods are unchanged. The 26 old tool names remain callable as deprecated, undiscoverable aliases for one release. See [`docs/MIGRATION-3.0.md`](docs/MIGRATION-3.0.md).
+
 ## Architecture decisions
 
-Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution, reconstructed across v0.1.0 -> v2.2.1. Start with [the index](docs/adrs/INDEX.md).
+Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution. Records 0001-0162 were reconstructed across v0.1.0 -> v2.2.1; 0163 onward are written at decision time, now through 0190 (v3.0.0). Start with [the index](docs/adrs/INDEX.md).
 
 ## License
 

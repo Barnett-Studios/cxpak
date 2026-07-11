@@ -6,6 +6,8 @@
 
 use super::layout::ComputedLayout;
 use super::render::RenderMetadata;
+use crate::core_graph::graph::{DependencyGraph, EdgeConfidence};
+use std::collections::BTreeSet;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
@@ -71,8 +73,19 @@ pub fn to_mermaid(layout: &ComputedLayout) -> String {
 }
 
 /// Escapes special XML characters in attribute values and text content.
+///
+/// C0 control bytes that are illegal in XML 1.0 (everything below U+0020 except
+/// tab/LF/CR) have no valid representation — not even a numeric char ref — so
+/// they are dropped before escaping. Node labels and repo names come from
+/// git-tracked paths/symbols, which on Unix may legally contain such bytes; a
+/// stray one would otherwise emit XML no conformant parser can load.
+/// ponytail: strips C0 only — U+FFFE/U+FFFF and other Unicode noncharacters
+/// (astronomically unlikely in a path) are left to the caller.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
+    s.chars()
+        .filter(|&c| c == '\t' || c == '\n' || c == '\r' || c >= '\u{20}')
+        .collect::<String>()
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
@@ -273,6 +286,193 @@ pub fn to_c4(layout: &ComputedLayout, metadata: &RenderMetadata) -> String {
 pub fn to_json(layout: &ComputedLayout) -> String {
     serde_json::to_string_pretty(layout)
         .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e))
+}
+
+// ─── Graph-serialization exports (Cypher + GraphML) ────────────────────────────
+//
+// Unlike the visual exporters above (which consume the laid-out `ComputedLayout`
+// of module nodes + `EdgeVisualType` edges), these serialize the *dependency
+// graph itself* — `DependencyGraph`'s typed edges carry the honest
+// `EdgeType` + `EdgeConfidence` (Phase A, ADR-0097 descriptive-honesty) that the
+// positional layout drops. They reuse the existing `index.graph` rather than
+// re-deriving it; the dispatch sites pass it in.
+
+/// String form of an [`EdgeConfidence`] for export metadata.
+///
+/// Derived from [`EdgeConfidence::is_inferred`] rather than `Debug` so the
+/// emitted token is a deliberate, stable part of the export contract.
+fn confidence_str(confidence: EdgeConfidence) -> &'static str {
+    if confidence.is_inferred() {
+        "Inferred"
+    } else {
+        "Extracted"
+    }
+}
+
+/// Collect every node id in the graph (edge sources, edge targets, and reverse
+/// roots) as a canonically sorted, de-duplicated list.
+///
+/// `DependencyGraph` stores adjacency as `BTreeMap`/`BTreeSet`, so insertion
+/// order here is already deterministic; the explicit `BTreeSet` guarantees the
+/// node list is sorted and unique regardless of which side an isolated node
+/// appears on.
+fn collect_graph_nodes(graph: &DependencyGraph) -> Vec<&str> {
+    let mut nodes: BTreeSet<&str> = BTreeSet::new();
+    for (source, targets) in &graph.edges {
+        nodes.insert(source.as_str());
+        for edge in targets {
+            nodes.insert(edge.target.as_str());
+        }
+    }
+    // Reverse roots catch nodes that only ever appear as a target (already
+    // covered above) and any source-less sink; harmless to re-insert.
+    for target in graph.reverse_edges.keys() {
+        nodes.insert(target.as_str());
+    }
+    nodes.into_iter().collect()
+}
+
+/// Map a node id to its Cypher/GraphML node kind.
+///
+/// Synthetic column nodes (Task A2) are keyed `col:{table}.{column}`; the `col:`
+/// prefix can never collide with a real file path, so any id carrying it is a
+/// `Column`. Everything else is an indexed source `File`.
+fn node_kind(id: &str) -> &'static str {
+    if id.starts_with("col:") {
+        "Column"
+    } else {
+        "File"
+    }
+}
+
+/// Escape a string for a single-quoted Cypher string literal.
+///
+/// Node ids/paths are attacker-influenced (a repo can contain a file whose name
+/// holds a quote, backslash, or newline), so this is a correctness + injection
+/// boundary: the output must always be a syntactically valid, non-breakable
+/// literal. Backslash is escaped first (handled char-by-char, so order is not a
+/// hazard), then the quote and the control characters that would otherwise split
+/// the statement across lines.
+fn escape_cypher(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Serialize a [`DependencyGraph`] as a Neo4j-importable Cypher script.
+///
+/// Shape (canonical, deterministic):
+/// - A header comment naming the repo and the node/relationship counts.
+/// - One `MERGE` per node, labeled by kind (`:File` / `:Column`) with an `id`
+///   property. `MERGE` (not `CREATE`) so re-running the script against an
+///   existing graph is idempotent — node identity is the `id` property.
+/// - One `MERGE` per relationship: endpoints matched by `id`, a single
+///   `DEPENDS_ON` relationship type carrying `type` (the [`EdgeType::label`]),
+///   `confidence` (`Extracted`/`Inferred`), and an `inferred` boolean. A fixed
+///   relationship type avoids having to escape edge labels (e.g.
+///   `cross_language:HttpCall`) into Cypher relationship-type identifiers; the
+///   honest type label lives in the `type` property instead.
+///
+/// Determinism: nodes come from [`collect_graph_nodes`] (sorted); relationships
+/// iterate the `BTreeMap`/`BTreeSet` adjacency in sorted order.
+pub fn to_cypher(graph: &DependencyGraph, repo_name: &str) -> String {
+    let nodes = collect_graph_nodes(graph);
+    let rel_count = graph.edge_count();
+
+    let mut out = format!(
+        "// cxpak dependency graph export — repo: {}\n// nodes: {}, relationships: {}\n",
+        escape_cypher(repo_name),
+        nodes.len(),
+        rel_count,
+    );
+
+    for id in &nodes {
+        out.push_str(&format!(
+            "MERGE (:{} {{id: '{}'}});\n",
+            node_kind(id),
+            escape_cypher(id),
+        ));
+    }
+
+    for (source, targets) in &graph.edges {
+        for edge in targets {
+            out.push_str(&format!(
+                "MATCH (a {{id: '{src}'}}), (b {{id: '{dst}'}}) MERGE (a)-[:DEPENDS_ON {{type: '{ty}', confidence: '{conf}', inferred: {inf}}}]->(b);\n",
+                src = escape_cypher(source),
+                dst = escape_cypher(&edge.target),
+                ty = escape_cypher(&edge.edge_type.label()),
+                conf = confidence_str(edge.confidence),
+                inf = edge.confidence.is_inferred(),
+            ));
+        }
+    }
+
+    out
+}
+
+/// Serialize a [`DependencyGraph`] as well-formed GraphML (plain XML).
+///
+/// Shape: `<graphml>` → `<key>` declarations for the node `kind` and the edge
+/// `type` / `confidence` / `inferred` attributes → `<graph edgedefault="directed">`
+/// → sorted `<node>`s then sorted `<edge>`s, each carrying its `<data>` children.
+/// Every id/value is XML-escaped via the module's [`xml_escape`] helper (shared
+/// with the SVG exporter — no new dependency; GraphML is plain XML).
+///
+/// Determinism: nodes from [`collect_graph_nodes`] (sorted); edges iterate the
+/// sorted adjacency and are assigned sequential `e{n}` ids in that order.
+pub fn to_graphml(graph: &DependencyGraph, repo_name: &str) -> String {
+    let nodes = collect_graph_nodes(graph);
+
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str("<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">\n");
+    out.push_str(&format!("  <!-- repo: {} -->\n", xml_escape(repo_name)));
+    out.push_str("  <key id=\"d_kind\" for=\"node\" attr.name=\"kind\" attr.type=\"string\"/>\n");
+    out.push_str("  <key id=\"d_type\" for=\"edge\" attr.name=\"type\" attr.type=\"string\"/>\n");
+    out.push_str(
+        "  <key id=\"d_confidence\" for=\"edge\" attr.name=\"confidence\" attr.type=\"string\"/>\n",
+    );
+    out.push_str(
+        "  <key id=\"d_inferred\" for=\"edge\" attr.name=\"inferred\" attr.type=\"boolean\"/>\n",
+    );
+    out.push_str("  <graph id=\"G\" edgedefault=\"directed\">\n");
+
+    for id in &nodes {
+        out.push_str(&format!(
+            "    <node id=\"{id}\"><data key=\"d_kind\">{kind}</data></node>\n",
+            id = xml_escape(id),
+            kind = node_kind(id),
+        ));
+    }
+
+    let mut edge_index = 0usize;
+    for (source, targets) in &graph.edges {
+        for edge in targets {
+            out.push_str(&format!(
+                "    <edge id=\"e{idx}\" source=\"{src}\" target=\"{dst}\"><data key=\"d_type\">{ty}</data><data key=\"d_confidence\">{conf}</data><data key=\"d_inferred\">{inf}</data></edge>\n",
+                idx = edge_index,
+                src = xml_escape(source),
+                dst = xml_escape(&edge.target),
+                ty = xml_escape(&edge.edge_type.label()),
+                conf = confidence_str(edge.confidence),
+                inf = edge.confidence.is_inferred(),
+            ));
+            edge_index += 1;
+        }
+    }
+
+    out.push_str("  </graph>\n");
+    out.push_str("</graphml>\n");
+    out
 }
 
 #[cfg(test)]
@@ -717,5 +917,240 @@ mod tests {
             "PNG output must be > 1KB, got {} bytes",
             bytes.len()
         );
+    }
+
+    // ── Graph-serialization exports: Cypher + GraphML ──────────────────────────
+
+    use crate::core_graph::graph::{DependencyGraph, EdgeConfidence, EdgeType};
+
+    /// A small fixture graph mixing an Extracted file→file import, an Inferred
+    /// embedded-SQL edge, and a synthetic `col:` column node — enough to exercise
+    /// node labeling, edge type/confidence metadata, and canonical ordering.
+    fn make_fixture_graph() -> DependencyGraph {
+        let mut g = DependencyGraph::new();
+        // Extracted import: api → db.
+        g.add_edge("src/api.rs", "src/db.rs", EdgeType::Import);
+        // Inferred embedded-SQL edge into a synthetic column node.
+        g.add_edge("src/db.rs", "col:users.id", EdgeType::EmbeddedSql);
+        // Structurally-extracted column→table anchor.
+        g.add_edge_with_confidence(
+            "col:users.id",
+            "src/schema.sql",
+            EdgeType::ColumnReference,
+            EdgeConfidence::Extracted,
+        );
+        g
+    }
+
+    #[test]
+    fn test_to_cypher_emits_nodes_and_relationships() {
+        let g = make_fixture_graph();
+        let cypher = to_cypher(&g, "demo-repo");
+
+        // Header comment names the repo.
+        assert!(
+            cypher.contains("// cxpak dependency graph export — repo: demo-repo"),
+            "header missing:\n{cypher}"
+        );
+        // Nodes are MERGE'd, labeled by kind.
+        assert!(
+            cypher.contains("MERGE (:File {id: 'src/api.rs'});"),
+            "file node missing:\n{cypher}"
+        );
+        assert!(
+            cypher.contains("MERGE (:Column {id: 'col:users.id'});"),
+            "column node missing:\n{cypher}"
+        );
+        // Relationships carry type + confidence + inferred flag.
+        assert!(
+            cypher.contains("MATCH (a {id: 'src/api.rs'}), (b {id: 'src/db.rs'}) MERGE (a)-[:DEPENDS_ON {type: 'import', confidence: 'Extracted', inferred: false}]->(b);"),
+            "extracted import relationship missing:\n{cypher}"
+        );
+        assert!(
+            cypher.contains("type: 'embedded_sql', confidence: 'Inferred', inferred: true"),
+            "inferred embedded-sql relationship metadata missing:\n{cypher}"
+        );
+    }
+
+    #[test]
+    fn test_to_cypher_escapes_quote_and_backslash_in_path() {
+        // A path holding a single quote, a backslash, and a newline must not break
+        // the literal — this is the injection/correctness boundary.
+        let mut g = DependencyGraph::new();
+        g.add_edge("src/weird'\\\n.rs", "src/db.rs", EdgeType::Import);
+        let cypher = to_cypher(&g, "r");
+
+        // The escaped node literal must appear with \' , \\ , and \n.
+        assert!(
+            cypher.contains("MERGE (:File {id: 'src/weird\\'\\\\\\n.rs'});"),
+            "adversarial path not correctly escaped:\n{cypher}"
+        );
+        // No raw newline may appear inside any statement: every line that opens a
+        // MERGE/MATCH statement must also terminate it with `;` on the same line.
+        for line in cypher.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("MERGE") || trimmed.starts_with("MATCH") {
+                assert!(
+                    line.trim_end().ends_with(';'),
+                    "statement split across lines (raw control char leaked): {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_to_cypher_is_byte_deterministic() {
+        let g = make_fixture_graph();
+        let a = to_cypher(&g, "demo-repo");
+        let b = to_cypher(&g, "demo-repo");
+        assert_eq!(a, b, "cypher export must be byte-identical across runs");
+    }
+
+    #[test]
+    fn test_to_cypher_every_relationship_endpoint_is_a_declared_node() {
+        // Structural validity proxy (no Neo4j): every id referenced in a MATCH
+        // relationship must have been MERGE'd as a node.
+        let g = make_fixture_graph();
+        let cypher = to_cypher(&g, "r");
+
+        let declared: BTreeSet<String> = cypher
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim_start();
+                // `MERGE (:Kind {id: '...'});`
+                l.strip_prefix("MERGE (:")?;
+                let start = l.find("{id: '")? + "{id: '".len();
+                let rest = &l[start..];
+                let end = rest.find("'}")?;
+                Some(rest[..end].to_string())
+            })
+            .collect();
+
+        let mut rel_endpoints = 0usize;
+        for l in cypher.lines() {
+            if let Some(rest) = l.trim_start().strip_prefix("MATCH (a {id: '") {
+                let src_end = rest.find("'}").expect("malformed MATCH src");
+                let src = &rest[..src_end];
+                let after = &rest[src_end..];
+                let dst_start = after.find("(b {id: '").expect("missing dst") + "(b {id: '".len();
+                let dst_rest = &after[dst_start..];
+                let dst_end = dst_rest.find("'}").expect("malformed MATCH dst");
+                let dst = &dst_rest[..dst_end];
+                assert!(declared.contains(src), "undeclared src node: {src}");
+                assert!(declared.contains(dst), "undeclared dst node: {dst}");
+                rel_endpoints += 1;
+            }
+        }
+        assert_eq!(
+            rel_endpoints,
+            g.edge_count(),
+            "every edge must produce exactly one relationship statement"
+        );
+    }
+
+    #[test]
+    fn test_to_graphml_is_well_formed_with_keys_and_data() {
+        let g = make_fixture_graph();
+        let xml = to_graphml(&g, "demo-repo");
+
+        assert!(
+            xml.starts_with("<?xml version=\"1.0\""),
+            "xml prolog missing"
+        );
+        assert!(xml.contains("<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">"));
+        // Key declarations for node kind + edge type/confidence/inferred.
+        assert!(xml.contains("<key id=\"d_kind\" for=\"node\""));
+        assert!(xml.contains("<key id=\"d_type\" for=\"edge\""));
+        assert!(xml.contains("<key id=\"d_confidence\" for=\"edge\""));
+        assert!(xml.contains("<key id=\"d_inferred\" for=\"edge\""));
+        // Nodes carry kind data.
+        assert!(xml.contains("<node id=\"col:users.id\"><data key=\"d_kind\">Column</data></node>"));
+        assert!(xml.contains("<node id=\"src/api.rs\"><data key=\"d_kind\">File</data></node>"));
+        // Edge carries type + confidence + inferred.
+        assert!(
+            xml.contains("<data key=\"d_type\">import</data><data key=\"d_confidence\">Extracted</data><data key=\"d_inferred\">false</data>"),
+            "edge data missing:\n{xml}"
+        );
+        assert!(xml.trim_end().ends_with("</graphml>"));
+    }
+
+    #[test]
+    fn test_to_graphml_structural_well_formedness() {
+        // No XML-parser dependency: assert structural well-formedness by counting
+        // balanced open/close tags for the elements we emit.
+        let g = make_fixture_graph();
+        let xml = to_graphml(&g, "demo-repo");
+
+        let opens = xml.matches("<node ").count();
+        let closes = xml.matches("</node>").count();
+        assert_eq!(opens, closes, "unbalanced <node> tags");
+        let eopens = xml.matches("<edge ").count();
+        let ecloses = xml.matches("</edge>").count();
+        assert_eq!(eopens, ecloses, "unbalanced <edge> tags");
+        assert_eq!(eopens, g.edge_count(), "one <edge> per graph edge");
+        // Exactly one <graph> and one <graphml> wrapper.
+        assert_eq!(xml.matches("<graph ").count(), 1);
+        assert_eq!(xml.matches("</graph>").count(), 1);
+        assert_eq!(xml.matches("</graphml>").count(), 1);
+    }
+
+    #[test]
+    fn test_to_graphml_xml_escapes_adversarial_node_id() {
+        let mut g = DependencyGraph::new();
+        g.add_edge("src/a<b>&\"c.rs", "src/db.rs", EdgeType::Import);
+        let xml = to_graphml(&g, "r");
+        // Raw angle brackets / ampersand / quote must be escaped inside the id.
+        assert!(
+            xml.contains("<node id=\"src/a&lt;b&gt;&amp;&quot;c.rs\">"),
+            "adversarial node id not XML-escaped:\n{xml}"
+        );
+        assert!(
+            !xml.contains("a<b>&\"c.rs"),
+            "raw unescaped chars leaked into XML:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn test_to_graphml_strips_xml_illegal_control_chars() {
+        // A git-tracked path can legally contain C0 control bytes on Unix.
+        // They are illegal in XML 1.0 and must not reach the output; tab/LF/CR
+        // are legal and must survive.
+        let mut g = DependencyGraph::new();
+        g.add_edge(
+            "src/a\u{01}b\u{0B}c\u{1F}\td.rs",
+            "src/db.rs",
+            EdgeType::Import,
+        );
+        let xml = to_graphml(&g, "r");
+        for illegal in ['\u{01}', '\u{0B}', '\u{1F}'] {
+            assert!(
+                !xml.contains(illegal),
+                "XML-illegal control char {:#04x} leaked into graphml output",
+                illegal as u32
+            );
+        }
+        // The three C0 controls are removed; the legal tab survives.
+        assert!(
+            xml.contains("<node id=\"src/abc\td.rs\">"),
+            "control chars not stripped as expected:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn test_to_graphml_is_byte_deterministic() {
+        let g = make_fixture_graph();
+        let a = to_graphml(&g, "demo-repo");
+        let b = to_graphml(&g, "demo-repo");
+        assert_eq!(a, b, "graphml export must be byte-identical across runs");
+    }
+
+    #[test]
+    fn test_graph_exports_handle_empty_graph() {
+        let g = DependencyGraph::new();
+        let cypher = to_cypher(&g, "empty");
+        assert!(cypher.contains("nodes: 0, relationships: 0"));
+        let xml = to_graphml(&g, "empty");
+        assert!(xml.contains("<graph id=\"G\""));
+        assert!(xml.trim_end().ends_with("</graphml>"));
     }
 }

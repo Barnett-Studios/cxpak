@@ -52,6 +52,8 @@ fn ext_for_format(format: &VisualFormatArg) -> &'static str {
         VisualFormatArg::Png => "png",
         VisualFormatArg::C4 => "dsl",
         VisualFormatArg::Json => "json",
+        VisualFormatArg::Cypher => "cypher",
+        VisualFormatArg::Graphml => "graphml",
     }
 }
 
@@ -175,6 +177,18 @@ pub fn run(
                 layout::build_module_layout(&index, &config).unwrap_or_else(|_| empty_layout());
             (export::to_json(&computed).into_bytes(), false)
         }
+        VisualFormatArg::Cypher => {
+            // Serialize the dependency graph itself (typed edges + confidence),
+            // not the positional module layout.
+            (
+                export::to_cypher(&index.graph, &metadata.repo_name).into_bytes(),
+                false,
+            )
+        }
+        VisualFormatArg::Graphml => (
+            export::to_graphml(&index.graph, &metadata.repo_name).into_bytes(),
+            false,
+        ),
     };
 
     // Determine output path.
@@ -211,7 +225,9 @@ pub fn run(
         (None, VisualFormatArg::Mermaid)
         | (None, VisualFormatArg::Svg)
         | (None, VisualFormatArg::C4)
-        | (None, VisualFormatArg::Json) => {
+        | (None, VisualFormatArg::Json)
+        | (None, VisualFormatArg::Cypher)
+        | (None, VisualFormatArg::Graphml) => {
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
             handle.write_all(&content_bytes)?;

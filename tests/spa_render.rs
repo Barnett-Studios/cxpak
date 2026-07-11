@@ -57,7 +57,7 @@ fn contains_doctype_and_html_close() {
 
 #[test]
 fn contains_all_view_containers() {
-    // Three-mode IA (ADR-0173): Overview / Explore / History. Architecture +
+    // Three-mode IA (ADR-0192): Overview / Explore / History. Architecture +
     // Risk merged into Explore; Flow + Diff removed from the SPA nav.
     let html = cxpak::visual::spa::render_spa(&fixture_index(), &fixture_meta()).unwrap();
     for id in ["view-dashboard", "view-explore", "view-timeline"] {

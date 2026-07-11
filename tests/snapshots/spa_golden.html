@@ -42,7 +42,7 @@
   --edge-default: #3a3a60;
   --edge-hover: #6a6aaa;
   --shadow: rgba(0, 0, 0, 0.4);
-  /* Blueprint (ADR-0172): square corners, hairline chrome, zero-blur elevation.
+  /* Blueprint (ADR-0191): square corners, hairline chrome, zero-blur elevation.
      Radius near-zero everywhere so every var(--radius-*) consumer squares off. */
   --radius-sm: 2px;
   --radius-md: 2px;
@@ -1585,7 +1585,7 @@ CX.header = function() {};
   // =============================================================================
   // 2) ROUTER
   // =============================================================================
-  // Three-mode IA (ADR-0173): Overview / Explore / History. Internal keys stay
+  // Three-mode IA (ADR-0192): Overview / Explore / History. Internal keys stay
   // dashboard/explore/timeline for routing + renderer compatibility. Flow and
   // Diff were removed from the SPA (param-only, always-empty); legacy #flow /
   // #diff hashes fall through to dashboard in parseHash below.
@@ -1942,7 +1942,7 @@ CX.header = function() {};
   function applyTheme(t) {
     document.documentElement.setAttribute('data-theme', t);
   }
-  // The palette picker (ADR-0172) is the single colour control — light/dark are
+  // The palette picker (ADR-0191) is the single colour control — light/dark are
   // palette variants, so the old ☾/☀ data-theme toggle was removed. We still
   // apply an initial data-theme (from a stored preference or the OS setting) so
   // any theme-scoped CSS resolves before the palette JS paints over it.
@@ -2208,10 +2208,10 @@ CX.header = function() {};
 
 })();
 </script>
-  <script>/* cxpak palette system (ADR-0172): one design language, many palettes.
+  <script>/* cxpak palette system (ADR-0191): one design language, many palettes.
    Palette is client-side runtime state applied as CSS custom properties on
    :root — the emitted HTML bytes are identical regardless of default or
-   selection, so the golden fixture is unaffected (ADR-0179 determinism note).
+   selection, so the golden fixture is unaffected (ADR-0198 determinism note).
    btop-schema token sets (bg/surf/ink/ink2/ink3/hair/accent/lo/mid/hi) are
    mapped onto the SPA's real CSS variables. Tokyo Night is the default. */
 (function () {
@@ -2374,7 +2374,7 @@ function navTo(view) {
 
 /* proveRisk() opens the inspector "prove-it" drawer with the literal
    derivation of a risk score from its churn/blast/test-penalty terms
-   (ADR-0174). No-op outside SPA context (standalone views lack CX.openInspector). */
+   (ADR-0193). No-op outside SPA context (standalone views lack CX.openInspector). */
 function proveRisk(r) {
   if (!(window.CX && typeof window.CX.openInspector === 'function')) return;
   // 3 significant figures per factor so the shown product actually reproduces
@@ -2413,7 +2413,7 @@ var sc = dash.health.composite;
 var gc = sc >= 7 ? 'good' : sc >= 4 ? 'warn' : 'bad';
 gw.appendChild(CX.h('div', {class: 'cxpak-gauge-score ' + gc}, [sc.toFixed(1)]));
 
-/* Blueprint needle dial (ADR-0172). Same real composite `sc` (0–10) — a needle
+/* Blueprint needle dial (ADR-0191). Same real composite `sc` (0–10) — a needle
    gauge, not a filled donut. Angle a is measured from 12 o'clock, clockwise
    positive; the top semicircle spans -90° (sc=0) to +90° (sc=10). */
 var dW = 150, dH = 92, dcx = 75, dcy = 78, dR = 60;
@@ -2560,7 +2560,7 @@ CX.renderGraph(cv.g, pl, {
   }
 });
 
-/* Q4: Signals (ADR-0172/0174). Restyle of the real detections — the chip is a
+/* Q4: Signals (ADR-0191/0174). Restyle of the real detections — the chip is a
    presentation label for a.kind, never a new or fabricated number. */
 var q4 = document.createElement('div'); q4.className = 'cxpak-quadrant';
 q4.innerHTML = '<div class="cxpak-quadrant-title">Signals<span class="cxpak-sheet">RANKED · PROVEN</span></div>';
@@ -2629,7 +2629,7 @@ if (alerts.length === 0) {
 q4.appendChild(al);
 grid.appendChild(q4);
 
-/* Repo-DNA band (ADR-0172): a full-width fingerprint barcode below the grid.
+/* Repo-DNA band (ADR-0191): a full-width fingerprint barcode below the grid.
    Every bar is a real PageRank value (importance spectrum); the caption carries
    real node/edge counts and a real SHA-256 prefix. Purely presentational — it
    invents no number. */
@@ -3175,7 +3175,7 @@ var H = (wrap.clientHeight || window.innerHeight) - 52;
 
 var svg = d3.select(wrap).append('svg').attr('width', W).attr('height', H);
 
-/* Colour by within-repo percentile (ADR-0179), not the absolute score: on a
+/* Colour by within-repo percentile (ADR-0198), not the absolute score: on a
    large repo the product-of-fractions score collapses into ~[0,0.04] and the
    old absolute ramp mapped every leaf into the first (green) band. Percentile
    is uniform in [0,1] by construction, so evenly-spaced quartile stops are the
@@ -3287,7 +3287,7 @@ function riskLegItem(bg, label) {
     label,
   ]);
 }
-/* Colour encodes within-repo risk PERCENTILE (ADR-0179), not the absolute
+/* Colour encodes within-repo risk PERCENTILE (ADR-0198), not the absolute
    score \u2014 so the legend must name the relative scale. On a small repo this is
    what keeps a trivial file from reading as "high risk" just because it ranks
    top of a low-risk pack. */

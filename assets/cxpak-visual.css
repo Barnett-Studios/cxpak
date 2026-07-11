@@ -27,7 +27,7 @@
   --edge-default: #3a3a60;
   --edge-hover: #6a6aaa;
   --shadow: rgba(0, 0, 0, 0.4);
-  /* Blueprint (ADR-0172): square corners, hairline chrome, zero-blur elevation.
+  /* Blueprint (ADR-0191): square corners, hairline chrome, zero-blur elevation.
      Radius near-zero everywhere so every var(--radius-*) consumer squares off. */
   --radius-sm: 2px;
   --radius-md: 2px;

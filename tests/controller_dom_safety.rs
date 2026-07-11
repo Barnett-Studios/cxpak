@@ -133,7 +133,7 @@ fn localStorage_is_guarded_with_try() {
     }
 }
 
-// ── Palette is the single colour control (ADR-0172) ──────────────────────────
+// ── Palette is the single colour control (ADR-0191) ──────────────────────────
 // The ☾/☀ theme toggle was removed — light/dark are palette variants applied as
 // CSS custom properties on :root, so chrome recolours live with no view re-render.
 // Data-encoding colours (health/risk green→yellow→red) are a fixed semantic ramp
@@ -143,7 +143,7 @@ fn localStorage_is_guarded_with_try() {
 fn theme_toggle_is_removed() {
     assert!(
         !CONTROLLER.contains("toggleTheme"),
-        "the ☾/☀ theme toggle was replaced by the palette picker (ADR-0172); \
+        "the ☾/☀ theme toggle was replaced by the palette picker (ADR-0191); \
          no toggleTheme should remain in the controller"
     );
 }

@@ -18,7 +18,7 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
     const CAP: usize = 20_000;
     let mut entries: Vec<SearchEntry> = Vec::new();
 
-    // 1. Views (3 fixed navigation entries — the three-mode IA per ADR-0173:
+    // 1. Views (3 fixed navigation entries — the three-mode IA per ADR-0192:
     // Overview / Explore / History. Architecture + Risk merged into Explore;
     // Flow + Diff removed from the SPA, so they are not palette targets either.
     // Lexicographically "view" > "symbol" > "module" > "file", so views sort to
@@ -231,7 +231,7 @@ mod tests {
     fn includes_all_three_views() {
         let index = make_test_index();
         let entries = build_search_index(&index);
-        // Three-mode IA: Overview / Explore / History (ADR-0173). Architecture +
+        // Three-mode IA: Overview / Explore / History (ADR-0192). Architecture +
         // Risk merged into Explore; Flow + Diff removed from the SPA nav.
         assert_eq!(entries.iter().filter(|e| e.kind == "view").count(), 3);
         assert!(entries

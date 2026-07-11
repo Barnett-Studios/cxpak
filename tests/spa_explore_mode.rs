@@ -1,5 +1,5 @@
 //! N9 acceptance: Architecture + Risk collapse into one Explore mode with a
-//! Dependencies|Risk lens toggle (ADR-0173). One nav item, both lenses in the
+//! Dependencies|Risk lens toggle (ADR-0192). One nav item, both lenses in the
 //! DOM, no standalone Architecture/Risk tabs.
 #![cfg(feature = "visual")]
 

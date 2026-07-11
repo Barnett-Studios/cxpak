@@ -65,8 +65,18 @@ pub fn select_seeds_with_graph(
         }
     };
 
-    // Step 3-5: Fan out to 1-hop neighbors
-    let seed_paths: Vec<String> = result_map.keys().cloned().collect();
+    // Step 3-5: Fan out to 1-hop neighbors.
+    //
+    // Determinism: the fan-out upgrade path below can RAISE a seed's score
+    // mid-loop (when a neighbor is itself a scored seed whose current score is
+    // below the incoming fan-out score), and that raised score then becomes the
+    // basis for the neighbor's OWN fan-out. Iterating in raw `HashMap` order
+    // (randomized per process by SipHash) therefore makes the final neighbor
+    // scores process-dependent. Sort the seed paths before iterating so the
+    // processing order — and thus every derived score — is reproducible across
+    // processes.
+    let mut seed_paths: Vec<String> = result_map.keys().cloned().collect();
+    seed_paths.sort();
     for seed_path in &seed_paths {
         let seed_score = result_map[seed_path].score;
         let fanout_score = seed_score * FANOUT_DISCOUNT;
@@ -126,9 +136,19 @@ pub fn select_seeds_with_graph(
     }
 
     // Step 6: Sort by score descending using total_cmp for a strict total order
-    // (handles NaN deterministically rather than treating it as Equal).
+    // (handles NaN deterministically rather than treating it as Equal), with a
+    // path-ascending secondary tiebreak. `into_values()` yields the map in
+    // per-process HashMap order; without the path tiebreak, equal-scored files
+    // keep that random order and the `truncate(limit)` / downstream budget cut
+    // then selects a different file set across processes when scores tie at the
+    // boundary. The path tiebreak makes the output a strict total order and thus
+    // reproducible. Matches the RRF path-asc tiebreak convention (rrf.rs).
     let mut results: Vec<ScoredFile> = result_map.into_values().collect();
-    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    results.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     // Step 7: Truncate to limit
     results.truncate(limit);
@@ -436,6 +456,74 @@ mod tests {
             (middleware.score - 0.9).abs() < 0.01,
             "should keep original higher score 0.9, got {}",
             middleware.score
+        );
+    }
+
+    #[test]
+    fn test_select_seeds_tied_scores_deterministic_path_order() {
+        // Determinism regression (task R-D1b): equal-scored seeds must be
+        // returned in `(score desc, path asc)` order, independent of the internal
+        // HashMap's per-process iteration order. Before the path tiebreak, tied
+        // files kept random HashMap order and the truncate/budget cut selected a
+        // different file set across processes (recall@8k flaked 0.6444 vs 0.6111).
+        //
+        // All four files share the SAME score, so the ONLY thing that can make
+        // the output deterministic is the path-ascending secondary key. The input
+        // is deliberately shuffled out of path order to prove the ordering is not
+        // an accident of insertion order.
+        let index = make_seed_index();
+        let scored = vec![
+            ScoredFile {
+                path: "src/utils.rs".into(),
+                score: 0.5,
+                signals: vec![],
+                token_count: 10,
+            },
+            ScoredFile {
+                path: "src/api.rs".into(),
+                score: 0.5,
+                signals: vec![],
+                token_count: 10,
+            },
+            ScoredFile {
+                path: "src/config.rs".into(),
+                score: 0.5,
+                signals: vec![],
+                token_count: 10,
+            },
+            ScoredFile {
+                path: "src/middleware.rs".into(),
+                score: 0.5,
+                signals: vec![],
+                token_count: 10,
+            },
+        ];
+
+        // Run repeatedly: each `select_seeds` call builds a fresh HashMap whose
+        // iteration order is randomized per process, so a stable result across
+        // iterations demonstrates the tiebreak (not luck) is doing the work.
+        let expected = vec![
+            "src/api.rs",
+            "src/config.rs",
+            "src/middleware.rs",
+            "src/utils.rs",
+        ];
+        for _ in 0..16 {
+            let seeds = select_seeds(&scored, &index, SEED_THRESHOLD, 100);
+            let paths: Vec<&str> = seeds.iter().map(|s| s.path.as_str()).collect();
+            assert_eq!(
+                paths, expected,
+                "tied-score seeds must be ordered by path ascending"
+            );
+        }
+
+        // The truncated top-`limit` set must also be the path-ordered prefix.
+        let top2 = select_seeds(&scored, &index, SEED_THRESHOLD, 2);
+        let top2_paths: Vec<&str> = top2.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(
+            top2_paths,
+            vec!["src/api.rs", "src/config.rs"],
+            "truncated top-2 must be the path-ordered prefix of the tied set"
         );
     }
 

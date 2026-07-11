@@ -1,5 +1,5 @@
 ---
-id: '0177'
+id: '0196'
 title: Canvas-2D over Rust-precomputed coordinates; no new graph library
 status: ACCEPTED
 date: 2026-07-11
@@ -7,7 +7,7 @@ triggered_by: cxpak UI overhaul (3.1.0) — visual surface redesign
 loop: planning
 ---
 
-# ADR-0177: Canvas-2D over Rust-precomputed coordinates; no new graph library
+# ADR-0196: Canvas-2D over Rust-precomputed coordinates; no new graph library
 
 **Context.** Explore must render 300–1000+ nodes without a hairball, deterministically, in a self-contained file. A Sugiyama layout engine already exists in Rust (`src/visual/layout.rs`: SCC condensation, barycenter, Brandes-Kopf). D3 v7 is already inlined (`assets/d3-bundle.min.js`, 273 KB).
 

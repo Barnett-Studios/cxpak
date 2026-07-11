@@ -1,18 +1,10 @@
-use crate::index::graph::DependencyGraph;
-use crate::index::CodebaseIndex;
-use serde::Serialize;
+use crate::core_graph::graph::DependencyGraph;
+use crate::core_graph::CodebaseIndex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[derive(Debug, Clone, Serialize)]
-pub struct HealthScore {
-    pub composite: f64,
-    pub conventions: f64,
-    pub test_coverage: f64,
-    pub churn_stability: f64,
-    pub coupling: f64,
-    pub cycles: f64,
-    pub dead_code: Option<f64>,
-}
+// `HealthScore` is a data-model type now in `core_graph` (cxpak 3.0.0 Phase 0
+// de-cycle); the scoring logic below stays here.
+pub use crate::core_graph::intel::HealthScore;
 
 /// Compute the dead_code dimension score.
 /// Score = 10.0 * (1.0 - dead_ratio). Zero symbols = 10.0 (no dead code possible).
@@ -108,7 +100,7 @@ fn score_conventions(index: &CodebaseIndex) -> f64 {
 /// - Python: `def test_` (function-level) or `class Test`
 /// - TypeScript/JavaScript: `describe(`, ` it(`, or `\ntest(` (non-word prefix)
 /// - Go: `func Test`
-pub(crate) fn has_inline_tests(file: &crate::index::IndexedFile) -> bool {
+pub(crate) fn has_inline_tests(file: &crate::core_graph::IndexedFile) -> bool {
     let lang = file.language.as_deref().unwrap_or("");
     let content = &file.content;
     match lang {
@@ -154,7 +146,7 @@ pub(crate) fn has_inline_tests(file: &crate::index::IndexedFile) -> bool {
 /// Test coverage dimension: ratio of source files with >= 1 mapped test file or inline
 /// tests, scaled to [0, 10].
 fn score_test_coverage(index: &CodebaseIndex) -> f64 {
-    let source_files: Vec<&crate::index::IndexedFile> = index
+    let source_files: Vec<&crate::core_graph::IndexedFile> = index
         .files
         .iter()
         .filter(|f| {
@@ -445,7 +437,7 @@ pub(crate) fn module_prefix(path: &str, depth: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::graph::DependencyGraph;
+    use crate::core_graph::graph::DependencyGraph;
     use crate::schema::EdgeType;
 
     #[test]
@@ -689,8 +681,8 @@ mod tests {
 
     // ---- has_inline_tests ----
 
-    fn mk_file(path: &str, lang: &str, content: &str) -> crate::index::IndexedFile {
-        crate::index::IndexedFile {
+    fn mk_file(path: &str, lang: &str, content: &str) -> crate::core_graph::IndexedFile {
+        crate::core_graph::IndexedFile {
             relative_path: path.to_string(),
             language: Some(lang.to_string()),
             size_bytes: content.len() as u64,
@@ -772,7 +764,7 @@ mod tests {
         );
         content_map.insert("src/no_tests.rs".to_string(), "pub fn bar() {}".to_string());
 
-        let index = crate::index::CodebaseIndex::build_with_content(
+        let index = crate::core_graph::CodebaseIndex::build_with_content(
             files,
             parse_results,
             &counter,
@@ -828,8 +820,11 @@ mod tests {
             })
             .collect();
 
-        let mut index =
-            crate::index::CodebaseIndex::build(files, std::collections::HashMap::new(), &counter);
+        let mut index = crate::core_graph::CodebaseIndex::build(
+            files,
+            std::collections::HashMap::new(),
+            &counter,
+        );
 
         // With no conventions, churn_30d is empty → score_churn_stability returns 10.0.
         let empty_score = score_churn_stability(&index);

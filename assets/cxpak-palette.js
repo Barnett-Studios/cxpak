@@ -1,7 +1,7 @@
-/* cxpak palette system (ADR-0172): one design language, many palettes.
+/* cxpak palette system (ADR-0191): one design language, many palettes.
    Palette is client-side runtime state applied as CSS custom properties on
    :root — the emitted HTML bytes are identical regardless of default or
-   selection, so the golden fixture is unaffected (ADR-0179 determinism note).
+   selection, so the golden fixture is unaffected (ADR-0198 determinism note).
    btop-schema token sets (bg/surf/ink/ink2/ink3/hair/accent/lo/mid/hi) are
    mapped onto the SPA's real CSS variables. Tokyo Night is the default. */
 (function () {

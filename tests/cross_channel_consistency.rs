@@ -467,12 +467,13 @@ async fn metadata_health_score_matches_health_cached() {
 async fn mcp_cxpak_visual_routes_through_make_metadata() {
     let source = include_str!("../src/commands/serve.rs");
     let cxpak_visual_marker = "cxpak_visual";
-    // Find the actual dispatch arm `"cxpak_visual" => { ... }` (not the
-    // tools/list schema string).  The dispatch arm uniquely matches the
-    // pattern with `=>` immediately after.
+    // Find the actual dispatch arm `"visual" => { ... }` (C3 re-keyed the
+    // dispatch from the legacy `cxpak_visual` tool name to the capability op id
+    // `visual`; see ADR-0182).  The dispatch arm uniquely matches the pattern
+    // with `=>` immediately after.
     let idx = source
-        .find(r#""cxpak_visual" => {"#)
-        .expect("MCP cxpak_visual handler dispatch arm must exist");
+        .find(r#""visual" => {"#)
+        .expect("MCP visual capability dispatch arm must exist");
     let window = &source[idx..idx + 4000];
     assert!(
         window.contains("commands::visual::make_metadata")

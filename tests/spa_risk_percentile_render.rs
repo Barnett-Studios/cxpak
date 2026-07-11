@@ -1,5 +1,5 @@
 //! N5 acceptance: the risk treemap colours by within-repo percentile, not the
-//! scale-collapsed absolute score (ADR-0179). Assertions target the treemap
+//! scale-collapsed absolute score (ADR-0198). Assertions target the treemap
 //! specifically — the architecture graph's separate `riskScale` (render.rs) is
 //! out of scope for this node and legitimately still keys off risk_score.
 #![cfg(feature = "visual")]

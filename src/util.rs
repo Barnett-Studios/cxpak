@@ -28,6 +28,10 @@ use std::path::Path;
 /// - U+200B ZWSP Zero-Width Space (homograph attack vector)
 /// - U+200C ZWNJ Zero-Width Non-Joiner
 /// - U+200D ZWJ  Zero-Width Joiner
+/// - U+2060 WJ   Word Joiner
+/// - U+FEFF ZWNBSP Byte Order Mark
+/// - U+206A..U+206F Deprecated format controls
+/// - U+180E MVS  Mongolian Vowel Separator
 ///
 /// Returns the input unchanged if it contains none of these — the
 /// allocation cost is paid only when sanitisation is actually needed.
@@ -55,6 +59,10 @@ fn is_dangerous_format_char(c: char) -> bool {
             | '\u{2066}'..='\u{2069}'  // LRI/RLI/FSI/PDI
             | '\u{200B}'..='\u{200F}'  // ZWSP/ZWNJ/ZWJ/LRM/RLM
             | '\u{061C}'  // ALM
+            | '\u{2060}'  // WJ Word Joiner
+            | '\u{FEFF}'  // ZWNBSP/BOM
+            | '\u{206A}'..='\u{206F}'  // deprecated format controls
+            | '\u{180E}'  // Mongolian Vowel Separator
     )
 }
 
@@ -104,5 +112,26 @@ mod tests {
         ensure_gitignore_entry(dir.path()).unwrap();
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert_eq!(content.matches(".cxpak/").count(), 1);
+    }
+
+    #[test]
+    fn test_sanitize_word_joiner() {
+        assert!(sanitize_bidi("a\u{2060}b").contains("<U+2060>"));
+    }
+
+    #[test]
+    fn test_sanitize_bom() {
+        assert!(sanitize_bidi("a\u{FEFF}b").contains("<U+FEFF>"));
+    }
+
+    #[test]
+    fn test_sanitize_deprecated_format() {
+        assert!(sanitize_bidi("a\u{206A}b").contains("<U+206A>"));
+        assert!(sanitize_bidi("a\u{206F}b").contains("<U+206F>"));
+    }
+
+    #[test]
+    fn test_sanitize_mongolian_sep() {
+        assert!(sanitize_bidi("a\u{180E}b").contains("<U+180E>"));
     }
 }

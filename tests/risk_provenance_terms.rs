@@ -1,6 +1,6 @@
 //! N7 acceptance (RED until RiskEntry carries the three factor terms): the
 //! provenance drawer needs the literal derivation, so churn_term × blast_term ×
-//! test_penalty_term must reproduce risk_score exactly (ADR-0174).
+//! test_penalty_term must reproduce risk_score exactly (ADR-0193).
 
 use cxpak::intelligence::risk::compute_risk_ranking;
 use cxpak::test_support::index_with;

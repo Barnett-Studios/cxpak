@@ -12,27 +12,20 @@ use std::collections::HashMap;
 
 fn git_tempdir() -> tempfile::TempDir {
     let temp = tempfile::TempDir::new().unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(temp.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.email", "t@t"])
-        .current_dir(temp.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.name", "t"])
-        .current_dir(temp.path())
-        .output();
-    std::fs::write(temp.path().join("README.md"), "init\n").unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(temp.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["commit", "-m", "init", "--quiet"])
-        .current_dir(temp.path())
-        .output();
+    {
+        let repo = git2::Repository::init(temp.path()).expect("git2 init");
+        std::fs::write(temp.path().join("README.md"), "init\n").unwrap();
+        let mut index = repo.index().expect("repo index");
+        index
+            .add_path(std::path::Path::new("README.md"))
+            .expect("git add");
+        index.write().expect("index write");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("t", "t@t").expect("sig");
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .expect("initial commit");
+    }
     temp
 }
 
@@ -49,26 +42,19 @@ fn process_watcher_changes_invalidates_dead_code_cache() {
     let foo_path = dir.path().join("foo.rs");
     std::fs::write(&foo_path, "fn dead_one() {}\n").unwrap();
     // Initialise git so build_index doesn't bail.
-    let _ = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(dir.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.email", "t@t"])
-        .current_dir(dir.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.name", "t"])
-        .current_dir(dir.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(dir.path())
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["commit", "-m", "init", "--quiet"])
-        .current_dir(dir.path())
-        .output();
+    {
+        let repo = git2::Repository::init(dir.path()).expect("git2 init");
+        let mut index = repo.index().expect("repo index");
+        index
+            .add_path(std::path::Path::new("foo.rs"))
+            .expect("git add");
+        index.write().expect("index write");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("t", "t@t").expect("sig");
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .expect("initial commit");
+    }
 
     let idx = cxpak::commands::serve::build_index(dir.path()).expect("build_index");
     let shared = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(idx)));

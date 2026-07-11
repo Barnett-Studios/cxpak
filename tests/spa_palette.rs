@@ -1,4 +1,4 @@
-//! N6 acceptance: the SPA ships the client-side palette system (ADR-0172) with
+//! N6 acceptance: the SPA ships the client-side palette system (ADR-0191) with
 //! Tokyo Night as the default, several popular schemes, no CDN, and — because
 //! the palette is applied at runtime — byte-identical output across renders.
 #![cfg(feature = "visual")]

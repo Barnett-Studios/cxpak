@@ -24,7 +24,7 @@ fn spa_renders_with_zero_files_index() {
     let idx = empty_index();
     let html = cxpak::visual::spa::render_spa(&idx, &fixture_metadata()).unwrap();
     assert!(html.starts_with("<!DOCTYPE html>"));
-    // Three-mode IA (ADR-0173): Flow + Diff removed from the SPA nav.
+    // Three-mode IA (ADR-0192): Flow + Diff removed from the SPA nav.
     for id in ["view-dashboard", "view-explore", "view-timeline"] {
         assert!(html.contains(&format!(r#"id="{id}""#)));
     }

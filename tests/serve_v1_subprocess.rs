@@ -65,64 +65,77 @@ mod v1_subprocess_tests {
         listener.local_addr().unwrap().port()
     }
 
+    /// Block until the server can actually *serve* a request, not merely
+    /// until the port is connectable.
+    ///
+    /// `cxpak serve` builds its index BEFORE binding the port
+    /// (`build_index` at commands/serve.rs:1086, `TcpListener::bind` at
+    /// :1138), so TCP-connectability already implies the index is built.
+    /// But the listener is bound *before* `axum::serve(...)` starts its
+    /// accept loop and installs the SIGTERM handler via
+    /// `.with_graceful_shutdown(...)` (:1166).  In that window the port
+    /// accepts the connection at the kernel level but no task pulls the
+    /// request off the socket, so a raw `read_to_end` returns 0 bytes /
+    /// times out, and a SIGTERM hits the kernel default disposition
+    /// (force-kill) instead of the graceful handler.
+    ///
+    /// Polling `GET /health` until it returns a parseable HTTP 200 proves
+    /// the accept loop is live and `axum::serve` is executing — which means
+    /// the signal handler is installed and the index is queryable.  `/health`
+    /// is unauthenticated (it sits outside the `/v1/*` auth layer) and
+    /// state-free, so it is the correct readiness probe regardless of
+    /// whether the server was launched with `--token`.
+    ///
+    /// Mirrors the readiness-poll fix already applied to the LSP subprocess
+    /// test (tests/lsp_subprocess.rs ~line 290), which replaced a fixed
+    /// sleep that lost the same build_index + signal-install race under
+    /// parallel-test load.
     fn wait_for_server(port: u16) -> bool {
-        for _ in 0..50 {
-            if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some((200, _)) = try_http_request(port, "GET", "/health", None, None) {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        false
     }
 
-    /// Send a raw HTTP/1.1 request over a fresh TCP connection. Optionally
-    /// attaches an `Authorization: Bearer <token>` header and a JSON body.
-    /// Returns `(status_code, body)`.
-    fn http_request(
+    /// One raw HTTP/1.1 request attempt over a fresh TCP connection.
+    ///
+    /// Returns `Some((status, body))` only when a complete, well-formed
+    /// response was read (status line parsed and, when the server declares
+    /// `Content-Length`, the full body received).  Returns `None` on any
+    /// transient failure — connect refused/reset, write error, read timeout,
+    /// a 0-byte / short read, or an unparseable status line.  Distinguishing
+    /// "transient nothing" from "real response" is what lets both the
+    /// readiness poll and the public `http_request` retry deterministically
+    /// instead of panicking on a partial read.
+    ///
+    /// The request always sends `Connection: close`, so the server closes
+    /// the socket after the response and a read-to-EOF is well-defined even
+    /// absent a `Content-Length`.
+    fn try_http_request(
         port: u16,
         method: &str,
         path: &str,
         bearer: Option<&str>,
         body_json: Option<&str>,
-    ) -> (u16, String) {
-        // Connect with brief retry: under parallel-test load on macOS the
-        // server's accept queue can be drained between two requests, even
-        // after wait_for_server proved the listener is up.  Three quick
-        // retries cover the transient ECONNREFUSED/ECONNRESET window
-        // without masking a genuinely-down server.
-        let mut stream = {
-            let mut last_err = None;
-            let mut connected = None;
-            for _ in 0..5 {
-                match TcpStream::connect(format!("127.0.0.1:{port}")) {
-                    Ok(s) => {
-                        connected = Some(s);
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                }
-            }
-            connected.unwrap_or_else(|| {
-                panic!(
-                    "could not connect to 127.0.0.1:{port} after 5 retries: {:?}",
-                    last_err
-                )
-            })
-        };
+    ) -> Option<(u16, String)> {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).ok()?;
         // 30s read timeout: heavy /v1/* handlers (briefing, auto_context-
         // backed, security_surface) routinely take 1-3s on cold caches,
-        // and Linux CI runners are slower than local macOS.  Original 5s
-        // value caused a sporadic Linux-only failure in
-        // `v1_briefing_with_correct_bearer_and_task_returns_200` —
-        // read_to_end timed out, returned 0 bytes, panicked at the status
-        // parse.  30s is generous enough to never bite a real success
-        // path while still catching genuinely-stuck servers.
+        // and Linux CI runners are slower than local macOS.  Generous
+        // enough to never bite a real success path while still bounding a
+        // genuinely-stuck server.
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
+            .ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .ok()?;
 
         let mut req = format!(
             "{method} {path} HTTP/1.1\r\n\
@@ -140,38 +153,107 @@ mod v1_subprocess_tests {
         } else {
             req.push_str("\r\n");
         }
-        stream.write_all(req.as_bytes()).unwrap();
+        stream.write_all(req.as_bytes()).ok()?;
+        stream.flush().ok()?;
 
-        // Read the full response body in one shot rather than line-by-line.
-        // The previous BufReader::read_line approach surfaced a flaky
-        // status==0 on macOS when the server closes immediately after a
-        // small response (e.g. an empty 401 body): partial-buffer drops
-        // can erase the status line that did arrive.
+        // Read until the header terminator (CRLFCRLF) is seen, then — if the
+        // server declared a Content-Length — read exactly that many body
+        // bytes; otherwise read to EOF (the server half-closes after the
+        // response because we sent `Connection: close`).
         //
         // Important: do NOT shutdown(Write) before reading.  Half-closing
-        // here causes hyper on the server side to see FIN mid-parse and
-        // abort the request without responding.
+        // makes hyper on the server side see FIN mid-parse and abort the
+        // request without responding.
         let mut buf = Vec::new();
-        let read_outcome = (&stream).read_to_end(&mut buf);
-        let response = String::from_utf8_lossy(&buf).into_owned();
+        let mut chunk = [0u8; 4096];
+        loop {
+            // Stop once we have full headers AND (Content-Length satisfied
+            // OR the peer closed).  Computing this each iteration keeps the
+            // read deterministic without over-reading.
+            if let Some(header_end) = find_header_end(&buf) {
+                if let Some(len) = content_length(&buf[..header_end]) {
+                    if buf.len() >= header_end + len {
+                        break;
+                    }
+                }
+            }
+            match (&stream).read(&mut chunk) {
+                Ok(0) => break, // EOF — server closed (Connection: close)
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break, // timeout / reset — fall through to parse
+            }
+        }
 
+        // A complete response must at minimum contain the header terminator.
+        // Anything short of that is a transient partial read → None so the
+        // caller retries rather than panicking on a half-line.
+        let header_end = find_header_end(&buf)?;
+        let response = String::from_utf8_lossy(&buf).into_owned();
         let status = response
             .lines()
             .next()
             .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or_else(|| {
-                panic!(
-                    "could not parse HTTP status from response. \
-                     read {} bytes; read_to_end outcome: {:?}; \
-                     method={method} path={path}; \
-                     response so far: <<<{response}>>>",
-                    buf.len(),
-                    read_outcome,
-                )
-            });
+            .and_then(|s| s.parse::<u16>().ok())?;
+        // If Content-Length was declared, require the full body before
+        // accepting the response as complete.
+        if let Some(len) = content_length(&buf[..header_end]) {
+            if buf.len() < header_end + len {
+                return None;
+            }
+        }
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-        (status, body)
+        Some((status, body))
+    }
+
+    /// Index of the first byte after the `\r\n\r\n` header terminator, or
+    /// `None` if the headers are not yet complete.
+    fn find_header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    }
+
+    /// Parse the `Content-Length` header value from a raw header block
+    /// (case-insensitive header name).  `None` when absent or unparseable.
+    fn content_length(headers: &[u8]) -> Option<usize> {
+        let text = String::from_utf8_lossy(headers);
+        for line in text.lines() {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    return value.trim().parse::<usize>().ok();
+                }
+            }
+        }
+        None
+    }
+
+    /// Send a raw HTTP/1.1 request and return `(status_code, body)`,
+    /// retrying once on a transient empty/short read before panicking.
+    /// Optionally attaches an `Authorization: Bearer <token>` header and a
+    /// JSON body.
+    fn http_request(
+        port: u16,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+        body_json: Option<&str>,
+    ) -> (u16, String) {
+        // Up to 3 attempts: under parallel-test load the accept queue can be
+        // momentarily drained or a connection reset between requests, even
+        // after wait_for_server proved the server serves.  A transient empty
+        // read returns None from try_http_request; one or two quick retries
+        // cover that window without masking a genuinely-down server.
+        for attempt in 0..3 {
+            if let Some(result) = try_http_request(port, method, path, bearer, body_json) {
+                return result;
+            }
+            if attempt < 2 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        panic!(
+            "no complete HTTP response from 127.0.0.1:{port} after 3 attempts; \
+             method={method} path={path} — server is unreachable, hung, or \
+             returned a truncated response"
+        );
     }
 
     fn spawn_serve(repo: &tempfile::TempDir, port: u16, token: Option<&str>) -> process::Child {

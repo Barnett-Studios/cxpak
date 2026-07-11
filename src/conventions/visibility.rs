@@ -1,17 +1,11 @@
 use crate::conventions::{FileContribution, PatternObservation};
-use crate::index::{CodebaseIndex, IndexedFile};
+use crate::core_graph::{CodebaseIndex, IndexedFile};
 use crate::parser::language::Visibility;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VisibilityConventions {
-    pub public_ratio: Option<PatternObservation>,
-    pub doc_comment_coverage: Option<PatternObservation>,
-    pub additional: Vec<PatternObservation>,
-    #[serde(skip)]
-    pub file_contributions: HashMap<String, FileContribution>,
-}
+// `VisibilityConventions` is a data-model type now in `core_graph::conventions`
+// (cxpak 3.0.0 Phase 0 de-cycle); the extraction logic stays here.
+pub use crate::core_graph::conventions::VisibilityConventions;
 
 /// Extract visibility conventions from the codebase index.
 pub fn extract_visibility(index: &CodebaseIndex) -> VisibilityConventions {

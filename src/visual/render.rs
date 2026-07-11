@@ -340,7 +340,7 @@ function navTo(view) {
 
 /* proveRisk() opens the inspector "prove-it" drawer with the literal
    derivation of a risk score from its churn/blast/test-penalty terms
-   (ADR-0174). No-op outside SPA context (standalone views lack CX.openInspector). */
+   (ADR-0193). No-op outside SPA context (standalone views lack CX.openInspector). */
 function proveRisk(r) {
   if (!(window.CX && typeof window.CX.openInspector === 'function')) return;
   // 3 significant figures per factor so the shown product actually reproduces
@@ -379,7 +379,7 @@ var sc = dash.health.composite;
 var gc = sc >= 7 ? 'good' : sc >= 4 ? 'warn' : 'bad';
 gw.appendChild(CX.h('div', {class: 'cxpak-gauge-score ' + gc}, [sc.toFixed(1)]));
 
-/* Blueprint needle dial (ADR-0172). Same real composite `sc` (0–10) — a needle
+/* Blueprint needle dial (ADR-0191). Same real composite `sc` (0–10) — a needle
    gauge, not a filled donut. Angle a is measured from 12 o'clock, clockwise
    positive; the top semicircle spans -90° (sc=0) to +90° (sc=10). */
 var dW = 150, dH = 92, dcx = 75, dcy = 78, dR = 60;
@@ -526,7 +526,7 @@ CX.renderGraph(cv.g, pl, {
   }
 });
 
-/* Q4: Signals (ADR-0172/0174). Restyle of the real detections — the chip is a
+/* Q4: Signals (ADR-0191/0174). Restyle of the real detections — the chip is a
    presentation label for a.kind, never a new or fabricated number. */
 var q4 = document.createElement('div'); q4.className = 'cxpak-quadrant';
 q4.innerHTML = '<div class="cxpak-quadrant-title">Signals<span class="cxpak-sheet">RANKED · PROVEN</span></div>';
@@ -595,7 +595,7 @@ if (alerts.length === 0) {
 q4.appendChild(al);
 grid.appendChild(q4);
 
-/* Repo-DNA band (ADR-0172): a full-width fingerprint barcode below the grid.
+/* Repo-DNA band (ADR-0191): a full-width fingerprint barcode below the grid.
    Every bar is a real PageRank value (importance spectrum); the caption carries
    real node/edge counts and a real SHA-256 prefix. Purely presentational — it
    invents no number. */
@@ -746,7 +746,7 @@ var H = (wrap.clientHeight || window.innerHeight) - 52;
 
 var svg = d3.select(wrap).append('svg').attr('width', W).attr('height', H);
 
-/* Colour by within-repo percentile (ADR-0179), not the absolute score: on a
+/* Colour by within-repo percentile (ADR-0198), not the absolute score: on a
    large repo the product-of-fractions score collapses into ~[0,0.04] and the
    old absolute ramp mapped every leaf into the first (green) band. Percentile
    is uniform in [0,1] by construction, so evenly-spaced quartile stops are the
@@ -858,7 +858,7 @@ function riskLegItem(bg, label) {
     label,
   ]);
 }
-/* Colour encodes within-repo risk PERCENTILE (ADR-0179), not the absolute
+/* Colour encodes within-repo risk PERCENTILE (ADR-0198), not the absolute
    score \u2014 so the legend must name the relative scale. On a small repo this is
    what keeps a trivial file from reading as "high risk" just because it ranks
    top of a low-risk pack. */
@@ -1536,7 +1536,7 @@ pub struct DashboardData {
     pub risks: RisksQuadrant,
     pub architecture_preview: ArchitecturePreviewQuadrant,
     pub alerts: AlertsQuadrant,
-    /// Repo-DNA barcode (ADR-0172): a purely-visual fingerprint band. Every
+    /// Repo-DNA barcode (ADR-0191): a purely-visual fingerprint band. Every
     /// value is real — `spine` is the PageRank importance spectrum, `nodes`/
     /// `edges` are graph cardinalities, `fingerprint` is a SHA-256 prefix of
     /// the sorted file set. No presentation number is invented.
@@ -1583,7 +1583,7 @@ pub struct RiskDisplayEntry {
     pub blast_radius: usize,
     pub has_tests: bool,
     pub severity: String,
-    /// Provenance for the prove-it drawer (ADR-0174): within-repo percentile
+    /// Provenance for the prove-it drawer (ADR-0193): within-repo percentile
     /// plus the three factors whose product reproduces `risk_score`.
     pub risk_percentile: f64,
     pub churn_term: f64,
@@ -2146,7 +2146,7 @@ pub struct TreemapNode {
     pub risk_score: f64,
     /// Within-repo risk percentile in [0, 1] (`rank/(n-1)`, `RiskEntry`); the
     /// treemap colours by this so the scale-collapsed absolute score no longer
-    /// maps every leaf into the first band (ADR-0179). 0.0 for group nodes.
+    /// maps every leaf into the first band (ADR-0198). 0.0 for group nodes.
     pub risk_percentile: f64,
     /// `"high"` | `"medium"` | `"low"` per [`risk_severity`].
     pub severity: String,

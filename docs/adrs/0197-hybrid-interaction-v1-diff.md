@@ -1,5 +1,5 @@
 ---
-id: '0178'
+id: '0197'
 title: Hybrid interaction model: bounded embed + opt-in Live serve; add `/v1/diff`
 status: ACCEPTED
 date: 2026-07-11
@@ -7,7 +7,7 @@ triggered_by: cxpak UI overhaul (3.1.0) — visual surface redesign
 loop: planning
 ---
 
-# ADR-0178: Hybrid interaction model: bounded embed + opt-in Live serve; add `/v1/diff`
+# ADR-0197: Hybrid interaction model: bounded embed + opt-in Live serve; add `/v1/diff`
 
 **Context.** The self-contained artifact can only answer questions the generator embedded — hence the dead Flow/Diff tabs. Users want arbitrary symbol/ref queries, but the "no network at runtime" invariant is sacred.
 

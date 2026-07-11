@@ -1,20 +1,12 @@
 use crate::conventions::{FileContribution, PatternObservation};
-use crate::index::{CodebaseIndex, IndexedFile};
+use crate::core_graph::{CodebaseIndex, IndexedFile};
 use crate::parser::language::SymbolKind;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ErrorConventions {
-    pub result_return: Option<PatternObservation>,
-    pub unwrap_usage: Option<PatternObservation>,
-    pub expect_usage: Option<PatternObservation>,
-    pub question_mark_propagation: Option<PatternObservation>,
-    pub additional: Vec<PatternObservation>,
-    #[serde(skip)]
-    pub file_contributions: HashMap<String, FileContribution>,
-}
+// `ErrorConventions` is a data-model type now in `core_graph::conventions`
+// (cxpak 3.0.0 Phase 0 de-cycle); the extraction logic stays here.
+pub use crate::core_graph::conventions::ErrorConventions;
 
 /// Returns true when the file path looks like a test file.
 pub fn is_test_file(path: &str) -> bool {

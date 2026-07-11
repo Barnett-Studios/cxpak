@@ -1,7 +1,7 @@
 //! SPA renderer — composes the three-mode UI (Overview, Explore, History)
 //! into one HTML file. Explore merges the former Architecture + Risk views
 //! under a lens toggle; Flow and Diff are param-only and live on the
-//! standalone render path, not the SPA nav (ADR-0173).
+//! standalone render path, not the SPA nav (ADR-0192).
 
 use crate::index::CodebaseIndex;
 use crate::visual::layout::{LayoutConfig, LayoutError};
@@ -11,7 +11,7 @@ use crate::visual::search_index;
 static D3_BUNDLE: &str = include_str!("../../assets/d3-bundle.min.js");
 static VISUAL_CSS: &str = include_str!("../../assets/cxpak-visual.css");
 static SPA_CONTROLLER: &str = include_str!("../../assets/cxpak-spa-controller.js");
-/// Client-side palette registry + picker (ADR-0172). Applies CSS custom
+/// Client-side palette registry + picker (ADR-0191). Applies CSS custom
 /// properties at runtime, so the emitted bytes never change with selection.
 static PALETTE_JS: &str = include_str!("../../assets/cxpak-palette.js");
 
@@ -214,7 +214,7 @@ pub fn render_spa_with_timeline(
     // tabindex/aria-selected as focus moves.  Without this, keyboard
     // users had to Tab through every preceding focusable element to
     // reach a non-dashboard view.
-    // Three-mode information architecture (ADR-0173): Overview / Explore /
+    // Three-mode information architecture (ADR-0192): Overview / Explore /
     // History. Flow and Diff were removed from the SPA nav — both are null in
     // every SPA render (they need CLI --symbol / --files params) so they only
     // ever showed a permanent empty state; they remain available via the
@@ -224,7 +224,7 @@ pub fn render_spa_with_timeline(
     html.push_str("      <nav class=\"cxpak-nav\" role=\"tablist\" aria-label=\"Views\">\n");
     html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"dashboard\" href=\"#dashboard\" role=\"tab\" aria-selected=\"true\" tabindex=\"0\">Overview</a>\n");
     // Explore merges the former Architecture + Risk tabs under one mode with a
-    // Dependencies|Risk lens toggle (ADR-0173). Legacy #architecture / #risk
+    // Dependencies|Risk lens toggle (ADR-0192). Legacy #architecture / #risk
     // hashes redirect here (see the controller's parseHash).
     html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"explore\" href=\"#explore\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Explore</a>\n");
     html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"timeline\" href=\"#timeline\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">History</a>\n");
@@ -354,7 +354,7 @@ pub fn render_spa_with_timeline(
 
     // Palette registry + picker — runs after the header exists and after the
     // controller so window.CX is present. Applies CSS custom properties at
-    // runtime; the emitted bytes are identical for every palette (ADR-0172).
+    // runtime; the emitted bytes are identical for every palette (ADR-0191).
     html.push_str("  <script>");
     html.push_str(PALETTE_JS);
     html.push_str("</script>\n");

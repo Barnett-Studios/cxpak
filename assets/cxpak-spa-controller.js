@@ -62,7 +62,7 @@
   // =============================================================================
   // 2) ROUTER
   // =============================================================================
-  // Three-mode IA (ADR-0173): Overview / Explore / History. Internal keys stay
+  // Three-mode IA (ADR-0192): Overview / Explore / History. Internal keys stay
   // dashboard/explore/timeline for routing + renderer compatibility. Flow and
   // Diff were removed from the SPA (param-only, always-empty); legacy #flow /
   // #diff hashes fall through to dashboard in parseHash below.
@@ -419,7 +419,7 @@
   function applyTheme(t) {
     document.documentElement.setAttribute('data-theme', t);
   }
-  // The palette picker (ADR-0172) is the single colour control — light/dark are
+  // The palette picker (ADR-0191) is the single colour control — light/dark are
   // palette variants, so the old ☾/☀ data-theme toggle was removed. We still
   // apply an initial data-theme (from a stored preference or the OS setting) so
   // any theme-scoped CSS resolves before the palette JS paints over it.

@@ -1,6 +1,6 @@
 //! N2 acceptance (RED until RiskEntry gains `risk_percentile`): within-repo
 //! percentile spans [0,1] even when raw risk scores collapse into a tiny band
-//! (ADR-0179 — fixes the uniform-teal treemap).
+//! (ADR-0198 — fixes the uniform-teal treemap).
 
 use cxpak::intelligence::risk::compute_risk_ranking;
 use cxpak::test_support::index_with;

@@ -221,57 +221,100 @@ pub fn diagnostics_for_file(
     // requests diagnostics per file open/save/focus, so the naive per-call
     // recomputation was O(F·S·C) per request, freezing editors on any
     // non-toy repo. The cache pays off on the second call onwards.
-    let Some(pr) = &file.parse_result else {
-        return Vec::new();
-    };
-    index
-        .dead_code_cached()
-        .iter()
-        .filter(|d| d.file == file.relative_path)
-        .filter_map(|d| {
-            let sym = pr
-                .symbols
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+
+    // Dead-code Warnings require a parse result to resolve declaration lines.
+    if let Some(pr) = &file.parse_result {
+        diagnostics.extend(
+            index
+                .dead_code_cached()
                 .iter()
-                .find(|s| s.name == d.symbol && s.kind == d.kind)?;
-            let line = sym.start_line.saturating_sub(1) as u32;
-            let end_line = sym.end_line.saturating_sub(1) as u32;
-            Some(Diagnostic {
+                .filter(|d| d.file == file.relative_path)
+                .filter_map(|d| {
+                    let sym = pr
+                        .symbols
+                        .iter()
+                        .find(|s| s.name == d.symbol && s.kind == d.kind)?;
+                    let line = sym.start_line.saturating_sub(1) as u32;
+                    let end_line = sym.end_line.saturating_sub(1) as u32;
+                    Some(Diagnostic {
+                        range: Range {
+                            start: Position { line, character: 0 },
+                            end: Position {
+                                line: end_line,
+                                character: 0,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "cxpak.dead_code".into(),
+                        )),
+                        code_description: None,
+                        source: Some("cxpak".into()),
+                        // Include kind and visibility so the IDE message is
+                        // actionable at a glance.  `d.reason` is the detector's
+                        // single fixed string ("zero callers, not entry point,
+                        // no test reference") — useful but repetitive across
+                        // every diagnostic; prefixing with kind+visibility tells
+                        // the user whether they can safely delete a private
+                        // function vs. whether a pub symbol requires review of
+                        // external callers.  Bidi-sanitised so a symbol named
+                        // with U+202E cannot flip the visual order of the
+                        // diagnostic message.
+                        message: format!(
+                            "dead code: {} {:?} `{}` — {}",
+                            visibility_label(&sym.visibility),
+                            d.kind,
+                            crate::util::sanitize_bidi(&d.symbol),
+                            d.reason,
+                        ),
+                        related_information: None,
+                        tags: Some(vec![tower_lsp::lsp_types::DiagnosticTag::UNNECESSARY]),
+                        data: None,
+                    })
+                }),
+        );
+    }
+
+    // Informational diagnostics for every heuristically *inferred* dependency
+    // edge originating from this file (embedded-SQL regex, cross-language
+    // bridges, heuristic column refs). Surfaces the "every edge proven, never
+    // inferred — and when it IS inferred, say so" honesty contract directly in
+    // the editor, distinct from the dead-code Warnings above. Edges carry no
+    // line numbers, so the diagnostic is anchored at the file head. Iterating
+    // the `BTreeSet` keeps the output order deterministic.
+    if let Some(deps) = index.graph.dependencies(&file.relative_path) {
+        for edge in deps.iter().filter(|e| e.confidence.is_inferred()) {
+            diagnostics.push(Diagnostic {
                 range: Range {
-                    start: Position { line, character: 0 },
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
                     end: Position {
-                        line: end_line,
+                        line: 0,
                         character: 0,
                     },
                 },
-                severity: Some(DiagnosticSeverity::WARNING),
+                severity: Some(DiagnosticSeverity::INFORMATION),
                 code: Some(tower_lsp::lsp_types::NumberOrString::String(
-                    "cxpak.dead_code".into(),
+                    "cxpak.inferred_edge".into(),
                 )),
                 code_description: None,
                 source: Some("cxpak".into()),
-                // Include kind and visibility so the IDE message is
-                // actionable at a glance.  `d.reason` is the detector's
-                // single fixed string ("zero callers, not entry point,
-                // no test reference") — useful but repetitive across
-                // every diagnostic; prefixing with kind+visibility tells
-                // the user whether they can safely delete a private
-                // function vs. whether a pub symbol requires review of
-                // external callers.  Bidi-sanitised so a symbol named
-                // with U+202E cannot flip the visual order of the
-                // diagnostic message.
                 message: format!(
-                    "dead code: {} {:?} `{}` — {}",
-                    visibility_label(&sym.visibility),
-                    d.kind,
-                    crate::util::sanitize_bidi(&d.symbol),
-                    d.reason,
+                    "inferred dependency on `{}` (via {}): heuristic match, not structurally extracted",
+                    crate::util::sanitize_bidi(&edge.target),
+                    edge.edge_type.label(),
                 ),
                 related_information: None,
-                tags: Some(vec![tower_lsp::lsp_types::DiagnosticTag::UNNECESSARY]),
+                tags: None,
                 data: None,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+
+    diagnostics
 }
 
 pub fn workspace_symbols(
@@ -334,6 +377,39 @@ pub fn workspace_symbols(
     results
 }
 
+/// LSP methods that are strictly read-only: they only read the in-memory index
+/// and never mutate the workspace or index state. This is the `readOnly`
+/// annotation the C1 retrieval capabilities carry (ADR-0180): the standard
+/// `workspace/symbol`, the legacy `cxpak/search`, and the catalog-routed
+/// `cxpak/retrieval` (search/references/expand) are all read-only — as is every
+/// other cxpak analysis method, since cxpak never mutates code. Clients /
+/// surfaces that advertise capability metadata can use [`method_is_read_only`]
+/// to tag these safe.
+pub const READ_ONLY_METHODS: &[&str] = &[
+    "workspace/symbol",
+    "cxpak/health",
+    "cxpak/conventions",
+    "cxpak/blastRadius",
+    "cxpak/overview",
+    "cxpak/trace",
+    "cxpak/diff",
+    "cxpak/search",
+    "cxpak/apiSurface",
+    "cxpak/deadCode",
+    "cxpak/callGraph",
+    "cxpak/graph",
+    "cxpak/retrieval",
+    "cxpak/predict",
+    "cxpak/drift",
+    "cxpak/securitySurface",
+    "cxpak/dataFlow",
+];
+
+/// Whether `method` is a read-only cxpak LSP method (see [`READ_ONLY_METHODS`]).
+pub fn method_is_read_only(method: &str) -> bool {
+    READ_ONLY_METHODS.contains(&method)
+}
+
 pub fn handle_custom_method(
     method: &str,
     params: serde_json::Value,
@@ -357,9 +433,28 @@ pub fn handle_custom_method(
                 },
             })))
         }
-        "cxpak/conventions" => serde_json::to_value(&index.conventions)
-            .map(Some)
-            .map_err(|e| LspMethodError::Internal(format!("serialization failed: {e}"))),
+        "cxpak/conventions" => {
+            // Accept `tokens` as either a plain u64 (JSON number) or a string
+            // in the same format as the MCP surface: "5000", "50k", "1m".
+            // This ensures LSP and MCP callers can use the same parameter form.
+            let token_budget = params
+                .get("tokens")
+                .and_then(|v| {
+                    v.as_u64().map(|n| n as usize).or_else(|| {
+                        v.as_str()
+                            .and_then(|s| crate::cli::parse_token_count(s).ok())
+                    })
+                })
+                .unwrap_or(crate::conventions::render::MAX_MCP_CONVENTIONS_TOKENS);
+            serde_json::to_value(&index.conventions)
+                .map(|v| {
+                    Some(crate::conventions::render::render_budgeted_conventions(
+                        v,
+                        token_budget,
+                    ))
+                })
+                .map_err(|e| LspMethodError::Internal(format!("serialization failed: {e}")))
+        }
         "cxpak/blastRadius" => {
             let files: Vec<String> = params
                 .get("files")
@@ -544,6 +639,45 @@ pub fn handle_custom_method(
             "edges": index.call_graph.edges,
             "total": index.call_graph.edges.len(),
         }))),
+        // Deterministic graph-query (cxpak 3.0.0 Task B1). `params` is
+        // `{ "op": "node"|"neighbors"|"path"|"subgraph", ... }`; it is passed
+        // straight to the single core `graph_query::execute`. A missing/invalid
+        // op or required param maps to JSON-RPC InternalError (-32603), matching
+        // the other required-param methods (trace/search/predict/dataFlow).
+        "cxpak/graph" => {
+            let op = params
+                .get("op")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    LspMethodError::Internal(
+                        "cxpak/graph requires 'op' (node|neighbors|path|subgraph) param".into(),
+                    )
+                })?
+                .to_string();
+            let result = crate::intelligence::graph_query::execute(&index.graph, &op, &params)
+                .map_err(|e| LspMethodError::Internal(e.to_string()))?;
+            Ok(Some(result))
+        }
+        // Deterministic iterative retrieval (cxpak 3.0.0 Task C1, ADR-0180).
+        // `params` is `{ "op": "search"|"references"|"expand", ... }`, passed
+        // straight to the single core `retrieval::execute`. This method is
+        // read-only (see `method_is_read_only`). A missing/invalid op or
+        // required param maps to JSON-RPC InternalError (-32603), matching the
+        // other required-param methods (trace/search/predict/dataFlow/graph).
+        "cxpak/retrieval" => {
+            let op = params
+                .get("op")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    LspMethodError::Internal(
+                        "cxpak/retrieval requires 'op' (search|references|expand) param".into(),
+                    )
+                })?
+                .to_string();
+            let result = crate::intelligence::retrieval::execute(index, &op, &params)
+                .map_err(|e| LspMethodError::Internal(e.to_string()))?;
+            Ok(Some(result))
+        }
         "cxpak/predict" => {
             let files = params
                 .get("files")
@@ -822,6 +956,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn diagnostics_emit_information_for_inferred_edge_and_keep_dead_code_warning() {
+        use crate::core_graph::graph::EdgeType;
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        // A file with a dead private function (→ Warning) and an inferred
+        // outgoing dependency edge (embedded SQL → INFORMATION).
+        let counter = TokenCounter::new();
+        let file = ScannedFile {
+            relative_path: "src/repo.rs".to_string(),
+            absolute_path: std::path::PathBuf::from("/tmp/src/repo.rs"),
+            language: Some("rust".to_string()),
+            size_bytes: 100,
+        };
+        let mut parses = HashMap::new();
+        parses.insert(
+            "src/repo.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "unused_helper".to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "fn unused_helper()".to_string(),
+                    body: "fn unused_helper() { 1 + 1; }".to_string(),
+                    start_line: 7,
+                    end_line: 9,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content = HashMap::new();
+        content.insert(
+            "src/repo.rs".to_string(),
+            "\n\n\n\n\n\nfn unused_helper() {}\n".to_string(),
+        );
+        let mut index = CodebaseIndex::build_with_content(vec![file], parses, &counter, content);
+        // Inferred edge: heuristic embedded-SQL match from this file.
+        index
+            .graph
+            .add_edge("src/repo.rs", "schema/orders.sql", EdgeType::EmbeddedSql);
+
+        let root = std::path::Path::new("/tmp");
+        let diags = diagnostics_for_file("src/repo.rs", &index, root);
+
+        // INFORMATION diagnostic for the inferred edge.
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::INFORMATION)
+                    && d.source.as_deref() == Some("cxpak")
+                    && d.message.contains("inferred dependency")
+                    && d.message.contains("schema/orders.sql")
+                    && d.message.contains("embedded_sql")),
+            "expected an INFORMATION diagnostic for the inferred edge, got {diags:?}"
+        );
+        // Inferred-edge diagnostic must NOT be tagged UNNECESSARY (that is
+        // reserved for dead code).
+        let info = diags
+            .iter()
+            .find(|d| d.severity == Some(DiagnosticSeverity::INFORMATION))
+            .unwrap();
+        assert!(
+            info.tags.is_none(),
+            "inferred-edge diagnostic must not carry the UNNECESSARY tag"
+        );
+        // Dead-code Warning must still be emitted.
+        assert!(
+            diags.iter().any(|d| d.severity == Some(DiagnosticSeverity::WARNING)
+                && d.message.contains("dead code")
+                && d.message.contains("unused_helper")),
+            "dead-code Warning must still be emitted alongside the inferred-edge diagnostic, got {diags:?}"
+        );
+    }
+
     fn make_multi_symbol_index() -> CodebaseIndex {
         let counter = TokenCounter::new();
         let files = vec![ScannedFile {
@@ -915,31 +1124,25 @@ mod tests {
         );
     }
 
-    /// Create a throwaway directory with `git init` so drift/diff can run.
+    /// Create a throwaway directory with a git repo so drift/diff can run.
+    ///
+    /// Uses `git2` instead of subprocess `git init` to avoid resource
+    /// contention when thousands of tests run in parallel on macOS.
+    /// Creates an initial commit so refs/heads/master exists (required by diff).
     fn make_git_tempdir() -> tempfile::TempDir {
         let temp = tempfile::TempDir::new().unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("init")
-            .arg("--quiet")
-            .current_dir(temp.path())
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.email", "t@t"])
-            .current_dir(temp.path())
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.name", "t"])
-            .current_dir(temp.path())
-            .output();
+        let repo = git2::Repository::init(temp.path()).expect("git2 init");
         std::fs::write(temp.path().join("README.md"), "init\n").unwrap();
-        let _ = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(temp.path())
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["commit", "-m", "init", "--quiet"])
-            .current_dir(temp.path())
-            .output();
+        let mut index = repo.index().expect("repo index");
+        index
+            .add_path(std::path::Path::new("README.md"))
+            .expect("git add README.md");
+        index.write().expect("index write");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("t", "t@t").expect("signature");
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .expect("initial commit");
         temp
     }
 
@@ -976,6 +1179,16 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_and_search_methods_are_annotated_read_only() {
+        // C1 readOnly annotation: the retrieval capabilities/LSP methods must
+        // carry the read-only annotation.
+        assert!(method_is_read_only("cxpak/retrieval"));
+        assert!(method_is_read_only("cxpak/search"));
+        assert!(method_is_read_only("workspace/symbol"));
+        assert!(!method_is_read_only("cxpak/nonexistent"));
+    }
+
+    #[test]
     fn all_registered_custom_methods_return_ok() {
         let index = make_test_index();
         let temp = make_git_tempdir();
@@ -994,6 +1207,10 @@ mod tests {
             ("cxpak/apiSurface", serde_json::Value::Null),
             ("cxpak/deadCode", serde_json::Value::Null),
             ("cxpak/callGraph", serde_json::Value::Null),
+            (
+                "cxpak/retrieval",
+                serde_json::json!({"op": "search", "query": "main"}),
+            ),
             (
                 "cxpak/predict",
                 serde_json::json!({"files": ["src/main.rs"]}),
@@ -1026,6 +1243,8 @@ mod tests {
             ("cxpak/predict", serde_json::json!({"files": []})),
             ("cxpak/dataFlow", serde_json::Value::Null),
             ("cxpak/blastRadius", serde_json::Value::Null),
+            ("cxpak/retrieval", serde_json::Value::Null),
+            ("cxpak/retrieval", serde_json::json!({"op": "search"})),
         ];
         for (m, p) in cases {
             let r = handle_custom_method(m, p, &index, root);

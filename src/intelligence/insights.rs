@@ -1,10 +1,10 @@
-//! Deterministic interpretive insights (ADR-0175) — proven analogues of an
+//! Deterministic interpretive insights (ADR-0194) — proven analogues of an
 //! LLM-narrated codebase, computed from existing signals with zero inference.
 //!
 //! The flagship is [`surprising_connections`]: file pairs that change together
 //! but have no direct import edge — computed today by no renderer, surfaced
 //! here for the Overview. Correlational, so honestly labelled `~ estimated` at
-//! the UI layer (the proof-tick contract, ADR-0174).
+//! the UI layer (the proof-tick contract, ADR-0193).
 
 use crate::index::CodebaseIndex;
 use serde::Serialize;

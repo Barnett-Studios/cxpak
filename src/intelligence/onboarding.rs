@@ -5,7 +5,7 @@
 //! The entry point for callers is [`compute_onboarding_map`] in
 //! `src/visual/onboard.rs`, which delegates to these functions.
 
-use crate::index::graph::DependencyGraph;
+use crate::core_graph::graph::DependencyGraph;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 // ---------------------------------------------------------------------------
@@ -370,7 +370,7 @@ pub fn format_reading_time(total_tokens: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::graph::EdgeType;
+    use crate::core_graph::graph::EdgeType;
 
     // -----------------------------------------------------------------------
     // Task 18: topological_sort_files

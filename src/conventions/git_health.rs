@@ -1,44 +1,11 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GitHealthProfile {
-    pub churn_30d: Vec<ChurnEntry>,
-    pub churn_180d: Vec<ChurnEntry>,
-    pub bugfix_density: HashMap<String, f64>,
-    pub reverts: Vec<RevertEntry>,
-    pub churn_trend: HashMap<String, ChurnTrend>,
-    pub co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
-    #[serde(skip)]
-    pub last_computed: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChurnEntry {
-    pub path: String,
-    pub modifications: usize,
-    /// UNIX epoch seconds of this file's most recent commit inside the window.
-    /// `#[serde(default)]` keeps deserialization of v2.1.0-and-earlier
-    /// conventions.json (which lacks this field) working — missing -> None.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_commit_epoch: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RevertEntry {
-    pub commit_message: String,
-    pub reverted_message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ChurnTrend {
-    Hot,        // high 30d, lower 180d (growing)
-    Stabilized, // low 30d, high 180d (cooling down)
-    Chronic,    // high both windows
-    Cold,       // low both windows
-}
+// `GitHealthProfile`, `ChurnEntry`, `RevertEntry`, `ChurnTrend` are data-model
+// types now in `core_graph::conventions` (cxpak 3.0.0 Phase 0 de-cycle); the
+// git-history extraction logic stays here.
+pub use crate::core_graph::conventions::{ChurnEntry, ChurnTrend, GitHealthProfile, RevertEntry};
 
 const TTL_SECONDS: u64 = 60;
 

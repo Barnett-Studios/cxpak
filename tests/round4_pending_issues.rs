@@ -213,8 +213,10 @@ fn no_inline_edge_count_lambda_anywhere_in_src() {
         let content = std::fs::read_to_string(&f).expect("read source file");
         // The DependencyGraph::edge_count helper itself is the canonical
         // implementation — exempt that one site by checking the call comes
-        // from outside the helper definition line.
-        let is_helper_def = f.ends_with("index/graph.rs");
+        // from outside the helper definition line. `DependencyGraph` (and its
+        // `edge_count` method) was relocated to `core_graph/graph.rs` in cxpak
+        // 3.0.0 Phase 0 (de-cycle); the exemption tracks the new location.
+        let is_helper_def = f.ends_with("core_graph/graph.rs");
         for (i, line) in content.lines().enumerate() {
             if line.contains(".edges.values().map(|v| v.len()).sum") {
                 if is_helper_def
