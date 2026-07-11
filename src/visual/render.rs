@@ -338,6 +338,27 @@ function navTo(view) {
   window.location.href = prefix + view + ext;
 }
 
+/* proveRisk() opens the inspector "prove-it" drawer with the literal
+   derivation of a risk score from its churn/blast/test-penalty terms
+   (ADR-0174). No-op outside SPA context (standalone views lack CX.openInspector). */
+function proveRisk(r) {
+  if (!(window.CX && typeof window.CX.openInspector === 'function')) return;
+  var deriv = r.risk_score.toFixed(4) + ' = churn(' + r.churn_term.toFixed(2)
+    + ') × blast(' + r.blast_term.toFixed(3)
+    + ') × test_penalty(' + r.test_penalty_term.toFixed(1) + ')';
+  window.CX.openInspector(
+    { id: r.path, label: r.path, metadata: { risk_score: r.risk_score } },
+    { fields: [
+        ['Derivation', deriv],
+        ['Risk percentile', Math.round(r.risk_percentile * 100) + 'th'],
+        ['Risk score (absolute)', r.risk_score.toFixed(4)],
+        ['Churn term', r.churn_term.toFixed(2)],
+        ['Blast term', r.blast_term.toFixed(3)],
+        ['Test penalty', r.test_penalty_term.toFixed(1)],
+      ] }
+  );
+}
+
 var grid = document.createElement('div');
 grid.className = 'cxpak-dashboard';
 CX.app.appendChild(grid);
@@ -403,8 +424,13 @@ if (risks.length === 0) {
   risks.forEach(function(r) {
     var tr = document.createElement('tr');
     tr.className = 'cxpak-clickable';
-    tr.title = 'View risk heatmap';
+    tr.title = 'View risk heatmap · press p to prove this score';
+    tr.tabIndex = 0;
     tr.onclick = function() { navTo('risk'); };
+    // 'p' proves the score (opens the derivation drawer) without navigating.
+    tr.onkeydown = (function(rr) { return function(ev) {
+      if (ev.key === 'p' || ev.key === 'P') { ev.preventDefault(); proveRisk(rr); }
+    }; })(r);
     // Severity badge: one-letter code (H/M/L) + colored background.
     // The letter is the non-color discriminator color-blind users rely on;
     // aria-label is what screen readers announce.
@@ -413,6 +439,15 @@ if (risks.length === 0) {
     var testsLabel = r.has_tests ? 'has tests' : 'no tests';
     var riskColor = r.risk_score >= 0.7 ? '#ef476f' : r.risk_score >= 0.4 ? '#ffd166' : '#06d6a0';
     var testsColor = r.has_tests ? '#06d6a0' : '#8888aa';
+    var proveBtn = CX.h('button', {
+      class: 'cxpak-prove-btn',
+      type: 'button',
+      title: 'Prove this risk score',
+      'aria-label': 'Prove risk score for ' + (r.path || ''),
+    }, ['⊢']);
+    proveBtn.onclick = (function(rr) { return function(ev) {
+      ev.stopPropagation(); proveRisk(rr);
+    }; })(r);
     tr.appendChild(CX.h('td', null, [
       CX.h('span', {
         class: 'cxpak-severity-dot ' + r.severity,
@@ -421,6 +456,7 @@ if (risks.length === 0) {
         title: sevLabel,
       }, [sevLetter]),
       r.path || '',
+      proveBtn,
     ]));
     tr.appendChild(CX.h('td', {style: 'color:' + riskColor}, [r.risk_score.toFixed(2)]));
     tr.appendChild(CX.h('td', null, [String(r.churn_30d)]));
@@ -490,9 +526,30 @@ if (alerts.length === 0) {
     var msgSpan = document.createElement('span');
     msgSpan.className = 'cxpak-alert-msg';
     msgSpan.textContent = a.message;
+    // Prove-it affordance: open the inspector with the alert's own provenance
+    // (severity + originating view) rather than fabricating risk terms it lacks.
+    var proveAlert = CX.h('button', {
+      class: 'cxpak-prove-btn',
+      type: 'button',
+      title: 'Why this alert?',
+      'aria-label': 'Prove alert: ' + a.message,
+    }, ['⊢']);
+    proveAlert.onclick = (function(aa) { return function(ev) {
+      ev.stopPropagation();
+      if (!(window.CX && typeof window.CX.openInspector === 'function')) return;
+      window.CX.openInspector(
+        { id: aa.message, label: aa.message, metadata: {} },
+        { fields: [
+            ['Severity', aa.severity || 'Low'],
+            ['Source view', aa.link_view || 'Dashboard'],
+            ['Detail', aa.message],
+          ] }
+      );
+    }; })(a);
     item.appendChild(srText);
     item.appendChild(iconSpan);
     item.appendChild(msgSpan);
+    item.appendChild(proveAlert);
     al.appendChild(item);
   });
 }
@@ -1419,6 +1476,12 @@ pub struct RiskDisplayEntry {
     pub blast_radius: usize,
     pub has_tests: bool,
     pub severity: String,
+    /// Provenance for the prove-it drawer (ADR-0174): within-repo percentile
+    /// plus the three factors whose product reproduces `risk_score`.
+    pub risk_percentile: f64,
+    pub churn_term: f64,
+    pub blast_term: f64,
+    pub test_penalty_term: f64,
 }
 
 /// Bottom-left quadrant: mini architecture graph preview.
@@ -1528,6 +1591,10 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
                 blast_radius: e.blast_radius,
                 has_tests,
                 severity,
+                risk_percentile: e.risk_percentile,
+                churn_term: e.churn_term,
+                blast_term: e.blast_term,
+                test_penalty_term: e.test_penalty_term,
             }
         })
         .collect();
@@ -2985,6 +3052,10 @@ pub fn build_diff_view_data(
                 blast_radius: e.blast_radius,
                 has_tests,
                 severity,
+                risk_percentile: e.risk_percentile,
+                churn_term: e.churn_term,
+                blast_term: e.blast_term,
+                test_penalty_term: e.test_penalty_term,
             }
         })
         .collect();

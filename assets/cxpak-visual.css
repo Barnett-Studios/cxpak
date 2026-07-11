@@ -349,6 +349,23 @@ path.cxpak-edge.cross-lang { stroke: var(--accent-orange); stroke-dasharray: 8 4
 .cxpak-severity-dot.medium { background: var(--accent-yellow); box-shadow: 0 0 4px var(--accent-yellow); }
 .cxpak-severity-dot.low { background: var(--accent-green); box-shadow: 0 0 4px var(--accent-green); }
 
+/* Prove-it affordance (risk rows + alerts) — opens the derivation drawer */
+.cxpak-prove-btn {
+  margin-left: 6px;
+  padding: 0 5px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.cxpak-prove-btn:hover,
+.cxpak-prove-btn:focus { color: var(--accent-blue); border-color: var(--accent-blue); }
+
 /* Alerts list */
 .cxpak-alerts {
   display: flex;
