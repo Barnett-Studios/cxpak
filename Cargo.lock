@@ -904,6 +904,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "cxpak",
  "fs2",
  "git2",
  "headless_chrome",

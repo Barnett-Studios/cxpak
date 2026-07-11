@@ -89,6 +89,9 @@ thiserror = { version = "2", optional = true }
 wasmtime = { version = "43", optional = true }
 
 [dev-dependencies]
+# Self dev-dependency so integration tests (tests/*.rs) see `cxpak::test_support`
+# with the `test-support` feature on, while the release build never enables it.
+cxpak = { path = ".", features = ["test-support"] }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
@@ -176,6 +179,10 @@ embeddings = [
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
 e2e-browser = []
 plugins = ["dep:wasmtime"]
+# Test-only helpers (`cxpak::test_support`). Off by default → never compiled
+# into a release binary. Integration tests receive it through the self
+# dev-dependency below, unit tests through `cfg(test)`.
+test-support = []
 
 # `dev_maintenance` cfg is flipped on by the project-local .cargo/config.toml
 # via rustflags during maintainer builds.  Whitelist it so rustc's
