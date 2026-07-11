@@ -617,8 +617,13 @@ var H = (wrap.clientHeight || window.innerHeight) - 52;
 
 var svg = d3.select(wrap).append('svg').attr('width', W).attr('height', H);
 
-var color = d3.scaleLinear().domain([0, 0.4, 0.7, 1.0])
-  .range(['#06d6a0', '#ffd166', '#ef476f', '#cc1144'])
+/* Colour by within-repo percentile (ADR-0179), not the absolute score: on a
+   large repo the product-of-fractions score collapses into ~[0,0.04] and the
+   old absolute ramp mapped every leaf into the first (green) band. Percentile
+   is uniform in [0,1] by construction, so evenly-spaced quartile stops are the
+   data-driven quantile legend and every cell discriminates. */
+var color = d3.scaleLinear().domain([0, 0.25, 0.5, 0.75, 1.0])
+  .range(['#06d6a0', '#a8d160', '#ffd166', '#ff9f43', '#ef476f'])
   .clamp(true);
 
 var root = d3.hierarchy(hm.root).sum(function(d) { return d.children && d.children.length ? 0 : d.area_value; });
@@ -631,8 +636,7 @@ var groups = svg.selectAll('g').data(root.descendants().filter(function(d) { ret
 groups.append('rect').attr('class', 'treemap-cell')
   .attr('width', function(d) { return Math.max(0, d.x1 - d.x0); })
   .attr('height', function(d) { return Math.max(0, d.y1 - d.y0); })
-  .attr('fill', function(d) { return d.children ? '#1a1a3e' : color(d.data.risk_score); })
-  .attr('fill-opacity', function(d) { if (d.children) return 1; var r = d.data.risk_score; return r < 0.1 ? 0.5 + r * 5 : 1; })
+  .attr('fill', function(d) { return d.children ? '#1a1a3e' : color(d.data.risk_percentile); })
   .attr('stroke', '#0f0f23').attr('stroke-width', function(d) { return d.children ? 0 : 1; })
   .attr('rx', 2);
 
@@ -648,7 +652,7 @@ groups.filter(function(d) { return d.children && d.depth === 1; }).append('text'
 groups.filter(function(d) { return !d.children; })
   .attr('tabindex', 0)
   .attr('role', 'button')
-  .attr('aria-label', function(d) { var t = d.data.tooltip || {}; return (t.path || d.data.label || '') + ', risk ' + (d.data.severity || 'unknown') + ', score ' + d.data.risk_score.toFixed(2); })
+  .attr('aria-label', function(d) { var t = d.data.tooltip || {}; return (t.path || d.data.label || '') + ', risk ' + (d.data.severity || 'unknown') + ', percentile ' + Math.round(d.data.risk_percentile * 100) + 'th, absolute score ' + d.data.risk_score.toFixed(2); })
   .on('click', function(ev, d) {
     if (typeof window.CX !== 'undefined' && typeof window.CX.openInspector === 'function') {
       var t = d.data.tooltip || {};
@@ -659,7 +663,8 @@ groups.filter(function(d) { return !d.children; })
       }, {
         fields: [
           ['Path', t.path || d.data.label],
-          ['Risk score', CX.format.score(d.data.risk_score * 100)],
+          ['Risk percentile', Math.round(d.data.risk_percentile * 100) + 'th'],
+          ['Risk score (absolute)', CX.format.score(d.data.risk_score * 100)],
           ['Severity', d.data.severity],
           ['Churn (30d)', t.churn_30d || 0],
           ['Blast radius', t.blast_radius || 0],
@@ -679,7 +684,8 @@ groups.filter(function(d) { return !d.children; })
       }, {
         fields: [
           ['Path', t.path || d.data.label],
-          ['Risk score', CX.format.score(d.data.risk_score * 100)],
+          ['Risk percentile', Math.round(d.data.risk_percentile * 100) + 'th'],
+          ['Risk score (absolute)', CX.format.score(d.data.risk_score * 100)],
           ['Severity', d.data.severity],
           ['Churn (30d)', t.churn_30d || 0],
           ['Blast radius', t.blast_radius || 0],
@@ -692,7 +698,8 @@ groups.filter(function(d) { return !d.children; })
     var t = d.data.tooltip || {};
     var sev = d.data.severity || 'low';
     var html = '<div class="tt-title">' + CX.esc(t.path || d.data.label) + '</div>' +
-      '<div class="tt-row"><span class="tt-label">Risk</span><span class="tt-value tt-' + sev + '">' + d.data.risk_score.toFixed(2) + '</span></div>' +
+      '<div class="tt-row"><span class="tt-label">Risk %ile</span><span class="tt-value tt-' + sev + '">' + Math.round(d.data.risk_percentile * 100) + 'th</span></div>' +
+      '<div class="tt-row"><span class="tt-label">Risk (abs)</span><span class="tt-value">' + d.data.risk_score.toFixed(2) + '</span></div>' +
       '<div class="tt-row"><span class="tt-label">Churn (30d)</span><span class="tt-value">' + (t.churn_30d || 0) + '</span></div>' +
       '<div class="tt-row"><span class="tt-label">Blast Radius</span><span class="tt-value">' + (t.blast_radius || 0) + '</span></div>' +
       '<div class="tt-row"><span class="tt-label">Tests</span><span class="tt-value">' + (t.test_count || 0) + '</span></div>';
@@ -1921,8 +1928,13 @@ pub struct TreemapNode {
     /// Sizing value for D3 treemap: `blast_radius` for leaves (floor 1),
     /// sum of children for module groups.
     pub area_value: f64,
-    /// Risk score in [0, 1]; 0.0 for non-leaf (group) nodes.
+    /// Absolute risk score in [0, 1]; 0.0 for non-leaf (group) nodes. Kept for
+    /// the tooltip/inspector ("absolute"), no longer the colour channel.
     pub risk_score: f64,
+    /// Within-repo risk percentile in [0, 1] (`rank/(n-1)`, `RiskEntry`); the
+    /// treemap colours by this so the scale-collapsed absolute score no longer
+    /// maps every leaf into the first band (ADR-0179). 0.0 for group nodes.
+    pub risk_percentile: f64,
     /// `"high"` | `"medium"` | `"low"` per [`risk_severity`].
     pub severity: String,
     /// Child nodes.  Empty for leaf nodes.
@@ -1984,6 +1996,7 @@ pub fn build_risk_heatmap_data(index: &CodebaseIndex) -> RiskHeatmapData {
                         label,
                         area_value,
                         risk_score: e.risk_score,
+                        risk_percentile: e.risk_percentile,
                         severity,
                         children: vec![],
                         blast_radius_files: vec![e.path.clone()],
@@ -2010,6 +2023,7 @@ pub fn build_risk_heatmap_data(index: &CodebaseIndex) -> RiskHeatmapData {
                 label: prefix,
                 area_value,
                 risk_score: 0.0,
+                risk_percentile: 0.0,
                 severity,
                 children,
                 blast_radius_files: vec![],
@@ -2044,6 +2058,7 @@ pub fn build_risk_heatmap_data(index: &CodebaseIndex) -> RiskHeatmapData {
         label: "Repository".to_string(),
         area_value: root_area,
         risk_score: 0.0,
+        risk_percentile: 0.0,
         severity: risk_severity(max_risk).to_string(),
         children: module_nodes,
         blast_radius_files: vec![],
