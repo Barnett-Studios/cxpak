@@ -10,6 +10,9 @@ pub struct RiskEntry {
     pub test_coverage: f64,
     pub risk_score: f64,
     pub risk_percentile: f64,
+    pub churn_term: f64,
+    pub blast_term: f64,
+    pub test_penalty_term: f64,
 }
 
 /// Compute standing risk per file, sorted descending by risk_score.
@@ -116,6 +119,9 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
                 test_coverage,
                 risk_score,
                 risk_percentile: 0.0,
+                churn_term: nc,
+                blast_term: nb,
+                test_penalty_term: tc_term,
             }
         })
         .collect();
@@ -205,6 +211,9 @@ mod tests {
             test_coverage: 0.0,
             risk_score: 0.42,
             risk_percentile: 0.5,
+            churn_term: 1.0,
+            blast_term: 0.42,
+            test_penalty_term: 1.0,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"path\":\"src/main.rs\""));
