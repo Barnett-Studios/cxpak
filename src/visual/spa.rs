@@ -1,6 +1,7 @@
-//! SPA renderer — composes all views (Dashboard, Explore, Flow, Timeline,
-//! Diff) into one HTML file. Explore merges the former Architecture + Risk
-//! views under a lens toggle (ADR-0173).
+//! SPA renderer — composes the three-mode UI (Overview, Explore, History)
+//! into one HTML file. Explore merges the former Architecture + Risk views
+//! under a lens toggle; Flow and Diff are param-only and live on the
+//! standalone render path, not the SPA nav (ADR-0173).
 
 use crate::index::CodebaseIndex;
 use crate::visual::layout::{LayoutConfig, LayoutError};
@@ -213,24 +214,29 @@ pub fn render_spa_with_timeline(
     // tabindex/aria-selected as focus moves.  Without this, keyboard
     // users had to Tab through every preceding focusable element to
     // reach a non-dashboard view.
+    // Three-mode information architecture (ADR-0173): Overview / Explore /
+    // History. Flow and Diff were removed from the SPA nav — both are null in
+    // every SPA render (they need CLI --symbol / --files params) so they only
+    // ever showed a permanent empty state; they remain available via the
+    // standalone `cxpak visual --visual-type flow|diff` render path. Internal
+    // view keys and hashes stay `dashboard`/`timeline` so deep-links and the
+    // shared renderers are unaffected; only the display labels changed.
     html.push_str("      <nav class=\"cxpak-nav\" role=\"tablist\" aria-label=\"Views\">\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"dashboard\" href=\"#dashboard\" role=\"tab\" aria-selected=\"true\" tabindex=\"0\">Dashboard</a>\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"dashboard\" href=\"#dashboard\" role=\"tab\" aria-selected=\"true\" tabindex=\"0\">Overview</a>\n");
     // Explore merges the former Architecture + Risk tabs under one mode with a
     // Dependencies|Risk lens toggle (ADR-0173). Legacy #architecture / #risk
     // hashes redirect here (see the controller's parseHash).
     html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"explore\" href=\"#explore\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Explore</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"flow\" href=\"#flow\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Flow</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"timeline\" href=\"#timeline\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Timeline</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"diff\" href=\"#diff\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Diff</a>\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"timeline\" href=\"#timeline\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">History</a>\n");
     html.push_str("      </nav>\n");
-    html.push_str("      <button class=\"cxpak-theme-toggle\" aria-label=\"Switch to light mode\">\u{2600}</button>\n");
     html.push_str("      <label class=\"cxpak-palette-picker-label\" for=\"cxpak-palette-select\">Palette</label>\n");
+    html.push_str("      <div id=\"cxpak-palette-swatches\" class=\"cxpak-palette-swatches\" aria-hidden=\"true\"></div>\n");
     html.push_str("      <select id=\"cxpak-palette-select\" class=\"cxpak-palette-picker\" aria-label=\"Colour palette\"></select>\n");
     html.push_str("      <span class=\"cxpak-freshness\"></span>\n");
     html.push_str("    </header>\n");
     html.push_str("    <noscript>\n");
     html.push_str("      <div style=\"padding:24px 32px;border:1px solid var(--accent-yellow);border-radius:8px;margin:16px;color:var(--text-primary);background:var(--bg-card)\">\n");
-    html.push_str("        <strong>JavaScript required.</strong> The cxpak dashboard is a single-page app that renders five interactive views (Dashboard, Explore, Flow, Timeline, Diff) entirely in the browser. Without JavaScript the views below remain empty.\n");
+    html.push_str("        <strong>JavaScript required.</strong> The cxpak dashboard is a single-page app that renders three interactive views (Overview, Explore, History) entirely in the browser. Without JavaScript the views below remain empty.\n");
     html.push_str("        <br><br>\n");
     html.push_str("        For a JS-free overview of this codebase, run <code>cxpak overview</code> on the command line, which produces a token-budgeted text/markdown report with the same intelligence (PageRank, blast radius, dead code, conventions) backing this dashboard.\n");
     html.push_str("      </div>\n");
@@ -250,9 +256,8 @@ pub fn render_spa_with_timeline(
     html.push_str("        <div id=\"explore-deps\" class=\"cxpak-lens-panel\" hidden></div>\n");
     html.push_str("        <div id=\"explore-risk\" class=\"cxpak-lens-panel\"></div>\n");
     html.push_str("      </section>\n");
-    html.push_str("      <section id=\"view-flow\" class=\"cxpak-view\" hidden></section>\n");
+    // History mode (nav label "History"; internal key/hash stay `timeline`).
     html.push_str("      <section id=\"view-timeline\" class=\"cxpak-view\" hidden></section>\n");
-    html.push_str("      <section id=\"view-diff\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("    </main>\n");
     html.push_str("    <aside id=\"cxpak-inspector\" class=\"cxpak-inspector\" role=\"dialog\" aria-modal=\"false\" aria-label=\"Node details inspector\" hidden>\n");
     html.push_str("      <div class=\"cxpak-inspector-header\">\n");
@@ -284,9 +289,8 @@ pub fn render_spa_with_timeline(
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Cmd/Ctrl+K</kbd> or <kbd>/</kbd></span><span class=\"cxpak-inspector-value\">Open command palette</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>\u{2191}</kbd> <kbd>\u{2193}</kbd></span><span class=\"cxpak-inspector-value\">Navigate palette items</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Enter</kbd></span><span class=\"cxpak-inspector-value\">Select palette item</span></div>\n");
-    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>1</kbd>\u{2013}<kbd>5</kbd></span><span class=\"cxpak-inspector-value\">Switch to Dashboard / Explore / Flow / Timeline / Diff</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>1</kbd>\u{2013}<kbd>3</kbd></span><span class=\"cxpak-inspector-value\">Switch to Overview / Explore / History</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>p</kbd></span><span class=\"cxpak-inspector-value\">Prove the focused risk score (Overview)</span></div>\n");
-    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>t</kbd></span><span class=\"cxpak-inspector-value\">Toggle dark / light theme</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>?</kbd></span><span class=\"cxpak-inspector-value\">This help overlay</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Esc</kbd></span><span class=\"cxpak-inspector-value\">Close palette / inspector / help overlay</span></div>\n");
     html.push_str("      </div>\n");
@@ -389,11 +393,13 @@ pub fn render_spa_with_timeline(
     html.push_str("}\n");
     html.push_str("</script>\n");
 
+    // Flow and Diff are not wired into the SPA (removed from the 3-mode nav —
+    // they are param-only, always-null views); their renderers stay live on the
+    // standalone `cxpak visual --visual-type flow|diff` path. Their JSON tags are
+    // still emitted (null) so the controller's data-tag bootstrap finds them.
     for (key, js) in [
         ("dashboard", render::dashboard_js()),
-        ("flow", render::flow_js()),
         ("timeline", render::timeline_js()),
-        ("diff", render::diff_js()),
     ] {
         html.push_str(&format!(
             "  <script>\nCX.init['{key}'] = function() {{ _cxpakRunView('{key}', function() {{\n"

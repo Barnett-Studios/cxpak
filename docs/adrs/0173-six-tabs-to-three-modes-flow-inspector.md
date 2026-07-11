@@ -20,3 +20,22 @@ loop: planning
 **Consequences.** No nav item is ever a dead end (enforced by the no-dead-nav gate, ADR-0180). Fewer top-level surfaces to build well. Migration risk: existing deep-links / muscle memory to the 6 tabs break — acceptable for a major visual release. Lens infra is new but small (a color/size re-encode over a fixed layout).
 
 **Revisit if.** A lens needs a *different layout* (not just re-encoding) — then it earns its own mode rather than a toggle.
+
+## 3.1.0 implementation note (Blueprint redesign)
+
+The three-mode nav shipped as **Overview / Explore / History**, but Flow and Diff
+were **removed from the SPA outright** rather than demoted to a Flow-inspector
+action / a Diff lens under History. Rationale: the SPA embeds only the data the
+generating CLI serialised, and both `flow_json` and `diff_json` are hardwired to
+`null` in every SPA render (they require `--symbol` / `--files` CLI params that the
+`all` render does not supply). A "Trace data flow" inspector or an in-History Diff
+built on absent data would have to **fabricate** a flow/diff — which violates the
+release's hard integrity constraint (every rendered figure must trace to a real
+computation). Flow and Diff remain fully available on the standalone
+`cxpak visual --visual-type flow|diff` render path, which receives the params.
+History therefore shows the Timeline scrubber only. No nav item is a dead end
+(the removed tabs are simply gone, satisfying the no-dead-nav intent).
+
+**Revisit if.** The SPA gains a way to carry real per-symbol flow data (or computes
+a neighbourhood from the already-embedded dependency graph) — then Flow returns as
+the "Trace data flow" inspector action this ADR originally specified, on real data.

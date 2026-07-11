@@ -373,24 +373,47 @@ var q1 = document.createElement('div');
 q1.className = 'cxpak-quadrant cxpak-clickable';
 q1.title = 'Open Explore (Dependencies)';
 q1.onclick = function() { navTo('architecture'); };
-q1.innerHTML = '<div class="cxpak-quadrant-title">Health Score</div>';
+q1.innerHTML = '<div class="cxpak-quadrant-title">Repo Health<span class="cxpak-sheet">COMPOSITE · 0–10</span></div>';
 var gw = document.createElement('div'); gw.className = 'cxpak-gauge-wrap';
 var sc = dash.health.composite;
 var gc = sc >= 7 ? 'good' : sc >= 4 ? 'warn' : 'bad';
 gw.appendChild(CX.h('div', {class: 'cxpak-gauge-score ' + gc}, [sc.toFixed(1)]));
 
-var gSvg = d3.select(gw).append('svg').attr('width', 160).attr('height', 160)
-  .append('g').attr('transform','translate(80,80)');
-var arc = d3.arc().innerRadius(60).outerRadius(72).startAngle(0);
-gSvg.append('path').datum({ endAngle: Math.PI * 2 })
-  .attr('d', arc).attr('fill','#252545');
-gSvg.append('path').datum({ endAngle: 0 })
-  .attr('fill', CX.dimColor(sc))
-  .transition().duration(800)
-  .attrTween('d', function() {
-    var i = d3.interpolate(0, Math.PI * 2 * sc / 10);
-    return function(t) { return arc({ startAngle: 0, endAngle: i(t) }); };
-  });
+/* Blueprint needle dial (ADR-0172). Same real composite `sc` (0–10) — a needle
+   gauge, not a filled donut. Angle a is measured from 12 o'clock, clockwise
+   positive; the top semicircle spans -90° (sc=0) to +90° (sc=10). */
+var dW = 150, dH = 92, dcx = 75, dcy = 78, dR = 60;
+var scv = Math.max(0, Math.min(10, sc));
+var vAng = -Math.PI / 2 + (scv / 10) * Math.PI;
+var dSvg = d3.select(gw).append('svg')
+  .attr('width', dW).attr('height', dH).attr('viewBox', '0 0 ' + dW + ' ' + dH)
+  .attr('role', 'img').attr('aria-label', 'Health ' + sc.toFixed(1) + ' of 10');
+var dg = dSvg.append('g').attr('transform', 'translate(' + dcx + ',' + dcy + ')');
+var track = d3.arc().innerRadius(dR - 3).outerRadius(dR).startAngle(-Math.PI / 2).endAngle(Math.PI / 2);
+dg.append('path').attr('d', track()).attr('fill', 'var(--border)');
+var valPath = dg.append('path').attr('fill', CX.dimColor(sc));
+valPath.transition().duration(800).attrTween('d', function() {
+  var i = d3.interpolate(-Math.PI / 2, vAng);
+  return function(t) { return d3.arc().innerRadius(dR - 3).outerRadius(dR).startAngle(-Math.PI / 2).endAngle(i(t))(); };
+});
+/* tick marks: long every 5, short otherwise */
+for (var tk = 0; tk <= 10; tk++) {
+  var ta = -Math.PI / 2 + (tk / 10) * Math.PI, tl = (tk % 5 === 0) ? 8 : 5;
+  dg.append('line')
+    .attr('x1', Math.sin(ta) * (dR + 2)).attr('y1', -Math.cos(ta) * (dR + 2))
+    .attr('x2', Math.sin(ta) * (dR + 2 + tl)).attr('y2', -Math.cos(ta) * (dR + 2 + tl))
+    .attr('stroke', 'var(--text-dim)').attr('stroke-width', tk % 5 === 0 ? 1.2 : 0.7);
+}
+/* needle + pivot, animated to the score angle */
+var needle = dg.append('line')
+  .attr('x1', 0).attr('y1', 0)
+  .attr('x2', 0).attr('y2', -(dR - 10))
+  .attr('stroke', CX.dimColor(sc)).attr('stroke-width', 2);
+needle.transition().duration(800).attrTween('transform', function() {
+  var i = d3.interpolate(-90, (scv / 10) * 180 - 90);
+  return function(t) { return 'rotate(' + i(t) + ')'; };
+});
+dg.append('circle').attr('r', 3.4).attr('fill', CX.dimColor(sc));
 
 var bars = document.createElement('div'); bars.className = 'cxpak-dim-bars';
 (dash.health.dimensions || []).forEach(function(dim) {
@@ -417,7 +440,7 @@ grid.appendChild(q1);
 
 /* Q2: Risk table */
 var q2 = document.createElement('div'); q2.className = 'cxpak-quadrant';
-q2.innerHTML = '<div class="cxpak-quadrant-title">Top Risks</div>';
+q2.innerHTML = '<div class="cxpak-quadrant-title">Top Risks<span class="cxpak-sheet">RANKED · PERCENTILE</span></div>';
 var risks = dash.risks.top_risks || [];
 if (risks.length === 0) {
   q2.innerHTML += '<div class="cxpak-empty">No significant risks detected</div>';
@@ -484,11 +507,11 @@ q3.className = 'cxpak-quadrant cxpak-clickable';
 q3.title = 'Open Explore (Dependencies)';
 q3.onclick = function() { navTo('architecture'); };
 q3.appendChild(CX.h('div', {class: 'cxpak-quadrant-title'}, [
-  'Architecture (',
-  String(dash.architecture_preview.module_count || 0),
-  ' modules, ',
-  String(dash.architecture_preview.circular_dep_count || 0),
-  ' cycles)',
+  CX.h('span', null, [
+    'Architecture (' + String(dash.architecture_preview.module_count || 0)
+      + ' modules, ' + String(dash.architecture_preview.circular_dep_count || 0) + ' cycles)',
+  ]),
+  CX.h('span', {class: 'cxpak-sheet'}, ['MODULE MAP']),
 ]));
 var mm = document.createElement('div'); mm.className = 'cxpak-minimap';
 q3.appendChild(mm);
@@ -503,67 +526,107 @@ CX.renderGraph(cv.g, pl, {
   }
 });
 
-/* Q4: Alerts */
+/* Q4: Signals (ADR-0172/0174). Restyle of the real detections — the chip is a
+   presentation label for a.kind, never a new or fabricated number. */
 var q4 = document.createElement('div'); q4.className = 'cxpak-quadrant';
-q4.innerHTML = '<div class="cxpak-quadrant-title">Alerts</div>';
-var al = document.createElement('div'); al.className = 'cxpak-alerts';
+q4.innerHTML = '<div class="cxpak-quadrant-title">Signals<span class="cxpak-sheet">RANKED · PROVEN</span></div>';
+var al = document.createElement('div'); al.className = 'cxpak-signals';
 var alerts = (dash.alerts && dash.alerts.alerts) || [];
+// Real detection kind → Blueprint category chip. Every kind here is computed
+// from a deterministic detector, so each signal is "proven" (solid tick).
+var SIGTAG = {
+  CircularDependency: 'CYCLE',
+  DeadSymbols: 'DEAD',
+  UnprotectedEndpoints: 'EXPOSURE',
+  CouplingTrend: 'COUPLING',
+  HighRiskFile: 'DANGER'
+};
 if (alerts.length === 0) {
-  al.innerHTML = '<div class="cxpak-empty">No alerts</div>';
+  al.innerHTML = '<div class="cxpak-empty">No signals</div>';
 } else {
   alerts.forEach(function(a) {
     var sev = a.severity || 'Low';
-    var icon = sev === 'High' ? '!!' : sev === 'Medium' ? '!' : 'i';
     var link = (a.link_view || 'Dashboard');
-    // Architecture + Risk collapsed into Explore (ADR-0173): navTo still uses the
-    // legacy hash so parseHash redirects to the right lens, but the human label
-    // must name the view the user actually lands on.
     var linkLabel = (link === 'Architecture' || link === 'Risk') ? 'Explore' : link;
+    var tag = SIGTAG[a.kind] || 'SIGNAL';
     var item = document.createElement('div');
-    item.className = 'cxpak-alert-item sev-' + sev + ' cxpak-clickable';
+    item.className = 'cxpak-signal sev-' + sev + ' cxpak-clickable';
     item.title = 'View details in ' + linkLabel + ' view';
     item.onclick = (function(target) {
       return function() { navTo(target.toLowerCase()); };
     })(link);
-    var srText = document.createElement('span');
-    srText.className = 'sr-only';
-    srText.textContent = sev + ' severity: ';
-    var iconSpan = document.createElement('span');
-    iconSpan.className = 'cxpak-alert-icon';
-    iconSpan.setAttribute('aria-hidden', 'true');
-    iconSpan.textContent = icon;
-    var msgSpan = document.createElement('span');
-    msgSpan.className = 'cxpak-alert-msg';
-    msgSpan.textContent = a.message;
-    // Prove-it affordance: open the inspector with the alert's own provenance
-    // (severity + originating view) rather than fabricating risk terms it lacks.
-    var proveAlert = CX.h('button', {
-      class: 'cxpak-prove-btn',
+    // Proof-tick marker = the prove affordance. Solid tick because the signal is
+    // computed, never inferred.
+    var mk = CX.h('button', {
+      class: 'cxpak-signal-mk',
       type: 'button',
-      title: 'Why this alert?',
-      'aria-label': 'Prove alert: ' + a.message,
+      title: 'Prove this signal',
+      'aria-label': 'Prove signal: ' + a.message,
     }, ['⊢']);
-    proveAlert.onclick = (function(aa) { return function(ev) {
+    mk.onclick = (function(aa, ll) { return function(ev) {
       ev.stopPropagation();
       if (!(window.CX && typeof window.CX.openInspector === 'function')) return;
       window.CX.openInspector(
         { id: aa.message, label: aa.message, metadata: {} },
         { fields: [
+            ['Signal', SIGTAG[aa.kind] || 'SIGNAL'],
             ['Severity', aa.severity || 'Low'],
-            ['Source view', aa.link_view || 'Dashboard'],
+            ['Source', ll + ' view'],
             ['Detail', aa.message],
           ] }
       );
-    }; })(a);
+    }; })(a, linkLabel);
+    var srText = document.createElement('span');
+    srText.className = 'sr-only';
+    srText.textContent = sev + ' severity: ';
+    var body = document.createElement('span');
+    body.className = 'cxpak-signal-body';
+    body.textContent = a.message;
+    var chip = document.createElement('span');
+    chip.className = 'cxpak-signal-tag';
+    chip.textContent = tag;
+    item.appendChild(mk);
     item.appendChild(srText);
-    item.appendChild(iconSpan);
-    item.appendChild(msgSpan);
-    item.appendChild(proveAlert);
+    item.appendChild(body);
+    item.appendChild(chip);
     al.appendChild(item);
   });
 }
 q4.appendChild(al);
 grid.appendChild(q4);
+
+/* Repo-DNA band (ADR-0172): a full-width fingerprint barcode below the grid.
+   Every bar is a real PageRank value (importance spectrum); the caption carries
+   real node/edge counts and a real SHA-256 prefix. Purely presentational — it
+   invents no number. */
+var dna = dash.dna || { spine: [], nodes: 0, edges: 0, fingerprint: '' };
+var dnaPanel = document.createElement('div');
+dnaPanel.className = 'cxpak-quadrant cxpak-dna';
+dnaPanel.innerHTML = '<div class="cxpak-quadrant-title">Repo DNA<span class="cxpak-sheet">FINGERPRINT</span></div>';
+var bc = document.createElement('div'); bc.className = 'cxpak-dna-barcode';
+var sp = dna.spine || [];
+if (sp.length) {
+  var barW = 3, gap = 1, unit = barW + gap, H = 44;
+  var vbW = Math.max(1, sp.length * unit);
+  var svg = d3.select(bc).append('svg')
+    .attr('viewBox', '0 0 ' + vbW + ' ' + H)
+    .attr('preserveAspectRatio', 'none')
+    .attr('role', 'img').attr('aria-label', 'Repository importance spectrum, ' + sp.length + ' files');
+  svg.selectAll('rect').data(sp).enter().append('rect')
+    .attr('x', function(_, i) { return i * unit; })
+    .attr('width', barW)
+    .attr('y', function(v) { return H - Math.max(2, v * H); })
+    .attr('height', function(v) { return Math.max(2, v * H); })
+    .attr('fill', 'var(--accent-blue)')
+    .attr('opacity', function(v) { return 0.45 + 0.55 * v; });
+} else {
+  bc.appendChild(CX.h('div', {class: 'cxpak-empty-inline'}, ['No graph — importance spectrum unavailable']));
+}
+dnaPanel.appendChild(bc);
+var cap = document.createElement('div'); cap.className = 'cxpak-dna-caption';
+cap.textContent = dna.nodes + ' nodes · ' + dna.edges + ' edges · ' + (dna.fingerprint || '—');
+dnaPanel.appendChild(cap);
+CX.app.appendChild(dnaPanel);
 "#
 }
 
@@ -1473,6 +1536,28 @@ pub struct DashboardData {
     pub risks: RisksQuadrant,
     pub architecture_preview: ArchitecturePreviewQuadrant,
     pub alerts: AlertsQuadrant,
+    /// Repo-DNA barcode (ADR-0172): a purely-visual fingerprint band. Every
+    /// value is real — `spine` is the PageRank importance spectrum, `nodes`/
+    /// `edges` are graph cardinalities, `fingerprint` is a SHA-256 prefix of
+    /// the sorted file set. No presentation number is invented.
+    pub dna: RepoDna,
+}
+
+/// Repo-DNA fingerprint band. Rendered as a barcode; carries only measured
+/// quantities so the visual never fabricates a figure.
+#[derive(Debug, serde::Serialize)]
+pub struct RepoDna {
+    /// PageRank importance of every file, sorted descending and normalized to
+    /// the maximum, resampled to at most 96 bars. The repo's "importance
+    /// spectrum" — deterministic for a given index.
+    pub spine: Vec<f64>,
+    /// File (node) count.
+    pub nodes: usize,
+    /// Dependency-graph edge count.
+    pub edges: usize,
+    /// First 8 hex chars of SHA-256 over the sorted relative-path set — a
+    /// stable content fingerprint of which files make up the repo.
+    pub fingerprint: String,
 }
 
 /// Top-left quadrant: composite health score plus individual dimensions.
@@ -1760,11 +1845,50 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
         });
     }
 
+    // ── Repo-DNA band ─────────────────────────────────────────────────────────
+    // Importance spectrum: every file's PageRank, sorted descending, normalized
+    // to the max, resampled to <=96 bars. Purely a re-presentation of measured
+    // PageRank — no invented figures.
+    let mut pr: Vec<f64> = index.pagerank.values().copied().collect();
+    pr.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let max_pr = pr.first().copied().unwrap_or(1.0).max(f64::MIN_POSITIVE);
+    let n = pr.len();
+    let width = n.min(96);
+    let spine: Vec<f64> = (0..width)
+        .map(|i| {
+            let idx = (i * n / width).min(n - 1);
+            (pr[idx] / max_pr).clamp(0.0, 1.0)
+        })
+        .collect();
+    // Content fingerprint: SHA-256 over the sorted relative-path set.
+    let mut paths: Vec<&str> = index
+        .files
+        .iter()
+        .map(|f| f.relative_path.as_str())
+        .collect();
+    paths.sort_unstable();
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    for p in &paths {
+        sha2::Digest::update(&mut hasher, p.as_bytes());
+        sha2::Digest::update(&mut hasher, b"\n");
+    }
+    let fingerprint: String = format!("{:X}", sha2::Digest::finalize(hasher))
+        .chars()
+        .take(8)
+        .collect();
+    let dna = RepoDna {
+        spine,
+        nodes: index.files.len(),
+        edges: index.graph.edge_count(),
+        fingerprint,
+    };
+
     DashboardData {
         health,
         risks,
         architecture_preview,
         alerts: AlertsQuadrant { alerts },
+        dna,
     }
 }
 

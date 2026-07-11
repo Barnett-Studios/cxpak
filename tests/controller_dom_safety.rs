@@ -133,19 +133,18 @@ fn localStorage_is_guarded_with_try() {
     }
 }
 
-// ── Fix 2: theme toggle re-renders active view ───────────────────────────────
+// ── Palette is the single colour control (ADR-0172) ──────────────────────────
+// The ☾/☀ theme toggle was removed — light/dark are palette variants applied as
+// CSS custom properties on :root, so chrome recolours live with no view re-render.
+// Data-encoding colours (health/risk green→yellow→red) are a fixed semantic ramp
+// by design, palette-independent. Guard that the obsolete toggle is really gone.
 
 #[test]
-fn theme_toggle_re_renders_active_view() {
-    // toggleTheme must invalidate CX._initialized for the active view AND
-    // clear the section DOM so D3-rendered SVG elements with inline hex fills
-    // are recreated under the new theme.
+fn theme_toggle_is_removed() {
     assert!(
-        CONTROLLER.contains("CX._initialized")
-            && CONTROLLER.contains("section.textContent = ''")
-            && CONTROLLER.contains("CX.init[current]"),
-        "toggleTheme must invalidate the active view and re-init it; \
-         otherwise D3 SVG elements with hardcoded hex fills don't theme-swap."
+        !CONTROLLER.contains("toggleTheme"),
+        "the ☾/☀ theme toggle was replaced by the palette picker (ADR-0172); \
+         no toggleTheme should remain in the controller"
     );
 }
 

@@ -73,6 +73,18 @@
     root.setAttribute('data-theme', dark ? 'dark' : 'light');
     var sel = document.getElementById('cxpak-palette-select');
     if (sel) sel.value = p.key;
+    // Blueprint swatch strip: a live preview of the active palette's semantic
+    // ramp (accent + risk lo/mid/hi + secondary ink). Decorative, aria-hidden.
+    var sw = document.getElementById('cxpak-palette-swatches');
+    if (sw) {
+      sw.textContent = '';
+      [p.accent, p.lo, p.mid, p.hi, p.ink2].forEach(function (c) {
+        var d = document.createElement('span');
+        d.className = 'cxpak-palette-swatch';
+        d.style.background = c;
+        sw.appendChild(d);
+      });
+    }
     try { localStorage.setItem('cxpak-palette', p.key); } catch (e) { /* ignore */ }
   }
   window.CX = window.CX || {};
