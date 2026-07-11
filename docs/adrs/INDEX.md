@@ -175,3 +175,12 @@
 | [0169](0169-versioned-context-format-schema.md) | Publish a versioned context-format schema over the existing JSON output, not a new format | ACCEPTED | 2026-06-14 |
 | [0170](0170-official-container-images-from-ci.md) | Publish official multi-arch container images from CI, built from release artifacts and signed | ACCEPTED | 2026-06-18 |
 | [0171](0171-review-mode-extends-diff.md) | Review mode as a --review extension of cxpak diff, composing existing intelligence + expected-but-absent detection | ACCEPTED | 2026-06-16 |
+| [0172](0172-one-design-language-palette-system.md) | One design language + a client-side palette system (Blueprint; btop-schema; Tokyo Night default) | ACCEPTED | 2026-07-11 |
+| [0173](0173-six-tabs-to-three-modes-flow-inspector.md) | Collapse 6 tabs into 3 modes (Overview/Explore/History); Flow becomes an inspector action | ACCEPTED | 2026-07-11 |
+| [0174](0174-provenance-proof-tick-drawer.md) | Provenance system: the proof-tick motif + the "prove-it" drawer | ACCEPTED | 2026-07-11 |
+| [0175](0175-deterministic-interpretive-layer.md) | Deterministic interpretive layer (proven analogues of LLM narration; co-change−import flagship) | ACCEPTED | 2026-07-11 |
+| [0176](0176-repo-dna-genome-barcode.md) | Repo-DNA genome-barcode signature | ACCEPTED | 2026-07-11 |
+| [0177](0177-canvas2d-rust-precomputed-coordinates.md) | Canvas-2D over Rust-precomputed coordinates; no new graph library; fixed-point rounding | ACCEPTED | 2026-07-11 |
+| [0178](0178-hybrid-interaction-v1-diff.md) | Hybrid interaction model: bounded embed + opt-in Live serve; add /v1/diff | ACCEPTED | 2026-07-11 |
+| [0179](0179-risk-percentile-normalization.md) | Risk normalization = within-repo percentile; one-signal-per-channel encoding | ACCEPTED | 2026-07-11 |
+| [0180](0180-broaden-visual-roundtrip-conformance.md) | Broaden Visual round-trip conformance; no-dead-nav + provenance-completeness gates | ACCEPTED | 2026-07-11 |
