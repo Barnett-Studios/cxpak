@@ -98,7 +98,20 @@ pub fn run(
 
     // Render the HTML string for the chosen visual type.
     let html: String = match visual_type {
-        VisualTypeArg::All => crate::visual::spa::render_spa(&index, &metadata)?,
+        VisualTypeArg::All => {
+            // Compute, backfill (per-commit health/cycles), and persist the
+            // timeline so the History view is live rather than a dead tab. The
+            // cache under .cxpak/timeline/ is git-ignorable; snapshots are
+            // injected into the render so the emitted bytes never depend on a
+            // pre-existing cache (determinism).
+            let mut snaps =
+                crate::visual::timeline::compute_timeline_snapshots(path, 12).unwrap_or_default();
+            crate::visual::timeline::enrich_snapshots_with_health(path, &mut snaps);
+            if let Err(e) = crate::visual::timeline::save_snapshots(path, &snaps) {
+                eprintln!("cxpak: could not persist timeline cache: {e}");
+            }
+            crate::visual::spa::render_spa_with_timeline(&index, &metadata, Some(&snaps))?
+        }
         VisualTypeArg::Dashboard => render::render_dashboard(&index, &metadata),
         VisualTypeArg::Architecture => render::render_architecture_explorer(&index, &metadata)?,
         VisualTypeArg::Risk => render::render_risk_heatmap(&index, &metadata),
@@ -108,8 +121,18 @@ pub fn run(
             render::render_flow_diagram(&flow_result, &index, &metadata)?
         }
         VisualTypeArg::Timeline => {
-            let snapshots =
+            // Compute-on-miss: use the cache if present, otherwise compute +
+            // backfill + persist so the standalone Timeline view is never empty.
+            let mut snapshots =
                 crate::visual::timeline::load_cached_snapshots(path).unwrap_or_default();
+            if snapshots.is_empty() {
+                snapshots = crate::visual::timeline::compute_timeline_snapshots(path, 12)
+                    .unwrap_or_default();
+                crate::visual::timeline::enrich_snapshots_with_health(path, &mut snapshots);
+                if let Err(e) = crate::visual::timeline::save_snapshots(path, &snapshots) {
+                    eprintln!("cxpak: could not persist timeline cache: {e}");
+                }
+            }
             render::render_time_machine(snapshots, &metadata, &config)?
         }
         VisualTypeArg::Diff => {

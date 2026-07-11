@@ -29,7 +29,23 @@ fn escape_html_text(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Render the SPA with no embedded timeline (the default, deterministic form).
+/// Never reads the live `.cxpak/timeline/` cache — that would make the emitted
+/// bytes depend on git history and break the golden fixture. Callers that want
+/// a live timeline compute snapshots and pass them to
+/// [`render_spa_with_timeline`].
 pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<String, LayoutError> {
+    render_spa_with_timeline(index, metadata, None)
+}
+
+/// Render the SPA, embedding `timeline` snapshots when provided. The snapshots
+/// are injected by the caller (CLI/serve) rather than read from disk here, so
+/// the fixture path stays byte-deterministic.
+pub fn render_spa_with_timeline(
+    index: &CodebaseIndex,
+    metadata: &RenderMetadata,
+    timeline: Option<&[crate::visual::timeline::TimelineSnapshot]>,
+) -> Result<String, LayoutError> {
     let cfg = LayoutConfig::default();
 
     let dashboard_data = render::build_dashboard_data(index);
@@ -61,20 +77,19 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     let risk_data = render::build_risk_heatmap_data(index);
     let search = search_index::build_search_index(index);
 
-    // Timeline: attempt to load cached snapshots; null when absent.
+    // Timeline: use the caller-injected snapshots; null when none supplied.
     // Each per-view JSON below uses `.expect("...is infallible")` because the
     // serialised types are plain `#[derive(serde::Serialize)]` data structures
     // (see render.rs DashboardData / ArchitectureExplorerData / RiskHeatmap and
     // search_index::SearchIndex).  None contains a custom `Serialize` impl that
     // could fail.  An infallible-fallback `unwrap_or_else(|_| "null".into())`
     // would only mask a corrupted build, not handle a real runtime failure.
-    let timeline_json =
-        match crate::visual::timeline::load_cached_snapshots(std::path::Path::new(".")) {
-            Some(snaps) if !snaps.is_empty() => {
-                serde_json::to_string(&snaps).expect("TimelineSnapshot serialization is infallible")
-            }
-            _ => "null".into(),
-        };
+    let timeline_json = match timeline {
+        Some(snaps) if !snaps.is_empty() => {
+            serde_json::to_string(snaps).expect("TimelineSnapshot serialization is infallible")
+        }
+        _ => "null".into(),
+    };
 
     // Flow and Diff: always null in SPA default (they require params).
     let flow_json = "null".to_string();

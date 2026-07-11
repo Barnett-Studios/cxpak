@@ -277,6 +277,113 @@ pub fn save_snapshots(
     std::fs::write(path, json)
 }
 
+/// Build a [`CodebaseIndex`] from a commit's tree, parsing each blob's content
+/// in memory (no working-tree checkout, no disk read). Used to compute a
+/// snapshot's health from that commit's OWN structure — never the current tree.
+fn build_index_at_commit(
+    repo: &git2::Repository,
+    commit: &git2::Commit<'_>,
+    counter: &crate::budget::counter::TokenCounter,
+) -> Option<crate::index::CodebaseIndex> {
+    let tree = commit.tree().ok()?;
+
+    // Collect (path, language, blob-oid) inside the walk; read blobs after so
+    // the walk closure doesn't borrow `repo`.
+    let mut blobs: Vec<(String, String, git2::Oid)> = Vec::new();
+    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        if entry.kind() == Some(git2::ObjectType::Blob) {
+            let name = entry.name().unwrap_or("");
+            let path = if root.is_empty() {
+                name.to_string()
+            } else {
+                format!("{root}{name}")
+            };
+            if let Some(lang) = crate::scanner::detect_language(std::path::Path::new(&path)) {
+                blobs.push((path, lang, entry.id()));
+            }
+        }
+        git2::TreeWalkResult::Ok
+    })
+    .ok()?;
+    if blobs.is_empty() {
+        return None;
+    }
+
+    let registry = crate::parser::LanguageRegistry::new();
+    let mut files = Vec::with_capacity(blobs.len());
+    let mut content_map = std::collections::HashMap::new();
+    let mut parse_results = std::collections::HashMap::new();
+    for (path, lang, oid) in blobs {
+        let blob = match repo.find_blob(oid) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Skip binary / oversized blobs (mirrors the parse-cache size guard).
+        if blob.is_binary() || blob.size() > 1_000_000 {
+            continue;
+        }
+        let source = match std::str::from_utf8(blob.content()) {
+            Ok(s) => s.to_string(),
+            Err(_) => continue,
+        };
+        if let Some(langsup) = registry.get(&lang) {
+            let mut parser = tree_sitter::Parser::new();
+            if parser.set_language(&langsup.ts_language()).is_ok() {
+                if let Some(t) = parser.parse(&source, None) {
+                    parse_results.insert(path.clone(), langsup.extract(&source, &t));
+                }
+            }
+        }
+        files.push(crate::scanner::ScannedFile {
+            relative_path: path.clone(),
+            absolute_path: std::path::PathBuf::from(&path),
+            language: Some(lang),
+            size_bytes: source.len() as u64,
+        });
+        content_map.insert(path, source);
+    }
+    if files.is_empty() {
+        return None;
+    }
+    Some(crate::index::CodebaseIndex::build_with_content(
+        files,
+        parse_results,
+        counter,
+        content_map,
+    ))
+}
+
+/// Backfill each snapshot's `health_composite` and `circular_dep_count` from
+/// that commit's OWN reconstructed index — NOT the current working tree
+/// (injecting current health into historical frames is a correctness bug).
+///
+/// The structural dimensions (coupling, cycles, dead code) are exact per
+/// commit. Conventions default to empty because per-commit git-churn
+/// reconstruction is out of MVP scope, so the composite is a structural proxy —
+/// still this commit's own data, never the current index's.
+pub fn enrich_snapshots_with_health(repo_path: &Path, snapshots: &mut [TimelineSnapshot]) {
+    let repo = match git2::Repository::open(repo_path) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let counter = crate::budget::counter::TokenCounter::new();
+    for snap in snapshots.iter_mut() {
+        let oid = match git2::Oid::from_str(&snap.commit_sha) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let commit = match repo.find_commit(oid) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Some(index) = build_index_at_commit(&repo, &commit, &counter) {
+            snap.health_composite = Some(index.health_cached().composite);
+            snap.circular_dep_count =
+                crate::intelligence::health::count_nontrivial_sccs(&index.graph);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
