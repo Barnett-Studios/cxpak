@@ -980,6 +980,16 @@ input:focus-visible {
   font-size: 14px; line-height: 1; transition: all 0.15s;
 }
 .cxpak-theme-toggle:hover { background: var(--bg-card-hover); color: var(--text-primary); }
+.cxpak-palette-picker-label {
+  margin-left: 10px; font-size: 11px; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+.cxpak-palette-picker {
+  margin-left: 6px; background: var(--bg-card); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 8px; font-size: 12px; font-family: inherit; cursor: pointer;
+}
+.cxpak-palette-picker:hover { border-color: var(--accent-blue); }
 
 /* ── Empty State (SPA views that require CLI parameters) ───────── */
 .cxpak-empty-state {

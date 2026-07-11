@@ -8,6 +8,9 @@ use crate::visual::search_index;
 static D3_BUNDLE: &str = include_str!("../../assets/d3-bundle.min.js");
 static VISUAL_CSS: &str = include_str!("../../assets/cxpak-visual.css");
 static SPA_CONTROLLER: &str = include_str!("../../assets/cxpak-spa-controller.js");
+/// Client-side palette registry + picker (ADR-0172). Applies CSS custom
+/// properties at runtime, so the emitted bytes never change with selection.
+static PALETTE_JS: &str = include_str!("../../assets/cxpak-palette.js");
 
 /// Delegates to `render::escape_script_tag` — the single canonical
 /// implementation — so SPA and standalone renders always produce identical
@@ -149,6 +152,8 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"diff\" href=\"#diff\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Diff</a>\n");
     html.push_str("      </nav>\n");
     html.push_str("      <button class=\"cxpak-theme-toggle\" aria-label=\"Switch to light mode\">\u{2600}</button>\n");
+    html.push_str("      <label class=\"cxpak-palette-picker-label\" for=\"cxpak-palette-select\">Palette</label>\n");
+    html.push_str("      <select id=\"cxpak-palette-select\" class=\"cxpak-palette-picker\" aria-label=\"Colour palette\"></select>\n");
     html.push_str("      <span class=\"cxpak-freshness\"></span>\n");
     html.push_str("    </header>\n");
     html.push_str("    <noscript>\n");
@@ -259,6 +264,13 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     // helpers defined by common_js.
     html.push_str("  <script>");
     html.push_str(SPA_CONTROLLER);
+    html.push_str("</script>\n");
+
+    // Palette registry + picker — runs after the header exists and after the
+    // controller so window.CX is present. Applies CSS custom properties at
+    // runtime; the emitted bytes are identical for every palette (ADR-0172).
+    html.push_str("  <script>");
+    html.push_str(PALETTE_JS);
     html.push_str("</script>\n");
 
     // Per-view renderers, each wrapped in a deferred CX.init.{view} function so it
