@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest a capability, a surface addition, or an improvement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, check the [ADR index](https://github.com/Barnett-Studios/cxpak/blob/main/docs/adrs/INDEX.md) —
+        a decision may already record why something is (or isn't) the way it is.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that cxpak makes hard or impossible today?
+      placeholder: >
+        When I run cxpak on a monorepo with X, I can't ... because ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: >
+        What would you like cxpak to do? If it touches a surface (CLI, MCP, HTTP,
+        LSP), say which and roughly how.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you've thought about, and why they fall short.
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: I'm willing to help implement this
+          required: false
