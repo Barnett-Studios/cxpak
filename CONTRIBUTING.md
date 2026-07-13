@@ -6,7 +6,8 @@ to get set up, the quality bar every change has to clear, and the conventions
 that keep the project consistent.
 
 By contributing you agree that your contributions are licensed under the
-project's [MIT license](LICENSE) (inbound = outbound).
+project's [MIT license](LICENSE) (inbound = outbound). Participation is governed
+by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Ways to contribute
 
@@ -135,8 +136,9 @@ the code that changes them).
 
 ## Reporting a security issue
 
-Please **don't** open a public issue for a security vulnerability. Report it
-privately via GitHub's [security advisory](https://github.com/Barnett-Studios/cxpak/security/advisories/new)
+Please **don't** open a public issue for a security vulnerability. See
+[SECURITY.md](SECURITY.md) — report it privately via GitHub's
+[security advisory](https://github.com/Barnett-Studios/cxpak/security/advisories/new)
 form so it can be fixed before disclosure.
 
 ---
