@@ -213,7 +213,7 @@ CodeLens, hover, diagnostics, workspace symbols, plus 16 custom `cxpak/*` method
 
 ### Auto Context
 
-`cxpak_auto_context` is the primary entry point. Give it a task and token budget; it returns exactly what the LLM needs.
+`cxpak_context` (`op: "context"`) is the primary entry point. Give it a task and token budget; it returns exactly what the LLM needs.
 
 The pipeline: query expansion with domain-specific synonyms, relevance scoring over **6 deterministic signals** (keyword, symbol, path, domain, import proximity, PageRank) fused with **Reciprocal Rank Fusion (RRF)** -- the default ranking as of 3.0.0, measured +164% recall over the prior weighted-sum on a 31-PR benchmark and deterministic across processes -- then seed selection, noise filtering, test/schema/blast-radius enrichment, progressive degradation (Full > Trimmed > Documented > Signature > Stub), and per-file annotations explaining why each file was included. Embeddings are an optional 7th signal (see [Embeddings](#embeddings)).
 
@@ -256,7 +256,7 @@ Layout engine: Sugiyama method with SCC condensation, barycenter crossing minimi
 
 Extracts a quantified convention profile from what your team actually does: naming, imports, error handling, dependencies, testing, visibility, function length, git health. Each pattern has counts, percentages, and strength labels (Convention >= 90%, Trend >= 70%, Mixed).
 
-`cxpak_verify` checks code changes against observed conventions -- only flags violations in changed lines. `cxpak conventions export/diff` enables CI drift detection with SHA256 checksums.
+`cxpak_review` (`op: "verify"`) checks code changes against observed conventions -- only flags violations in changed lines. `cxpak conventions export/diff` enables CI drift detection with SHA256 checksums.
 
 ### Onboarding
 
