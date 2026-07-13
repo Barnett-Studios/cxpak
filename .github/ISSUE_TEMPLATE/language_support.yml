@@ -1,0 +1,45 @@
+name: Language support request
+description: Request (or offer to add) support for a programming language.
+labels: ["enhancement", "language-support"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        cxpak extracts symbols via tree-sitter, so a language needs a maintained
+        tree-sitter grammar. Adding one is a well-scoped contribution — see the
+        [recipe in CONTRIBUTING.md](https://github.com/Barnett-Studios/cxpak/blob/main/CONTRIBUTING.md#adding-a-language).
+  - type: input
+    id: language
+    attributes:
+      label: Language
+      placeholder: "Elm"
+    validations:
+      required: true
+  - type: input
+    id: grammar
+    attributes:
+      label: tree-sitter grammar crate
+      description: Link to the `tree-sitter-*` grammar (crates.io or repo). Required — cxpak can't parse without one.
+      placeholder: "https://crates.io/crates/tree-sitter-elm"
+    validations:
+      required: true
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Extraction tier
+      description: >
+        Full = functions, classes/types, imports, exports (a real programming
+        language). Structural = selectors/keys/blocks (config, markup, data).
+      options:
+        - Full extraction (programming language)
+        - Structural extraction (config / markup / data)
+        - Not sure
+    validations:
+      required: true
+  - type: checkboxes
+    id: offer
+    attributes:
+      label: Contribution
+      options:
+        - label: I'm willing to implement this following the CONTRIBUTING recipe
+          required: false

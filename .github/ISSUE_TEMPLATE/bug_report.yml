@@ -1,0 +1,81 @@
+name: Bug report
+description: Something cxpak did wrong — a crash, a wrong result, or unexpected behavior.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A minimal reproduction is the single most useful
+        thing you can provide — it turns hours of guessing into minutes of fixing.
+        For security vulnerabilities, do **not** file here — use a private
+        [security advisory](https://github.com/Barnett-Studios/cxpak/security/advisories/new).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you run, what did you expect, and what did you get instead?
+      placeholder: |
+        Ran `cxpak overview .` on my repo and it panicked / produced wrong output / ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Ideally a link to a minimal repo or a snippet that triggers it. Include
+        the exact command and any relevant file(s).
+      placeholder: |
+        1. Clone https://github.com/me/minimal-repro
+        2. Run `cxpak trace handle_request .`
+        3. See error
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: cxpak version
+      description: Output of `cxpak --version`.
+      placeholder: "cxpak 3.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install cxpak?
+      options:
+        - Homebrew
+        - "cargo install"
+        - Prebuilt release binary
+        - Docker (ghcr.io image)
+        - Built from source
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: "macOS 15 arm64 / Ubuntu 24.04 x86_64 / Windows 11 x86_64"
+    validations:
+      required: true
+  - type: input
+    id: features
+    attributes:
+      label: Non-default features enabled (if any)
+      description: >
+        e.g. built with `--features data-introspect,lsp`. Leave blank for a
+        default build.
+      placeholder: "data-introspect"
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output or backtrace
+      description: >
+        Paste any error output. For a panic, re-run with `RUST_BACKTRACE=1`.
+        This is automatically formatted as code — no backticks needed.
+      render: shell
+    validations:
+      required: false
