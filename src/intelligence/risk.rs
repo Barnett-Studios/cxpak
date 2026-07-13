@@ -9,6 +9,20 @@ pub struct RiskEntry {
     pub blast_radius: usize,
     pub test_coverage: f64,
     pub risk_score: f64,
+    /// Within-repo rank of `risk_score` in [0, 1] (0 = lowest-risk file,
+    /// 1 = highest). Drives the treemap's colour encoding (ADR-0198) so risk
+    /// reads relative to this repo rather than an absolute scale.
+    pub risk_percentile: f64,
+    /// Provenance factors whose product reproduces `risk_score` exactly
+    /// (ADR-0193): `risk_score == churn_term × blast_term × test_penalty_term`.
+    /// Surfaced verbatim by the prove-it drawer so the score is auditable.
+    /// `churn_term` = normalized 30-day churn (floored at 0.01).
+    pub churn_term: f64,
+    /// `blast_term` = normalized blast radius (see the formula doc below).
+    pub blast_term: f64,
+    /// `test_penalty_term` = `max(1.0 - test_coverage, 0.01)` — the untested-risk
+    /// multiplier (1.0 when a file has no test coverage).
+    pub test_penalty_term: f64,
 }
 
 /// Compute standing risk per file, sorted descending by risk_score.
@@ -114,6 +128,10 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
                 blast_radius: blast_count,
                 test_coverage,
                 risk_score,
+                risk_percentile: 0.0,
+                churn_term: nc,
+                blast_term: nb,
+                test_penalty_term: tc_term,
             }
         })
         .collect();
@@ -124,6 +142,14 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.path.cmp(&b.path))
     });
+    let n = entries.len();
+    for (i, e) in entries.iter_mut().enumerate() {
+        e.risk_percentile = if n <= 1 {
+            1.0
+        } else {
+            (n - 1 - i) as f64 / (n - 1) as f64
+        };
+    }
     entries
 }
 
@@ -194,6 +220,10 @@ mod tests {
             blast_radius: 10,
             test_coverage: 0.0,
             risk_score: 0.42,
+            risk_percentile: 0.5,
+            churn_term: 1.0,
+            blast_term: 0.42,
+            test_penalty_term: 1.0,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"path\":\"src/main.rs\""));

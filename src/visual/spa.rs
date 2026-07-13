@@ -1,4 +1,7 @@
-//! SPA renderer — composes all six views into one HTML file.
+//! SPA renderer — composes the three-mode UI (Overview, Explore, History)
+//! into one HTML file. Explore merges the former Architecture + Risk views
+//! under a lens toggle; Flow and Diff are param-only and live on the
+//! standalone render path, not the SPA nav (ADR-0192).
 
 use crate::index::CodebaseIndex;
 use crate::visual::layout::{LayoutConfig, LayoutError};
@@ -8,6 +11,51 @@ use crate::visual::search_index;
 static D3_BUNDLE: &str = include_str!("../../assets/d3-bundle.min.js");
 static VISUAL_CSS: &str = include_str!("../../assets/cxpak-visual.css");
 static SPA_CONTROLLER: &str = include_str!("../../assets/cxpak-spa-controller.js");
+/// Client-side palette registry + picker (ADR-0191). Applies CSS custom
+/// properties at runtime, so the emitted bytes never change with selection.
+static PALETTE_JS: &str = include_str!("../../assets/cxpak-palette.js");
+
+/// Wires the Explore lens toggle: swaps panel visibility and picks the initial
+/// lens (Risk by default; Dependencies when a drill-down param is present).
+static EXPLORE_LENS_JS: &str = r#"
+function _cxSetLens(lens) {
+  var isDeps = lens === 'deps';
+  var d = document.getElementById('explore-deps');
+  var r = document.getElementById('explore-risk');
+  if (d) d.hidden = !isDeps;
+  if (r) r.hidden = isDeps;
+  _exSection.querySelectorAll('.cxpak-lens-btn').forEach(function(b) {
+    var on = b.getAttribute('data-lens') === lens;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  var live = document.getElementById('cxpak-live');
+  if (live) live.textContent = isDeps ? 'Dependencies lens' : 'Risk lens';
+  // Showing the Risk treemap: re-fit it to the now-visible panel. Its resize
+  // handler ignores zero-size (hidden) events, so a window resize that happened
+  // while this lens was hidden left the treemap un-fitted — heal it on show.
+  if (!isDeps) { try { window.dispatchEvent(new Event('resize')); } catch (e) {} }
+}
+_exSection.querySelectorAll('.cxpak-lens-btn').forEach(function(b) {
+  b.onclick = function() { _cxSetLens(b.getAttribute('data-lens')); };
+});
+// The route selects the lens: an explicit ?lens=deps or a file/module drill →
+// Dependencies; ?lens=risk → Risk; a plain #explore names nothing.
+function _cxLensFromRoute() {
+  if (CX.state.lens === 'deps' || CX.state.file || CX.state.module) return 'deps';
+  if (CX.state.lens === 'risk') return 'risk';
+  return null;
+}
+_cxSetLens(_cxLensFromRoute() || 'risk');
+// Explore inits once, so re-apply the lens on RE-navigation — otherwise a later
+// #architecture / #risk / palette deep-link would keep the stale lens. Only
+// override when the route names one; a plain #explore preserves the user's toggle.
+CX.update = CX.update || {};
+CX.update['explore'] = function() {
+  var want = _cxLensFromRoute();
+  if (want) _cxSetLens(want);
+};
+"#;
 
 /// Delegates to `render::escape_script_tag` — the single canonical
 /// implementation — so SPA and standalone renders always produce identical
@@ -26,14 +74,30 @@ fn escape_html_text(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Render the SPA with no embedded timeline (the default, deterministic form).
+/// Never reads the live `.cxpak/timeline/` cache — that would make the emitted
+/// bytes depend on git history and break the golden fixture. Callers that want
+/// a live timeline compute snapshots and pass them to
+/// [`render_spa_with_timeline`].
 pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<String, LayoutError> {
+    render_spa_with_timeline(index, metadata, None)
+}
+
+/// Render the SPA, embedding `timeline` snapshots when provided. The snapshots
+/// are injected by the caller (CLI/serve) rather than read from disk here, so
+/// the fixture path stays byte-deterministic.
+pub fn render_spa_with_timeline(
+    index: &CodebaseIndex,
+    metadata: &RenderMetadata,
+    timeline: Option<&[crate::visual::timeline::TimelineSnapshot]>,
+) -> Result<String, LayoutError> {
     let cfg = LayoutConfig::default();
 
     let dashboard_data = render::build_dashboard_data(index);
     // An empty index produces LayoutError::Empty from the module layout step.
     // That is not a bug — it simply means there are no files to visualise.
-    // The SPA must still render all six view containers so the controller can
-    // boot cleanly; the architecture view will display an empty graph.
+    // The SPA must still render every view container so the controller can
+    // boot cleanly; the Explore graph lens will display an empty graph.
     let arch_data = match render::build_architecture_explorer_data(index, &cfg) {
         Ok(d) => d,
         Err(LayoutError::Empty) => render::ArchitectureExplorerData {
@@ -58,20 +122,30 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     let risk_data = render::build_risk_heatmap_data(index);
     let search = search_index::build_search_index(index);
 
-    // Timeline: attempt to load cached snapshots; null when absent.
+    // Timeline: use the caller-injected snapshots; null when none supplied.
     // Each per-view JSON below uses `.expect("...is infallible")` because the
     // serialised types are plain `#[derive(serde::Serialize)]` data structures
     // (see render.rs DashboardData / ArchitectureExplorerData / RiskHeatmap and
     // search_index::SearchIndex).  None contains a custom `Serialize` impl that
     // could fail.  An infallible-fallback `unwrap_or_else(|_| "null".into())`
     // would only mask a corrupted build, not handle a real runtime failure.
-    let timeline_json =
-        match crate::visual::timeline::load_cached_snapshots(std::path::Path::new(".")) {
-            Some(snaps) if !snaps.is_empty() => {
-                serde_json::to_string(&snaps).expect("TimelineSnapshot serialization is infallible")
+    // timeline_js consumes the {steps, current_index, health_sparkline} view-model
+    // (TimeMachineData), NOT a raw Vec<TimelineSnapshot> — injecting the snapshots
+    // verbatim leaves `tl.steps` undefined and the view falls back to its
+    // "insufficient git history" empty state. Build the same view-model the
+    // standalone Time Machine renderer uses (render::build_time_machine_data).
+    let timeline_json = match timeline {
+        Some(snaps) if !snaps.is_empty() => {
+            match render::build_time_machine_data(snaps.to_vec(), &cfg) {
+                Ok(tm) => {
+                    serde_json::to_string(&tm).expect("TimeMachineData serialization is infallible")
+                }
+                // Empty/degenerate history → null → the view's own empty state.
+                Err(_) => "null".into(),
             }
-            _ => "null".into(),
-        };
+        }
+        _ => "null".into(),
+    };
 
     // Flow and Diff: always null in SPA default (they require params).
     let flow_json = "null".to_string();
@@ -140,33 +214,50 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     // tabindex/aria-selected as focus moves.  Without this, keyboard
     // users had to Tab through every preceding focusable element to
     // reach a non-dashboard view.
+    // Three-mode information architecture (ADR-0192): Overview / Explore /
+    // History. Flow and Diff were removed from the SPA nav — both are null in
+    // every SPA render (they need CLI --symbol / --files params) so they only
+    // ever showed a permanent empty state; they remain available via the
+    // standalone `cxpak visual --visual-type flow|diff` render path. Internal
+    // view keys and hashes stay `dashboard`/`timeline` so deep-links and the
+    // shared renderers are unaffected; only the display labels changed.
     html.push_str("      <nav class=\"cxpak-nav\" role=\"tablist\" aria-label=\"Views\">\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"dashboard\" href=\"#dashboard\" role=\"tab\" aria-selected=\"true\" tabindex=\"0\">Dashboard</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"architecture\" href=\"#architecture\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Architecture</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"risk\" href=\"#risk\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Risk</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"flow\" href=\"#flow\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Flow</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"timeline\" href=\"#timeline\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Timeline</a>\n");
-    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"diff\" href=\"#diff\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Diff</a>\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"dashboard\" href=\"#dashboard\" role=\"tab\" aria-selected=\"true\" tabindex=\"0\">Overview</a>\n");
+    // Explore merges the former Architecture + Risk tabs under one mode with a
+    // Dependencies|Risk lens toggle (ADR-0192). Legacy #architecture / #risk
+    // hashes redirect here (see the controller's parseHash).
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"explore\" href=\"#explore\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">Explore</a>\n");
+    html.push_str("        <a class=\"cxpak-nav-link\" data-view=\"timeline\" href=\"#timeline\" role=\"tab\" aria-selected=\"false\" tabindex=\"-1\">History</a>\n");
     html.push_str("      </nav>\n");
-    html.push_str("      <button class=\"cxpak-theme-toggle\" aria-label=\"Switch to light mode\">\u{2600}</button>\n");
+    html.push_str("      <label class=\"cxpak-palette-picker-label\" for=\"cxpak-palette-select\">Palette</label>\n");
+    html.push_str("      <div id=\"cxpak-palette-swatches\" class=\"cxpak-palette-swatches\" aria-hidden=\"true\"></div>\n");
+    html.push_str("      <select id=\"cxpak-palette-select\" class=\"cxpak-palette-picker\" aria-label=\"Colour palette\"></select>\n");
     html.push_str("      <span class=\"cxpak-freshness\"></span>\n");
     html.push_str("    </header>\n");
     html.push_str("    <noscript>\n");
     html.push_str("      <div style=\"padding:24px 32px;border:1px solid var(--accent-yellow);border-radius:8px;margin:16px;color:var(--text-primary);background:var(--bg-card)\">\n");
-    html.push_str("        <strong>JavaScript required.</strong> The cxpak dashboard is a single-page app that renders six interactive views (Dashboard, Architecture, Risk, Flow, Timeline, Diff) entirely in the browser. Without JavaScript the views below remain empty.\n");
+    html.push_str("        <strong>JavaScript required.</strong> The cxpak dashboard is a single-page app that renders three interactive views (Overview, Explore, History) entirely in the browser. Without JavaScript the views below remain empty.\n");
     html.push_str("        <br><br>\n");
     html.push_str("        For a JS-free overview of this codebase, run <code>cxpak overview</code> on the command line, which produces a token-budgeted text/markdown report with the same intelligence (PageRank, blast radius, dead code, conventions) backing this dashboard.\n");
     html.push_str("      </div>\n");
     html.push_str("    </noscript>\n");
     html.push_str("    <main id=\"cxpak-main\">\n");
     html.push_str("      <section id=\"view-dashboard\" class=\"cxpak-view\"></section>\n");
+    // Explore hosts both lenses. The Risk panel is visible by default so the
+    // treemap's clientWidth measurement is non-zero at render time; the init
+    // flips to the Dependencies lens when a drill-down param is present.
+    html.push_str("      <section id=\"view-explore\" class=\"cxpak-view\" hidden>\n");
     html.push_str(
-        "      <section id=\"view-architecture\" class=\"cxpak-view\" hidden></section>\n",
+        "        <div class=\"cxpak-lens-toggle\" role=\"tablist\" aria-label=\"Explore lens\">\n",
     );
-    html.push_str("      <section id=\"view-risk\" class=\"cxpak-view\" hidden></section>\n");
-    html.push_str("      <section id=\"view-flow\" class=\"cxpak-view\" hidden></section>\n");
+    html.push_str("          <button class=\"cxpak-lens-btn\" data-lens=\"deps\" role=\"tab\" aria-selected=\"false\">Dependencies</button>\n");
+    html.push_str("          <button class=\"cxpak-lens-btn active\" data-lens=\"risk\" role=\"tab\" aria-selected=\"true\">Risk</button>\n");
+    html.push_str("        </div>\n");
+    html.push_str("        <div id=\"explore-deps\" class=\"cxpak-lens-panel\" hidden></div>\n");
+    html.push_str("        <div id=\"explore-risk\" class=\"cxpak-lens-panel\"></div>\n");
+    html.push_str("      </section>\n");
+    // History mode (nav label "History"; internal key/hash stay `timeline`).
     html.push_str("      <section id=\"view-timeline\" class=\"cxpak-view\" hidden></section>\n");
-    html.push_str("      <section id=\"view-diff\" class=\"cxpak-view\" hidden></section>\n");
     html.push_str("    </main>\n");
     html.push_str("    <aside id=\"cxpak-inspector\" class=\"cxpak-inspector\" role=\"dialog\" aria-modal=\"false\" aria-label=\"Node details inspector\" hidden>\n");
     html.push_str("      <div class=\"cxpak-inspector-header\">\n");
@@ -198,8 +289,8 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Cmd/Ctrl+K</kbd> or <kbd>/</kbd></span><span class=\"cxpak-inspector-value\">Open command palette</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>\u{2191}</kbd> <kbd>\u{2193}</kbd></span><span class=\"cxpak-inspector-value\">Navigate palette items</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Enter</kbd></span><span class=\"cxpak-inspector-value\">Select palette item</span></div>\n");
-    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>1</kbd>\u{2013}<kbd>6</kbd></span><span class=\"cxpak-inspector-value\">Switch to Dashboard / Architecture / Risk / Flow / Timeline / Diff</span></div>\n");
-    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>t</kbd></span><span class=\"cxpak-inspector-value\">Toggle dark / light theme</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>1</kbd>\u{2013}<kbd>3</kbd></span><span class=\"cxpak-inspector-value\">Switch to Overview / Explore / History</span></div>\n");
+    html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>p</kbd></span><span class=\"cxpak-inspector-value\">Prove the focused risk score (Overview)</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>?</kbd></span><span class=\"cxpak-inspector-value\">This help overlay</span></div>\n");
     html.push_str("        <div class=\"cxpak-inspector-row\"><span class=\"cxpak-inspector-label\"><kbd>Esc</kbd></span><span class=\"cxpak-inspector-value\">Close palette / inspector / help overlay</span></div>\n");
     html.push_str("      </div>\n");
@@ -261,6 +352,13 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str(SPA_CONTROLLER);
     html.push_str("</script>\n");
 
+    // Palette registry + picker — runs after the header exists and after the
+    // controller so window.CX is present. Applies CSS custom properties at
+    // runtime; the emitted bytes are identical for every palette (ADR-0191).
+    html.push_str("  <script>");
+    html.push_str(PALETTE_JS);
+    html.push_str("</script>\n");
+
     // Per-view renderers, each wrapped in a deferred CX.init.{view} function so it
     // only runs when the router navigates to that view. Before running, CX.app is
     // repointed to the view's section so the renderer's appendChild calls land in
@@ -295,13 +393,13 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
     html.push_str("}\n");
     html.push_str("</script>\n");
 
+    // Flow and Diff are not wired into the SPA (removed from the 3-mode nav —
+    // they are param-only, always-null views); their renderers stay live on the
+    // standalone `cxpak visual --visual-type flow|diff` path. Their JSON tags are
+    // still emitted (null) so the controller's data-tag bootstrap finds them.
     for (key, js) in [
         ("dashboard", render::dashboard_js()),
-        ("architecture", render::architecture_js()),
-        ("risk", render::risk_js()),
-        ("flow", render::flow_js()),
         ("timeline", render::timeline_js()),
-        ("diff", render::diff_js()),
     ] {
         html.push_str(&format!(
             "  <script>\nCX.init['{key}'] = function() {{ _cxpakRunView('{key}', function() {{\n"
@@ -309,6 +407,25 @@ pub fn render_spa(index: &CodebaseIndex, metadata: &RenderMetadata) -> Result<St
         html.push_str(js);
         html.push_str("\n}); };\n</script>\n");
     }
+
+    // Explore mode: renders both lenses into their panels, reusing the
+    // architecture (Dependencies) and risk (Risk) renderers verbatim, each
+    // scoped to its own panel via CX.app. A lens toggle swaps visibility
+    // (encoding-only; both stay in the DOM). Default lens = Risk, unless a
+    // drill-down param (file/module) or ?lens=deps selects Dependencies.
+    html.push_str(
+        "  <script>\nCX.init['explore'] = function() { _cxpakRunView('explore', function() {\n",
+    );
+    html.push_str("var _exSection = document.getElementById('view-explore');\n");
+    html.push_str("CX.app = document.getElementById('explore-deps');\n(function() {\n");
+    html.push_str(render::architecture_js());
+    html.push_str("\n})();\n");
+    html.push_str("CX.app = document.getElementById('explore-risk');\n(function() {\n");
+    html.push_str(render::risk_js());
+    html.push_str("\n})();\n");
+    html.push_str("CX.app = _exSection;\n");
+    html.push_str(EXPLORE_LENS_JS);
+    html.push_str("\n}); };\n</script>\n");
 
     html.push_str("</body>\n");
     html.push_str("</html>\n");

@@ -62,9 +62,13 @@
   // =============================================================================
   // 2) ROUTER
   // =============================================================================
-  var VIEWS = ['dashboard','architecture','risk','flow','timeline','diff'];
+  // Three-mode IA (ADR-0192): Overview / Explore / History. Internal keys stay
+  // dashboard/explore/timeline for routing + renderer compatibility. Flow and
+  // Diff were removed from the SPA (param-only, always-empty); legacy #flow /
+  // #diff hashes fall through to dashboard in parseHash below.
+  var VIEWS = ['dashboard','explore','timeline'];
   var initialized = {};
-  CX._initialized = initialized; // expose for toggleTheme re-render
+  CX._initialized = initialized; // exposed so per-view re-entry can check init state
 
   function parseHash() {
     var raw = window.location.hash.replace(/^#/, '') || 'dashboard';
@@ -81,6 +85,10 @@
         }
       });
     }
+    // Legacy deep-links (#architecture / #risk, incl. palette file/module
+    // targets) redirect to the merged Explore mode; the lens param survives.
+    if (name === 'architecture') { name = 'explore'; if (!params.lens) params.lens = 'deps'; }
+    else if (name === 'risk') { name = 'explore'; if (!params.lens) params.lens = 'risk'; }
     if (VIEWS.indexOf(name) < 0) name = 'dashboard';
     return { name: name, params: params };
   }
@@ -115,6 +123,7 @@
     CX.state.module = parsed.params.module || null;
     CX.state.file = parsed.params.file || null;
     CX.state.symbol = parsed.params.symbol || null;
+    CX.state.lens = parsed.params.lens || null;
 
     // Interrupt old, close inspector
     if (CX.state.view && CX.state.view !== newView) {
@@ -146,12 +155,9 @@
     var live = document.getElementById('cxpak-live');
     if (live) {
       var hint = {
-        dashboard: 'Dashboard view with health, risks, and alerts',
-        architecture: 'Architecture view with module graph',
-        risk: 'Risk heatmap view',
-        flow: 'Flow diagram view',
-        timeline: 'Timeline view',
-        diff: 'Diff view',
+        dashboard: 'Overview with health, risks, signals, and repo DNA',
+        explore: 'Explore view with Dependencies and Risk lenses',
+        timeline: 'History view with the architecture timeline',
       }[newView] || newView;
       live.textContent = 'Navigated to ' + hint;
     }
@@ -288,7 +294,7 @@
       if (s) scored.push({ s: s, e: index[i] });
     }
     scored.sort(function(a, b) { return cmpKey(a.s, b.s); });
-    // Empty query: show 6 views + top-10 files by PageRank (first views by sort, then files).
+    // Empty query: show the 3 views + top-10 files by PageRank (views first by sort, then files).
     if (q === '') {
       var views = scored.filter(function(x) { return x.e.kind === 'view'; });
       var files = scored.filter(function(x) { return x.e.kind === 'file'; }).slice(0, 10);
@@ -410,45 +416,16 @@
       return (v === 'dark' || v === 'light') ? v : null;
     } catch (e) { return null; }
   }
-  function writeTheme(v) {
-    if (!CX.state.localStorageAvailable) return;
-    try { localStorage.setItem('cxpak-theme', v); } catch (e) { /* ignore */ }
-  }
   function applyTheme(t) {
     document.documentElement.setAttribute('data-theme', t);
-    var btn = document.querySelector('.cxpak-theme-toggle');
-    if (btn) {
-      btn.textContent = t === 'dark' ? '☀' : '☾';
-      btn.setAttribute('aria-label', 'Switch to ' + (t === 'dark' ? 'light' : 'dark') + ' mode');
-    }
   }
+  // The palette picker (ADR-0191) is the single colour control — light/dark are
+  // palette variants, so the old ☾/☀ data-theme toggle was removed. We still
+  // apply an initial data-theme (from a stored preference or the OS setting) so
+  // any theme-scoped CSS resolves before the palette JS paints over it.
   var savedTheme = readTheme();
   var initialTheme = savedTheme || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
   applyTheme(initialTheme);
-  CX.toggleTheme = function() {
-    var curr = document.documentElement.getAttribute('data-theme') || 'dark';
-    var next = curr === 'dark' ? 'light' : 'dark';
-    applyTheme(next);
-    writeTheme(next);
-    // Re-render the active view so D3 elements with hardcoded hex fills
-    // pick up the new theme's color palette.
-    var current = CX.state.view;
-    var section = document.getElementById('view-' + current);
-    if (section) {
-      section.textContent = ''; // clear DOM
-      if (CX._initialized) CX._initialized[current] = false;
-      if (typeof CX.init[current] === 'function') {
-        CX.init[current]();
-      }
-    }
-  };
-
-  // Wire the theme-toggle button click. Runs at script load since the button
-  // lives in the header which is rendered before this script executes.
-  (function() {
-    var btn = document.querySelector('.cxpak-theme-toggle');
-    if (btn) btn.addEventListener('click', CX.toggleTheme);
-  })();
 
   // Catch renderer-generated links to standalone view files (e.g. cxpak-architecture.html)
   // and redirect them through the SPA router. Defense-in-depth — Fix 1 handles the main
@@ -593,11 +570,10 @@
       if (CX.state.inspector) { closeInspector(); return; }
       if (CX.state.helpOverlayOpen) { closeHelp(); return; }
     }
-    if (['1','2','3','4','5','6'].indexOf(ev.key) >= 0 && !CX.state.paletteOpen) {
+    if (['1','2','3'].indexOf(ev.key) >= 0 && !CX.state.paletteOpen) {
       var v = VIEWS[parseInt(ev.key) - 1];
       if (v) { CX.pushHash('#' + v); navigate(); }
     }
-    if (ev.key === 't' && !CX.state.paletteOpen) { CX.toggleTheme(); }
     if (ev.key === '?' && !CX.state.paletteOpen) {
       var ho = document.getElementById('cxpak-help-overlay');
       if (ho) {

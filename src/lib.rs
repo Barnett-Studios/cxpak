@@ -25,6 +25,11 @@ pub mod plugin;
 pub mod relevance;
 pub mod scanner;
 pub mod schema;
+/// Shared test scaffolding (index builder + SPA fixture). Present only in test
+/// builds — `cfg(test)` for unit tests, the `test-support` feature (enabled via
+/// the self dev-dependency) for integration tests. Never in a release binary.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod util;
 #[cfg(feature = "visual")]
 pub mod visual;

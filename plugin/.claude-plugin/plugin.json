@@ -1,7 +1,7 @@
 {
   "name": "cxpak",
-  "description": "Structured codebase context for Claude. Auto-context on every prompt plus an on-demand single-page dashboard with Cmd+K command palette: architecture explorer, risk heatmap, flow diagram, timeline, and diff view. 26 MCP tools, 12 HTTP endpoints, 14 LSP custom methods — all wired to real intelligence: health scoring, blast radius, change prediction, drift detection, security surface, data flow tracing, cross-language resolution. tree-sitter across 43 languages. Cross-process deterministic output.",
-  "version": "3.0.0",
+  "description": "Structured codebase context for Claude. Auto-context on every prompt plus an on-demand single-page dashboard with Cmd+K command palette: three modes — Overview (health, top risks, signals, repo-DNA), Explore (dependency + risk lenses), and History (architecture timeline). 5 intent-parameterized MCP tools, 12 HTTP endpoints, 14 LSP custom methods — all wired to real intelligence: health scoring, blast radius, change prediction, drift detection, security surface, data flow tracing, cross-language resolution. tree-sitter across 43 languages. Cross-process deterministic output.",
+  "version": "3.1.0",
   "author": {
     "name": "Barnett Studios"
   },

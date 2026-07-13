@@ -1,6 +1,6 @@
 [package]
 name = "cxpak"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 rust-version = "1.91"
 description = "Spends CPU cycles so you don't spend tokens. The LLM gets a briefing packet instead of a flashlight in a dark room."
@@ -96,6 +96,9 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 mysql_async = { version = "0.34", optional = true, default-features = false, features = ["minimal", "rustls-tls"] }
 
 [dev-dependencies]
+# Self dev-dependency so integration tests (tests/*.rs) see `cxpak::test_support`
+# with the `test-support` feature on, while the release build never enables it.
+cxpak = { path = ".", features = ["test-support"] }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
@@ -183,6 +186,10 @@ embeddings = [
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
 e2e-browser = []
 plugins = ["dep:wasmtime"]
+# Test-only helpers (`cxpak::test_support`). Off by default → never compiled
+# into a release binary. Integration tests receive it through the self
+# dev-dependency below, unit tests through `cfg(test)`.
+test-support = []
 # Live DB introspection: rustls-only Postgres + MySQL drivers + a scoped tokio
 # runtime.  Off by default — keeps the default build OpenSSL-free AND DB-free.
 data-introspect = [

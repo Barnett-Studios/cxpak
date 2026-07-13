@@ -18,16 +18,16 @@ pub fn build_search_index(index: &CodebaseIndex) -> Vec<SearchEntry> {
     const CAP: usize = 20_000;
     let mut entries: Vec<SearchEntry> = Vec::new();
 
-    // 1. Views (6 fixed navigation entries). Lexicographically "view" > "symbol" > "module" > "file",
-    // so views will sort to the END of the final list after step 5. The cap branch at step 6 filters
-    // views explicitly to ensure they are always retained regardless of sort position.
+    // 1. Views (3 fixed navigation entries — the three-mode IA per ADR-0192:
+    // Overview / Explore / History. Architecture + Risk merged into Explore;
+    // Flow + Diff removed from the SPA, so they are not palette targets either.
+    // Lexicographically "view" > "symbol" > "module" > "file", so views sort to
+    // the END after step 5. The cap branch at step 6 filters views explicitly to
+    // ensure they are always retained.
     for (label, hash) in [
-        ("Dashboard", "#dashboard"),
-        ("Architecture Explorer", "#architecture"),
-        ("Risk Heatmap", "#risk"),
-        ("Flow Diagram", "#flow"),
-        ("Time Machine", "#timeline"),
-        ("Diff View", "#diff"),
+        ("Overview", "#dashboard"),
+        ("Explore", "#explore"),
+        ("History", "#timeline"),
     ] {
         entries.push(SearchEntry {
             label: label.to_string(),
@@ -228,10 +228,26 @@ mod tests {
     }
 
     #[test]
-    fn includes_all_six_views() {
+    fn includes_all_three_views() {
         let index = make_test_index();
         let entries = build_search_index(&index);
-        assert_eq!(entries.iter().filter(|e| e.kind == "view").count(), 6);
+        // Three-mode IA: Overview / Explore / History (ADR-0192). Architecture +
+        // Risk merged into Explore; Flow + Diff removed from the SPA nav.
+        assert_eq!(entries.iter().filter(|e| e.kind == "view").count(), 3);
+        assert!(entries
+            .iter()
+            .any(|e| e.kind == "view" && e.label == "Explore"));
+        assert!(entries
+            .iter()
+            .any(|e| e.kind == "view" && e.label == "Overview"));
+        assert!(entries
+            .iter()
+            .any(|e| e.kind == "view" && e.label == "History"));
+        assert!(!entries.iter().any(|e| e.target == "#architecture"));
+        // Flow and Diff are no longer navigable in the SPA.
+        assert!(!entries
+            .iter()
+            .any(|e| e.target == "#flow" || e.target == "#diff"));
     }
 
     #[test]

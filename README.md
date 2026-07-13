@@ -12,33 +12,22 @@ cxpak indexes your codebase using tree-sitter across 43 languages, builds a type
 
 ## What it looks like
 
+`cxpak visual` renders a self-contained single-page dashboard -- three modes, inlined D3, **zero external assets, works offline**. Nineteen built-in colour palettes and a Cmd+K command palette over every file, symbol, and view. Every number on the page traces to a real computation; click any risk to see its exact derivation.
+
 <p align="center">
-<img src="docs/images/dashboard.png" alt="Dashboard" width="100%">
+<img src="docs/images/overview.png" alt="Overview" width="100%">
 </p>
 
+<p align="center"><em>Overview -- a needle health dial and genome bars, ranked top risks, a proven Signals feed, and the Repo-DNA fingerprint barcode.</em></p>
+
 <details>
-<summary>Architecture Explorer -- directed dependency graph with risk coloring</summary>
-<img src="docs/images/architecture.png" alt="Architecture Explorer" width="100%">
+<summary>Explore -- one spatial canvas, Dependencies and Risk lenses</summary>
+<img src="docs/images/explore.png" alt="Explore -- risk treemap coloured by within-repo percentile" width="100%">
 </details>
 
 <details>
-<summary>Architecture -- tooltip with PageRank and metadata on hover</summary>
-<img src="docs/images/architecture-tooltip.png" alt="Architecture Tooltip" width="100%">
-</details>
-
-<details>
-<summary>Risk Heatmap -- treemap sized by token count, colored by risk score</summary>
-<img src="docs/images/risk.png" alt="Risk Heatmap" width="100%">
-</details>
-
-<details>
-<summary>Flow Diagram -- call graph with directional arrows</summary>
-<img src="docs/images/flow.png" alt="Flow Diagram" width="100%">
-</details>
-
-<details>
-<summary>Diff View -- before/after with blast radius overlay</summary>
-<img src="docs/images/diff.png" alt="Diff View" width="100%">
+<summary>History -- the architecture timeline, scrubbed commit by commit</summary>
+<img src="docs/images/history.png" alt="History -- architecture timeline" width="100%">
 </details>
 
 ## Install
@@ -66,14 +55,14 @@ docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak overview .
 Pin a tag or an immutable digest for reproducible deploys:
 
 ```bash
-docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak:2.2.1 overview .
+docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak:3.1.0 overview .
 docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak@sha256:<digest> overview .
 ```
 
 Images are signed with [cosign](https://github.com/sigstore/cosign) (keyless) and carry SBOM + build-provenance attestations. Verify before deploying:
 
 ```bash
-cosign verify ghcr.io/barnett-studios/cxpak:2.2.1 \
+cosign verify ghcr.io/barnett-studios/cxpak:3.1.0 \
   --certificate-identity-regexp '^https://github.com/Barnett-Studios/cxpak/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -93,11 +82,12 @@ Builds the full default feature set from your local checkout. First build is slo
 All three build-args are **required** — the build fails immediately if any is omitted, so you can never accidentally produce a stale or mismatched image. Checksums are available on the [releases page](https://github.com/Barnett-Studios/cxpak/releases).
 
 ```bash
+# SHA-256 values are per-release — copy the two for VERSION from the releases page.
 docker build -f Dockerfile.standalone \
-  --build-arg VERSION=2.3.0 \
-  --build-arg SHA256_AMD64=c98d142aec62a70bb5ecccdf44120aaa55641a26b27d5a52821a093c79dd8cac \
-  --build-arg SHA256_ARM64=2f7cc078446a65bdb8f2cbcc81b2e1932431b066d560fe99e90519c7afd3d580 \
-  -t cxpak:2.3.0 .
+  --build-arg VERSION=3.1.0 \
+  --build-arg SHA256_AMD64=<cxpak-x86_64-unknown-linux-gnu checksum> \
+  --build-arg SHA256_ARM64=<cxpak-aarch64-unknown-linux-gnu checksum> \
+  -t cxpak:3.1.0 .
 ```
 
 ### Usage
@@ -348,7 +338,7 @@ v2.0.0 establishes semver for the MCP API. Tool names, parameters, and response 
 
 ## Architecture decisions
 
-Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution. Records 0001-0162 were reconstructed across v0.1.0 -> v2.2.1; 0163 onward are written at decision time, now through 0190 (v3.0.0). Start with [the index](docs/adrs/INDEX.md).
+Every architecturally significant decision is recorded as an ADR in [`docs/adrs/`](docs/adrs/) -- what was chosen, the options considered, and the conditions under which to revisit it. The records span parsing, the typed dependency graph, relevance scoring, token budgeting, the MCP/HTTP/LSP surfaces, and distribution. Records 0001-0162 were reconstructed across v0.1.0 -> v2.2.1; 0163 onward are written at decision time, now through 0199 (v3.1.0). Start with [the index](docs/adrs/INDEX.md).
 
 ## License
 
