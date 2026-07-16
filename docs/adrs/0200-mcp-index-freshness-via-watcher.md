@@ -12,18 +12,18 @@ loop: planning
 ## Context
 
 `cxpak serve --mcp` builds its index **once** at startup (`run_mcp` →
-`spawn_mcp_index_build`, `src/commands/serve.rs:2238/2318`, ADR-0185) and never
-refreshes it. Its own doc comment admits it (serve.rs:2448-2449: "a long-lived
+`spawn_mcp_index_build`, ADR-0185) and never
+refreshes it. Its own doc comment admits it (`snapshot_ready_index`: "a long-lived
 session would keep the first ready index (no periodic rebuild)"). Reproduced
-(REPRO.md): a warm MCP session returns `out_degree 0` for a symbol after an edit
+empirically: a warm MCP session returns `out_degree 0` for a symbol after an edit
 that a fresh index shows as `out_degree 1` — silently, no staleness signal.
 
-The HTTP path (`run`, serve.rs:1351) does **not** have this bug: it spawns a
+The HTTP path (`run`) does **not** have this bug: it spawns a
 `daemon::watcher::FileWatcher` and drives `process_watcher_changes`
-(serve.rs:4231, takes `&SharedIndex`) — snapshot-then-swap, edge-delta graph
+(takes `&SharedIndex`) — snapshot-then-swap, edge-delta graph
 rebuild + warm PageRank (ADR-0165/0166), fresh derived caches — on every
 debounced change batch, atomically swapping a `SharedIndex`. The delta==full
-parity is already tested (serve.rs:6169). So the freshness *primitives* exist and
+parity is already tested. So the freshness *primitives* exist and
 are proven; they are simply not wired into `run_mcp`.
 
 The reuse is **not** verbatim, though: the HTTP watcher loop is an infinite

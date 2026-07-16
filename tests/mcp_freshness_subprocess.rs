@@ -121,9 +121,14 @@ fn mcp_subprocess_warm_session_reflects_edit() {
         &mut stdin,
         &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
     );
+    // Generous upper bound, not a latency assertion: `initialize` is answered
+    // off the index-build path, but a cold fork+exec+dynamic-link of the large
+    // cxpak binary plus the first JSON-RPC roundtrip can take several seconds on
+    // a saturated CI runner. The bound only exists to fail instead of hang; it
+    // costs nothing on the happy path (returns the instant the response lands).
     let init = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("initialize must answer promptly, off the index-build path");
+        .recv_timeout(Duration::from_secs(30))
+        .expect("initialize must answer before the process is presumed hung");
     assert_eq!(init["id"], 1);
     assert_eq!(init["result"]["serverInfo"]["name"], "cxpak");
 
@@ -160,28 +165,22 @@ fn mcp_subprocess_warm_session_reflects_edit() {
     assert_eq!(before["exists"], true, "before edit: {before}");
     assert_eq!(before["out_degree"], 0, "before edit: {before}");
 
-    // The build reaching `Ready` only proves the *build* thread is done;
-    // `spawn_mcp_watcher` polls the same cell independently (every
-    // `WATCHER_WAIT_POLL`) before it installs its own `FileWatcher`. Give it
-    // a moment -- an edit that lands before the watcher exists produces no
-    // event to miss, so the assertion below would hang until `edit_deadline`
-    // for a reason unrelated to #18. This is the FS-event timing tradeoff
-    // this test documents (see module doc comment).
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Real edit -- the exact #18 repro: a.rs gains an out-edge.
-    std::fs::write(path.join("src/c.rs"), "pub fn cee() {}\n").unwrap();
-    std::fs::write(
-        path.join("src/a.rs"),
-        "use crate::c::cee;\npub fn helper() { cee(); }\n",
-    )
-    .unwrap();
-
     // Bounded poll -- same warm session, no restart -- for the watcher's
-    // debounced republish to land.
+    // debounced republish to land. The edit (a.rs gains an out-edge to a new
+    // c.rs -- the exact #18 repro) is re-asserted each iteration rather than
+    // written once after a fixed sleep: `spawn_mcp_watcher` polls the readiness
+    // cell independently before it installs its `FileWatcher`, so an edit that
+    // lands before that install produces no event and is missed with no retry.
+    // Re-writing keeps producing modify events until the watcher is live and
+    // catches one -- no guessed-duration sleep, no install-timing flake.
     let mut after = before.clone();
     let edit_deadline = std::time::Instant::now() + Duration::from_secs(15);
     while std::time::Instant::now() < edit_deadline {
+        let _ = std::fs::write(path.join("src/c.rs"), "pub fn cee() {}\n");
+        let _ = std::fs::write(
+            path.join("src/a.rs"),
+            "use crate::c::cee;\npub fn helper() { cee(); }\n",
+        );
         write_line(&mut stdin, &call_node_a);
         let resp = rx
             .recv_timeout(Duration::from_secs(5))

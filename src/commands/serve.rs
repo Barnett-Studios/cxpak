@@ -4967,15 +4967,15 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = spawn_mcp_watcher(dir.path(), Arc::clone(&readiness), Arc::clone(&shutdown));
 
-        // Let the watcher install its FileWatcher before the edit below --
-        // a real (if generous) startup allowance, not a substitute for the
-        // bounded poll that follows.
-        std::thread::sleep(Duration::from_millis(300));
-        std::fs::write(dir.path().join("src/new_file.rs"), "fn brand_new() {}").unwrap();
-
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut observed = 2;
         while std::time::Instant::now() < deadline {
+            // Re-assert the edit each iteration rather than sleeping a guessed
+            // interval then writing once: an edit that lands before the watcher
+            // installs its FileWatcher produces no event and is missed with no
+            // retry. Re-writing keeps producing modify events until the watcher
+            // is live and catches one — no fixed-sleep race.
+            let _ = std::fs::write(dir.path().join("src/new_file.rs"), "fn brand_new() {}");
             if let Ok(g) = readiness.read() {
                 if let IndexReadiness::Ready(idx) = &*g {
                     observed = idx.total_files;
@@ -5086,21 +5086,20 @@ mod tests {
         assert_eq!(before["exists"], true, "before edit: {before}");
         assert_eq!(before["out_degree"], 0, "before edit: {before}");
 
-        // Give the watcher's FileWatcher a moment to be installed, then make
-        // the edit the #18 repro exercises: a.rs gains an out-edge.
-        std::thread::sleep(Duration::from_millis(300));
-        std::fs::write(path.join("src/c.rs"), "pub fn cee() {}\n").unwrap();
-        std::fs::write(
-            path.join("src/a.rs"),
-            "use crate::c::cee;\npub fn helper() { cee(); }\n",
-        )
-        .unwrap();
-
         // AFTER the edit: bounded poll (not a fixed sleep) on the warm
         // session's own tool call -- the same call the client would replay.
+        // Re-assert the edit (a.rs gains an out-edge to a new c.rs) each
+        // iteration rather than sleeping-then-editing-once: an edit that lands
+        // before the watcher installs its FileWatcher is missed with no retry,
+        // so re-writing keeps producing modify events until the watcher is live.
         let edit_deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut after = before.clone();
         while std::time::Instant::now() < edit_deadline {
+            let _ = std::fs::write(path.join("src/c.rs"), "pub fn cee() {}\n");
+            let _ = std::fs::write(
+                path.join("src/a.rs"),
+                "use crate::c::cee;\npub fn helper() { cee(); }\n",
+            );
             after = drive(call_node_a);
             if after["out_degree"] == 1 {
                 break;
