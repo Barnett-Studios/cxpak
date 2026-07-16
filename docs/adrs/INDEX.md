@@ -203,3 +203,5 @@
 | [0197](0197-hybrid-interaction-v1-diff.md) | Hybrid interaction model: bounded embed + opt-in Live serve; add /v1/diff | ACCEPTED | 2026-07-11 |
 | [0198](0198-risk-percentile-normalization.md) | Risk normalization = within-repo percentile; one-signal-per-channel encoding | ACCEPTED | 2026-07-11 |
 | [0199](0199-broaden-visual-roundtrip-conformance.md) | Broaden Visual round-trip conformance; no-dead-nav + provenance-completeness gates | ACCEPTED | 2026-07-11 |
+| [0202](0202-graph-node-enumeration-and-seed-validation.md) | Graph query — `nodes` enumeration op + `subgraph` unknown-seed partition + documented id format | ACCEPTED | 2026-07-16 |
+| [0203](0203-self-package-import-resolution-deferred.md) | Self-package import resolution (`use <own-crate>::`) — deferred, limitation documented | ACCEPTED | 2026-07-16 |

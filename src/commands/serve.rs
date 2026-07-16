@@ -1113,12 +1113,16 @@ async fn v1_predict_handler(
     })?))
 }
 
-/// `POST /v1/graph` — deterministic graph-query (cxpak 3.0.0 Task B1).
+/// `POST /v1/graph` — deterministic graph-query (cxpak 3.0.0 Task B1; `nodes`
+/// added by ADR-0202).
 ///
-/// The request body is `{ "op": "node"|"neighbors"|"path"|"subgraph", ... }`;
-/// the remaining fields are the op's params. The body is passed straight to the
-/// single core [`crate::intelligence::graph_query::execute`] — this surface only
-/// adapts transport, it does not re-derive. Malformed requests (missing `op`,
+/// The request body is
+/// `{ "op": "nodes"|"node"|"neighbors"|"path"|"subgraph", ... }`; the
+/// remaining fields are the op's params (`nodes` takes none — it enumerates
+/// every node id, the way to discover valid ids for the other ops). The body
+/// is passed straight to the single core
+/// [`crate::intelligence::graph_query::execute`] — this surface only adapts
+/// transport, it does not re-derive. Malformed requests (missing `op`,
 /// missing a required param, bad direction, unknown op) map to `400`.
 async fn v1_graph_handler(
     axum::extract::State(index): axum::extract::State<SharedIndex>,
@@ -2814,10 +2818,11 @@ fn dispatch_capability_op(
     match op {
         // ---- Newly MCP-surfaced cores (B1 graph, C1 retrieval, C3 data) -----
         "graph" => {
-            // `graph_op` selects node/neighbors/path/subgraph — renamed so it
-            // does not collide with the intent-tool `op` discriminator. The
-            // neighbors/path/subgraph output carries per-edge `edge_type` +
-            // `confidence` (`inferred`) — A3 (ADR-0175) edge confidence.
+            // `graph_op` selects nodes/node/neighbors/path/subgraph (`nodes`
+            // added by ADR-0202) — renamed so it does not collide with the
+            // intent-tool `op` discriminator. The neighbors/path/subgraph
+            // output carries per-edge `edge_type` + `confidence` (`inferred`)
+            // — A3 (ADR-0175) edge confidence.
             let sub = args
                 .get("graph_op")
                 .or_else(|| args.get("query"))

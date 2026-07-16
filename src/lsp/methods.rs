@@ -639,18 +639,21 @@ pub fn handle_custom_method(
             "edges": index.call_graph.edges,
             "total": index.call_graph.edges.len(),
         }))),
-        // Deterministic graph-query (cxpak 3.0.0 Task B1). `params` is
-        // `{ "op": "node"|"neighbors"|"path"|"subgraph", ... }`; it is passed
-        // straight to the single core `graph_query::execute`. A missing/invalid
-        // op or required param maps to JSON-RPC InternalError (-32603), matching
-        // the other required-param methods (trace/search/predict/dataFlow).
+        // Deterministic graph-query (cxpak 3.0.0 Task B1; `nodes` added by
+        // ADR-0202). `params` is
+        // `{ "op": "nodes"|"node"|"neighbors"|"path"|"subgraph", ... }`; it is
+        // passed straight to the single core `graph_query::execute`. A
+        // missing/invalid op or required param maps to JSON-RPC InternalError
+        // (-32603), matching the other required-param methods
+        // (trace/search/predict/dataFlow).
         "cxpak/graph" => {
             let op = params
                 .get("op")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
                     LspMethodError::Internal(
-                        "cxpak/graph requires 'op' (node|neighbors|path|subgraph) param".into(),
+                        "cxpak/graph requires 'op' (nodes|node|neighbors|path|subgraph) param"
+                            .into(),
                     )
                 })?
                 .to_string();
