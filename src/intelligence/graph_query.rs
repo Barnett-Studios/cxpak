@@ -183,7 +183,7 @@ impl fmt::Display for GraphQueryError {
             GraphQueryError::InvalidParam(m) => write!(f, "invalid parameter: {m}"),
             GraphQueryError::UnknownOp(op) => write!(
                 f,
-                "unknown graph op `{op}`; expected one of node|neighbors|path|subgraph|nodes"
+                "unknown graph op `{op}`; expected one of nodes|node|neighbors|path|subgraph"
             ),
         }
     }
@@ -853,6 +853,7 @@ mod tests {
     fn outputs_are_byte_deterministic() {
         let g = diamond();
         let ops = [
+            ("nodes", json!({})),
             ("node", json!({"id": "a"})),
             ("neighbors", json!({"id": "a", "direction": "both"})),
             ("path", json!({"from": "a", "to": "d"})),
