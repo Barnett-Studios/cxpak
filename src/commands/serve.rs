@@ -2533,8 +2533,20 @@ pub fn spawn_mcp_watcher(
         // can be `strip_prefix`-ed against `path` without mismatch inside
         // `classify_changes`; same fix `commands::watch::run` applies before
         // its own watcher. Fail-open: if canonicalization fails (path already
-        // gone), fall back to the original rather than aborting the watcher.
-        let path = path.canonicalize().unwrap_or(path);
+        // gone), fall back to the original rather than aborting the watcher --
+        // but log it, because an uncanonical root makes every `notify` event's
+        // `strip_prefix` miss, silently dropping all edits (issue #18's mode).
+        let path = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "cxpak: MCP watcher canonicalize failed for {}: {e} — \
+                     file-change matching may silently miss edits under this root",
+                    path.display()
+                );
+                path
+            }
+        };
 
         let seed = loop {
             if shutdown.load(Ordering::Relaxed) {
