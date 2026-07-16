@@ -2593,12 +2593,20 @@ pub fn mcp_stdio_loop_readiness(
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
                 // Gate on background-build readiness (Task R0): once ready, run
                 // against the base index exactly as before; before ready, return
-                // a graceful tool `result` (retry/failed status), never an error.
+                // a graceful tool result carrying a machine-readable status
+                // discriminator (ADR-0201) — retryable `Indexing`, terminal
+                // `Failed` — never a bare error indistinguishable from a
+                // param/capability failure.
                 match snapshot_ready_index(readiness) {
                     Ok(idx) => {
                         handle_tool_call(id, tool_name, &arguments, &idx, repo_path, snapshot)
                     }
-                    Err(status) => mcp_tool_result(id, &status.message()),
+                    Err(NotReady::Indexing) => {
+                        mcp_tool_status(id, &NotReady::Indexing.message(), "indexing", true, false)
+                    }
+                    Err(status @ NotReady::Failed(_)) => {
+                        mcp_tool_status(id, &status.message(), "failed", false, true)
+                    }
                 }
             }
             _ => mcp_error_response(id, -32601, "Method not found"),
@@ -4248,6 +4256,36 @@ fn mcp_tool_error(id: Option<Value>, text: &str) -> Value {
     })
 }
 
+/// Tool-call result carrying a machine-readable status discriminator
+/// (ADR-0201, Option C). Used only for the two states that need a positive
+/// signal beyond plain success/error: `Indexing` (retryable, no `isError`)
+/// and `Failed` (terminal, `isError: true`). `structuredContent` carries
+/// `{"status": status, "retryable": retryable}`; `text` stays the same
+/// human prose either helper would have produced, so display is unaffected.
+/// Generic param/capability/IO errors keep using `mcp_tool_error` and gain
+/// no `structuredContent` — see ADR-0201 on why the shared helper is not
+/// tagged.
+fn mcp_tool_status(
+    id: Option<Value>,
+    text: &str,
+    status: &str,
+    retryable: bool,
+    is_error: bool,
+) -> Value {
+    let mut result = json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": {"status": status, "retryable": retryable}
+    });
+    if is_error {
+        result["isError"] = json!(true);
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
 /// Process a batch of watcher changes, updating the shared index.
 ///
 /// Public so integration tests can drive the watcher invalidation contract
@@ -4785,6 +4823,151 @@ mod tests {
         // `stats` reports the two indexed files — proves it ran against the index.
         let parsed: Value = serde_json::from_str(text).expect("stats result is JSON");
         assert_eq!(parsed["files"], 2, "stats should reflect 2 indexed files");
+    }
+
+    // --- N19.2 (ADR-0201): machine-readable status discriminator ---
+
+    /// `mcp_tool_status` for the retryable case: no `isError`, and
+    /// `structuredContent` names the state a client branches on.
+    #[test]
+    fn mcp_tool_status_indexing_marks_retryable_no_error() {
+        let resp = mcp_tool_status(Some(json!(1)), "still indexing", "indexing", true, false);
+        assert!(resp["result"]["isError"].is_null());
+        assert_eq!(resp["result"]["structuredContent"]["status"], "indexing");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
+        assert_eq!(resp["result"]["content"][0]["text"], "still indexing");
+    }
+
+    /// `mcp_tool_status` for the terminal case: `isError:true` plus
+    /// `retryable:false` — a client stops retrying without parsing prose.
+    #[test]
+    fn mcp_tool_status_failed_marks_terminal_retryable_false() {
+        let resp = mcp_tool_status(Some(json!(1)), "build failed", "failed", false, true);
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["status"], "failed");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], false);
+    }
+
+    /// Envelope table (ADR-0201): a `tools/call` while `Building` returns a
+    /// non-error result carrying `{status:"indexing", retryable:true}`.
+    #[test]
+    fn tool_call_envelope_indexing_carries_retryable_marker() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(resp["error"].is_null());
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "Building must not be isError"
+        );
+        assert_eq!(resp["result"]["structuredContent"]["status"], "indexing");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
+    }
+
+    /// Envelope table (ADR-0201): a `tools/call` while `Failed` returns
+    /// `isError:true` plus `{status:"failed", retryable:false}` — an
+    /// intentional envelope change from the prior no-marker/no-isError shape.
+    #[test]
+    fn tool_call_envelope_failed_carries_terminal_marker() {
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            resp["error"].is_null(),
+            "must not be a protocol-level error"
+        );
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["status"], "failed");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("boom"));
+    }
+
+    /// A generic param error (MAJOR-2/finding): `isError:true` via the shared
+    /// `mcp_tool_error` helper, with NO `structuredContent` — it must not be
+    /// mislabelled with the Building/Failed discriminator.
+    #[test]
+    fn tool_call_envelope_param_error_has_no_structured_content() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"not_a_real_op"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(
+            resp["result"]["structuredContent"].is_null(),
+            "generic param errors must not carry the Building/Failed marker"
+        );
+    }
+
+    /// Success stays a bare result — no `structuredContent` at all, so a
+    /// client's three-way branch (`retryable` / `isError` / else success)
+    /// never mistakes a real answer for a status marker.
+    #[test]
+    fn tool_call_envelope_success_has_no_structured_content() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(resp["result"]["isError"].is_null());
+        assert!(
+            resp["result"]["structuredContent"].is_null(),
+            "success must carry no structuredContent"
+        );
     }
 
     // --- Health handler ---
