@@ -176,7 +176,7 @@ Your AI tool gets five intent-parameterized tools; each selects a capability via
 | Intent tool | Capabilities (via `op`) |
 |----------|-------|
 | **`cxpak_context`** | `context`, `retrieval`, `search`, `overview`, `stats`, `briefing`, `pack_context`, `context_for_task` |
-| **`cxpak_graph`** | `graph` (`node`/`neighbors`/`path`/`subgraph`), `trace`, `blast_radius`, `call_graph`, `dead_code`, `api_surface`, `data_flow`, `cross_lang`, `predict` |
+| **`cxpak_graph`** | `graph` (`nodes`/`node`/`neighbors`/`path`/`subgraph`), `trace`, `blast_radius`, `call_graph`, `dead_code`, `api_surface`, `data_flow`, `cross_lang`, `predict` |
 | **`cxpak_data`** | `data` (indexed / live schema) |
 | **`cxpak_review`** | `review`, `diff`, `verify` |
 | **`cxpak_insight`** | `health`, `risks`, `architecture`, `conventions`, `security_surface`, `drift`, `visual`, `onboard` |
@@ -289,9 +289,10 @@ cxpak understands your data layer and uses it to build a richer dependency graph
 
 ## Graph query and export
 
-Query the typed dependency graph directly -- four primitives (`node`, `neighbors`, `path`, `subgraph`), identical across MCP, HTTP, LSP, and CLI. Edges carry a typed `edge_type` and a confidence marker; inferred (heuristic) edges are surfaced as such.
+Query the typed dependency graph directly -- five primitives (`nodes`, `node`, `neighbors`, `path`, `subgraph`), identical across MCP, HTTP, LSP, and CLI. Edges carry a typed `edge_type` and a confidence marker; inferred (heuristic) edges are surfaced as such. `nodes` enumerates every valid id with no arguments -- the way to discover ids (they're repo-relative file paths) before calling the others; `subgraph` reports any seed that isn't a real node in `unknown_seeds` rather than echoing it back as one.
 
 ```bash
+cxpak graph nodes .
 cxpak graph neighbors --id src/index/graph.rs .
 cxpak graph path --from src/main.rs --to src/output/mod.rs .
 cxpak graph subgraph --seeds src/scanner/mod.rs,src/parser/mod.rs --depth 2 .

@@ -88,7 +88,7 @@ does not collide with the top-level `op` discriminator:
 
 | `op` | Sub-selector param | Values | Notes |
 |---|---|---|---|
-| `graph` (under `cxpak_graph`) | `graph_op` | `node`, `neighbors`, `path`, `subgraph` | The typed graph-query capability (ADR-0176). `neighbors`/`path`/`subgraph` output carries per-edge `edge_type` + `confidence` (`inferred`) — ADR-0175. |
+| `graph` (under `cxpak_graph`) | `graph_op` | `nodes`, `node`, `neighbors`, `path`, `subgraph` | The typed graph-query capability (ADR-0176). `neighbors`/`path`/`subgraph` output carries per-edge `edge_type` + `confidence` (`inferred`) — ADR-0175. `nodes` (added in 3.1.1, ADR-0202) takes no params and enumerates every node id; `subgraph` reports non-existent seeds in `unknown_seeds` rather than echoing them as real nodes. |
 | `retrieval` (under `cxpak_context`) | `retrieval_op` | `search`, `references`, `expand` | The iterative retrieval capability (ADR-0180). Distinct from the legacy `search` op. |
 
 The `data` op (under `cxpak_data`) returns the indexed data layer (`SchemaIndex`:
