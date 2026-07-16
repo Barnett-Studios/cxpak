@@ -642,6 +642,75 @@ mod v1_subprocess_tests {
         child.wait().ok();
     }
 
+    // ─── Warm-server index freshness (issue #24) ────────────────────────────
+
+    /// A warm `cxpak serve` (HTTP) must reflect a post-startup filesystem edit,
+    /// not serve the stale startup index forever.
+    ///
+    /// Regression guard for #24 (the HTTP-transport twin of #18): the watcher
+    /// thread in `commands::serve::run` watched the RAW CLI path, never the
+    /// canonicalized one. `notify` delivers canonical, symlink-resolved
+    /// absolute paths, so `classify_changes`' `strip_prefix(base_path)` missed
+    /// on every event when `base_path` was non-canonical — which every macOS
+    /// `TMPDIR` temp dir is (`/var/folders/...` -> `/private/var/folders/...`).
+    /// A `tempfile::TempDir` therefore reproduces the exact bug: pre-fix, the
+    /// server drops every edit and `total_files` never moves.
+    ///
+    /// The observable is `/v1/health`'s `total_files`, read live from the
+    /// swapped-in index under the read lock. Adding a file bumps it from N to
+    /// N+1 once the watcher applies the change; pre-fix it stays at N and this
+    /// test times out on the poll, failing.
+    #[test]
+    fn warm_server_reflects_new_file() {
+        let repo = make_test_repo();
+        let port = find_free_port();
+        let mut child = spawn_serve(&repo, port, None);
+        assert!(wait_for_server(port), "server did not start within 60s");
+
+        // Baseline count from the live index.
+        let (status, body) = http_request(port, "GET", "/v1/health", None, None);
+        assert_eq!(status, 200, "GET /v1/health baseline; body: {body}");
+        let before: u64 = serde_json::from_str::<Value>(&body)
+            .expect("/v1/health body must be JSON")["total_files"]
+            .as_u64()
+            .expect("/v1/health must return total_files");
+
+        // Bounded poll for the watcher's debounced rebuild to land. The new
+        // file is (re-)written each iteration rather than once before a fixed
+        // sleep: the watcher thread installs its `FileWatcher` asynchronously
+        // after `run` spawns it, so a create event that fires before the
+        // watch is installed produces nothing and is missed with no retry.
+        // Re-writing keeps producing events until the watch is live and
+        // catches one — no guessed-duration sleep, no install-timing flake.
+        let added = repo.path().join("src/added_by_test.rs");
+        let mut after = before;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            std::fs::write(&added, "pub fn added() -> i32 { 7 }\n")
+                .expect("write new source file into the watched repo");
+            let (status, body) = http_request(port, "GET", "/v1/health", None, None);
+            assert_eq!(status, 200, "GET /v1/health during poll; body: {body}");
+            after = serde_json::from_str::<Value>(&body).expect("/v1/health body must be JSON")
+                ["total_files"]
+                .as_u64()
+                .expect("/v1/health must return total_files");
+            if after > before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        assert!(
+            after > before,
+            "warm HTTP server must reflect the added file (total_files {before} -> \
+             expected > {before}, got {after}) — the watcher is serving a stale \
+             index (issue #24)"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
     // ─── SIGTERM graceful shutdown (Unix only) ──────────────────────────────
 
     /// Verifies that `cxpak serve` exits cleanly when sent SIGTERM, draining
