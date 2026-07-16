@@ -89,6 +89,13 @@ pub struct NodeInfo {
     pub in_degree: usize,
 }
 
+/// Result of [`nodes`]: every node id known to the graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeList {
+    /// Every node id, sorted, each with its existence and degree.
+    pub nodes: Vec<NodeInfo>,
+}
+
 /// One neighbour of a node, with the connecting edge described honestly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NeighborEdge {
@@ -140,13 +147,19 @@ pub struct PathResult {
 /// Result of [`subgraph`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subgraph {
-    /// The seed node ids, sorted and de-duplicated.
+    /// The real (edge-participating) seed node ids, sorted and de-duplicated.
+    /// Unknown seeds are excluded here — see `unknown_seeds`.
     pub seeds: Vec<String>,
     pub depth: usize,
-    /// All nodes within `depth` hops of any seed (both directions), sorted.
+    /// All nodes within `depth` hops of any real seed (both directions), sorted.
     pub nodes: Vec<String>,
     /// The induced edges among those nodes, sorted by `(from, to, edge_type)`.
     pub edges: Vec<GraphEdge>,
+    /// Seeds that are not edge-participating nodes (`graph.contains_node` is
+    /// false), sorted. Never emitted as `nodes` — consistent with `node --id`
+    /// reporting `exists:false` for the same id (ADR-0202).
+    #[serde(default)]
+    pub unknown_seeds: Vec<String>,
 }
 
 /// Error from [`execute`] when a request is malformed. Surfaces map these to
@@ -170,7 +183,7 @@ impl fmt::Display for GraphQueryError {
             GraphQueryError::InvalidParam(m) => write!(f, "invalid parameter: {m}"),
             GraphQueryError::UnknownOp(op) => write!(
                 f,
-                "unknown graph op `{op}`; expected one of node|neighbors|path|subgraph"
+                "unknown graph op `{op}`; expected one of node|neighbors|path|subgraph|nodes"
             ),
         }
     }
@@ -189,6 +202,20 @@ pub fn node(graph: &DependencyGraph, id: &str) -> NodeInfo {
         exists: graph.contains_node(id),
         out_degree: graph.dependencies(id).map(|s| s.len()).unwrap_or(0),
         in_degree: graph.dependents(id).len(),
+    }
+}
+
+/// `nodes()` — every node id known to the graph (the union of `edges` and
+/// `reverse_edges` keys), sorted with in/out degree. No prefix/focus filter
+/// (ADR-0202): the bare enumerate op is all issue #20 asked for.
+pub fn nodes(graph: &DependencyGraph) -> NodeList {
+    let ids: BTreeSet<&String> = graph
+        .edges
+        .keys()
+        .chain(graph.reverse_edges.keys())
+        .collect();
+    NodeList {
+        nodes: ids.into_iter().map(|id| node(graph, id)).collect(),
     }
 }
 
@@ -324,11 +351,18 @@ pub fn subgraph(graph: &DependencyGraph, seeds: &[&str], depth: usize) -> Subgra
     // De-duplicated, sorted seeds → deterministic regardless of caller order.
     let sorted_seeds: BTreeSet<String> = seeds.iter().map(|s| s.to_string()).collect();
 
+    // Partition into real (edge-participating) seeds, which drive the BFS,
+    // and unknown seeds, which are reported honestly rather than echoed back
+    // as a node — consistent with `node --id` (ADR-0202).
+    let (real_seeds, unknown_seeds): (BTreeSet<String>, BTreeSet<String>) = sorted_seeds
+        .into_iter()
+        .partition(|s| graph.contains_node(s));
+
     // Multi-source bounded BFS, both directions, visiting each node once at its
     // minimum hop distance. `dist` keys form the included node set.
     let mut dist: BTreeMap<String, usize> = BTreeMap::new();
     let mut queue: VecDeque<String> = VecDeque::new();
-    for s in &sorted_seeds {
+    for s in &real_seeds {
         dist.insert(s.clone(), 0);
         queue.push_back(s.clone());
     }
@@ -377,10 +411,11 @@ pub fn subgraph(graph: &DependencyGraph, seeds: &[&str], depth: usize) -> Subgra
     }
 
     Subgraph {
-        seeds: sorted_seeds.into_iter().collect(),
+        seeds: real_seeds.into_iter().collect(),
         depth,
         nodes,
         edges,
+        unknown_seeds: unknown_seeds.into_iter().collect(),
     }
 }
 
@@ -391,16 +426,23 @@ pub fn subgraph(graph: &DependencyGraph, seeds: &[&str], depth: usize) -> Subgra
 /// Execute a graph-query `op` with JSON `params` against `graph`, returning the
 /// deterministic JSON result. This is the one core all four surfaces invoke.
 ///
-/// * `node`      — params: `{ "id": string }`
+/// * `nodes` — params: none. Lists every node id (repo-relative file path)
+///   known to the graph, sorted, each with in/out degree — the way to
+///   discover valid ids for the other ops (ADR-0202).
+/// * `node` — params: `{ "id": string }` (id: repo-relative file path,
+///   enumerate with `nodes`)
 /// * `neighbors` — params: `{ "id": string, "direction"?: "out"|"in"|"both" }`
-/// * `path`      — params: `{ "from": string, "to": string }`
-/// * `subgraph`  — params: `{ "seeds": [string], "depth"?: number }`
+/// * `path` — params: `{ "from": string, "to": string }`
+/// * `subgraph` — params: `{ "seeds": [string], "depth"?: number }`; unknown
+///   seeds are partitioned into `unknown_seeds`, never emitted as `nodes`
+///   (ADR-0202)
 pub fn execute(
     graph: &DependencyGraph,
     op: &str,
     params: &Value,
 ) -> Result<Value, GraphQueryError> {
     match op {
+        "nodes" => Ok(to_json(&nodes(graph))),
         "node" => {
             let id = req_str(params, "id")?;
             Ok(to_json(&node(graph, id)))
@@ -635,6 +677,93 @@ mod tests {
     }
 
     #[test]
+    fn nodes_enumerates_all_ids_sorted_with_degree() {
+        let g = linear(); // a -> b -> c
+        let list = nodes(&g);
+        let ids: Vec<&str> = list.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "b", "c"],
+            "sorted, every edge-participating id"
+        );
+        for n in &list.nodes {
+            assert!(n.exists, "every enumerated node exists by construction");
+        }
+        let a = list.nodes.iter().find(|n| n.id == "a").unwrap();
+        assert_eq!(a.out_degree, 1);
+        assert_eq!(a.in_degree, 0);
+        let b = list.nodes.iter().find(|n| n.id == "b").unwrap();
+        assert_eq!(b.out_degree, 1);
+        assert_eq!(b.in_degree, 1);
+        let c = list.nodes.iter().find(|n| n.id == "c").unwrap();
+        assert_eq!(c.out_degree, 0);
+        assert_eq!(c.in_degree, 1);
+    }
+
+    #[test]
+    fn nodes_diamond_union_of_edges_and_reverse_edges() {
+        let g = diamond(); // a->b, a->c, b->d, c->d
+        let list = nodes(&g);
+        let ids: Vec<&str> = list.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+        let d = list.nodes.iter().find(|n| n.id == "d").unwrap();
+        assert_eq!(d.out_degree, 0);
+        assert_eq!(d.in_degree, 2);
+    }
+
+    #[test]
+    fn nodes_empty_graph_is_empty() {
+        let g = DependencyGraph::new();
+        let list = nodes(&g);
+        assert!(list.nodes.is_empty());
+    }
+
+    #[test]
+    fn subgraph_partitions_unknown_seeds() {
+        let g = linear(); // a -> b -> c
+        let sg = subgraph(&g, &["a", "bogus"], 1);
+        assert_eq!(sg.seeds, vec!["a"], "unknown seed excluded from seeds too");
+        assert_eq!(sg.unknown_seeds, vec!["bogus"]);
+        assert_eq!(
+            sg.nodes,
+            vec!["a", "b"],
+            "bogus seed never emitted as a node"
+        );
+    }
+
+    #[test]
+    fn subgraph_all_unknown_empty_nodes() {
+        let g = linear();
+        let sg = subgraph(&g, &["totally", "bogus"], 1);
+        assert_eq!(sg.seeds, Vec::<String>::new());
+        assert_eq!(sg.unknown_seeds, vec!["bogus", "totally"], "sorted");
+        assert!(sg.nodes.is_empty());
+        assert!(sg.edges.is_empty());
+    }
+
+    #[test]
+    fn subgraph_mixed_seeds() {
+        let g = diamond(); // a->b, a->c, b->d, c->d
+        let sg = subgraph(&g, &["a", "nope", "d"], 1);
+        assert_eq!(sg.seeds, vec!["a", "d"]);
+        assert_eq!(sg.unknown_seeds, vec!["nope"]);
+        // depth 1 from a (out: b,c) and d (in: b,c) both real seeds.
+        assert_eq!(sg.nodes, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn subgraph_real_but_edgeless_seed() {
+        // A file with zero resolved edges is not a node (contains_node is
+        // false), matching `node --id` exists:false for the same case
+        // (ADR-0203 main.rs class) — it lands in unknown_seeds too.
+        let g = linear();
+        let sg = subgraph(&g, &["a", "src/main.rs"], 1);
+        assert_eq!(sg.seeds, vec!["a"]);
+        assert_eq!(sg.unknown_seeds, vec!["src/main.rs"]);
+        assert_eq!(sg.nodes, vec!["a", "b"]);
+    }
+
+    #[test]
     fn execute_node_roundtrips() {
         let g = linear();
         let v = execute(&g, "node", &json!({"id": "b"})).unwrap();
@@ -656,6 +785,29 @@ mod tests {
         assert_eq!(p["nodes"], json!(["a", "b", "d"]));
         let s = execute(&g, "subgraph", &json!({"seeds": ["a"], "depth": 1})).unwrap();
         assert_eq!(s["depth"], json!(1));
+    }
+
+    #[test]
+    fn execute_nodes_op_returns_sorted_list() {
+        let g = linear();
+        let v = execute(&g, "nodes", &json!({})).unwrap();
+        let ids: Vec<&str> = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn execute_unknown_op_lists_nodes() {
+        let g = linear();
+        let err = execute(&g, "frobnicate", &json!({})).unwrap_err();
+        assert!(
+            err.to_string().contains("nodes"),
+            "UnknownOp message must name `nodes` as a valid op: {err}"
+        );
     }
 
     #[test]
