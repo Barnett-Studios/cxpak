@@ -2416,15 +2416,44 @@ fn publish_ready_enriched(
     }
 }
 
+/// Typed not-ready state for a `tools/call` that arrives before the base
+/// index is available (ADR-0201). Distinguishes **retryable** (`Indexing`)
+/// from **terminal** (`Failed`) at the type level, so the tool-call site can
+/// attach the right machine-readable discriminator instead of re-deriving it
+/// from prose.
+#[derive(Debug)]
+enum NotReady {
+    /// Background base-index build in progress; the call is retryable.
+    Indexing,
+    /// The background build failed; not retryable without a server restart.
+    Failed(String),
+}
+
+impl NotReady {
+    /// Human-readable status text — byte-identical to the pre-ADR-0201
+    /// prose, so the `text` field of the tool-call envelope never changes
+    /// even though the caller now branches on `structuredContent` instead of
+    /// parsing this string.
+    fn message(&self) -> String {
+        match self {
+            NotReady::Indexing => INDEXING_IN_PROGRESS_MESSAGE.to_string(),
+            NotReady::Failed(msg) => format!(
+                "cxpak: indexing failed and no context is available: {msg}. \
+                 Check the cxpak server logs, then restart the MCP server to retry."
+            ),
+        }
+    }
+}
+
 /// Snapshot the base index if the background build has finished, else return the
-/// human-readable status to surface as a tool `result` (Task R0).
+/// typed not-ready state to surface as a tool `result` (Task R0, ADR-0201).
 ///
 /// Cloning the `Ready` `Arc` under a brief read lock is O(1); the lock is
 /// released before the (possibly long-running) tool handler runs, so tool calls
 /// never hold the readiness lock across a handler and never starve the
 /// background publish. A poisoned lock is recovered rather than propagated so a
 /// panicked reader cannot wedge the server.
-fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex>, String> {
+fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex>, NotReady> {
     let guard = match readiness.read() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -2433,11 +2462,8 @@ fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex
         // `ReadyEnriched` (R-E1) serves exactly like `Ready`; the attached
         // embedding index rides on the snapshotted `CodebaseIndex`.
         IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => Ok(Arc::clone(idx)),
-        IndexReadiness::Building => Err(INDEXING_IN_PROGRESS_MESSAGE.to_string()),
-        IndexReadiness::Failed(msg) => Err(format!(
-            "cxpak: indexing failed and no context is available: {msg}. \
-             Check the cxpak server logs, then restart the MCP server to retry."
-        )),
+        IndexReadiness::Building => Err(NotReady::Indexing),
+        IndexReadiness::Failed(msg) => Err(NotReady::Failed(msg.clone())),
     }
 }
 
@@ -2572,7 +2598,7 @@ pub fn mcp_stdio_loop_readiness(
                     Ok(idx) => {
                         handle_tool_call(id, tool_name, &arguments, &idx, repo_path, snapshot)
                     }
-                    Err(status) => mcp_tool_result(id, &status),
+                    Err(status) => mcp_tool_result(id, &status.message()),
                 }
             }
             _ => mcp_error_response(id, -32601, "Method not found"),
@@ -4609,8 +4635,9 @@ mod tests {
         let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
         let status =
             snapshot_ready_index(&readiness).expect_err("building must not yield an index");
-        assert_eq!(status, INDEXING_IN_PROGRESS_MESSAGE);
-        assert!(status.contains("indexing in progress"));
+        assert!(matches!(status, NotReady::Indexing));
+        assert_eq!(status.message(), INDEXING_IN_PROGRESS_MESSAGE);
+        assert!(status.message().contains("indexing in progress"));
     }
 
     /// `Failed` surfaces the build error text as a clear status.
@@ -4619,8 +4646,53 @@ mod tests {
         let readiness: SharedReadiness =
             Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
         let status = snapshot_ready_index(&readiness).expect_err("failed must not yield an index");
-        assert!(status.contains("indexing failed"));
-        assert!(status.contains("boom"));
+        assert!(matches!(status, NotReady::Failed(_)));
+        assert!(status.message().contains("indexing failed"));
+        assert!(status.message().contains("boom"));
+    }
+
+    /// N19.1 (ADR-0201): `snapshot_ready_index` returns a **typed** `NotReady`
+    /// — not a bare `String` — so retryable (`Indexing`) and terminal
+    /// (`Failed`) are distinguishable at the type level, before any caller
+    /// gets a chance to collapse them into indistinguishable prose.
+    #[test]
+    fn snapshot_ready_index_typed_states() {
+        let building: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        assert!(matches!(
+            snapshot_ready_index(&building),
+            Err(NotReady::Indexing)
+        ));
+
+        let failed: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
+        match snapshot_ready_index(&failed) {
+            Err(NotReady::Failed(msg)) => assert_eq!(msg, "boom"),
+            other => panic!("expected Err(NotReady::Failed(\"boom\")), got {other:?}"),
+        }
+
+        let ready: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        assert!(snapshot_ready_index(&ready).is_ok());
+
+        let ready_enriched: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::ReadyEnriched(
+            Arc::new(make_test_index()),
+        )));
+        assert!(snapshot_ready_index(&ready_enriched).is_ok());
+    }
+
+    /// N19.1 (ADR-0201, finding m9): `NotReady::message()` must reproduce
+    /// today's human prose byte-for-byte — including the `Failed` wrapper —
+    /// so existing prose-matching assertions/clients don't regress even
+    /// though the type now carries a machine-readable discriminator too.
+    #[test]
+    fn notready_message_byte_identical() {
+        assert_eq!(NotReady::Indexing.message(), INDEXING_IN_PROGRESS_MESSAGE);
+        assert_eq!(
+            NotReady::Failed("boom".to_string()).message(),
+            "cxpak: indexing failed and no context is available: boom. \
+             Check the cxpak server logs, then restart the MCP server to retry."
+        );
     }
 
     /// A tool call BEFORE the index is ready returns a JSON-RPC `result`
