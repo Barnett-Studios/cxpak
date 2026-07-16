@@ -19,19 +19,19 @@ only tell "retry soon" from "give up" by substring-matching the prose — a word
 change silently breaks retry logic (issue #19 documents a client pinning the exact
 string in a unit test for exactly this reason).
 
-REPRO.md corrects the issue's cited root cause and it was independently
-re-verified: Building/Failed do **not** flow through `mcp_tool_error`
-(serve.rs:4213). They flow through `mcp_tool_result` (serve.rs:2575) and carry
+Empirical reproduction corrects the issue's cited root cause; it was independently
+re-verified: Building/Failed do **not** flow through `mcp_tool_error`.
+They flow through `mcp_tool_result` and carry
 **no `isError`** — so they are indistinguishable not only from each other but from
 a genuine success result, except by prose. Parameter/capability errors *do* set
-`isError:true` (`mcp_tool_error`, serve.rs:4214). The current
-`snapshot_ready_index` collapses both not-ready states into a bare
-`Result<_, String>` (serve.rs:2427), discarding retryable/terminal at the type
+`isError:true` (via `mcp_tool_error`). Before this change,
+`snapshot_ready_index` collapsed both not-ready states into a bare
+`Result<_, String>`, discarding retryable/terminal at the type
 level before the caller can act on it.
 
 Crucially, `mcp_tool_error` is a **shared** helper for many terminal conditions —
 param validation *and* capability-execution failures, invalid regex, IO/render
-errors (serve.rs:2828/2839/3127/3475/3576/4143/4178). So a discriminator cannot be
+errors across many call sites. So a discriminator cannot be
 attached at that helper without mislabelling a disk-write failure as
 "invalid_params". The design must add a positive signal only where one is actually
 missing.
@@ -70,9 +70,11 @@ the cost of being wrong is low (additive field).
 
 Option C. Change `snapshot_ready_index` to `Result<Arc<CodebaseIndex>, NotReady>`
 with `NotReady { Indexing, Failed(String) }` (typed, with a `message()` accessor
-reproducing today's human prose **byte-for-byte**). At the tool-call site
-(serve.rs:2575): `Indexing` → non-error result + `{status:"indexing",
-retryable:true}`; `Failed` → `isError:true` + `{status:"failed",retryable:false}`
+reproducing today's human prose **byte-for-byte**). A single helper renders the
+not-ready envelope, deriving the `(status, retryable, isError)` triple from the
+`NotReady` variant so the two valid combinations are the only representable ones:
+`Indexing` → non-error result + `{status:"indexing", retryable:true}`; `Failed` →
+`isError:true` + `{status:"failed",retryable:false}`
 (an intentional, ADR'd envelope change — Failed is a terminal error state).
 Param/capability/IO errors are untouched. Success is untouched (no
 `structuredContent`). The readiness gate runs before param validation, so during
@@ -93,9 +95,9 @@ not left implicit).
 
 ### Negative
 - One intentional envelope change: Failed now sets `isError:true` (it previously
-  had none). No existing test asserts its absence (verified:
-  tests/mcp_nonblocking_startup.rs:166-181 checks `error==null`+text only), but a
-  client relying on Failed-as-normal-result must adapt. Documented in the PR.
+  had none), so a client relying on Failed-as-normal-result must adapt. Documented
+  in the PR; the end-to-end tests (`tests/mcp_nonblocking_startup.rs`) assert the
+  new `isError`/`structuredContent` envelope directly, not just the prose.
 - During Building, a permanently-malformed call is reported retryable until the
   build finishes; bounded by index build time, then terminal. Documented + tested.
 
@@ -109,3 +111,7 @@ not left implicit).
 - Param validation is hoisted before the readiness gate (a larger dispatch change)
   — then Building would no longer mask param errors and the "self-correcting" note
   is moot.
+- An older MCP client appears that reads only the `content` text block: the spec's
+  SHOULD is to also mirror `structuredContent` there as serialized JSON, but today
+  `text` stays human prose. Add a mirrored JSON content block if such a client needs
+  the marker.

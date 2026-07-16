@@ -2601,12 +2601,7 @@ pub fn mcp_stdio_loop_readiness(
                     Ok(idx) => {
                         handle_tool_call(id, tool_name, &arguments, &idx, repo_path, snapshot)
                     }
-                    Err(NotReady::Indexing) => {
-                        mcp_tool_status(id, &NotReady::Indexing.message(), "indexing", true, false)
-                    }
-                    Err(status @ NotReady::Failed(_)) => {
-                        mcp_tool_status(id, &status.message(), "failed", false, true)
-                    }
+                    Err(not_ready) => mcp_tool_status(id, &not_ready),
                 }
             }
             _ => mcp_error_response(id, -32601, "Method not found"),
@@ -4265,15 +4260,20 @@ fn mcp_tool_error(id: Option<Value>, text: &str) -> Value {
 /// Generic param/capability/IO errors keep using `mcp_tool_error` and gain
 /// no `structuredContent` — see ADR-0201 on why the shared helper is not
 /// tagged.
-fn mcp_tool_status(
-    id: Option<Value>,
-    text: &str,
-    status: &str,
-    retryable: bool,
-    is_error: bool,
-) -> Value {
+/// Render a not-ready state as a `tools/call` result envelope (ADR-0201).
+///
+/// The `(status, retryable, is_error)` triple is derived from the typed
+/// [`NotReady`] variant, not passed in — so the only two representable
+/// envelopes are the two valid ones (retryable `indexing` / terminal
+/// `failed`); a caller cannot spell an invalid combination like
+/// `(retryable: true, is_error: true)`.
+fn mcp_tool_status(id: Option<Value>, not_ready: &NotReady) -> Value {
+    let (status, retryable, is_error) = match not_ready {
+        NotReady::Indexing => ("indexing", true, false),
+        NotReady::Failed(_) => ("failed", false, true),
+    };
     let mut result = json!({
-        "content": [{"type": "text", "text": text}],
+        "content": [{"type": "text", "text": not_ready.message()}],
         "structuredContent": {"status": status, "retryable": retryable}
     });
     if is_error {
@@ -4831,21 +4831,31 @@ mod tests {
     /// `structuredContent` names the state a client branches on.
     #[test]
     fn mcp_tool_status_indexing_marks_retryable_no_error() {
-        let resp = mcp_tool_status(Some(json!(1)), "still indexing", "indexing", true, false);
+        let resp = mcp_tool_status(Some(json!(1)), &NotReady::Indexing);
         assert!(resp["result"]["isError"].is_null());
         assert_eq!(resp["result"]["structuredContent"]["status"], "indexing");
         assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
-        assert_eq!(resp["result"]["content"][0]["text"], "still indexing");
+        assert_eq!(
+            resp["result"]["content"][0]["text"],
+            INDEXING_IN_PROGRESS_MESSAGE
+        );
     }
 
     /// `mcp_tool_status` for the terminal case: `isError:true` plus
     /// `retryable:false` — a client stops retrying without parsing prose.
     #[test]
     fn mcp_tool_status_failed_marks_terminal_retryable_false() {
-        let resp = mcp_tool_status(Some(json!(1)), "build failed", "failed", false, true);
+        let resp = mcp_tool_status(
+            Some(json!(1)),
+            &NotReady::Failed("build failed".to_string()),
+        );
         assert_eq!(resp["result"]["isError"], true);
         assert_eq!(resp["result"]["structuredContent"]["status"], "failed");
         assert_eq!(resp["result"]["structuredContent"]["retryable"], false);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("build failed"));
     }
 
     /// Envelope table (ADR-0201): a `tools/call` while `Building` returns a
@@ -4973,32 +4983,32 @@ mod tests {
     // --- N19.3 (ADR-0201): substring-independence + masked-during-Building ---
 
     /// A client's retry decision must derive from `structuredContent.retryable`
-    /// alone, never from parsing `text` — swapping the prose out entirely (as a
-    /// reworded/localized message would) leaves the machine signal untouched.
+    /// alone, never from parsing `text`. The variant now fixes both the marker
+    /// and the prose, so the marker is independent of the *variable* part — the
+    /// `Failed` message: two failures with no substring in common both mark
+    /// terminal, and `Indexing` marks retryable.
     #[test]
     fn retryable_marker_is_independent_of_prose() {
-        let indexing = mcp_tool_status(
+        let failed_a = mcp_tool_status(
             Some(json!(1)),
-            "some entirely different wording",
-            "indexing",
-            true,
-            false,
+            &NotReady::Failed("some wording".to_string()),
         );
+        let failed_b = mcp_tool_status(
+            Some(json!(1)),
+            &NotReady::Failed("yet another, no substring in common".to_string()),
+        );
+        assert_eq!(failed_a["result"]["isError"], true);
+        assert_eq!(failed_a["result"]["structuredContent"]["retryable"], false);
+        assert_eq!(failed_b["result"]["isError"], true);
+        assert_eq!(failed_b["result"]["structuredContent"]["retryable"], false);
+
+        let indexing = mcp_tool_status(Some(json!(1)), &NotReady::Indexing);
         assert!(indexing["result"]["isError"].is_null());
         assert_eq!(indexing["result"]["structuredContent"]["retryable"], true);
-
-        let failed = mcp_tool_status(
-            Some(json!(1)),
-            "yet another wording, still no substring in common",
-            "failed",
-            false,
-            true,
-        );
-        assert_eq!(failed["result"]["isError"], true);
-        assert_eq!(failed["result"]["structuredContent"]["retryable"], false);
     }
 
-    /// Finding M4: the readiness gate (2571) runs *before* param validation,
+    /// Finding M4: the readiness gate (the `snapshot_ready_index` match in the
+    /// `tools/call` dispatch arm) runs *before* param validation,
     /// so a permanently-malformed call is masked as retryable while
     /// `Building`. This is bounded and self-correcting: once `Ready`, the
     /// same call reaches validation and returns the terminal `isError` with
