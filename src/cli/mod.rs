@@ -169,23 +169,29 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: PluginSubcommand,
     },
-    /// Query the dependency graph: node, neighbors, path, subgraph
+    /// Query the dependency graph: nodes, node, neighbors, path, subgraph
     Graph {
-        /// Operation: node | neighbors | path | subgraph
+        /// Operation: nodes | node | neighbors | path | subgraph. `nodes`
+        /// takes no other params — it lists every valid id.
         op: String,
-        /// Node id (for `node` and `neighbors`)
+        /// Node id for `node`/`neighbors` — repo-relative file path
+        /// (enumerate with `graph nodes`)
         #[arg(long)]
         id: Option<String>,
-        /// Source node (for `path`)
+        /// Source node for `path` — repo-relative file path (enumerate with
+        /// `graph nodes`)
         #[arg(long)]
         from: Option<String>,
-        /// Target node (for `path`)
+        /// Target node for `path` — repo-relative file path (enumerate with
+        /// `graph nodes`)
         #[arg(long)]
         to: Option<String>,
         /// Neighbor direction: out | in | both
         #[arg(long, default_value = "both")]
         direction: String,
-        /// Seed nodes for `subgraph` (comma-separated)
+        /// Seed nodes for `subgraph` (comma-separated) — repo-relative file
+        /// paths (enumerate with `graph nodes`); unknown ids are reported in
+        /// `unknown_seeds`, not treated as real nodes
         #[arg(long, value_delimiter = ',')]
         seeds: Vec<String>,
         /// Hop depth for `subgraph`
