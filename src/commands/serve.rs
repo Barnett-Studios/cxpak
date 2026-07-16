@@ -4970,6 +4970,87 @@ mod tests {
         );
     }
 
+    // --- N19.3 (ADR-0201): substring-independence + masked-during-Building ---
+
+    /// A client's retry decision must derive from `structuredContent.retryable`
+    /// alone, never from parsing `text` — swapping the prose out entirely (as a
+    /// reworded/localized message would) leaves the machine signal untouched.
+    #[test]
+    fn retryable_marker_is_independent_of_prose() {
+        let indexing = mcp_tool_status(
+            Some(json!(1)),
+            "some entirely different wording",
+            "indexing",
+            true,
+            false,
+        );
+        assert!(indexing["result"]["isError"].is_null());
+        assert_eq!(indexing["result"]["structuredContent"]["retryable"], true);
+
+        let failed = mcp_tool_status(
+            Some(json!(1)),
+            "yet another wording, still no substring in common",
+            "failed",
+            false,
+            true,
+        );
+        assert_eq!(failed["result"]["isError"], true);
+        assert_eq!(failed["result"]["structuredContent"]["retryable"], false);
+    }
+
+    /// Finding M4: the readiness gate (2571) runs *before* param validation,
+    /// so a permanently-malformed call is masked as retryable while
+    /// `Building`. This is bounded and self-correcting: once `Ready`, the
+    /// same call reaches validation and returns the terminal `isError` with
+    /// no marker, so a conformant client stops retrying.
+    #[test]
+    fn malformed_call_during_building_is_retryable_then_terminal_once_ready() {
+        let malformed = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"not_a_real_op"}}}"#,
+            "\n",
+        );
+
+        // Building masks the malformed call: retryable, no isError.
+        let building: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let snapshot = make_shared_snapshot();
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &building,
+            &snapshot,
+            std::io::Cursor::new(malformed.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "malformed call must be masked as retryable while Building"
+        );
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
+
+        // Once Ready, the same call reaches param validation: terminal, no marker.
+        let ready: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot2 = make_shared_snapshot();
+        let mut out2: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &ready,
+            &snapshot2,
+            std::io::Cursor::new(malformed.as_bytes()),
+            &mut out2,
+        )
+        .expect("loop");
+        let resp2: Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(resp2["result"]["isError"], true);
+        assert!(
+            resp2["result"]["structuredContent"].is_null(),
+            "once Ready the terminal param error carries no marker"
+        );
+    }
+
     // --- Health handler ---
 
     #[test]
