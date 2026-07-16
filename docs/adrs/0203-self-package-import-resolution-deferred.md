@@ -12,14 +12,14 @@ loop: planning
 ## Context
 
 Issue #20 flags (as "secondary") that cxpak's own `src/main.rs` reports
-`exists:false` from `graph node`. REPRO.md explains it: the dependency graph
+`exists:false` from `graph node`. The cause: the dependency graph
 stores only edge-participating nodes (`contains_node`, core_graph/graph.rs:240),
 and cxpak's `main.rs` imports only `clap::` (external) and `cxpak::cli` /
 `cxpak::commands` — via the **package name `cxpak::`**. The Rust import resolver
 (`src/index/graph.rs`) resolves `crate::`/`super::`/`self::` relative paths to
 local files but treats a `<package-name>::` path as an external crate, so
 `main.rs` gets zero resolved edges and is not a node. On a repo whose `main.rs`
-uses `use crate::foo` the same path resolves fine (REPRO.md tiny-repo: `main.rs`
+uses `use crate::foo` the same path resolves fine (a tiny repro's `main.rs`:
 exists:true, out:1). So this is a **narrow self-package (binary→library
 cross-crate) resolution gap**, not a graph-model bug.
 

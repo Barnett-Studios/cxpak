@@ -1,6 +1,6 @@
 //! Deterministic graph-query core (cxpak 3.0.0 Task B1).
 //!
-//! Four primitives — [`node`], [`neighbors`], [`path`], [`subgraph`] — answer
+//! Five primitives — [`node`], [`nodes`], [`neighbors`], [`path`], [`subgraph`] — answer
 //! structural questions over the typed [`DependencyGraph`]. This is the SINGLE
 //! source of truth for graph-query: every surface (MCP `cxpak_graph`, LSP
 //! `cxpak/graph`, CLI `graph`, HTTP `/v1/graph`) calls [`execute`] and reshapes

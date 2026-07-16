@@ -13,7 +13,7 @@ loop: planning
 
 The deterministic graph-query surface (`intelligence::graph_query`, ADR-0176;
 projected to CLI `graph`, HTTP `/v1/graph`, LSP `cxpak/graph`, MCP `cxpak_graph`)
-cannot be bootstrapped by a fresh consumer (issue #20, reproduced in REPRO.md):
+cannot be bootstrapped by a fresh consumer (issue #20, reproduced empirically):
 
 1. **No enumerate op.** `execute` (graph_query.rs:398) offers only
    node|neighbors|path|subgraph; `node`/`neighbors` require an `--id`, `path`
