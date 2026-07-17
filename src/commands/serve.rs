@@ -1377,8 +1377,28 @@ pub fn run(
     let shared = Arc::new(RwLock::new(Arc::new(index)));
     let shared_path = Arc::new(path.to_path_buf());
 
-    // Background watcher thread
-    let watcher_path = path.to_path_buf();
+    // Background watcher thread.
+    //
+    // Canonicalize the watch root: `notify` delivers canonical,
+    // symlink-resolved absolute paths, so `classify_changes`'
+    // `strip_prefix(base_path)` only matches when `base_path` is itself
+    // canonical. A raw (relative, or macOS `/tmp` -> `/private/tmp`, `/var`
+    // -> `/private/var`) root makes every event miss `strip_prefix`, silently
+    // dropping all edits and serving a stale index forever (issue #24 -- the
+    // HTTP-transport twin of #18's MCP watcher). Fail-open: if canonicalize
+    // fails (path already gone), fall back to the raw path rather than
+    // aborting the watcher, but log it because the miss is otherwise silent.
+    let watcher_path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "cxpak: HTTP watcher canonicalize failed for {}: {e} — \
+                 file-change matching may silently miss edits under this root",
+                path.display()
+            );
+            path.to_path_buf()
+        }
+    };
     let watcher_index = Arc::clone(&shared);
     std::thread::spawn(move || {
         let watcher = match FileWatcher::new(&watcher_path) {
