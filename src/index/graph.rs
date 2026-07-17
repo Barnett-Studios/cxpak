@@ -592,6 +592,19 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_rust_super_exhausted_returns_none() {
+        // `super::` resolves to a real directory, but no candidate file for the
+        // remaining path segment exists anywhere (neither the direct file, nor
+        // any progressive-shortening prefix, nor the zero-segment mod.rs
+        // fallback) — must fall through to the final `None`.
+        let all: HashSet<&str> = ["src/other.rs"].iter().copied().collect();
+        assert_eq!(
+            resolve_rust_import("src/sub/mod.rs", "super::totally_missing", &all),
+            None
+        );
+    }
+
+    #[test]
     fn test_resolve_rust_external_returns_none() {
         let all: HashSet<&str> = ["src/main.rs"].iter().copied().collect();
         assert_eq!(
@@ -638,6 +651,67 @@ mod tests {
         assert_eq!(
             resolve_python_import("app/bar.py", ".", &all),
             Some("app/__init__.py".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_python_single_dot_no_match_returns_none() {
+        // Progressive prefix shortening exhausts every candidate for a single
+        // leading dot with no matching file anywhere.
+        let all: HashSet<&str> = ["app/other.py"].iter().copied().collect();
+        assert_eq!(resolve_python_import("app/bar.py", ".missing", &all), None);
+    }
+
+    #[test]
+    fn test_resolve_python_bare_double_dot_package() {
+        // `from .. import Y` (dots=2, nothing after) walks up one directory
+        // from a non-top-level file and resolves to that package's __init__.py.
+        let all: HashSet<&str> = ["app/__init__.py"].iter().copied().collect();
+        assert_eq!(
+            resolve_python_import("app/sub/inner.py", "..", &all),
+            Some("app/__init__.py".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_python_bare_double_dot_from_top_level() {
+        // From a top-level file, walking up one more directory than exists
+        // leaves an empty target_dir — exercises the target_dir.is_empty()
+        // branch when the remaining path (after the dots) is also empty.
+        let all: HashSet<&str> = ["__init__.py"].iter().copied().collect();
+        assert_eq!(
+            resolve_python_import("sub/inner.py", "..", &all),
+            Some("__init__.py".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_python_double_dot_target_dir_empty_with_name() {
+        // From a top-level file, ".." plus a following segment still resolves
+        // when walking up leaves an empty target_dir (root-relative candidates,
+        // the target_dir.is_empty() branch of the progressive-shortening loop).
+        let all: HashSet<&str> = ["sibling.py"].iter().copied().collect();
+        assert_eq!(
+            resolve_python_import("inner.py", "..sibling", &all),
+            Some("sibling.py".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_python_double_dot_no_match_returns_none() {
+        let all: HashSet<&str> = ["app/other.py"].iter().copied().collect();
+        assert_eq!(
+            resolve_python_import("app/sub/inner.py", "..missing", &all),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_python_absolute_no_match_returns_none() {
+        let all: HashSet<&str> = ["other/thing.py"].iter().copied().collect();
+        assert_eq!(
+            resolve_python_import("main.py", "missing.module", &all),
+            None
         );
     }
 
@@ -716,6 +790,28 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_ts_dot_without_slash() {
+        // `.foo` (a leading dot with no following slash) is the edge case
+        // fallback branch, distinct from `./foo` and `../foo`.
+        let all: HashSet<&str> = ["src/foo.ts"].iter().copied().collect();
+        assert_eq!(
+            resolve_ts_import("src/bar.ts", ".foo", &all),
+            Some("src/foo.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_ts_dot_without_slash_top_level() {
+        // Same edge case, but the source file has no directory component —
+        // exercises the source_dir.is_empty() branch of that fallback.
+        let all: HashSet<&str> = ["foo.ts"].iter().copied().collect();
+        assert_eq!(
+            resolve_ts_import("bar.ts", ".foo", &all),
+            Some("foo.ts".to_string())
+        );
+    }
+
+    #[test]
     fn test_resolve_ts_external_returns_none() {
         let all: HashSet<&str> = ["src/main.ts"].iter().copied().collect();
         assert_eq!(resolve_ts_import("src/main.ts", "react", &all), None);
@@ -752,6 +848,17 @@ mod tests {
         assert_eq!(
             resolve_import("app/views.py", ".models", &all),
             Some("app/models.py".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_import_dispatches_legacy_for_unknown_extension() {
+        // A source file extension that isn't rs/py/pyi/ts/tsx/js/jsx/mjs falls
+        // through to the catch-all legacy resolver.
+        let all: HashSet<&str> = ["foo.go"].iter().copied().collect();
+        assert_eq!(
+            resolve_import("main.go", "foo", &all),
+            Some("foo.go".to_string())
         );
     }
 

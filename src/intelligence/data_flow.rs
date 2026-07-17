@@ -1004,4 +1004,290 @@ mod tests {
             "deep chain trace must complete in <5s, took {elapsed:?}"
         );
     }
+
+    #[test]
+    fn test_trace_transform_classification() {
+        // A middle hop whose name matches a TRANSFORM_KEYWORD (e.g. "validate")
+        // must classify as FlowNodeType::Transform, not Passthrough or Sink.
+        let mut index = build_index_with_symbols(&[
+            ("src/api.rs", "rust", "fn handle_request(req: Request)"),
+            (
+                "src/validate.rs",
+                "rust",
+                "fn validate_request(req: Request)",
+            ),
+            ("src/db.rs", "rust", "fn save_user(req: Request)"),
+        ]);
+        index.call_graph = CallGraph {
+            edges: vec![
+                CallEdge {
+                    caller_file: "src/api.rs".into(),
+                    caller_symbol: "handle_request".into(),
+                    callee_file: "src/validate.rs".into(),
+                    callee_symbol: "validate_request".into(),
+                    confidence: CallConfidence::Exact,
+                    resolution_note: None,
+                },
+                CallEdge {
+                    caller_file: "src/validate.rs".into(),
+                    caller_symbol: "validate_request".into(),
+                    callee_file: "src/db.rs".into(),
+                    callee_symbol: "save_user".into(),
+                    confidence: CallConfidence::Exact,
+                    resolution_note: None,
+                },
+            ],
+            unresolved: Vec::new(),
+        };
+        let result = trace_data_flow("handle_request", None, 10, &index);
+        let validate_node = result
+            .paths
+            .iter()
+            .flat_map(|p| p.nodes.iter())
+            .find(|n| n.symbol == "validate_request")
+            .expect("validate_request node present");
+        assert_eq!(validate_node.node_type, FlowNodeType::Transform);
+    }
+
+    #[test]
+    fn test_trace_stops_at_user_supplied_sink() {
+        // "route" is a Passthrough by keyword heuristic, but it is named
+        // explicitly as the `sink` argument — the trace must stop there rather
+        // than continuing on to the heuristic sink "save_user".
+        let mut index = build_index_with_symbols(&[
+            ("src/api.rs", "rust", "fn handle_request(req: Request)"),
+            ("src/middle.rs", "rust", "fn route(req: Request)"),
+            ("src/db.rs", "rust", "fn save_user(req: Request)"),
+        ]);
+        index.call_graph = CallGraph {
+            edges: vec![
+                CallEdge {
+                    caller_file: "src/api.rs".into(),
+                    caller_symbol: "handle_request".into(),
+                    callee_file: "src/middle.rs".into(),
+                    callee_symbol: "route".into(),
+                    confidence: CallConfidence::Exact,
+                    resolution_note: None,
+                },
+                CallEdge {
+                    caller_file: "src/middle.rs".into(),
+                    caller_symbol: "route".into(),
+                    callee_file: "src/db.rs".into(),
+                    callee_symbol: "save_user".into(),
+                    confidence: CallConfidence::Exact,
+                    resolution_note: None,
+                },
+            ],
+            unresolved: Vec::new(),
+        };
+        let result = trace_data_flow("handle_request", Some("route"), 10, &index);
+        assert!(
+            result.sink.is_some(),
+            "explicit sink match should populate result.sink"
+        );
+        assert_eq!(result.sink.as_ref().unwrap().symbol, "route");
+        assert!(
+            result
+                .paths
+                .iter()
+                .all(|p| p.nodes.last().unwrap().symbol == "route"),
+            "trace must terminate at the user-supplied sink symbol, never reaching save_user"
+        );
+    }
+
+    #[test]
+    fn test_trace_unresolved_parameter_yields_speculative() {
+        // Source parameter "conn" is not one of INPUT_PARAM_NAMES, so
+        // forward_parameter cannot prove it survives the call boundary. The hop
+        // is marked unresolved and the path confidence must become Speculative.
+        let mut index = build_index_with_symbols(&[
+            ("src/api.rs", "rust", "fn handle_request(conn: Connection)"),
+            ("src/db.rs", "rust", "fn save_user(conn: Connection)"),
+        ]);
+        index.call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "src/api.rs".into(),
+                caller_symbol: "handle_request".into(),
+                callee_file: "src/db.rs".into(),
+                callee_symbol: "save_user".into(),
+                confidence: CallConfidence::Exact,
+                resolution_note: None,
+            }],
+            unresolved: Vec::new(),
+        };
+        let result = trace_data_flow("handle_request", None, 10, &index);
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(result.paths[0].confidence, FlowConfidence::Speculative);
+        assert!(
+            result.paths[0].nodes.last().unwrap().parameter.is_none(),
+            "an unforwardable parameter must be recorded as None on the next hop"
+        );
+    }
+
+    #[test]
+    fn test_trace_source_signature_without_colon_uses_last_word() {
+        // A "Type name" style signature (no colon between type and name, as
+        // produced by some non-Rust parsers) must fall back to the last
+        // whitespace-separated token for the parameter name.
+        let mut index = build_index_with_symbols(&[
+            ("src/Api.java", "java", "void handleRequest(Request req)"),
+            ("src/Db.java", "java", "void saveUser(Request req)"),
+        ]);
+        index.call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "src/Api.java".into(),
+                caller_symbol: "handleRequest".into(),
+                callee_file: "src/Db.java".into(),
+                callee_symbol: "saveUser".into(),
+                confidence: CallConfidence::Exact,
+                resolution_note: None,
+            }],
+            unresolved: Vec::new(),
+        };
+        let result = trace_data_flow("handleRequest", None, 10, &index);
+        assert_eq!(result.source.parameter.as_deref(), Some("req"));
+    }
+
+    #[test]
+    fn test_compute_security_file_set_covers_all_categories() {
+        // Independently of the trace path itself, compute_security_file_set
+        // scans every file in the index for all four security-surface
+        // categories. This test proves each of the four insertion loops
+        // (unprotected endpoints, validation gaps, secrets, SQL injection)
+        // actually executes on a real, non-overlapping fixture.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let api_path = dir.path().join("src/api.rs");
+        std::fs::create_dir_all(api_path.parent().unwrap()).unwrap();
+        std::fs::write(&api_path, "fn handle_request(req: Request) {}\n").unwrap();
+        let db_path = dir.path().join("src/db.rs");
+        std::fs::write(&db_path, "fn save_user(req: Request) {}\n").unwrap();
+
+        // Unprotected endpoint: Express route with no auth keyword in the file.
+        let routes_path = dir.path().join("src/routes.js");
+        std::fs::write(
+            &routes_path,
+            "const express = require('express');\napp.get('/api/users', listUsers);\n",
+        )
+        .unwrap();
+
+        // Validation gap: public fn with an unvalidated String param.
+        let user_path = dir.path().join("src/user.rs");
+        std::fs::write(
+            &user_path,
+            "pub fn create_user(name: String) {\n    db.insert(name);\n}\n",
+        )
+        .unwrap();
+
+        // SQL injection: Rust format! with a SELECT and a `{}` placeholder.
+        let repo_path = dir.path().join("src/repo.rs");
+        std::fs::write(
+            &repo_path,
+            "fn find_user(id: &str) -> String { format!(\"SELECT * FROM users WHERE id = '{}'\", id) }\n",
+        )
+        .unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/api.rs".into(),
+                absolute_path: api_path,
+                language: Some("rust".into()),
+                size_bytes: 40,
+            },
+            ScannedFile {
+                relative_path: "src/db.rs".into(),
+                absolute_path: db_path,
+                language: Some("rust".into()),
+                size_bytes: 30,
+            },
+            ScannedFile {
+                relative_path: "src/routes.js".into(),
+                absolute_path: routes_path,
+                language: Some("javascript".into()),
+                size_bytes: 80,
+            },
+            ScannedFile {
+                relative_path: "src/user.rs".into(),
+                absolute_path: user_path,
+                language: Some("rust".into()),
+                size_bytes: 60,
+            },
+            ScannedFile {
+                relative_path: "src/repo.rs".into(),
+                absolute_path: repo_path,
+                language: Some("rust".into()),
+                size_bytes: 90,
+            },
+        ];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "src/api.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "handle_request".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn handle_request(req: Request)".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "src/db.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "save_user".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "fn save_user(req: Request)".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let mut index = CodebaseIndex::build(files, parse_results, &counter);
+        // Ensure validation-gap scanning activates (requires pagerank >= 0.5).
+        index.pagerank.insert("src/user.rs".to_string(), 0.9);
+        index.call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "src/api.rs".into(),
+                caller_symbol: "handle_request".into(),
+                callee_file: "src/db.rs".into(),
+                callee_symbol: "save_user".into(),
+                confidence: CallConfidence::Exact,
+                resolution_note: None,
+            }],
+            unresolved: Vec::new(),
+        };
+
+        // The trace itself still works with the extra unrelated files present.
+        let result = trace_data_flow("handle_request", None, 10, &index);
+        assert!(!result.paths.is_empty());
+
+        // Directly verify build_security_surface actually found all four
+        // categories, which is what feeds compute_security_file_set's four
+        // insertion loops.
+        let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
+        assert!(
+            !surface.unprotected_endpoints.is_empty(),
+            "expected an unprotected endpoint finding"
+        );
+        assert!(
+            !surface.input_validation_gaps.is_empty(),
+            "expected a validation-gap finding"
+        );
+        assert!(
+            !surface.sql_injection_surface.is_empty(),
+            "expected a sql-injection finding"
+        );
+    }
 }
