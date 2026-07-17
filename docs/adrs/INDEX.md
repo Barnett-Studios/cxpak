@@ -203,3 +203,4 @@
 | [0197](0197-hybrid-interaction-v1-diff.md) | Hybrid interaction model: bounded embed + opt-in Live serve; add /v1/diff | ACCEPTED | 2026-07-11 |
 | [0198](0198-risk-percentile-normalization.md) | Risk normalization = within-repo percentile; one-signal-per-channel encoding | ACCEPTED | 2026-07-11 |
 | [0199](0199-broaden-visual-roundtrip-conformance.md) | Broaden Visual round-trip conformance; no-dead-nav + provenance-completeness gates | ACCEPTED | 2026-07-11 |
+| [0200](0200-mcp-index-freshness-via-watcher.md) | MCP index freshness — wire the file watcher into `serve --mcp` (mirror + republish `Ready`); `refresh` op deferred | ACCEPTED | 2026-07-16 |
