@@ -821,3 +821,97 @@ fn test_diff_invalid_since_fails() {
         .assert()
         .failure();
 }
+
+/// A repo with a real cross-file edge (`src/main.rs` `use crate::`-imports
+/// `src/helper_mod.rs`), so `graph nodes`/`subgraph` have something to
+/// enumerate. `make_test_repo`'s `main.rs` has no imports at all.
+fn make_graph_test_repo() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    let sig = git2::Signature::now("Test", "t@t.com").unwrap();
+
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/main.rs"),
+        "mod helper_mod;\nuse crate::helper_mod::helper;\nfn main() { helper(); }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("src/helper_mod.rs"), "pub fn helper() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+        .unwrap();
+
+    dir
+}
+
+/// Issue #20 (ADR-0202): `graph nodes` enumerates every node id with no
+/// `--id`/`--seeds`/`--from`/`--to` required — the bootstrap op for a fresh
+/// consumer who doesn't yet know a valid id.
+#[test]
+fn graph_cli_nodes_op() {
+    let repo = make_graph_test_repo();
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["graph", "nodes", repo.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("src/main.rs"))
+        .stdout(predicate::str::contains("src/helper_mod.rs"));
+}
+
+/// Negative-path regression: `node` must still require `--id` after the
+/// `nodes` op is added (op stays a free-form positional; only `nodes` skips
+/// the id requirement).
+#[test]
+fn graph_cli_node_still_requires_id() {
+    let repo = make_test_repo();
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["graph", "node", repo.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("id"));
+}
+
+/// Negative-path regression: same as above for `neighbors`.
+#[test]
+fn graph_cli_neighbors_still_requires_id() {
+    let repo = make_test_repo();
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["graph", "neighbors", repo.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("id"));
+}
+
+/// Issue #20 (ADR-0202): `subgraph` partitions a non-existent seed into
+/// `unknown_seeds` instead of echoing it back as a node.
+#[test]
+fn graph_cli_subgraph_reports_unknown_seed() {
+    let repo = make_graph_test_repo();
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args([
+            "graph",
+            "subgraph",
+            "--seeds",
+            "totally/bogus.xyz",
+            repo.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"unknown_seeds\""))
+        .stdout(predicate::str::contains("totally/bogus.xyz"))
+        .stdout(
+            predicate::str::contains("\"nodes\": []").or(predicate::str::contains("\"nodes\":[]")),
+        );
+}

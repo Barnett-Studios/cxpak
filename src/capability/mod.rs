@@ -295,13 +295,16 @@ fn build_catalog() -> Vec<Capability> {
             s(true, false, false, true, false),
         ),
         // ---- Intent::Graph — query the dependency graph --------------------
-        // `graph` (B1, ADR-0176) — node/neighbors/path/subgraph over one core;
-        // CLI `cxpak graph`, HTTP `/v1/graph`, LSP `cxpak/graph`, MCP op. Its
+        // `graph` (B1, ADR-0176; `nodes` + `unknown_seeds` added by ADR-0202)
+        // — nodes/node/neighbors/path/subgraph over one core; CLI `cxpak
+        // graph`, HTTP `/v1/graph`, LSP `cxpak/graph`, MCP op. Its
         // neighbors/path/subgraph output carries per-edge `edge_type` +
         // `confidence` (`inferred`) — the A3 (ADR-0175) edge-confidence surface.
         cap(
             "graph",
-            "Query the typed dependency graph: node, neighbors, path, subgraph.",
+            "Query the typed dependency graph: nodes (enumerate all ids), \
+             node, neighbors, path, subgraph (unknown seeds reported in \
+             `unknown_seeds`, never echoed as nodes).",
             Intent::Graph,
             &[
                 "graph_op",

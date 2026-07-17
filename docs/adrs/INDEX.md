@@ -205,3 +205,5 @@
 | [0199](0199-broaden-visual-roundtrip-conformance.md) | Broaden Visual round-trip conformance; no-dead-nav + provenance-completeness gates | ACCEPTED | 2026-07-11 |
 | [0200](0200-mcp-index-freshness-via-watcher.md) | MCP index freshness — wire the file watcher into `serve --mcp` (mirror + republish `Ready`); `refresh` op deferred | ACCEPTED | 2026-07-16 |
 | [0201](0201-mcp-tool-call-status-discriminator.md) | Machine-readable MCP tool-call status discriminator — Building carries `structuredContent{status,retryable}`, Failed→`isError:true` | ACCEPTED | 2026-07-16 |
+| [0202](0202-graph-node-enumeration-and-seed-validation.md) | Graph query — `nodes` enumeration op + `subgraph` unknown-seed partition + documented id format | ACCEPTED | 2026-07-16 |
+| [0203](0203-self-package-import-resolution-deferred.md) | Self-package import resolution (`use <own-crate>::`) — deferred, limitation documented | ACCEPTED | 2026-07-16 |
