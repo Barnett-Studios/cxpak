@@ -2465,6 +2465,35 @@ fn publish_ready_enriched(
     }
 }
 
+/// Typed not-ready state for a `tools/call` that arrives before the base
+/// index is available (ADR-0201). Distinguishes **retryable** (`Indexing`)
+/// from **terminal** (`Failed`) at the type level, so the tool-call site can
+/// attach the right machine-readable discriminator instead of re-deriving it
+/// from prose.
+#[derive(Debug)]
+enum NotReady {
+    /// Background base-index build in progress; the call is retryable.
+    Indexing,
+    /// The background build failed; not retryable without a server restart.
+    Failed(String),
+}
+
+impl NotReady {
+    /// Human-readable status text — byte-identical to the pre-ADR-0201
+    /// prose, so the `text` field of the tool-call envelope never changes
+    /// even though the caller now branches on `structuredContent` instead of
+    /// parsing this string.
+    fn message(&self) -> String {
+        match self {
+            NotReady::Indexing => INDEXING_IN_PROGRESS_MESSAGE.to_string(),
+            NotReady::Failed(msg) => format!(
+                "cxpak: indexing failed and no context is available: {msg}. \
+                 Check the cxpak server logs, then restart the MCP server to retry."
+            ),
+        }
+    }
+}
+
 /// Outcome of checking the readiness cell during the watcher's pre-`Ready`
 /// wait (Task #18, ADR-0200): `Seed` once a queryable base exists — `Ready`
 /// and `ReadyEnriched` both qualify, and the watcher mirrors whichever landed
@@ -2618,14 +2647,14 @@ pub fn spawn_mcp_watcher(
 }
 
 /// Snapshot the base index if the background build has finished, else return the
-/// human-readable status to surface as a tool `result` (Task R0).
+/// typed not-ready state to surface as a tool `result` (Task R0, ADR-0201).
 ///
 /// Cloning the `Ready` `Arc` under a brief read lock is O(1); the lock is
 /// released before the (possibly long-running) tool handler runs, so tool calls
 /// never hold the readiness lock across a handler and never starve the
 /// background publish. A poisoned lock is recovered rather than propagated so a
 /// panicked reader cannot wedge the server.
-fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex>, String> {
+fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex>, NotReady> {
     let guard = match readiness.read() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -2634,11 +2663,8 @@ fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex
         // `ReadyEnriched` (R-E1) serves exactly like `Ready`; the attached
         // embedding index rides on the snapshotted `CodebaseIndex`.
         IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => Ok(Arc::clone(idx)),
-        IndexReadiness::Building => Err(INDEXING_IN_PROGRESS_MESSAGE.to_string()),
-        IndexReadiness::Failed(msg) => Err(format!(
-            "cxpak: indexing failed and no context is available: {msg}. \
-             Check the cxpak server logs, then restart the MCP server to retry."
-        )),
+        IndexReadiness::Building => Err(NotReady::Indexing),
+        IndexReadiness::Failed(msg) => Err(NotReady::Failed(msg.clone())),
     }
 }
 
@@ -2771,12 +2797,15 @@ pub fn mcp_stdio_loop_readiness(
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
                 // Gate on background-build readiness (Task R0): once ready, run
                 // against the base index exactly as before; before ready, return
-                // a graceful tool `result` (retry/failed status), never an error.
+                // a graceful tool result carrying a machine-readable status
+                // discriminator (ADR-0201) — retryable `Indexing`, terminal
+                // `Failed` — never a bare error indistinguishable from a
+                // param/capability failure.
                 match snapshot_ready_index(readiness) {
                     Ok(idx) => {
                         handle_tool_call(id, tool_name, &arguments, &idx, repo_path, snapshot)
                     }
-                    Err(status) => mcp_tool_result(id, &status),
+                    Err(not_ready) => mcp_tool_status(id, &not_ready),
                 }
             }
             _ => mcp_error_response(id, -32601, "Method not found"),
@@ -4426,6 +4455,41 @@ fn mcp_tool_error(id: Option<Value>, text: &str) -> Value {
     })
 }
 
+/// Tool-call result carrying a machine-readable status discriminator
+/// (ADR-0201, Option C). Used only for the two states that need a positive
+/// signal beyond plain success/error: `Indexing` (retryable, no `isError`)
+/// and `Failed` (terminal, `isError: true`). `structuredContent` carries
+/// `{"status": status, "retryable": retryable}`; `text` stays the same
+/// human prose either helper would have produced, so display is unaffected.
+/// Generic param/capability/IO errors keep using `mcp_tool_error` and gain
+/// no `structuredContent` — see ADR-0201 on why the shared helper is not
+/// tagged.
+/// Render a not-ready state as a `tools/call` result envelope (ADR-0201).
+///
+/// The `(status, retryable, is_error)` triple is derived from the typed
+/// [`NotReady`] variant, not passed in — so the only two representable
+/// envelopes are the two valid ones (retryable `indexing` / terminal
+/// `failed`); a caller cannot spell an invalid combination like
+/// `(retryable: true, is_error: true)`.
+fn mcp_tool_status(id: Option<Value>, not_ready: &NotReady) -> Value {
+    let (status, retryable, is_error) = match not_ready {
+        NotReady::Indexing => ("indexing", true, false),
+        NotReady::Failed(_) => ("failed", false, true),
+    };
+    let mut result = json!({
+        "content": [{"type": "text", "text": not_ready.message()}],
+        "structuredContent": {"status": status, "retryable": retryable}
+    });
+    if is_error {
+        result["isError"] = json!(true);
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
 /// Process a batch of watcher changes, updating the shared index.
 ///
 /// Public so integration tests can drive the watcher invalidation contract
@@ -5155,8 +5219,9 @@ mod tests {
         let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
         let status =
             snapshot_ready_index(&readiness).expect_err("building must not yield an index");
-        assert_eq!(status, INDEXING_IN_PROGRESS_MESSAGE);
-        assert!(status.contains("indexing in progress"));
+        assert!(matches!(status, NotReady::Indexing));
+        assert_eq!(status.message(), INDEXING_IN_PROGRESS_MESSAGE);
+        assert!(status.message().contains("indexing in progress"));
     }
 
     /// `Failed` surfaces the build error text as a clear status.
@@ -5165,8 +5230,53 @@ mod tests {
         let readiness: SharedReadiness =
             Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
         let status = snapshot_ready_index(&readiness).expect_err("failed must not yield an index");
-        assert!(status.contains("indexing failed"));
-        assert!(status.contains("boom"));
+        assert!(matches!(status, NotReady::Failed(_)));
+        assert!(status.message().contains("indexing failed"));
+        assert!(status.message().contains("boom"));
+    }
+
+    /// N19.1 (ADR-0201): `snapshot_ready_index` returns a **typed** `NotReady`
+    /// — not a bare `String` — so retryable (`Indexing`) and terminal
+    /// (`Failed`) are distinguishable at the type level, before any caller
+    /// gets a chance to collapse them into indistinguishable prose.
+    #[test]
+    fn snapshot_ready_index_typed_states() {
+        let building: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        assert!(matches!(
+            snapshot_ready_index(&building),
+            Err(NotReady::Indexing)
+        ));
+
+        let failed: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
+        match snapshot_ready_index(&failed) {
+            Err(NotReady::Failed(msg)) => assert_eq!(msg, "boom"),
+            other => panic!("expected Err(NotReady::Failed(\"boom\")), got {other:?}"),
+        }
+
+        let ready: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        assert!(snapshot_ready_index(&ready).is_ok());
+
+        let ready_enriched: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::ReadyEnriched(
+            Arc::new(make_test_index()),
+        )));
+        assert!(snapshot_ready_index(&ready_enriched).is_ok());
+    }
+
+    /// N19.1 (ADR-0201, finding m9): `NotReady::message()` must reproduce
+    /// today's human prose byte-for-byte — including the `Failed` wrapper —
+    /// so existing prose-matching assertions/clients don't regress even
+    /// though the type now carries a machine-readable discriminator too.
+    #[test]
+    fn notready_message_byte_identical() {
+        assert_eq!(NotReady::Indexing.message(), INDEXING_IN_PROGRESS_MESSAGE);
+        assert_eq!(
+            NotReady::Failed("boom".to_string()).message(),
+            "cxpak: indexing failed and no context is available: boom. \
+             Check the cxpak server logs, then restart the MCP server to retry."
+        );
     }
 
     /// A tool call BEFORE the index is ready returns a JSON-RPC `result`
@@ -5259,6 +5369,242 @@ mod tests {
         // `stats` reports the two indexed files — proves it ran against the index.
         let parsed: Value = serde_json::from_str(text).expect("stats result is JSON");
         assert_eq!(parsed["files"], 2, "stats should reflect 2 indexed files");
+    }
+
+    // --- N19.2 (ADR-0201): machine-readable status discriminator ---
+
+    /// `mcp_tool_status` for the retryable case: no `isError`, and
+    /// `structuredContent` names the state a client branches on.
+    #[test]
+    fn mcp_tool_status_indexing_marks_retryable_no_error() {
+        let resp = mcp_tool_status(Some(json!(1)), &NotReady::Indexing);
+        assert!(resp["result"]["isError"].is_null());
+        assert_eq!(resp["result"]["structuredContent"]["status"], "indexing");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
+        assert_eq!(
+            resp["result"]["content"][0]["text"],
+            INDEXING_IN_PROGRESS_MESSAGE
+        );
+    }
+
+    /// `mcp_tool_status` for the terminal case: `isError:true` plus
+    /// `retryable:false` — a client stops retrying without parsing prose.
+    #[test]
+    fn mcp_tool_status_failed_marks_terminal_retryable_false() {
+        let resp = mcp_tool_status(
+            Some(json!(1)),
+            &NotReady::Failed("build failed".to_string()),
+        );
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["status"], "failed");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], false);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("build failed"));
+    }
+
+    /// Envelope table (ADR-0201): a `tools/call` while `Building` returns a
+    /// non-error result carrying `{status:"indexing", retryable:true}`.
+    #[test]
+    fn tool_call_envelope_indexing_carries_retryable_marker() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(resp["error"].is_null());
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "Building must not be isError"
+        );
+        assert_eq!(resp["result"]["structuredContent"]["status"], "indexing");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
+    }
+
+    /// Envelope table (ADR-0201): a `tools/call` while `Failed` returns
+    /// `isError:true` plus `{status:"failed", retryable:false}` — an
+    /// intentional envelope change from the prior no-marker/no-isError shape.
+    #[test]
+    fn tool_call_envelope_failed_carries_terminal_marker() {
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            resp["error"].is_null(),
+            "must not be a protocol-level error"
+        );
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["status"], "failed");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("boom"));
+    }
+
+    /// A generic param error (MAJOR-2/finding): `isError:true` via the shared
+    /// `mcp_tool_error` helper, with NO `structuredContent` — it must not be
+    /// mislabelled with the Building/Failed discriminator.
+    #[test]
+    fn tool_call_envelope_param_error_has_no_structured_content() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"not_a_real_op"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(
+            resp["result"]["structuredContent"].is_null(),
+            "generic param errors must not carry the Building/Failed marker"
+        );
+    }
+
+    /// Success stays a bare result — no `structuredContent` at all, so a
+    /// client's three-way branch (`retryable` / `isError` / else success)
+    /// never mistakes a real answer for a status marker.
+    #[test]
+    fn tool_call_envelope_success_has_no_structured_content() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(resp["result"]["isError"].is_null());
+        assert!(
+            resp["result"]["structuredContent"].is_null(),
+            "success must carry no structuredContent"
+        );
+    }
+
+    // --- N19.3 (ADR-0201): substring-independence + masked-during-Building ---
+
+    /// A client's retry decision must derive from `structuredContent.retryable`
+    /// alone, never from parsing `text`. The variant now fixes both the marker
+    /// and the prose, so the marker is independent of the *variable* part — the
+    /// `Failed` message: two failures with no substring in common both mark
+    /// terminal, and `Indexing` marks retryable.
+    #[test]
+    fn retryable_marker_is_independent_of_prose() {
+        let failed_a = mcp_tool_status(
+            Some(json!(1)),
+            &NotReady::Failed("some wording".to_string()),
+        );
+        let failed_b = mcp_tool_status(
+            Some(json!(1)),
+            &NotReady::Failed("yet another, no substring in common".to_string()),
+        );
+        assert_eq!(failed_a["result"]["isError"], true);
+        assert_eq!(failed_a["result"]["structuredContent"]["retryable"], false);
+        assert_eq!(failed_b["result"]["isError"], true);
+        assert_eq!(failed_b["result"]["structuredContent"]["retryable"], false);
+
+        let indexing = mcp_tool_status(Some(json!(1)), &NotReady::Indexing);
+        assert!(indexing["result"]["isError"].is_null());
+        assert_eq!(indexing["result"]["structuredContent"]["retryable"], true);
+    }
+
+    /// Finding M4: the readiness gate (the `snapshot_ready_index` match in the
+    /// `tools/call` dispatch arm) runs *before* param validation,
+    /// so a permanently-malformed call is masked as retryable while
+    /// `Building`. This is bounded and self-correcting: once `Ready`, the
+    /// same call reaches validation and returns the terminal `isError` with
+    /// no marker, so a conformant client stops retrying.
+    #[test]
+    fn malformed_call_during_building_is_retryable_then_terminal_once_ready() {
+        let malformed = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"not_a_real_op"}}}"#,
+            "\n",
+        );
+
+        // Building masks the malformed call: retryable, no isError.
+        let building: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let snapshot = make_shared_snapshot();
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &building,
+            &snapshot,
+            std::io::Cursor::new(malformed.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "malformed call must be masked as retryable while Building"
+        );
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
+
+        // Once Ready, the same call reaches param validation: terminal, no marker.
+        let ready: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot2 = make_shared_snapshot();
+        let mut out2: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &ready,
+            &snapshot2,
+            std::io::Cursor::new(malformed.as_bytes()),
+            &mut out2,
+        )
+        .expect("loop");
+        let resp2: Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(resp2["result"]["isError"], true);
+        assert!(
+            resp2["result"]["structuredContent"].is_null(),
+            "once Ready the terminal param error carries no marker"
+        );
     }
 
     // --- Health handler ---
