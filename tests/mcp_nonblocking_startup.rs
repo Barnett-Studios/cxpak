@@ -158,6 +158,20 @@ fn before_ready_tool_call_returns_graceful_status() {
         text.contains("indexing in progress"),
         "expected a retry status, got: {text}"
     );
+    // ADR-0201 envelope: Building is retryable and NOT an error — assert the
+    // machine-readable discriminator end-to-end, not just the prose.
+    assert!(
+        responses[2]["result"]["isError"].is_null(),
+        "Building must not be isError"
+    );
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["status"],
+        "indexing"
+    );
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["retryable"],
+        true
+    );
 }
 
 /// A failed background build surfaces a clear status on tool calls rather than
@@ -178,4 +192,15 @@ fn failed_build_surfaces_status_without_crashing() {
         .unwrap();
     assert!(text.contains("indexing failed"), "got: {text}");
     assert!(text.contains("scanner exploded"), "got: {text}");
+    // ADR-0201 envelope: Failed is terminal — isError:true and retryable:false,
+    // the intentional envelope change this PR introduces, asserted end-to-end.
+    assert_eq!(responses[0]["result"]["isError"], true);
+    assert_eq!(
+        responses[0]["result"]["structuredContent"]["status"],
+        "failed"
+    );
+    assert_eq!(
+        responses[0]["result"]["structuredContent"]["retryable"],
+        false
+    );
 }

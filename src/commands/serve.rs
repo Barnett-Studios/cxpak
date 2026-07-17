@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -1381,8 +1382,28 @@ pub fn run(
     let shared = Arc::new(RwLock::new(Arc::new(index)));
     let shared_path = Arc::new(path.to_path_buf());
 
-    // Background watcher thread
-    let watcher_path = path.to_path_buf();
+    // Background watcher thread.
+    //
+    // Canonicalize the watch root: `notify` delivers canonical,
+    // symlink-resolved absolute paths, so `classify_changes`'
+    // `strip_prefix(base_path)` only matches when `base_path` is itself
+    // canonical. A raw (relative, or macOS `/tmp` -> `/private/tmp`, `/var`
+    // -> `/private/var`) root makes every event miss `strip_prefix`, silently
+    // dropping all edits and serving a stale index forever (issue #24 -- the
+    // HTTP-transport twin of #18's MCP watcher). Fail-open: if canonicalize
+    // fails (path already gone), fall back to the raw path rather than
+    // aborting the watcher, but log it because the miss is otherwise silent.
+    let watcher_path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "cxpak: HTTP watcher canonicalize failed for {}: {e} — \
+                 file-change matching may silently miss edits under this root",
+                path.display()
+            );
+            path.to_path_buf()
+        }
+    };
     let watcher_index = Arc::clone(&shared);
     std::thread::spawn(move || {
         let watcher = match FileWatcher::new(&watcher_path) {
@@ -2253,12 +2274,25 @@ pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     );
     let build_handle = spawn_mcp_index_build(path, Arc::clone(&readiness));
 
+    // Freshness (Task #18, ADR-0200): a long-lived MCP session otherwise keeps
+    // the first-ready index forever (no periodic rebuild). The watcher mirrors
+    // the base once it lands, then republishes `Ready` into the same cell on
+    // every debounced edit — symmetric with HTTP `run`'s watcher (serve.rs
+    // above). `shutdown` gives it an owned, terminable lifecycle so it never
+    // leaks past this function's return (resource-cleanup on every path,
+    // including error).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let watcher_handle = spawn_mcp_watcher(path, Arc::clone(&readiness), Arc::clone(&shutdown));
+
     let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
     let result = mcp_stdio_loop(path, &readiness, &snapshot);
 
-    // Reclaim the background thread before returning (stdin closed / EOF).
-    // Best-effort: a panicked build thread must not turn a clean shutdown into
-    // an error, so the join result is intentionally discarded.
+    // Reclaim both background threads before returning (stdin closed / EOF).
+    // Signal the watcher first so it stops promptly instead of riding out its
+    // next `recv_timeout` poll. Best-effort: a panicked thread must not turn a
+    // clean shutdown into an error, so both join results are discarded.
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = watcher_handle.join();
     let _ = build_handle.join();
     result
 }
@@ -2400,11 +2434,19 @@ fn enrich_ready_with_embeddings(
 /// cell as [`IndexReadiness::ReadyEnriched`] (R-E1).
 ///
 /// The enriched index is built into a local *before* the lock is taken, so the
-/// write lock is held only for the O(1) `Arc` swap — no lock is held across the
-/// clone/build. A `tools/call` racing this swap snapshots either the pre-swap
-/// `Ready` (6-signal) or the `ReadyEnriched` (7-signal), never a torn state.
-/// Poison recovery matches R0's discipline: a panicked reader cannot wedge the
-/// publish.
+/// write lock is held only for the O(1) compare-and-swap — no lock is held
+/// across the clone/build. A `tools/call` racing this swap snapshots either
+/// the pre-swap `Ready` (6-signal) or the `ReadyEnriched` (7-signal), never a
+/// torn state. Poison recovery matches R0's discipline: a panicked reader
+/// cannot wedge the publish.
+///
+/// Compare-and-swap (Task #18, ADR-0200): this enrichment runs on the
+/// background build thread, seconds after `Ready` — the same window a
+/// long-lived MCP session's freshness watcher (N18.2) may republish a fresh
+/// `Ready(Arc)` into this same cell. The swap lands ONLY if the cell still
+/// holds the exact base `Arc` this enrichment was built from (`Arc::ptr_eq`);
+/// otherwise it is a stale enrichment racing a fresher republish, so it is
+/// skipped rather than clobbering the watcher's edit with pre-edit content.
 #[cfg(feature = "embeddings")]
 fn publish_ready_enriched(
     readiness: &SharedReadiness,
@@ -2414,21 +2456,209 @@ fn publish_ready_enriched(
     let mut enriched = (**base).clone();
     enriched.embedding_index = Some(emb);
     let next = IndexReadiness::ReadyEnriched(Arc::new(enriched));
-    match readiness.write() {
-        Ok(mut g) => *g = next,
-        Err(poisoned) => *poisoned.into_inner() = next,
+
+    let mut guard = match readiness.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match &*guard {
+        IndexReadiness::Ready(cur) if Arc::ptr_eq(cur, base) => *guard = next,
+        _ => {
+            eprintln!("cxpak: index changed during enrichment — serving fresh 6-signal");
+        }
     }
 }
 
+/// Typed not-ready state for a `tools/call` that arrives before the base
+/// index is available (ADR-0201). Distinguishes **retryable** (`Indexing`)
+/// from **terminal** (`Failed`) at the type level, so the tool-call site can
+/// attach the right machine-readable discriminator instead of re-deriving it
+/// from prose.
+#[derive(Debug)]
+enum NotReady {
+    /// Background base-index build in progress; the call is retryable.
+    Indexing,
+    /// The background build failed; not retryable without a server restart.
+    Failed(String),
+}
+
+impl NotReady {
+    /// Human-readable status text — byte-identical to the pre-ADR-0201
+    /// prose, so the `text` field of the tool-call envelope never changes
+    /// even though the caller now branches on `structuredContent` instead of
+    /// parsing this string.
+    fn message(&self) -> String {
+        match self {
+            NotReady::Indexing => INDEXING_IN_PROGRESS_MESSAGE.to_string(),
+            NotReady::Failed(msg) => format!(
+                "cxpak: indexing failed and no context is available: {msg}. \
+                 Check the cxpak server logs, then restart the MCP server to retry."
+            ),
+        }
+    }
+}
+
+/// Outcome of checking the readiness cell during the watcher's pre-`Ready`
+/// wait (Task #18, ADR-0200): `Seed` once a queryable base exists — `Ready`
+/// and `ReadyEnriched` both qualify, and the watcher mirrors whichever landed
+/// first — `Pending` while still `Building` (keep polling), and `Abort` on
+/// `Failed` (the one-shot build never became queryable; nothing to watch
+/// over).
+///
+/// Extracted as a pure function over `&IndexReadiness` so the classification
+/// is unit-testable without spawning a thread or a real `FileWatcher`.
+enum WatcherWait {
+    Seed(Arc<CodebaseIndex>),
+    Pending,
+    Abort,
+}
+
+fn classify_watcher_wait(state: &IndexReadiness) -> WatcherWait {
+    match state {
+        IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => {
+            WatcherWait::Seed(Arc::clone(idx))
+        }
+        IndexReadiness::Building => WatcherWait::Pending,
+        IndexReadiness::Failed(_) => WatcherWait::Abort,
+    }
+}
+
+/// Poll interval for the watcher's pre-`Ready` wait (Task #18). A sleep, not a
+/// busy-spin — `shutdown` is checked on every iteration, so a stdin EOF during
+/// the 13–34s initial build joins within one interval instead of blocking on
+/// the full build.
+const WATCHER_WAIT_POLL: Duration = Duration::from_millis(100);
+
+/// Build the `Ready(..)` payload for a watcher republish: snapshot the
+/// mirrored `SharedIndex` and actively clear `embedding_index`.
+///
+/// A delta-rebuilt clone otherwise carries the *stale* enrichment forward —
+/// scoring the 7th signal against pre-edit embedded text would be worse than
+/// not having it (ADR-0200 Consequences). Extracted so the clearing behavior
+/// is unit-testable without a real edit + `FileWatcher` cycle.
+fn republish_watcher_index(shared: &SharedIndex) -> Arc<CodebaseIndex> {
+    let mut idx = match shared.read() {
+        Ok(g) => (**g).clone(),
+        Err(poisoned) => (**poisoned.into_inner()).clone(),
+    };
+    #[cfg(feature = "embeddings")]
+    {
+        idx.embedding_index = None;
+    }
+    Arc::new(idx)
+}
+
+/// Spawn the MCP freshness watcher (Task #18, ADR-0200).
+///
+/// Owns its lifecycle end to end — it is NOT a verbatim reuse of HTTP `run`'s
+/// detached, infinite watcher thread (serve.rs above), which is fine for a
+/// server whose lifetime *is* the process but would leak into every in-process
+/// MCP test and could never be joined on shutdown:
+///
+/// 1. Waits for the one-shot background build to become queryable (`Ready` or
+///    `ReadyEnriched`; see [`classify_watcher_wait`]), checking `shutdown` on
+///    every poll so a stdin EOF during the initial build joins promptly
+///    rather than riding out the full 13–34s build. Aborts without installing
+///    a watcher if the build resolves `Failed`.
+/// 2. Seeds a `SharedIndex` mirror from that base and runs the same debounced
+///    `FileWatcher` + `process_watcher_changes` loop HTTP `run` uses — but
+///    terminable: `shutdown` is checked at each `recv_timeout(1s)` poll, not
+///    just at process exit.
+/// 3. Each republish clears `embedding_index` on the rebuilt index (see
+///    [`republish_watcher_index`]) and swaps a fresh `Ready(..)` into
+///    `readiness` — never `ReadyEnriched`; a swap downgrades to the
+///    documented 6-signal fallback until a future re-enrich lands.
+///
+/// `#[doc(hidden)] pub` (not private) so integration tests can drive the real
+/// `FileWatcher` end-to-end without spawning a subprocess, matching the
+/// existing convention for testable internals in this module
+/// (`spawn_mcp_index_build`, `process_watcher_changes`).
+#[doc(hidden)]
+pub fn spawn_mcp_watcher(
+    path: &Path,
+    readiness: SharedReadiness,
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        // Canonicalize so the absolute paths `notify` delivers (which resolve
+        // symlinks -- e.g. macOS /var -> /private/var, /tmp -> /private/tmp)
+        // can be `strip_prefix`-ed against `path` without mismatch inside
+        // `classify_changes`; same fix `commands::watch::run` applies before
+        // its own watcher. Fail-open: if canonicalization fails (path already
+        // gone), fall back to the original rather than aborting the watcher --
+        // but log it, because an uncanonical root makes every `notify` event's
+        // `strip_prefix` miss, silently dropping all edits (issue #18's mode).
+        let path = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "cxpak: MCP watcher canonicalize failed for {}: {e} — \
+                     file-change matching may silently miss edits under this root",
+                    path.display()
+                );
+                path
+            }
+        };
+
+        let seed = loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            let wait = match readiness.read() {
+                Ok(g) => classify_watcher_wait(&g),
+                Err(poisoned) => classify_watcher_wait(&poisoned.into_inner()),
+            };
+            match wait {
+                WatcherWait::Seed(idx) => break idx,
+                WatcherWait::Abort => {
+                    eprintln!(
+                        "cxpak: MCP watcher aborting — background build failed, \
+                         nothing to watch over"
+                    );
+                    return;
+                }
+                WatcherWait::Pending => std::thread::sleep(WATCHER_WAIT_POLL),
+            }
+        };
+
+        let shared: SharedIndex = Arc::new(RwLock::new(seed));
+
+        let watcher = match FileWatcher::new(&path) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("cxpak: MCP watcher failed to start: {e} — index will not refresh");
+                return;
+            }
+        };
+
+        while !shutdown.load(Ordering::Relaxed) {
+            let Some(first) = watcher.recv_timeout(Duration::from_secs(1)) else {
+                continue;
+            };
+            let mut changes = vec![first];
+            std::thread::sleep(Duration::from_millis(50));
+            changes.extend(watcher.drain());
+            process_watcher_changes(&changes, &path, &shared);
+
+            let republished = republish_watcher_index(&shared);
+            match readiness.write() {
+                Ok(mut g) => *g = IndexReadiness::Ready(republished),
+                Err(poisoned) => *poisoned.into_inner() = IndexReadiness::Ready(republished),
+            }
+        }
+    })
+}
+
 /// Snapshot the base index if the background build has finished, else return the
-/// human-readable status to surface as a tool `result` (Task R0).
+/// typed not-ready state to surface as a tool `result` (Task R0, ADR-0201).
 ///
 /// Cloning the `Ready` `Arc` under a brief read lock is O(1); the lock is
 /// released before the (possibly long-running) tool handler runs, so tool calls
 /// never hold the readiness lock across a handler and never starve the
 /// background publish. A poisoned lock is recovered rather than propagated so a
 /// panicked reader cannot wedge the server.
-fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex>, String> {
+fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex>, NotReady> {
     let guard = match readiness.read() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -2437,20 +2667,20 @@ fn snapshot_ready_index(readiness: &SharedReadiness) -> Result<Arc<CodebaseIndex
         // `ReadyEnriched` (R-E1) serves exactly like `Ready`; the attached
         // embedding index rides on the snapshotted `CodebaseIndex`.
         IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => Ok(Arc::clone(idx)),
-        IndexReadiness::Building => Err(INDEXING_IN_PROGRESS_MESSAGE.to_string()),
-        IndexReadiness::Failed(msg) => Err(format!(
-            "cxpak: indexing failed and no context is available: {msg}. \
-             Check the cxpak server logs, then restart the MCP server to retry."
-        )),
+        IndexReadiness::Building => Err(NotReady::Indexing),
+        IndexReadiness::Failed(msg) => Err(NotReady::Failed(msg.clone())),
     }
 }
 
 /// Run the MCP stdio loop against a background-built index (Task R0).
 ///
 /// The index is published asynchronously into `readiness` by
-/// [`spawn_mcp_index_build`]; the loop itself never blocks on the build.
-/// Connections are typically short-lived (one task ≈ one connection); a
-/// long-lived session would keep the first ready index (no periodic rebuild).
+/// [`spawn_mcp_index_build`]; the loop itself never blocks on the build. A
+/// long-lived session stays fresh: `run_mcp` also spawns
+/// [`spawn_mcp_watcher`] (Task #18, ADR-0200) against the same `readiness`
+/// cell, so a `tools/call` here picks up every debounced edit with no
+/// protocol change — the loop simply snapshots whatever `Ready`/`ReadyEnriched`
+/// is current.
 fn mcp_stdio_loop(
     repo_path: &Path,
     readiness: &SharedReadiness,
@@ -2571,12 +2801,15 @@ pub fn mcp_stdio_loop_readiness(
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
                 // Gate on background-build readiness (Task R0): once ready, run
                 // against the base index exactly as before; before ready, return
-                // a graceful tool `result` (retry/failed status), never an error.
+                // a graceful tool result carrying a machine-readable status
+                // discriminator (ADR-0201) — retryable `Indexing`, terminal
+                // `Failed` — never a bare error indistinguishable from a
+                // param/capability failure.
                 match snapshot_ready_index(readiness) {
                     Ok(idx) => {
                         handle_tool_call(id, tool_name, &arguments, &idx, repo_path, snapshot)
                     }
-                    Err(status) => mcp_tool_result(id, &status),
+                    Err(not_ready) => mcp_tool_status(id, &not_ready),
                 }
             }
             _ => mcp_error_response(id, -32601, "Method not found"),
@@ -4227,6 +4460,41 @@ fn mcp_tool_error(id: Option<Value>, text: &str) -> Value {
     })
 }
 
+/// Tool-call result carrying a machine-readable status discriminator
+/// (ADR-0201, Option C). Used only for the two states that need a positive
+/// signal beyond plain success/error: `Indexing` (retryable, no `isError`)
+/// and `Failed` (terminal, `isError: true`). `structuredContent` carries
+/// `{"status": status, "retryable": retryable}`; `text` stays the same
+/// human prose either helper would have produced, so display is unaffected.
+/// Generic param/capability/IO errors keep using `mcp_tool_error` and gain
+/// no `structuredContent` — see ADR-0201 on why the shared helper is not
+/// tagged.
+/// Render a not-ready state as a `tools/call` result envelope (ADR-0201).
+///
+/// The `(status, retryable, is_error)` triple is derived from the typed
+/// [`NotReady`] variant, not passed in — so the only two representable
+/// envelopes are the two valid ones (retryable `indexing` / terminal
+/// `failed`); a caller cannot spell an invalid combination like
+/// `(retryable: true, is_error: true)`.
+fn mcp_tool_status(id: Option<Value>, not_ready: &NotReady) -> Value {
+    let (status, retryable, is_error) = match not_ready {
+        NotReady::Indexing => ("indexing", true, false),
+        NotReady::Failed(_) => ("failed", false, true),
+    };
+    let mut result = json!({
+        "content": [{"type": "text", "text": not_ready.message()}],
+        "structuredContent": {"status": status, "retryable": retryable}
+    });
+    if is_error {
+        result["isError"] = json!(true);
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
 /// Process a batch of watcher changes, updating the shared index.
 ///
 /// Public so integration tests can drive the watcher invalidation contract
@@ -4596,6 +4864,348 @@ mod tests {
         );
     }
 
+    // --- Task #18 (ADR-0200): enrichment compare-and-swap ---
+    //
+    // `publish_ready_enriched` runs on the one-shot background build thread,
+    // seconds after `Ready`. A long-lived MCP session's watcher (N18.2) can
+    // republish a *fresh* `Ready(Arc)` into the same cell in that window; a
+    // blind swap would clobber the fresh watcher republish with the stale
+    // pre-edit base the enrichment was built from — reintroducing the exact
+    // staleness #18 fixes. The publish must be a compare-and-swap: swap to
+    // `ReadyEnriched` only if the cell still holds the *exact* base Arc this
+    // enrichment was built from (`Arc::ptr_eq`); otherwise skip and keep
+    // serving whatever fresher `Ready` landed.
+
+    /// The base moved (a watcher republish landed) between the enrich build
+    /// starting and its publish: the CAS must skip the swap and leave the
+    /// cell exactly as the watcher left it — never resurrect the stale base
+    /// the enrichment was built from.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn enrich_cas_skips_when_base_moved() {
+        let idx0 = Arc::new(make_test_index());
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Ready(Arc::clone(&idx0))));
+
+        // Simulate a watcher republish landing *during* enrichment: a fresh
+        // Arc allocation, not the one this enrichment was built from.
+        let idx1 = Arc::new(make_test_index());
+        *readiness.write().unwrap() = IndexReadiness::Ready(Arc::clone(&idx1));
+
+        let mut emb = crate::embeddings::EmbeddingIndex::new(3);
+        emb.add("src/main.rs".to_string(), vec![0.1, 0.2, 0.3]);
+        publish_ready_enriched(&readiness, &idx0, emb);
+
+        let guard = readiness.read().unwrap();
+        let IndexReadiness::Ready(cur) = &*guard else {
+            panic!(
+                "a stale enrichment must not clobber the watcher's republish \
+                 -- expected the cell to still be Ready, not ReadyEnriched"
+            );
+        };
+        assert!(
+            Arc::ptr_eq(cur, &idx1),
+            "cell must still hold the watcher's republished Arc, not the \
+             stale enrichment's base"
+        );
+    }
+
+    /// The base is unchanged since the enrichment started: the CAS proceeds
+    /// and swaps in `ReadyEnriched` exactly as the pre-CAS behavior did.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn enrich_cas_swaps_when_base_unchanged() {
+        let idx0 = Arc::new(make_test_index());
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Ready(Arc::clone(&idx0))));
+
+        let mut emb = crate::embeddings::EmbeddingIndex::new(3);
+        emb.add("src/main.rs".to_string(), vec![0.1, 0.2, 0.3]);
+        publish_ready_enriched(&readiness, &idx0, emb);
+
+        assert!(
+            matches!(
+                &*readiness.read().unwrap(),
+                IndexReadiness::ReadyEnriched(_)
+            ),
+            "cell must swap to ReadyEnriched when the base is unchanged"
+        );
+    }
+
+    // --- Task #18 (ADR-0200): the MCP freshness watcher ---
+
+    /// `classify_watcher_wait` is the single dispatch point `spawn_mcp_watcher`
+    /// polls during its pre-`Ready` wait, so unit-testing it directly proves
+    /// the watcher's wait behavior deterministically — no thread, no real
+    /// `FileWatcher`, no timing dependence.
+    #[test]
+    fn classify_watcher_wait_seeds_from_ready() {
+        let idx = Arc::new(make_test_index());
+        match classify_watcher_wait(&IndexReadiness::Ready(Arc::clone(&idx))) {
+            WatcherWait::Seed(got) => assert!(Arc::ptr_eq(&got, &idx)),
+            _ => panic!("Ready must yield Seed"),
+        }
+    }
+
+    /// finding MAJOR-2: a session where the base was already enriched before
+    /// the watcher's first poll (a fast build + fast opt-in enrich) must still
+    /// be treated as a valid seed, not stall waiting for a plain `Ready` that
+    /// will never come again.
+    #[test]
+    fn mcp_watcher_seeds_from_ready_enriched() {
+        let idx = Arc::new(make_test_index());
+        match classify_watcher_wait(&IndexReadiness::ReadyEnriched(Arc::clone(&idx))) {
+            WatcherWait::Seed(got) => assert!(Arc::ptr_eq(&got, &idx)),
+            _ => panic!("ReadyEnriched must be treated as a valid seed, not Pending/Abort"),
+        }
+    }
+
+    #[test]
+    fn classify_watcher_wait_pending_on_building() {
+        assert!(matches!(
+            classify_watcher_wait(&IndexReadiness::Building),
+            WatcherWait::Pending
+        ));
+    }
+
+    /// The one-shot build never became queryable — nothing to watch over, so
+    /// the watcher must abort rather than poll forever.
+    #[test]
+    fn mcp_watcher_aborts_on_failed_build() {
+        assert!(matches!(
+            classify_watcher_wait(&IndexReadiness::Failed("boom".to_string())),
+            WatcherWait::Abort
+        ));
+    }
+
+    /// finding M5: a watcher republish must actively clear `embedding_index`,
+    /// not carry it forward stale. Exercises `republish_watcher_index`
+    /// directly (the function `spawn_mcp_watcher`'s loop calls on every
+    /// debounced batch) — deterministic, no real edit or `FileWatcher` needed.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn mcp_watcher_swap_clears_embedding() {
+        let mut idx = make_test_index();
+        let mut emb = crate::embeddings::EmbeddingIndex::new(3);
+        emb.add("src/main.rs".to_string(), vec![0.1, 0.2, 0.3]);
+        idx.embedding_index = Some(emb);
+        assert!(idx.has_embedding_index());
+        let shared: SharedIndex = Arc::new(RwLock::new(Arc::new(idx)));
+
+        let republished = republish_watcher_index(&shared);
+
+        assert!(
+            !republished.has_embedding_index(),
+            "a watcher republish must actively clear embedding_index, not \
+             carry it forward stale"
+        );
+    }
+
+    /// Deterministic: the shutdown signal is already set before the watcher's
+    /// very first poll, so it must return without ever touching the
+    /// filesystem or installing a real `FileWatcher`.
+    #[test]
+    fn mcp_watcher_shuts_down_on_signal() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let handle = spawn_mcp_watcher(dir.path(), readiness, shutdown);
+        handle
+            .join()
+            .expect("watcher thread must join promptly once already signalled");
+    }
+
+    /// finding MAJOR-3: the cell never becomes `Ready` (stays `Building` for
+    /// the whole test), so only the shutdown signal can end the pre-`Ready`
+    /// wait. Proves the wait polls `shutdown` rather than blocking on the
+    /// build — a stdin EOF during the initial 13–34s build must join
+    /// promptly, not ride out the full build.
+    #[test]
+    fn mcp_watcher_shuts_down_during_pre_ready_wait() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let handle = spawn_mcp_watcher(dir.path(), Arc::clone(&readiness), Arc::clone(&shutdown));
+        std::thread::sleep(Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+        handle
+            .join()
+            .expect("watcher must join promptly on shutdown, without waiting for Ready");
+    }
+
+    /// End-to-end: a real edit through a real `FileWatcher` is mirrored into
+    /// the readiness cell as a fresh `Ready(..)`. Bounded poll for the
+    /// debounced republish to land (not a fixed sleep-then-assert) — the FS
+    /// event itself is inherently best-effort/platform-timed, so this test
+    /// documents that tradeoff rather than hiding it; the fast, fully
+    /// deterministic assertions (wait predicate, shutdown, embedding-clearing)
+    /// live in the tests above, driving the pure functions directly.
+    #[test]
+    fn mcp_watcher_republishes_ready() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn hello() {}").unwrap();
+
+        let idx0 = Arc::new(make_test_index()); // matches the 2 files on disk above
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(idx0)));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_mcp_watcher(dir.path(), Arc::clone(&readiness), Arc::clone(&shutdown));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut observed = 2;
+        while std::time::Instant::now() < deadline {
+            // Re-assert the edit each iteration rather than sleeping a guessed
+            // interval then writing once: an edit that lands before the watcher
+            // installs its FileWatcher produces no event and is missed with no
+            // retry. Re-writing keeps producing modify events until the watcher
+            // is live and catches one — no fixed-sleep race.
+            let _ = std::fs::write(dir.path().join("src/new_file.rs"), "fn brand_new() {}");
+            if let Ok(g) = readiness.read() {
+                if let IndexReadiness::Ready(idx) = &*g {
+                    observed = idx.total_files;
+                    if observed == 3 {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("watcher must join after shutdown");
+        assert_eq!(
+            observed, 3,
+            "watcher must republish a Ready index reflecting the new file"
+        );
+    }
+
+    /// A committed git repo `build_index` can index — `spawn_mcp_index_build`
+    /// walks git-tracked files (ADR-0185). `b.rs` imports `a.rs`'s `helper` fn
+    /// via `use crate::a::helper;` -- a *leaf-item* import, the pattern that
+    /// actually resolves to a graph edge (`resolve_rust_import`, index/graph.rs,
+    /// strips the last segment as the imported name and resolves the rest as
+    /// the source file). A bare `use crate::a;` does NOT resolve the same way
+    /// -- the whole-module form has no leaf segment to strip, so it never
+    /// produces a source path the resolver can match.
+    fn make_watcher_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "pub fn helper() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/b.rs"),
+            "use crate::a::helper;\npub fn go() { helper(); }\n",
+        )
+        .unwrap();
+        let repo = git2::Repository::init(dir.path()).expect("git2 init");
+        let mut index = repo.index().expect("repo index");
+        for rel in ["src/a.rs", "src/b.rs"] {
+            index.add_path(std::path::Path::new(rel)).expect("git add");
+        }
+        index.write().expect("index write");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("t", "t@t").expect("sig");
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .expect("initial commit");
+        dir
+    }
+
+    /// N18.3 — the wiring `run_mcp` adds: a real background build
+    /// ([`spawn_mcp_index_build`]) plus a real freshness watcher
+    /// ([`spawn_mcp_watcher`]) sharing one `readiness` cell, driven through
+    /// the real JSON-RPC loop ([`mcp_stdio_loop_readiness`]). `run_mcp`
+    /// itself can't be driven in-process (it owns real stdin/stdout), so this
+    /// exercises the exact components it wires together end-to-end — a warm
+    /// session's `tools/call` reflects a post-startup edit, closing #18.
+    #[test]
+    fn run_mcp_warm_session_reflects_edit() {
+        let repo = make_watcher_test_repo();
+        let path = repo.path().to_path_buf();
+
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let build_handle = spawn_mcp_index_build(&path, Arc::clone(&readiness));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let watcher_handle =
+            spawn_mcp_watcher(&path, Arc::clone(&readiness), Arc::clone(&shutdown));
+
+        // Bounded wait for the real background build to publish `Ready`.
+        let build_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if matches!(&*readiness.read().unwrap(), IndexReadiness::Ready(_)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < build_deadline,
+                "background build did not become ready within 30s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        build_handle.join().expect("build thread joins cleanly");
+
+        let call_node_a = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","#,
+            r#""params":{"name":"cxpak_graph","arguments":{"op":"graph","graph_op":"node","id":"src/a.rs"}}}"#,
+            "\n",
+        );
+        let drive = |input: &str| -> Value {
+            let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
+            let mut out: Vec<u8> = Vec::new();
+            mcp_stdio_loop_readiness(
+                &path,
+                &readiness,
+                &snapshot,
+                std::io::Cursor::new(input.as_bytes()),
+                &mut out,
+            )
+            .expect("mcp loop");
+            let line = String::from_utf8(out).unwrap();
+            let resp: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            serde_json::from_str(text).expect("tool result JSON")
+        };
+
+        // BEFORE the edit: a.rs is imported by b.rs (in_degree 1) but imports
+        // nothing itself (out_degree 0) -- the exact #18 repro shape.
+        let before = drive(call_node_a);
+        assert_eq!(before["exists"], true, "before edit: {before}");
+        assert_eq!(before["out_degree"], 0, "before edit: {before}");
+
+        // AFTER the edit: bounded poll (not a fixed sleep) on the warm
+        // session's own tool call -- the same call the client would replay.
+        // Re-assert the edit (a.rs gains an out-edge to a new c.rs) each
+        // iteration rather than sleeping-then-editing-once: an edit that lands
+        // before the watcher installs its FileWatcher is missed with no retry,
+        // so re-writing keeps producing modify events until the watcher is live.
+        let edit_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut after = before.clone();
+        while std::time::Instant::now() < edit_deadline {
+            let _ = std::fs::write(path.join("src/c.rs"), "pub fn cee() {}\n");
+            let _ = std::fs::write(
+                path.join("src/a.rs"),
+                "use crate::c::cee;\npub fn helper() { cee(); }\n",
+            );
+            after = drive(call_node_a);
+            if after["out_degree"] == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        watcher_handle.join().expect("watcher joins after shutdown");
+
+        assert_eq!(
+            after["out_degree"], 1,
+            "warm MCP session must reflect the edit, not serve the stale \
+             startup index (issue #18): {after}"
+        );
+    }
+
     // --- R0: non-blocking MCP startup / readiness gating ---
 
     /// `Ready` yields the base index (an O(1) Arc snapshot); the returned index
@@ -4614,8 +5224,9 @@ mod tests {
         let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
         let status =
             snapshot_ready_index(&readiness).expect_err("building must not yield an index");
-        assert_eq!(status, INDEXING_IN_PROGRESS_MESSAGE);
-        assert!(status.contains("indexing in progress"));
+        assert!(matches!(status, NotReady::Indexing));
+        assert_eq!(status.message(), INDEXING_IN_PROGRESS_MESSAGE);
+        assert!(status.message().contains("indexing in progress"));
     }
 
     /// `Failed` surfaces the build error text as a clear status.
@@ -4624,8 +5235,53 @@ mod tests {
         let readiness: SharedReadiness =
             Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
         let status = snapshot_ready_index(&readiness).expect_err("failed must not yield an index");
-        assert!(status.contains("indexing failed"));
-        assert!(status.contains("boom"));
+        assert!(matches!(status, NotReady::Failed(_)));
+        assert!(status.message().contains("indexing failed"));
+        assert!(status.message().contains("boom"));
+    }
+
+    /// N19.1 (ADR-0201): `snapshot_ready_index` returns a **typed** `NotReady`
+    /// — not a bare `String` — so retryable (`Indexing`) and terminal
+    /// (`Failed`) are distinguishable at the type level, before any caller
+    /// gets a chance to collapse them into indistinguishable prose.
+    #[test]
+    fn snapshot_ready_index_typed_states() {
+        let building: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        assert!(matches!(
+            snapshot_ready_index(&building),
+            Err(NotReady::Indexing)
+        ));
+
+        let failed: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
+        match snapshot_ready_index(&failed) {
+            Err(NotReady::Failed(msg)) => assert_eq!(msg, "boom"),
+            other => panic!("expected Err(NotReady::Failed(\"boom\")), got {other:?}"),
+        }
+
+        let ready: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        assert!(snapshot_ready_index(&ready).is_ok());
+
+        let ready_enriched: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::ReadyEnriched(
+            Arc::new(make_test_index()),
+        )));
+        assert!(snapshot_ready_index(&ready_enriched).is_ok());
+    }
+
+    /// N19.1 (ADR-0201, finding m9): `NotReady::message()` must reproduce
+    /// today's human prose byte-for-byte — including the `Failed` wrapper —
+    /// so existing prose-matching assertions/clients don't regress even
+    /// though the type now carries a machine-readable discriminator too.
+    #[test]
+    fn notready_message_byte_identical() {
+        assert_eq!(NotReady::Indexing.message(), INDEXING_IN_PROGRESS_MESSAGE);
+        assert_eq!(
+            NotReady::Failed("boom".to_string()).message(),
+            "cxpak: indexing failed and no context is available: boom. \
+             Check the cxpak server logs, then restart the MCP server to retry."
+        );
     }
 
     /// A tool call BEFORE the index is ready returns a JSON-RPC `result`
@@ -4718,6 +5374,242 @@ mod tests {
         // `stats` reports the two indexed files — proves it ran against the index.
         let parsed: Value = serde_json::from_str(text).expect("stats result is JSON");
         assert_eq!(parsed["files"], 2, "stats should reflect 2 indexed files");
+    }
+
+    // --- N19.2 (ADR-0201): machine-readable status discriminator ---
+
+    /// `mcp_tool_status` for the retryable case: no `isError`, and
+    /// `structuredContent` names the state a client branches on.
+    #[test]
+    fn mcp_tool_status_indexing_marks_retryable_no_error() {
+        let resp = mcp_tool_status(Some(json!(1)), &NotReady::Indexing);
+        assert!(resp["result"]["isError"].is_null());
+        assert_eq!(resp["result"]["structuredContent"]["status"], "indexing");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
+        assert_eq!(
+            resp["result"]["content"][0]["text"],
+            INDEXING_IN_PROGRESS_MESSAGE
+        );
+    }
+
+    /// `mcp_tool_status` for the terminal case: `isError:true` plus
+    /// `retryable:false` — a client stops retrying without parsing prose.
+    #[test]
+    fn mcp_tool_status_failed_marks_terminal_retryable_false() {
+        let resp = mcp_tool_status(
+            Some(json!(1)),
+            &NotReady::Failed("build failed".to_string()),
+        );
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["status"], "failed");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], false);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("build failed"));
+    }
+
+    /// Envelope table (ADR-0201): a `tools/call` while `Building` returns a
+    /// non-error result carrying `{status:"indexing", retryable:true}`.
+    #[test]
+    fn tool_call_envelope_indexing_carries_retryable_marker() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(resp["error"].is_null());
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "Building must not be isError"
+        );
+        assert_eq!(resp["result"]["structuredContent"]["status"], "indexing");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
+    }
+
+    /// Envelope table (ADR-0201): a `tools/call` while `Failed` returns
+    /// `isError:true` plus `{status:"failed", retryable:false}` — an
+    /// intentional envelope change from the prior no-marker/no-isError shape.
+    #[test]
+    fn tool_call_envelope_failed_carries_terminal_marker() {
+        let readiness: SharedReadiness =
+            Arc::new(RwLock::new(IndexReadiness::Failed("boom".to_string())));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            resp["error"].is_null(),
+            "must not be a protocol-level error"
+        );
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(resp["result"]["structuredContent"]["status"], "failed");
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("boom"));
+    }
+
+    /// A generic param error (MAJOR-2/finding): `isError:true` via the shared
+    /// `mcp_tool_error` helper, with NO `structuredContent` — it must not be
+    /// mislabelled with the Building/Failed discriminator.
+    #[test]
+    fn tool_call_envelope_param_error_has_no_structured_content() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"not_a_real_op"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(
+            resp["result"]["structuredContent"].is_null(),
+            "generic param errors must not carry the Building/Failed marker"
+        );
+    }
+
+    /// Success stays a bare result — no `structuredContent` at all, so a
+    /// client's three-way branch (`retryable` / `isError` / else success)
+    /// never mistakes a real answer for a status marker.
+    #[test]
+    fn tool_call_envelope_success_has_no_structured_content() {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot = make_shared_snapshot();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"stats"}}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &readiness,
+            &snapshot,
+            std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(resp["result"]["isError"].is_null());
+        assert!(
+            resp["result"]["structuredContent"].is_null(),
+            "success must carry no structuredContent"
+        );
+    }
+
+    // --- N19.3 (ADR-0201): substring-independence + masked-during-Building ---
+
+    /// A client's retry decision must derive from `structuredContent.retryable`
+    /// alone, never from parsing `text`. The variant now fixes both the marker
+    /// and the prose, so the marker is independent of the *variable* part — the
+    /// `Failed` message: two failures with no substring in common both mark
+    /// terminal, and `Indexing` marks retryable.
+    #[test]
+    fn retryable_marker_is_independent_of_prose() {
+        let failed_a = mcp_tool_status(
+            Some(json!(1)),
+            &NotReady::Failed("some wording".to_string()),
+        );
+        let failed_b = mcp_tool_status(
+            Some(json!(1)),
+            &NotReady::Failed("yet another, no substring in common".to_string()),
+        );
+        assert_eq!(failed_a["result"]["isError"], true);
+        assert_eq!(failed_a["result"]["structuredContent"]["retryable"], false);
+        assert_eq!(failed_b["result"]["isError"], true);
+        assert_eq!(failed_b["result"]["structuredContent"]["retryable"], false);
+
+        let indexing = mcp_tool_status(Some(json!(1)), &NotReady::Indexing);
+        assert!(indexing["result"]["isError"].is_null());
+        assert_eq!(indexing["result"]["structuredContent"]["retryable"], true);
+    }
+
+    /// Finding M4: the readiness gate (the `snapshot_ready_index` match in the
+    /// `tools/call` dispatch arm) runs *before* param validation,
+    /// so a permanently-malformed call is masked as retryable while
+    /// `Building`. This is bounded and self-correcting: once `Ready`, the
+    /// same call reaches validation and returns the terminal `isError` with
+    /// no marker, so a conformant client stops retrying.
+    #[test]
+    fn malformed_call_during_building_is_retryable_then_terminal_once_ready() {
+        let malformed = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cxpak_context","arguments":{"op":"not_a_real_op"}}}"#,
+            "\n",
+        );
+
+        // Building masks the malformed call: retryable, no isError.
+        let building: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        let snapshot = make_shared_snapshot();
+        let mut out: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &building,
+            &snapshot,
+            std::io::Cursor::new(malformed.as_bytes()),
+            &mut out,
+        )
+        .expect("loop");
+        let resp: Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "malformed call must be masked as retryable while Building"
+        );
+        assert_eq!(resp["result"]["structuredContent"]["retryable"], true);
+
+        // Once Ready, the same call reaches param validation: terminal, no marker.
+        let ready: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::new(
+            make_test_index(),
+        ))));
+        let snapshot2 = make_shared_snapshot();
+        let mut out2: Vec<u8> = Vec::new();
+        mcp_stdio_loop_readiness(
+            std::path::Path::new("/tmp"),
+            &ready,
+            &snapshot2,
+            std::io::Cursor::new(malformed.as_bytes()),
+            &mut out2,
+        )
+        .expect("loop");
+        let resp2: Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(resp2["result"]["isError"], true);
+        assert!(
+            resp2["result"]["structuredContent"].is_null(),
+            "once Ready the terminal param error carries no marker"
+        );
     }
 
     // --- Health handler ---

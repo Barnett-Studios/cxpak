@@ -4,6 +4,53 @@ pub mod languages;
 use language::LanguageSupport;
 use std::collections::HashMap;
 
+/// Returns `true` when `lang` (an `IndexedFile.language`/`detect_language()`
+/// identifier, e.g. `"rust"`) names a Tier-1 programming language rather than
+/// a Tier-2 structural/config/doc language or a DB DSL.
+///
+/// Allowlist by design (Tier-1 identifiers only) rather than a denylist of
+/// non-code languages, so a future Tier-2 addition can't silently get
+/// counted as code. Independent of which `lang-*` feature flags are
+/// compiled in — a scanned file keeps its detected language even when the
+/// corresponding parser feature is disabled, so this can't be derived from
+/// `LanguageRegistry::supported_languages()`.
+///
+/// Used by `intelligence::health::score_test_coverage` to keep the
+/// denominator restricted to files that could plausibly carry a test.
+pub fn is_code_language(lang: &str) -> bool {
+    matches!(
+        lang,
+        "rust"
+            | "typescript"
+            | "javascript"
+            | "java"
+            | "python"
+            | "go"
+            | "c"
+            | "cpp"
+            | "ruby"
+            | "csharp"
+            | "swift"
+            | "kotlin"
+            | "bash"
+            | "php"
+            | "dart"
+            | "scala"
+            | "lua"
+            | "clojure"
+            | "elixir"
+            | "zig"
+            | "haskell"
+            | "groovy"
+            | "objc"
+            | "r"
+            | "julia"
+            | "ocaml"
+            | "ocaml_interface"
+            | "matlab"
+    )
+}
+
 pub struct LanguageRegistry {
     languages: HashMap<String, Box<dyn LanguageSupport>>,
 }
@@ -218,5 +265,28 @@ mod tests {
     fn test_get_nonexistent_language() {
         let registry = LanguageRegistry::new();
         assert!(registry.get("brainfuck").is_none());
+    }
+
+    #[test]
+    fn test_is_code_language_tier1() {
+        assert!(is_code_language("rust"));
+        assert!(is_code_language("python"));
+        assert!(is_code_language("java"));
+    }
+
+    #[test]
+    fn test_is_code_language_excludes_tier2() {
+        assert!(!is_code_language("markdown"));
+        assert!(!is_code_language("yaml"));
+        assert!(!is_code_language("toml"));
+        assert!(!is_code_language("json"));
+        assert!(!is_code_language("sql"));
+        assert!(!is_code_language("prisma"));
+    }
+
+    #[test]
+    fn test_is_code_language_unknown_is_not_code() {
+        assert!(!is_code_language("brainfuck"));
+        assert!(!is_code_language(""));
     }
 }

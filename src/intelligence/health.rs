@@ -143,12 +143,24 @@ pub(crate) fn has_inline_tests(file: &crate::core_graph::IndexedFile) -> bool {
     }
 }
 
-/// Test coverage dimension: ratio of source files with >= 1 mapped test file or inline
-/// tests, scaled to [0, 10].
+/// Test coverage dimension: ratio of *code* source files with >= 1 mapped test file or
+/// inline tests, scaled to [0, 10].
+///
+/// The denominator is restricted to Tier-1 programming-language files
+/// (`parser::is_code_language`) — Tier-2 structural/config/doc files
+/// (Markdown, YAML, TOML, JSON, ...) and DB DSLs (SQL, Prisma) can never
+/// carry an inline test or a name-mapped test file, so counting them as
+/// uncovered "source files" dilutes the ratio. Files with an unrecognized
+/// or missing `language` are excluded too (can't classify as code).
 fn score_test_coverage(index: &CodebaseIndex) -> f64 {
     let source_files: Vec<&crate::core_graph::IndexedFile> = index
         .files
         .iter()
+        .filter(|f| {
+            f.language
+                .as_deref()
+                .is_some_and(crate::parser::is_code_language)
+        })
         .filter(|f| {
             // Exclude test files themselves from the denominator
             let p = &f.relative_path;
@@ -777,6 +789,87 @@ mod tests {
         assert!(
             (score - 5.0).abs() < 1e-9,
             "expected coverage score 5.0, got {score}"
+        );
+    }
+
+    #[test]
+    fn test_score_test_coverage_excludes_non_code_files_from_denominator() {
+        // Regression for the bug where Tier-2 doc/config files (markdown,
+        // yaml, ...) were counted as uncovered "source files", diluting the
+        // ratio. Only the 2 Rust *code* files should land in the
+        // denominator; the 3 non-code files must be excluded entirely.
+        use crate::budget::counter::TokenCounter;
+        use crate::parser::language::ParseResult;
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/with_tests.rs".into(),
+                absolute_path: std::path::PathBuf::from("/tmp/with_tests.rs"),
+                language: Some("rust".into()),
+                size_bytes: 60,
+            },
+            ScannedFile {
+                relative_path: "src/no_tests.rs".into(),
+                absolute_path: std::path::PathBuf::from("/tmp/no_tests.rs"),
+                language: Some("rust".into()),
+                size_bytes: 20,
+            },
+            ScannedFile {
+                relative_path: "docs/adrs/0001-example.md".into(),
+                absolute_path: std::path::PathBuf::from("/tmp/0001-example.md"),
+                language: Some("markdown".into()),
+                size_bytes: 40,
+            },
+            ScannedFile {
+                relative_path: "config/app.yaml".into(),
+                absolute_path: std::path::PathBuf::from("/tmp/app.yaml"),
+                language: Some("yaml".into()),
+                size_bytes: 15,
+            },
+            ScannedFile {
+                relative_path: "Cargo.toml".into(),
+                absolute_path: std::path::PathBuf::from("/tmp/Cargo.toml"),
+                language: Some("toml".into()),
+                size_bytes: 10,
+            },
+        ];
+        let parse_results: HashMap<String, ParseResult> = HashMap::new();
+        let mut content_map = HashMap::new();
+        content_map.insert(
+            "src/with_tests.rs".to_string(),
+            "pub fn foo() {}\n\n#[cfg(test)]\nmod tests { #[test] fn t() {} }".to_string(),
+        );
+        content_map.insert("src/no_tests.rs".to_string(), "pub fn bar() {}".to_string());
+        content_map.insert(
+            "docs/adrs/0001-example.md".to_string(),
+            "# ADR 0001\n\nSome decision text.".to_string(),
+        );
+        content_map.insert(
+            "config/app.yaml".to_string(),
+            "key: value\nother: 1".to_string(),
+        );
+        content_map.insert(
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"x\"".to_string(),
+        );
+
+        let index = crate::core_graph::CodebaseIndex::build_with_content(
+            files,
+            parse_results,
+            &counter,
+            content_map,
+        );
+        let score = score_test_coverage(&index);
+        // Denominator must be the 2 Rust files only (docs/config excluded);
+        // 1 of 2 covered → 0.5 × 10 = 5.0. Before the fix, the denominator
+        // includes all 5 files (1 of 5 covered → 2.0), so this assertion
+        // fails on the pre-fix code.
+        assert!(
+            (score - 5.0).abs() < 1e-9,
+            "expected coverage score 5.0 (2 code files, 1 covered), got {score}"
         );
     }
 
