@@ -1017,4 +1017,105 @@ mod tests {
         // Should show 0% for each language
         assert!(result.contains("0%"));
     }
+
+    // -----------------------------------------------------------------------
+    // End-to-end `run()` coverage: empty repo error path, and a full
+    // pipeline run exercising pack mode, verbose logging, the health
+    // section, writing to an output file, and the cache-save failure path.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_run_errors_on_no_source_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+
+        let result = run(
+            dir.path(),
+            50000,
+            &OutputFormat::Markdown,
+            None,
+            false,
+            None,
+            false,
+            false,
+            None,
+        );
+
+        let err = result.expect_err("empty repo must fail with no source files");
+        assert!(
+            err.to_string().contains("no source files"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_full_pipeline_pack_mode_health_and_cache_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+
+        // Keep the scanner from walking our synthetic .cxpak/cache fixture.
+        std::fs::write(dir.path().join(".gitignore"), ".cxpak/\n").unwrap();
+
+        // Pre-seed .cxpak/cache as a *file* (not a directory). The cache
+        // refresh step will then fail to `create_dir_all` over it, exercising
+        // the verbose warning branch on the save error path.
+        std::fs::create_dir_all(dir.path().join(".cxpak")).unwrap();
+        std::fs::write(dir.path().join(".cxpak").join("cache"), "not a directory").unwrap();
+
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let mut main_rs = String::from("fn main() {\n    greet();\n}\n\n");
+        for i in 0..40 {
+            main_rs.push_str(&format!(
+                "pub fn helper_{i}(value: i32) -> i32 {{ value + {i} }}\n"
+            ));
+        }
+        std::fs::write(dir.path().join("src").join("main.rs"), &main_rs).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "pub fn greet() -> String { \"hello\".to_string() }\n",
+        )
+        .unwrap();
+
+        let out_path = dir.path().join("context.md");
+
+        // A tiny budget forces pack_mode and truncates every section,
+        // guaranteeing at least one detail file gets written.
+        let result = run(
+            dir.path(),
+            100,
+            &OutputFormat::Markdown,
+            Some(out_path.as_path()),
+            true, // verbose: exercises the "wrote", "pack mode", "written to",
+            // and cache-save-warning eprintln branches
+            None,
+            false,
+            true, // health: appends the Codebase Health section
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "run() must still succeed despite the cache-save error: {result:?}"
+        );
+
+        let rendered = std::fs::read_to_string(&out_path).expect("output file must be written");
+        assert!(
+            rendered.contains("Codebase Health"),
+            "health section must be appended when health=true"
+        );
+        assert!(
+            rendered.contains("Composite:"),
+            "health section must include the composite score"
+        );
+
+        assert!(
+            dir.path().join(".cxpak").exists(),
+            "pack mode must keep the .cxpak directory"
+        );
+    }
 }

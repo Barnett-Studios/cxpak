@@ -1117,4 +1117,432 @@ subprocess.run(["my-binary", "--arg"])
         assert_eq!(edge.target_language, "python");
         assert_eq!(edge.bridge_type, BridgeType::HttpCall);
     }
+
+    #[test]
+    fn test_is_test_path_matches_dunder_tests_directory() {
+        assert!(is_test_path("frontend/__tests__/api.spec.ts"));
+        assert!(!is_test_path("frontend/components/api.ts"));
+    }
+
+    #[test]
+    fn test_normalize_route_path_trims_to_root() {
+        // A bare "/" trims to an empty string internally and must normalize
+        // back to "/", not "".
+        assert_eq!(normalize_route_path("/"), "/");
+        assert_eq!(normalize_route_path("/users/"), "/users");
+    }
+
+    #[test]
+    fn test_detect_http_bridge_skips_self_referencing_route() {
+        // A fetch() call to a route registered in the SAME file must not
+        // produce a self-referencing edge.
+        let index = build_index(&[(
+            "backend/api.py",
+            "python",
+            "from fastapi import FastAPI\n@app.get(\"/api/users\")\ndef get_users():\n    return fetch(\"/api/users\")\n",
+        )]);
+        let edges = detect_http_bridges(&index);
+        assert!(
+            edges.is_empty(),
+            "a fetch call to a route defined in the same file must not self-link: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_ffi_binding_python_ctypes() {
+        // ctypes.CDLL("libfoo.so").my_c_func(...) should resolve to the C
+        // file that exports a symbol named `my_c_func`.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let py = dir.path().join("wrapper.py");
+        std::fs::write(
+            &py,
+            "import ctypes\nresult = ctypes.CDLL(\"libfoo.so\").my_c_func(3)\n",
+        )
+        .unwrap();
+
+        let c = dir.path().join("native/foo.c");
+        std::fs::create_dir_all(c.parent().unwrap()).unwrap();
+        std::fs::write(&c, "int my_c_func(int x) { return x + 1; }\n").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "wrapper.py".into(),
+                absolute_path: py,
+                language: Some("python".into()),
+                size_bytes: 64,
+            },
+            ScannedFile {
+                relative_path: "native/foo.c".into(),
+                absolute_path: c,
+                language: Some("c".into()),
+                size_bytes: 40,
+            },
+        ];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "wrapper.py".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "<module>".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "".into(),
+                    body: "".into(),
+                    start_line: 1,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "native/foo.c".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "my_c_func".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "int my_c_func(int)".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let edges = detect_ffi_bridges(&index);
+        assert!(
+            edges.iter().any(|e| e.bridge_type == BridgeType::FfiBinding
+                && e.source_file == "wrapper.py"
+                && e.target_file == "native/foo.c"
+                && e.target_symbol == "my_c_func"
+                && e.source_language == "python"
+                && e.target_language == "c"),
+            "expected Python ctypes.CDLL FFI edge: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_grpc_call_with_service_kinded_symbol() {
+        // Unlike `test_detect_grpc_call` (which uses a mis-kinded symbol and
+        // tolerates zero matches), this seeds `SymbolKind::Service` so the
+        // detector must deterministically produce exactly one edge.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let go = dir.path().join("client/main.go");
+        std::fs::create_dir_all(go.parent().unwrap()).unwrap();
+        std::fs::write(
+            &go,
+            "package main\nfunc run() { userServiceClient.GetUser(ctx, req) }\n",
+        )
+        .unwrap();
+
+        let proto = dir.path().join("proto/user.proto");
+        std::fs::create_dir_all(proto.parent().unwrap()).unwrap();
+        std::fs::write(
+            &proto,
+            "service UserService { rpc GetUser (GetUserRequest) returns (User); }\n",
+        )
+        .unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "client/main.go".into(),
+                absolute_path: go,
+                language: Some("go".into()),
+                size_bytes: 80,
+            },
+            ScannedFile {
+                relative_path: "proto/user.proto".into(),
+                absolute_path: proto,
+                language: Some("protobuf".into()),
+                size_bytes: 60,
+            },
+        ];
+
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "client/main.go".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "run".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "func run()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "proto/user.proto".into(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "UserService".into(),
+                        kind: SymbolKind::Service,
+                        visibility: Visibility::Public,
+                        signature: "service UserService".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "GetUser".into(),
+                        kind: SymbolKind::Method,
+                        visibility: Visibility::Public,
+                        signature: "rpc GetUser".into(),
+                        body: "".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let edges = detect_grpc_bridges(&index);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one GrpcCall edge: {edges:#?}"
+        );
+        let e = &edges[0];
+        assert_eq!(e.bridge_type, BridgeType::GrpcCall);
+        assert_eq!(e.source_file, "client/main.go");
+        assert_eq!(e.source_symbol, "run");
+        assert_eq!(e.source_language, "go");
+        assert_eq!(e.target_file, "proto/user.proto");
+        assert_eq!(e.target_symbol, "UserService.GetUser");
+        assert_eq!(e.target_language, "protobuf");
+    }
+
+    #[test]
+    fn test_detect_graphql_call_with_query_kinded_symbol() {
+        // Unlike `test_detect_graphql_call` (which uses a mis-kinded symbol
+        // and tolerates zero matches), this seeds `SymbolKind::Query` so the
+        // detector must deterministically produce exactly one edge.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let ts = dir.path().join("src/client.ts");
+        std::fs::create_dir_all(ts.parent().unwrap()).unwrap();
+        std::fs::write(&ts, r#"const q = `query GetUser { user { id } }`;"#).unwrap();
+
+        let gql = dir.path().join("schema.graphql");
+        std::fs::write(&gql, "type Query { GetUser: User }\n").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/client.ts".into(),
+                absolute_path: ts,
+                language: Some("typescript".into()),
+                size_bytes: 60,
+            },
+            ScannedFile {
+                relative_path: "schema.graphql".into(),
+                absolute_path: gql,
+                language: Some("graphql".into()),
+                size_bytes: 30,
+            },
+        ];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "schema.graphql".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "GetUser".into(),
+                    kind: SymbolKind::Query,
+                    visibility: Visibility::Public,
+                    signature: "GetUser: User".into(),
+                    body: "".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "src/client.ts".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "<module>".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "".into(),
+                    body: "".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let edges = detect_graphql_bridges(&index);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one GraphqlCall edge: {edges:#?}"
+        );
+        let e = &edges[0];
+        assert_eq!(e.bridge_type, BridgeType::GraphqlCall);
+        assert_eq!(e.source_file, "src/client.ts");
+        assert_eq!(e.source_language, "typescript");
+        assert_eq!(e.target_file, "schema.graphql");
+        assert_eq!(e.target_symbol, "GetUser");
+        assert_eq!(e.target_language, "graphql");
+    }
+
+    #[test]
+    fn test_detect_shared_schema_skips_edges_with_missing_or_langless_source() {
+        // Two defensive `continue` branches: an edge keyed by a source_file
+        // string that does not correspond to any file in `index.files`, and
+        // an edge from a file that IS in `index.files` but has `language:
+        // None`. Neither should panic or count as a valid schema toucher.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let py = dir.path().join("known.py");
+        std::fs::write(&py, r#"cursor.execute("SELECT * FROM users")"#).unwrap();
+        let unknown = dir.path().join("unknown.txt");
+        std::fs::write(&unknown, "no language assigned").unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "known.py".into(),
+                absolute_path: py,
+                language: Some("python".into()),
+                size_bytes: 40,
+            },
+            ScannedFile {
+                relative_path: "unknown.txt".into(),
+                absolute_path: unknown,
+                language: None,
+                size_bytes: 20,
+            },
+        ];
+        let parse_results = HashMap::new();
+        let mut index = CodebaseIndex::build(files, parse_results, &counter);
+
+        // Source file present in index.files but with no language.
+        index
+            .graph
+            .add_edge("unknown.txt", "db/schema.sql", EdgeType::EmbeddedSql);
+        // Source file string with no corresponding entry in index.files at all.
+        index
+            .graph
+            .add_edge("ghost.py", "db/schema.sql", EdgeType::EmbeddedSql);
+        // One legitimate toucher — without a second, *different-language*
+        // toucher counted alongside it, no pair can form.
+        index
+            .graph
+            .add_edge("known.py", "db/schema.sql", EdgeType::EmbeddedSql);
+
+        let edges = detect_shared_schema_bridges(&index);
+        assert!(
+            edges.is_empty(),
+            "missing-file and langless-file edges must be skipped, leaving only \
+             one (insufficient for a pair) toucher: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_command_exec_skips_self_target() {
+        // A file whose content matches its own basename as the command
+        // target must not produce a self-referencing CommandExec edge.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let sh = dir.path().join("bin/my-binary.sh");
+        std::fs::create_dir_all(sh.parent().unwrap()).unwrap();
+        std::fs::write(
+            &sh,
+            "std::process::Command::new(\"my-binary\").spawn().unwrap();\n",
+        )
+        .unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "bin/my-binary.sh".into(),
+            absolute_path: sh,
+            language: Some("bash".into()),
+            size_bytes: 60,
+        }];
+        let parse_results = HashMap::new();
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+        let edges = detect_command_exec_bridges(&index);
+        assert!(
+            edges.is_empty(),
+            "a file invoking a command matching its own basename must not self-link: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn test_guess_containing_symbol_falls_back_to_module_outside_symbol_ranges() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let content = "fn foo() {}\n\nfn bar() {}\n";
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, content).unwrap();
+        let scanned = ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: content.len() as u64,
+        };
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "a.rs".to_string(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "foo".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "fn foo()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "bar".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "fn bar()".into(),
+                        body: "{}".into(),
+                        start_line: 3,
+                        end_line: 3,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("a.rs".to_string(), content.to_string());
+        let index =
+            CodebaseIndex::build_with_content(vec![scanned], parse_results, &counter, content_map);
+        let file = index
+            .files
+            .iter()
+            .find(|f| f.relative_path == "a.rs")
+            .unwrap();
+        // The blank line 2 is covered by neither `foo` (1..1) nor `bar` (3..3).
+        let offset = content.find("\n\nfn bar").unwrap() + 1;
+        assert_eq!(
+            guess_containing_symbol(file, offset),
+            "<module>",
+            "an offset outside every symbol's line range must fall back to <module>"
+        );
+    }
 }

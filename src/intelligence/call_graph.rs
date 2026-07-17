@@ -1174,4 +1174,149 @@ fn helper(_y: i32) -> i32 { 0 }
             cg.unresolved
         );
     }
+
+    // ─── extract_body_from_offset direct tests ──────────────────────────────
+
+    #[test]
+    fn extract_body_from_offset_returns_empty_when_body_start_beyond_end() {
+        let source = "fn foo(";
+        let offset = source.len();
+        assert_eq!(extract_body_from_offset(source, offset), "");
+    }
+
+    #[test]
+    fn extract_body_from_offset_handles_nested_braces() {
+        // Depth must go 1 (entering) -> 2 (nested open) -> 1 (nested close,
+        // not yet zero) -> 0 (final close, stop).
+        let body = extract_body_from_offset("X{a{b}c}", 0);
+        assert_eq!(body, "a{b}c");
+    }
+
+    #[test]
+    fn extract_body_from_offset_handles_colon_delimited_body() {
+        // No opening brace before EOF but a ':' — the indent-delimited
+        // (Python-style) fallback takes the following lines verbatim.
+        let source = "def foo():\n    return 1\n    return 2\n";
+        let body = extract_body_from_offset(source, 0);
+        assert!(body.contains("return 1"));
+        assert!(body.contains("return 2"));
+    }
+
+    // ─── extract_func_name / find_identifier_deep direct tests ─────────────
+
+    #[cfg(feature = "lang-go")]
+    #[test]
+    fn test_extract_calls_go_receiver_method_name_unresolved() {
+        // Go's `method_declaration` name field is a `field_identifier`, not
+        // `identifier` — `extract_func_name` has no branch that resolves that
+        // kind (no "identifier"/"name" child, no declarator chain), so a
+        // receiver method's call sites are never attributed to it. This pins
+        // down the current (fallback-to-None) behaviour rather than treating
+        // it as a Go-support gap to fix here.
+        let source =
+            "package main\ntype Receiver struct{}\nfunc (r *Receiver) DoWork() {\n\thelper()\n}\nfunc helper() {}\n";
+        let calls = extract_call_sites_from_source(source, "go", "DoWork");
+        assert!(
+            calls.is_empty(),
+            "receiver method name cannot currently be resolved by extract_func_name: {:?}",
+            calls
+        );
+    }
+
+    #[cfg(feature = "lang-c")]
+    #[test]
+    fn find_identifier_deep_returns_none_for_subtree_without_identifier_then_continues() {
+        // `function_definition`'s first child is the return-type node (e.g.
+        // the `void` `primitive_type` leaf), which has no identifier
+        // subtree anywhere — `find_identifier_deep` must return None for it
+        // (its empty-recursion fallback) before the search loop continues to
+        // the `declarator` child, which does contain the function's name.
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .unwrap();
+        let source = "void handler() { init(); }\n";
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let func_def = root.child(0).expect("function_definition node");
+        assert_eq!(func_def.kind(), "function_definition");
+
+        let name = find_identifier_deep(&func_def, source.as_bytes());
+        assert_eq!(name, Some("handler".to_string()));
+    }
+
+    // ─── extract_call_name attribute-fallback direct test ───────────────────
+
+    #[test]
+    fn test_extract_calls_python_method_call_via_attribute_access() {
+        // Python's `attribute` node names its member field with plain
+        // `identifier` (not `field_identifier`/`property_identifier`), so
+        // resolution must go through extract_call_name's fallback branch
+        // that scans for a bare identifier/name child.
+        let source = "class Foo:\n    def run(self):\n        self.helper()\n        obj.method_call()\n    def helper(self):\n        pass\n";
+        let calls = extract_call_sites_from_source(source, "python", "run");
+        assert!(
+            calls.contains(&"helper".to_string()),
+            "expected helper via self.helper() attribute call, got {:?}",
+            calls
+        );
+        assert!(
+            calls.contains(&"method_call".to_string()),
+            "expected method_call via obj.method_call() attribute call, got {:?}",
+            calls
+        );
+    }
+
+    // ─── build_call_graph self-recursion test ───────────────────────────────
+
+    #[test]
+    fn test_build_call_graph_skips_self_recursive_calls() {
+        use crate::core_graph::CodebaseIndex;
+        use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = crate::budget::counter::TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let src =
+            "fn factorial(n: i32) -> i32 {\n    if n <= 1 { 1 } else { n * factorial(n - 1) }\n}\n";
+        let fp = dir.path().join("lib.rs");
+        std::fs::write(&fp, src).unwrap();
+
+        let files = vec![ScannedFile {
+            relative_path: "lib.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: src.len() as u64,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "lib.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "factorial".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "fn factorial(n: i32) -> i32".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 3,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("lib.rs".to_string(), src.to_string());
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+
+        let cg = build_call_graph(&index);
+        assert!(
+            !cg.edges
+                .iter()
+                .any(|e| e.caller_symbol == "factorial" && e.callee_symbol == "factorial"),
+            "a recursive self-call must not produce a self-referencing edge: {:?}",
+            cg.edges
+        );
+    }
 }

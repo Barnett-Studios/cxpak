@@ -1230,4 +1230,182 @@ CREATE TABLE orders (
         assert_eq!(strip_schema_prefix("a.b.c"), "c");
         assert_eq!(strip_schema_prefix(""), "");
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: multi-token paren absorption, malformed
+    // REFERENCES/DEFAULT clauses, table-level constraints parsed directly,
+    // and Cypher/Elasticsearch/Prisma edge branches.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_type_paren_group_split_across_tokens() {
+        // "NUMERIC(10, 2)" has a space after the comma, so split_whitespace
+        // yields two tokens ("NUMERIC(10," and "2)") that collect_type must
+        // re-join by absorbing until the parens balance.
+        let sql = "(price NUMERIC(10, 2) NOT NULL)";
+        let schema = extract_table_schema(sql, "products", "schema.sql", 1);
+        let col = schema.columns.iter().find(|c| c.name == "price").unwrap();
+        assert_eq!(col.data_type, "NUMERIC(10, 2)");
+        assert!(!col.nullable);
+    }
+
+    #[test]
+    fn test_references_with_no_target_table() {
+        // REFERENCES as the final token of a column def has nothing to parse.
+        let sql = "(id INTEGER, user_id INTEGER REFERENCES)";
+        let schema = extract_table_schema(sql, "orders", "schema.sql", 1);
+        let col = schema.columns.iter().find(|c| c.name == "user_id").unwrap();
+        let fk = col.foreign_key.as_ref().unwrap();
+        assert_eq!(fk.target_table, "");
+        assert_eq!(fk.target_column, "");
+    }
+
+    #[test]
+    fn test_references_column_as_separate_token() {
+        // A space between the target table and its column paren group means
+        // the column reference arrives as its own token: `users` `(id)`.
+        let sql = "(id INTEGER, user_id INTEGER REFERENCES users (id))";
+        let schema = extract_table_schema(sql, "orders", "schema.sql", 1);
+        let col = schema.columns.iter().find(|c| c.name == "user_id").unwrap();
+        let fk = col.foreign_key.as_ref().unwrap();
+        assert_eq!(fk.target_table, "users");
+        assert_eq!(fk.target_column, "id");
+    }
+
+    #[test]
+    fn test_default_with_no_value() {
+        // DEFAULT as the final token has no expression to capture.
+        let sql = "(status TEXT DEFAULT)";
+        let schema = extract_table_schema(sql, "items", "schema.sql", 1);
+        let col = schema.columns.iter().find(|c| c.name == "status").unwrap();
+        assert_eq!(col.default, Some(String::new()));
+    }
+
+    #[test]
+    fn test_default_multi_token_paren_expression() {
+        // "DEFAULT (1 + 1)" splits into three tokens; capture_default must
+        // absorb all of them until the parens balance.
+        let sql = "(amount INTEGER DEFAULT (1 + 1))";
+        let schema = extract_table_schema(sql, "ledger", "schema.sql", 1);
+        let col = schema.columns.iter().find(|c| c.name == "amount").unwrap();
+        assert_eq!(col.default, Some("(1 + 1)".to_string()));
+    }
+
+    #[test]
+    fn test_trailing_comma_produces_empty_def_skipped() {
+        // A trailing comma leaves an empty definition after splitting; it
+        // must be skipped rather than producing a phantom column.
+        let sql = "(id INTEGER, name TEXT,)";
+        let schema = extract_table_schema(sql, "items", "schema.sql", 1);
+        assert_eq!(schema.columns.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_column_def_skips_table_level_constraints_directly() {
+        // extract_table_schema already filters these out before calling
+        // parse_column_def, so exercise the function's own guard directly.
+        assert!(parse_column_def("UNIQUE (email)").is_none());
+        assert!(parse_column_def("FOREIGN KEY (x) REFERENCES y(z)").is_none());
+        assert!(parse_column_def("PRIMARY KEY (id)").is_none());
+        assert!(parse_column_def("CHECK (age > 0)").is_none());
+        assert!(parse_column_def("CONSTRAINT chk_age CHECK (age > 0)").is_none());
+    }
+
+    #[test]
+    fn test_explicit_null_keyword() {
+        let sql = "(id INTEGER, email TEXT NULL)";
+        let schema = extract_table_schema(sql, "users", "schema.sql", 1);
+        let col = schema.columns.iter().find(|c| c.name == "email").unwrap();
+        assert!(col.nullable);
+    }
+
+    #[test]
+    fn test_references_on_delete_set_null() {
+        let sql = "(id INTEGER, owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL)";
+        let schema = extract_table_schema(sql, "docs", "schema.sql", 1);
+        // The whole ON DELETE SET NULL clause must be consumed, leaving
+        // exactly the two real columns (no phantom column from "NULL").
+        assert_eq!(schema.columns.len(), 2);
+        let col = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "owner_id")
+            .unwrap();
+        let fk = col.foreign_key.as_ref().unwrap();
+        assert_eq!(fk.target_table, "users");
+        assert_eq!(fk.target_column, "id");
+    }
+
+    #[test]
+    fn test_references_followed_by_non_on_token() {
+        // A constraint keyword directly after the REFERENCES target (no ON
+        // clause at all) must terminate the REFERENCES sub-loop immediately.
+        let sql = "(id INTEGER, code TEXT REFERENCES codes(code) UNIQUE)";
+        let schema = extract_table_schema(sql, "items", "schema.sql", 1);
+        let col = schema.columns.iter().find(|c| c.name == "code").unwrap();
+        let fk = col.foreign_key.as_ref().unwrap();
+        assert_eq!(fk.target_table, "codes");
+        assert_eq!(fk.target_column, "code");
+        assert!(col.constraints.contains(&"UNIQUE".to_string()));
+    }
+
+    #[test]
+    fn test_unrecognized_trailing_token_is_skipped() {
+        // After NOT NULL is consumed, a stray unrecognized token must fall
+        // through the catch-all arm rather than panicking or being parsed
+        // as a new column.
+        let sql = "(id INTEGER, name TEXT NOT NULL GARBAGE)";
+        let schema = extract_table_schema(sql, "items", "schema.sql", 1);
+        assert_eq!(schema.columns.len(), 2);
+        let col = schema.columns.iter().find(|c| c.name == "name").unwrap();
+        assert!(!col.nullable);
+    }
+
+    #[test]
+    fn test_elasticsearch_properties_not_an_object() {
+        let json = r#"{"mappings": {"properties": "not-an-object"}}"#;
+        let result = extract_elasticsearch_schema(json, "index.json");
+        assert!(
+            result.is_none(),
+            "non-object properties value must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_elasticsearch_nested_properties_not_an_object() {
+        // The nested "properties" key for "address" is a string, not an
+        // object, so recursion into it must stop without adding sub-fields.
+        let json = r#"{
+            "mappings": {
+                "properties": {
+                    "address": {
+                        "type": "object",
+                        "properties": "not-an-object"
+                    }
+                }
+            }
+        }"#;
+        let schema = extract_elasticsearch_schema(json, "index.json").unwrap();
+        assert!(schema
+            .fields
+            .iter()
+            .any(|f| f.name == "address" && f.field_type == "object"));
+        assert!(
+            !schema.fields.iter().any(|f| f.name.starts_with("address.")),
+            "malformed nested properties must not produce sub-fields, got {:?}",
+            schema.fields
+        );
+    }
+
+    #[test]
+    fn test_prisma_skips_single_token_lines() {
+        // A stray one-word line (not a comment, not @@, not blank) has fewer
+        // than 2 tokens and must be skipped rather than misparsed as a field.
+        let body = "\n  id     Int    @id\n  orphan\n  name   String\n";
+        let model = extract_prisma_schema(body, "User", "schema.prisma", 1);
+        assert_eq!(model.fields.len(), 2);
+        assert!(!model.fields.iter().any(|f| f.name == "orphan"));
+        assert!(model.fields.iter().any(|f| f.name == "id"));
+        assert!(model.fields.iter().any(|f| f.name == "name"));
+    }
 }

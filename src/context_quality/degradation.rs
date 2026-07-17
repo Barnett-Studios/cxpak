@@ -511,6 +511,13 @@ mod tests {
     }
 
     #[test]
+    fn test_concept_priority_catch_all_variant() {
+        // SymbolKind::Macro has no explicit arm in concept_priority — it must
+        // fall through to the catch-all (imports and any future variants).
+        assert_eq!(concept_priority(&SymbolKind::Macro), 0.14);
+    }
+
+    #[test]
     fn test_concept_priority_ordering_is_monotonic() {
         assert!(concept_priority(&SymbolKind::Function) > concept_priority(&SymbolKind::Struct));
         assert!(concept_priority(&SymbolKind::Struct) > concept_priority(&SymbolKind::Message));
@@ -765,6 +772,38 @@ mod tests {
     }
 
     #[test]
+    fn test_split_giant_single_line_becomes_own_chunk() {
+        // A single line whose own token count alone exceeds MAX_SYMBOL_TOKENS is
+        // the pathological case: it must be flushed as its own one-line chunk
+        // rather than merged with surrounding lines.
+        let giant_line = "word ".repeat(5000);
+        let body = format!("pub fn giant() {{\n{giant_line}\n    let after = 1;\n}}");
+        let sym = Symbol {
+            name: "giant".to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: "pub fn giant()".to_string(),
+            body: body.clone(),
+            start_line: 1,
+            end_line: 3,
+        };
+        let chunks = split_oversized_symbol(&sym, &body);
+        assert!(
+            chunks.len() > 1,
+            "the giant line must force a split, got {} chunk(s)",
+            chunks.len()
+        );
+        let has_isolated_giant_chunk = chunks
+            .iter()
+            .any(|c| c.rendered.contains("word word") && !c.rendered.contains("let after"));
+        assert!(
+            has_isolated_giant_chunk,
+            "the oversized line must occupy a chunk by itself, chunk sizes: {:?}",
+            chunks.iter().map(|c| c.rendered.len()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_split_line_numbers_adjusted() {
         let big_body = (0..500)
             .map(|i| format!("    let v{i} = f{i}();"))
@@ -875,6 +914,88 @@ mod tests {
         let files = vec![(&file, FileRole::Selected, 0.8)];
         let result = allocate_with_degradation(&files, 1000, None);
         assert_eq!(result[0].level, DetailLevel::Full);
+    }
+
+    #[test]
+    fn test_allocate_skips_raw_fast_path_but_fits_at_full_render() {
+        // The file's stored `token_count` (an independent, inflated field —
+        // e.g. computed from raw file bytes including whitespace/comments) is
+        // far above budget, so the raw-token fast path must be skipped. But
+        // the symbol's actual rendered body is tiny, so the *next* fast path
+        // (compute_total of the real Full-detail render) must still succeed.
+        let file = make_indexed_file("inflated.rs", 5000, vec![make_fn_symbol("tiny", 5)]);
+        let files = vec![(&file, FileRole::Selected, 0.8)];
+        let result = allocate_with_degradation(&files, 100, None);
+        assert_eq!(result[0].path, "inflated.rs");
+        assert_eq!(
+            result[0].level,
+            DetailLevel::Full,
+            "real rendered content fits the budget even though the raw token_count field did not"
+        );
+    }
+
+    fn make_long_signature_symbol(name: &str, num_params: usize) -> Symbol {
+        let params: String = (0..num_params)
+            .map(|i| format!("arg_{i}: Type{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let signature = format!("pub fn {name}({params})");
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            signature: signature.clone(),
+            body: format!("{signature} {{\n    do_work();\n}}"),
+            start_line: 1,
+            end_line: 3,
+        }
+    }
+
+    #[test]
+    fn test_allocate_phase3_drops_dependency_when_degradation_alone_is_not_enough() {
+        // Two dependency files carry huge parameter-list signatures, so their
+        // cost survives every detail level down to Stub (Stub still renders
+        // the full signature). The selected file is tiny. Degrading everything
+        // to its floor (dep=Stub, sel=Documented) still cannot fit the budget,
+        // so Phase 3 must drop a dependency's content entirely to succeed.
+        // token_count must reflect the real rendered cost (~2100 tokens for a
+        // 300-param signature) so the raw-token-count fast path at the top of
+        // allocate_with_degradation does not short-circuit before Phase 3 runs.
+        let sel = make_indexed_file("sel.rs", 15, vec![make_fn_symbol("sel", 10)]);
+        let dep_a = make_indexed_file(
+            "dep_a.rs",
+            2200,
+            vec![make_long_signature_symbol("dep_a", 300)],
+        );
+        let dep_b = make_indexed_file(
+            "dep_b.rs",
+            2200,
+            vec![make_long_signature_symbol("dep_b", 300)],
+        );
+
+        let files = vec![
+            (&sel, FileRole::Selected, 0.9),
+            (&dep_a, FileRole::Dependency, 0.2),
+            (&dep_b, FileRole::Dependency, 0.1),
+        ];
+
+        let result = allocate_with_degradation(&files, 900, None);
+
+        let dep_a_alloc = result.iter().find(|r| r.path == "dep_a.rs").unwrap();
+        let dep_b_alloc = result.iter().find(|r| r.path == "dep_b.rs").unwrap();
+        assert!(
+            dep_a_alloc.symbols.is_empty() || dep_b_alloc.symbols.is_empty(),
+            "expected at least one huge-signature dependency to be dropped entirely by Phase 3: \
+             dep_a symbols={}, dep_b symbols={}",
+            dep_a_alloc.symbols.len(),
+            dep_b_alloc.symbols.len()
+        );
+        // The selected file must always survive with rendered content.
+        let sel_alloc = result.iter().find(|r| r.path == "sel.rs").unwrap();
+        assert!(
+            !sel_alloc.symbols.is_empty(),
+            "a Selected file must never be dropped entirely"
+        );
     }
 
     // --- pagerank-aware allocation test ---

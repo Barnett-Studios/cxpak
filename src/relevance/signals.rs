@@ -1034,6 +1034,150 @@ mod tests {
         assert!(result.score > 0.6);
     }
 
+    // --- symbol_match: symbols with no tokenizable name ---
+
+    #[test]
+    fn test_symbol_match_skips_untokenizable_symbol_name() {
+        // A symbol whose name tokenizes to nothing (a single character) must be
+        // skipped by the `continue` in the scoring loop, while a later, real
+        // symbol still gets scored normally.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("mixed.rs");
+        std::fs::write(&fp, "fn x() {}\npub fn handle_api_request() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "mixed.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 40,
+        }];
+        let mut pr = HashMap::new();
+        pr.insert(
+            "mixed.rs".to_string(),
+            ParseResult {
+                symbols: vec![
+                    Symbol {
+                        name: "x".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Private,
+                        signature: "fn x()".into(),
+                        body: "{}".into(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    Symbol {
+                        name: "handle_api_request".into(),
+                        kind: SymbolKind::Function,
+                        visibility: Visibility::Public,
+                        signature: "pub fn handle_api_request()".into(),
+                        body: "{}".into(),
+                        start_line: 2,
+                        end_line: 2,
+                    },
+                ],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let index = CodebaseIndex::build(files, pr, &counter);
+        let result = symbol_match("handle api request", "mixed.rs", &index, None);
+        assert!(
+            result.score > 0.5,
+            "the untokenizable single-char symbol must be skipped, letting the \
+             real symbol win the best-score comparison: {}",
+            result.score
+        );
+        assert!(result.detail.contains("handle_api_request"));
+    }
+
+    // --- term_frequency: tf_map present but empty / all-zero counts ---
+
+    #[test]
+    fn test_term_frequency_empty_tf_map_for_empty_file() {
+        // An indexed empty file gets a present-but-empty term-frequency map
+        // (distinct from "file not found"), which must short-circuit to 0.0.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("empty.rs");
+        std::fs::write(&fp, "").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "empty.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 0,
+        }];
+        let index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        assert!(
+            index.term_frequencies.get("empty.rs").unwrap().is_empty(),
+            "precondition: empty file must produce an empty (not missing) tf map"
+        );
+        let result = term_frequency("anything", "empty.rs", &index, None);
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.detail, "no terms");
+    }
+
+    #[test]
+    fn test_term_frequency_all_zero_counts_treated_as_no_terms() {
+        // A tf map that is non-empty but whose counts all sum to zero (a
+        // degenerate state no real `compute_term_frequencies` output produces,
+        // but one the function must still handle defensively) must be treated
+        // identically to "no terms".
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        let mut zeroed = HashMap::new();
+        zeroed.insert("stale".to_string(), 0u32);
+        index
+            .term_frequencies
+            .insert("weird.rs".to_string(), zeroed);
+        let result = term_frequency("stale", "weird.rs", &index, None);
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.detail, "no terms");
+    }
+
+    // --- embedding_similarity_signal (feature-gated) ---
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn test_embedding_similarity_no_query_embedding() {
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        index.embedding_index = Some(crate::embeddings::EmbeddingIndex::new(3));
+        let result = embedding_similarity_signal(None, "any.rs", &index);
+        assert_eq!(result.score, 0.5);
+        assert_eq!(result.detail, "no query embedding");
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn test_embedding_similarity_cosine_match_scores_high() {
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        let mut emb = crate::embeddings::EmbeddingIndex::new(3);
+        emb.add("src/api.rs", vec![1.0, 0.0, 0.0]);
+        index.embedding_index = Some(emb);
+        let result = embedding_similarity_signal(Some(&[1.0, 0.0, 0.0]), "src/api.rs", &index);
+        assert_eq!(result.name, "embedding_similarity");
+        assert!(
+            (result.score - 1.0).abs() < 1e-6,
+            "identical vectors should score ~1.0: {}",
+            result.score
+        );
+        assert!(result.detail.starts_with("cosine="), "{}", result.detail);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn test_embedding_similarity_file_not_in_index() {
+        let counter = TokenCounter::new();
+        let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
+        let mut emb = crate::embeddings::EmbeddingIndex::new(3);
+        emb.add("src/other.rs", vec![1.0, 0.0, 0.0]);
+        index.embedding_index = Some(emb);
+        let result = embedding_similarity_signal(Some(&[1.0, 0.0, 0.0]), "src/missing.rs", &index);
+        assert_eq!(result.score, 0.5);
+        assert_eq!(result.detail, "file not in embedding index");
+    }
+
     #[test]
     fn test_recency_boost_signal_in_180d_only() {
         use crate::conventions::git_health::ChurnEntry;

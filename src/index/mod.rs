@@ -1546,4 +1546,146 @@ mod tests {
         assert_eq!(index.files.len(), 1);
         assert_eq!(index.files[0].relative_path, "a.rs");
     }
+
+    #[test]
+    fn test_incremental_rebuild_reparses_when_existing_mtime_missing() {
+        // When the stored IndexedFile has no mtime (e.g. loaded from a cache
+        // that didn't record one), the `needs_update` match falls into its
+        // wildcard arm and must always force a re-parse, regardless of what
+        // the freshly-scanned file's mtime turns out to be.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn old() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp.clone(),
+            language: Some("rust".into()),
+            size_bytes: 11,
+        }];
+        let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
+        assert!(
+            index.files[0].mtime_secs.is_some(),
+            "precondition: disk build populates mtime"
+        );
+        index.files[0].mtime_secs = None;
+
+        let current = vec![ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 11,
+        }];
+        index.incremental_rebuild(&current, &HashMap::new(), &counter);
+        assert!(
+            index.files[0].mtime_secs.is_some(),
+            "the wildcard re-parse arm must have run upsert_file, repopulating mtime_secs from disk"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn test_build_embedding_index_no_public_symbols_returns_none() {
+        // create_provider succeeds (api_key_env is left empty so no environment
+        // variable is required), but the index has no files/symbols at all —
+        // must short-circuit to None before ever attempting to embed anything.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".cxpak.json"),
+            r#"{"embeddings": {"provider": "openai", "api_key_env": "", "base_url": "http://127.0.0.1:1", "dimensions": 4}}"#,
+        )
+        .unwrap();
+        let index = CodebaseIndex::empty();
+        let result =
+            build_embedding_index(&index, dir.path(), crate::relevance::RelevanceMode::Inert);
+        assert!(
+            result.is_none(),
+            "an index with no symbols must yield no embedding index"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn test_build_embedding_index_success_bare_and_contextual() {
+        // Spin up a loopback-only fake OpenAI-compatible embeddings endpoint so
+        // the full success path (provider construction, symbol collection,
+        // batch embedding, and index population) runs without any real network
+        // access or model download. Exercised under both RelevanceMode::Inert
+        // (bare signature embedded) and RelevanceMode::Active (contextual
+        // header prepended), since both branches live in the same function.
+        use tiny_http::{Response, Server};
+
+        let server = Server::http("127.0.0.1:0").expect("failed to bind local HTTP server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("server_addr is not an IP")
+            .port();
+        let _handle = std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = serde_json::json!({
+                    "data": [{"embedding": [0.1_f32, 0.2, 0.3, 0.4]}]
+                });
+                let response = Response::from_string(body.to_string()).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .expect("valid header"),
+                );
+                let _ = request.respond(response);
+            }
+        });
+
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("api.rs");
+        std::fs::write(&fp, "pub fn handle_request() {}").unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "api.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: 27,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "api.rs".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "handle_request".into(),
+                    kind: crate::parser::language::SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    signature: "pub fn handle_request()".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let index = CodebaseIndex::build(files, parse_results, &counter);
+
+        std::fs::write(
+            dir.path().join(".cxpak.json"),
+            format!(
+                r#"{{"embeddings": {{"provider": "openai", "api_key_env": "", "base_url": "http://127.0.0.1:{port}", "dimensions": 4, "batch_size": 64}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let bare =
+            build_embedding_index(&index, dir.path(), crate::relevance::RelevanceMode::Inert)
+                .expect(
+                "bare-mode embedding index should build successfully against the local fake server",
+            );
+        assert!(
+            !bare.is_empty(),
+            "successful embed_batch must populate the index"
+        );
+        assert_eq!(bare.len(), 1);
+
+        let contextual =
+            build_embedding_index(&index, dir.path(), crate::relevance::RelevanceMode::Active)
+                .expect("contextual-mode embedding index should build successfully");
+        assert!(!contextual.is_empty());
+        assert_eq!(contextual.len(), 1);
+    }
 }

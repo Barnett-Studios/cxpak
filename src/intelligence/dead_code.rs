@@ -1360,4 +1360,407 @@ mod tests {
             "single-char struct name must be assumed alive (too short to search reliably)"
         );
     }
+
+    // ---- is_entry_point direct branch tests ----
+
+    #[test]
+    fn is_entry_point_true_for_trait_impl_or_override_signature() {
+        let cache = HashMap::new();
+        assert!(
+            is_entry_point("src/foo.rs", "fmt", "impl Display for Foo", false, &cache),
+            "impl Trait for Type signature must be an entry point"
+        );
+        assert!(
+            is_entry_point(
+                "src/foo.rs",
+                "run",
+                "@Override public void run()",
+                false,
+                &cache
+            ),
+            "@Override signature must be an entry point"
+        );
+        assert!(
+            is_entry_point("src/foo.rs", "run", "override fun run()", false, &cache),
+            "Kotlin-style `override ` signature must be an entry point"
+        );
+    }
+
+    #[test]
+    fn is_entry_point_true_for_http_handler_when_file_has_routes() {
+        let mut cache = HashMap::new();
+        cache.insert("src/routes.rs".to_string(), true);
+        assert!(
+            is_entry_point("src/routes.rs", "handler", "pub fn handler()", true, &cache),
+            "public symbol in a file with route registrations must be an entry point"
+        );
+    }
+
+    #[test]
+    fn is_entry_point_false_when_route_cache_has_no_routes_or_not_public() {
+        let mut cache = HashMap::new();
+        cache.insert("src/routes.rs".to_string(), false);
+        assert!(!is_entry_point(
+            "src/routes.rs",
+            "helper",
+            "fn helper()",
+            true,
+            &cache
+        ));
+        cache.insert("src/routes.rs".to_string(), true);
+        assert!(!is_entry_point(
+            "src/routes.rs",
+            "helper",
+            "fn helper()",
+            false,
+            &cache
+        ));
+    }
+
+    // ---- strip_code_noise / strip_strings_and_comments direct tests ----
+
+    #[test]
+    fn strip_code_noise_removes_line_comments_block_comments_and_strings() {
+        let src = "// mentions encode here\nlet x = \"encode\"; /* also encode */ real_encode();";
+        let stripped = strip_code_noise(src);
+        assert!(!stripped.contains("mentions encode here"));
+        assert!(!stripped.contains("\"encode\""));
+        assert!(!stripped.contains("also encode"));
+        assert!(stripped.contains("real_encode"));
+    }
+
+    #[test]
+    fn strip_code_noise_handles_escaped_quote_inside_string() {
+        // The backslash-escape branch: `\"` inside a string must not end it.
+        let src = "let s = \"esc\\\"aped encode\"; keep_this();";
+        let stripped = strip_code_noise(src);
+        assert!(!stripped.contains("encode"));
+        assert!(stripped.contains("keep_this"));
+    }
+
+    #[test]
+    fn strip_strings_and_comments_breaks_on_line_comment_and_toggles_string_state() {
+        let with_comment = strip_strings_and_comments("let x = 1; // trailing comment { }");
+        assert_eq!(with_comment, "let x = 1; ");
+        let with_string = strip_strings_and_comments("if x == \"{ brace }\" { y(); }");
+        // Braces inside the string are stripped (not counted); braces outside remain.
+        assert_eq!(with_string, "if x ==  { y(); }");
+    }
+
+    // ---- has_string_references direct tests ----
+
+    #[test]
+    fn has_string_references_short_name_assumed_alive() {
+        assert!(has_string_references("ab", "def.rs", &[]));
+    }
+
+    // ---- has_receiver_method_reference direct tests ----
+
+    fn make_file(path: &str, content: &str) -> IndexedFile {
+        IndexedFile {
+            relative_path: path.to_string(),
+            language: Some("rust".to_string()),
+            size_bytes: content.len() as u64,
+            token_count: 0,
+            parse_result: None,
+            content: content.to_string(),
+            mtime_secs: None,
+        }
+    }
+
+    #[test]
+    fn has_receiver_method_reference_short_name_returns_false() {
+        let files: Vec<IndexedFile> = vec![make_file("caller.rs", "obj.run(1);")];
+        assert!(!has_receiver_method_reference("def.rs", "run", &files));
+    }
+
+    #[test]
+    fn has_receiver_method_reference_skips_content_shorter_than_needle() {
+        let files = vec![make_file("caller.rs", "x")];
+        assert!(!has_receiver_method_reference(
+            "def.rs",
+            "process_data",
+            &files
+        ));
+    }
+
+    #[test]
+    fn has_receiver_method_reference_finds_dot_call_and_ignores_range_operator() {
+        let files = vec![make_file("caller.rs", "obj.process_data(1);")];
+        assert!(has_receiver_method_reference(
+            "def.rs",
+            "process_data",
+            &files
+        ));
+
+        let range_files = vec![make_file("caller.rs", "arr[0..process_data(1)];")];
+        assert!(!has_receiver_method_reference(
+            "def.rs",
+            "process_data",
+            &range_files
+        ));
+    }
+
+    #[test]
+    fn has_receiver_method_reference_no_match_returns_false() {
+        let files = vec![make_file(
+            "caller.rs",
+            "something_else_entirely_long_enough();",
+        )];
+        assert!(!has_receiver_method_reference(
+            "def.rs",
+            "process_data",
+            &files
+        ));
+    }
+
+    // ---- has_qualified_reference direct tests ----
+
+    #[test]
+    fn has_qualified_reference_false_for_empty_stem() {
+        let files = vec![make_file("other.rs", "some::path::ref_target")];
+        assert!(!has_qualified_reference("", "ref_target", &files));
+    }
+
+    // ---- has_serde_derive_above / has_test_attribute_above start_line=0 ----
+
+    #[test]
+    fn has_serde_derive_above_returns_false_for_start_line_zero() {
+        assert!(!has_serde_derive_above("struct Foo {}", 0));
+    }
+
+    #[test]
+    fn has_test_attribute_above_returns_false_for_start_line_zero() {
+        assert!(!has_test_attribute_above("fn foo(){}", 0));
+    }
+
+    // ---- enclosing_impl / parse_impl_type direct tests ----
+
+    #[test]
+    fn enclosing_impl_returns_none_for_start_line_zero() {
+        assert_eq!(enclosing_impl("impl Foo {}", 0), None);
+    }
+
+    #[test]
+    fn enclosing_impl_counts_closing_braces_from_prior_sibling_method() {
+        // `two`'s own declaration line is start_line=5; scanning backward must
+        // pass over `one`'s complete `{ 1 }` body (a matched brace pair) before
+        // finding the impl block's own opening brace.
+        let content =
+            "impl Foo {\n    fn one() {\n        1\n    }\n    fn two() -> i32 {\n        2\n    }\n}\n";
+        assert_eq!(
+            enclosing_impl(content, 5),
+            Some((false, Some("Foo".to_string())))
+        );
+    }
+
+    #[test]
+    fn enclosing_impl_returns_none_when_opener_is_not_impl() {
+        let content = "if condition {\n    let x = 1;\n}\n";
+        assert_eq!(enclosing_impl(content, 2), None);
+    }
+
+    #[test]
+    fn parse_impl_type_skips_generic_param_prefix() {
+        assert_eq!(
+            parse_impl_type("<T: Clone> Foo<T> {"),
+            Some("Foo".to_string())
+        );
+        assert_eq!(
+            parse_impl_type("<'a, T: Clone + Debug> Bar<'a, T> {"),
+            Some("Bar".to_string())
+        );
+    }
+
+    // ---- detect_dead_code end-to-end branch tests ----
+
+    #[test]
+    fn test_dead_code_skips_function_with_test_attribute_above_regardless_of_name() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let content = "#[test]\nfn checks_invariant() {}\n";
+        let fp = dir.path().join("util.rs");
+        std::fs::write(&fp, content).unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "util.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: content.len() as u64,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "util.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "checks_invariant".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "fn checks_invariant()".into(),
+                    body: "{}".into(),
+                    start_line: 2,
+                    end_line: 2,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("util.rs".to_string(), content.to_string());
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            !dead.iter().any(|d| d.symbol == "checks_invariant"),
+            "function with #[test] attribute above must be alive regardless of its name"
+        );
+    }
+
+    #[test]
+    fn test_dead_code_treats_trait_impl_method_as_alive() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let content =
+            "impl std::fmt::Display for Foo {\n    fn fmt(&self) -> String {\n        String::new()\n    }\n}\n";
+        let fp = dir.path().join("foo.rs");
+        std::fs::write(&fp, content).unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "foo.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: content.len() as u64,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "foo.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "fmt".into(),
+                    kind: SymbolKind::Method,
+                    visibility: Visibility::Private,
+                    signature: "fn fmt(&self) -> String".into(),
+                    body: "{}".into(),
+                    start_line: 2,
+                    end_line: 4,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("foo.rs".to_string(), content.to_string());
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            !dead.iter().any(|d| d.symbol == "fmt"),
+            "trait-impl method with zero callers must be alive via dynamic dispatch exemption"
+        );
+    }
+
+    #[test]
+    fn test_dead_code_treats_inherent_method_referenced_via_type_path_as_alive() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let a_content = "impl Foo {\n    fn helper() -> i32 {\n        1\n    }\n}\n";
+        let b_content = "fn caller() -> i32 { Foo::helper() }\n";
+        let a_path = dir.path().join("a.rs");
+        let b_path = dir.path().join("b.rs");
+        std::fs::write(&a_path, a_content).unwrap();
+        std::fs::write(&b_path, b_content).unwrap();
+
+        let files = vec![
+            ScannedFile {
+                relative_path: "a.rs".into(),
+                absolute_path: a_path,
+                language: Some("rust".into()),
+                size_bytes: a_content.len() as u64,
+            },
+            ScannedFile {
+                relative_path: "b.rs".into(),
+                absolute_path: b_path,
+                language: Some("rust".into()),
+                size_bytes: b_content.len() as u64,
+            },
+        ];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "a.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "helper".into(),
+                    kind: SymbolKind::Method,
+                    visibility: Visibility::Private,
+                    signature: "fn helper() -> i32".into(),
+                    body: "{}".into(),
+                    start_line: 2,
+                    end_line: 4,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "b.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "caller".into(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Private,
+                    signature: "fn caller() -> i32".into(),
+                    body: "{}".into(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("a.rs".to_string(), a_content.to_string());
+        content_map.insert("b.rs".to_string(), b_content.to_string());
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            !dead.iter().any(|d| d.symbol == "helper"),
+            "inherent method referenced via Type::method in another file must be alive"
+        );
+    }
+
+    #[test]
+    fn test_dead_code_treats_serde_derived_enum_as_alive() {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let content = "use serde::Deserialize;\n\n#[derive(Debug, Deserialize)]\npub enum Status {\n    Active,\n    Inactive,\n}\n";
+        let fp = dir.path().join("model.rs");
+        std::fs::write(&fp, content).unwrap();
+        let files = vec![ScannedFile {
+            relative_path: "model.rs".into(),
+            absolute_path: fp,
+            language: Some("rust".into()),
+            size_bytes: content.len() as u64,
+        }];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "model.rs".into(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "Status".into(),
+                    kind: SymbolKind::Enum,
+                    visibility: Visibility::Public,
+                    signature: "pub enum Status".into(),
+                    body: "{}".into(),
+                    start_line: 4,
+                    end_line: 7,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("model.rs".to_string(), content.to_string());
+        let index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+        let dead = detect_dead_code(&index, None);
+        assert!(
+            !dead.iter().any(|d| d.symbol == "Status"),
+            "serde-Deserialize-derived enum with zero references must be alive"
+        );
+    }
 }
