@@ -4508,6 +4508,14 @@ pub fn process_watcher_changes(
 ) {
     let (modified_paths, removed_paths) = classify_changes(changes, base_path);
 
+    // Nothing the index cares about changed — every event was a git-ignored
+    // path (target/, .cxpak/, .git/) filtered out by classify_changes, which is
+    // the common case for editor/build churn under the watched root. Return
+    // before the expensive full-index deep clone below.
+    if modified_paths.is_empty() && removed_paths.is_empty() {
+        return;
+    }
+
     // Snapshot-then-swap: clone the inner Arc under the read lock (O(1)),
     // drop the lock, build the new index off a deep clone of the snapshot,
     // then take the write lock briefly to swap in the new Arc.  Long-running
@@ -6972,6 +6980,39 @@ mod tests {
         // Original index had 2 files; the modified file wasn't one of them,
         // so it gets added as a new file (upsert)
         assert!(idx.total_files >= 2);
+    }
+
+    #[test]
+    fn test_process_watcher_changes_ignored_only_skips_rebuild() {
+        use crate::daemon::watcher::FileChange;
+
+        // A batch of only git-ignored paths (e.g. the target/ churn a `cargo
+        // build` produces under the watched root) must be dropped before the
+        // deep clone — no index swap, no rebuild.
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target\n.cxpak/\n").unwrap();
+
+        let shared = make_shared_index();
+        let before = {
+            let g = shared.read().unwrap();
+            Arc::clone(&g)
+        };
+
+        let changes = vec![
+            FileChange::Modified(dir.path().join("target/debug/foo.rs")),
+            FileChange::Created(dir.path().join(".cxpak/cache/root/detail.md")),
+        ];
+        process_watcher_changes(&changes, dir.path(), &shared);
+
+        let after = {
+            let g = shared.read().unwrap();
+            Arc::clone(&g)
+        };
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "ignored-only batch must not swap the index"
+        );
     }
 
     #[test]

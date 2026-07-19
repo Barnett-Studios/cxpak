@@ -85,9 +85,32 @@ pub(crate) fn classify_changes(
     let mut modified_paths = HashSet::new();
     let mut removed_paths = HashSet::new();
 
+    // The recursive FileWatcher fires on every path under the root, including
+    // git-ignored trees (target/, .cxpak/, node_modules/, …) and .git
+    // internals. The index is built from git-tracked files only, so ingesting
+    // those grows the index without bound and triggers a full-rebuild storm on
+    // every `cargo build` / cache write. Drop anything git ignores. Fail-open:
+    // if the repo can't be opened, keep the prior unfiltered behaviour.
+    let repo = git2::Repository::open(base_path).ok();
+    let is_ignored = |abs: &Path| -> bool {
+        let Ok(rel) = abs.strip_prefix(base_path) else {
+            return false;
+        };
+        // git never reports .git/ itself as "ignored", but it must never index.
+        if rel.components().any(|c| c.as_os_str() == ".git") {
+            return true;
+        }
+        repo.as_ref()
+            .map(|r| r.is_path_ignored(rel).unwrap_or(false))
+            .unwrap_or(false)
+    };
+
     for change in changes {
         match change {
             FileChange::Created(p) | FileChange::Modified(p) => {
+                if is_ignored(p) {
+                    continue;
+                }
                 if let Ok(rel) = p.strip_prefix(base_path) {
                     // Use a lowercase key so that case-insensitive filesystems
                     // (macOS HFS+, Windows NTFS) don't produce duplicate entries
@@ -96,6 +119,9 @@ pub(crate) fn classify_changes(
                 }
             }
             FileChange::Removed(p) => {
+                if is_ignored(p) {
+                    continue;
+                }
                 if let Ok(rel) = p.strip_prefix(base_path) {
                     removed_paths.insert(rel.to_string_lossy().to_ascii_lowercase());
                 }
@@ -217,6 +243,35 @@ mod tests {
         assert!(modified.contains("b.rs"));
         assert_eq!(removed.len(), 1);
         assert!(removed.contains("c.rs"));
+    }
+
+    #[test]
+    fn test_classify_changes_skips_git_ignored() {
+        // git-ignored trees (target/, .cxpak/) and .git internals must be
+        // dropped so the watcher never ingests them into the index.
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target\n.cxpak/\n").unwrap();
+        let base = dir.path();
+
+        let changes = vec![
+            FileChange::Modified(base.join("src/main.rs")),
+            FileChange::Modified(base.join("target/debug/foo.rs")),
+            FileChange::Created(base.join(".cxpak/cache/root/detail.md")),
+            FileChange::Removed(base.join(".git/index")),
+        ];
+        let (modified, removed) = classify_changes(&changes, base);
+
+        assert!(modified.contains("src/main.rs"), "tracked source kept");
+        assert!(
+            !modified.iter().any(|p| p.starts_with("target")),
+            "target/ dropped: {modified:?}"
+        );
+        assert!(
+            !modified.iter().any(|p| p.contains("cxpak")),
+            ".cxpak/ dropped: {modified:?}"
+        );
+        assert!(removed.is_empty(), ".git/ dropped: {removed:?}");
     }
 
     #[test]
