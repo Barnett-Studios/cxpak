@@ -46,11 +46,17 @@ chosen shape and the rejected alternatives, not a genuine either/or product deci
 
 ## Options considered
 
-- **Option A — filter at classification + guard the clone + parse once (chosen):** drop
-  git-ignored paths in `classify_changes` (via `git2::is_path_ignored`, plus an explicit
-  `.git/` guard), early-return in `process_watcher_changes` before the clone when no
-  relevant path changed, and rebuild the call graph with one parse per file. Fixes the
-  unbounded growth at its source (the index only ever holds tracked files), removes the
+- **Option A — filter at classification + guard the clone + parse once (chosen):** in
+  `classify_changes` drop exactly what `Scanner::scan` excludes — git's ignore rules
+  (`git2::is_path_ignored`: `.gitignore` / `core.excludesFile` / `.git/info/exclude`,
+  nested-aware) **plus** `BUILTIN_IGNORES` and `.cxpakignore` (an `ignore`-crate
+  `Gitignore` matcher built the same way the scanner builds it), plus an explicit `.git/`
+  guard; early-return in `process_watcher_changes` before the clone when no relevant path
+  changed; and rebuild the call graph with one parse per file. The watcher's inclusion set
+  must equal the initial scan's — git rules alone are insufficient, because committed
+  build-noise (`Cargo.lock`, `*.png`, `dist/`, `*.min.js`, `.DS_Store`) is not git-ignored
+  yet must never enter the index. Fixes the unbounded growth at its source (the live index
+  stays identical to a fresh scan), removes the
   needless clone, and collapses the parse count from `Σ(symbols)` to `files`.
 - **Option B — cap the index size / evict:** bound `index.files` and evict least-recently-
   seen entries. Treats the symptom, not the cause: the index would still ingest junk, the
@@ -63,26 +69,31 @@ chosen shape and the rejected alternatives, not a genuine either/or product deci
 
 ## Decision
 
-Adopt Option A. `classify_changes` filters git-ignored paths (fail-open if the repo can't
-be opened, preserving prior behaviour and existing tests); `process_watcher_changes`
-returns before the deep clone when both change sets are empty; `build_call_graph` parses
-each file exactly once via `extract_calls_by_symbol`, set-equivalent to the old per-symbol
-path. The call-graph change is covered by `test_calls_by_symbol_matches_per_symbol_rust`;
-the watcher changes by `test_classify_changes_skips_git_ignored` and
+Adopt Option A. `classify_changes` filters the same exclusion set as `Scanner::scan` —
+git rules via `git2` (using `Repository::discover` so a non-root watch root can't
+silently fail-open) plus `BUILTIN_IGNORES`/`.cxpakignore` via an `ignore`-crate matcher —
+fail-open only if the repo can't be resolved; `process_watcher_changes` returns before the
+deep clone when both change sets are empty; `build_call_graph` parses each file exactly
+once via `extract_calls_by_symbol`, set-equivalent to the old per-symbol path. Covered by
+`test_calls_by_symbol_matches_per_symbol_rust`, `test_classify_changes_skips_git_ignored`,
+`test_classify_changes_skips_builtin_noise_not_gitignored`, and
 `test_process_watcher_changes_ignored_only_skips_rebuild`. Shipped in 3.1.2.
 
 ## Consequences
 
 ### Positive
-- Watcher memory is bounded by the tracked-file set; `target/` / `.cxpak/` / `.git/` churn
-  no longer grows the index or triggers rebuilds.
+- Watcher memory is bounded by the scanner's inclusion set; `target/` / `.cxpak/` / `.git/`
+  and committed build-noise (`Cargo.lock`, images, `dist/`, `*.min.js`) no longer grow the
+  index or trigger rebuilds. The live index stays identical to a fresh scan.
 - Call-graph rebuild cost drops from `Σ(symbols)` parses to `files` parses — orders of
   magnitude fewer tree-sitter parses and far less allocation churn per rebuild.
 - Spurious watcher wakes no longer deep-clone the full index.
 
 ### Negative
-- `classify_changes` now opens the git repo per debounced batch and runs an ignore check
-  per path — negligible next to the clone it prevents, but not free.
+- `classify_changes` now resolves the git repo and builds the `BUILTIN_IGNORES`/`.cxpakignore`
+  matcher once per debounced batch, then runs an ignore check per path — negligible next to
+  the full-index clone it prevents, but not free; the matcher/handle could be hoisted to the
+  watcher's lifetime if a profile ever shows it.
 - A brand-new source file that is *untracked but not ignored* is still picked up (correct),
   so "ignored" — not "tracked" — is the boundary; a file force-added despite an ignore rule
   will not be watched until the ignore rule is removed.
