@@ -589,6 +589,136 @@ fn extract_csharp_calls(source: &str, symbol_name: &str) -> Vec<String> {
     extract_regex_calls_from_function(source, symbol_name)
 }
 
+/// Parse `source` **once** and map every function/method name to the call-site
+/// names in its body — the one-pass equivalent of calling
+/// [`extract_call_sites_from_source`] once per symbol.
+///
+/// `build_call_graph` previously re-parsed each file once per symbol it
+/// contains (O(symbols) full tree-sitter parses per file); on a large file that
+/// is quadratic in both wall-clock and syntax-tree allocation, the cause of the
+/// watcher thread pegging CPU and the RSS ratcheting under repeated rebuilds.
+/// This parses each file exactly once. Returns `None` for languages with no
+/// tree-sitter extractor so the caller keeps the per-symbol regex fallback.
+///
+/// The result is *set*-equivalent to the per-symbol path: a name maps to the
+/// union of calls over every same-named function node, matching the old
+/// find-all-matches-then-dedup behaviour once the caller applies
+/// retain/sort/dedup on read.
+fn extract_calls_by_symbol(
+    source: &str,
+    language: &str,
+) -> Option<std::collections::HashMap<String, Vec<String>>> {
+    let (lang, func_kinds, call_kinds): (tree_sitter::Language, &[&str], &[&str]) = match language {
+        #[cfg(feature = "lang-rust")]
+        "rust" => (
+            tree_sitter_rust::LANGUAGE.into(),
+            &["function_item"],
+            &["call_expression"],
+        ),
+        #[cfg(feature = "lang-python")]
+        "python" => (
+            tree_sitter_python::LANGUAGE.into(),
+            &["function_definition"],
+            &["call"],
+        ),
+        #[cfg(feature = "lang-typescript")]
+        "typescript" | "javascript" => (
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            &[
+                "function_declaration",
+                "method_definition",
+                "arrow_function",
+            ],
+            &["call_expression"],
+        ),
+        #[cfg(all(not(feature = "lang-typescript"), feature = "lang-javascript"))]
+        "typescript" | "javascript" => (
+            tree_sitter_javascript::LANGUAGE.into(),
+            &[
+                "function_declaration",
+                "method_definition",
+                "arrow_function",
+            ],
+            &["call_expression"],
+        ),
+        #[cfg(feature = "lang-go")]
+        "go" => (
+            tree_sitter_go::LANGUAGE.into(),
+            &["function_declaration", "method_declaration"],
+            &["call_expression"],
+        ),
+        #[cfg(feature = "lang-java")]
+        "java" => (
+            tree_sitter_java::LANGUAGE.into(),
+            &["method_declaration", "constructor_declaration"],
+            &["method_invocation"],
+        ),
+        #[cfg(feature = "lang-c")]
+        "c" => (
+            tree_sitter_c::LANGUAGE.into(),
+            &["function_definition"],
+            &["call_expression"],
+        ),
+        #[cfg(feature = "lang-cpp")]
+        "cpp" => (
+            tree_sitter_cpp::LANGUAGE.into(),
+            &["function_definition"],
+            &["call_expression"],
+        ),
+        #[cfg(feature = "lang-ruby")]
+        "ruby" => (
+            tree_sitter_ruby::LANGUAGE.into(),
+            &["method", "singleton_method"],
+            &["call", "method_call"],
+        ),
+        #[cfg(feature = "lang-csharp")]
+        "csharp" => (
+            tree_sitter_c_sharp::LANGUAGE.into(),
+            &[
+                "method_declaration",
+                "constructor_declaration",
+                "local_function_statement",
+            ],
+            &["invocation_expression"],
+        ),
+        _ => return None,
+    };
+
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).ok()?;
+    let tree = parser.parse(source, None)?;
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    collect_calls_by_symbol(
+        &tree.root_node(),
+        source.as_bytes(),
+        func_kinds,
+        call_kinds,
+        &mut map,
+    );
+    Some(map)
+}
+
+/// One-pass tree walk backing [`extract_calls_by_symbol`]: for every
+/// function/method node, append the calls in its subtree to that name's entry.
+fn collect_calls_by_symbol(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    func_kinds: &[&str],
+    call_kinds: &[&str],
+    map: &mut std::collections::HashMap<String, Vec<String>>,
+) {
+    if func_kinds.contains(&node.kind()) {
+        if let Some(name) = extract_func_name(node, source) {
+            let entry = map.entry(name).or_default();
+            collect_calls_recursive(node, source, call_kinds, entry);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_calls_by_symbol(&child, source, func_kinds, call_kinds, map);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cross-file call graph construction
 // ---------------------------------------------------------------------------
@@ -668,8 +798,22 @@ pub fn build_call_graph(index: &crate::core_graph::CodebaseIndex) -> CallGraph {
         let lang = file.language.as_deref().unwrap_or("unknown");
         let imports_of_this_file = imported_from.get(&file.relative_path);
 
+        // Parse each file exactly once (was: once per symbol — quadratic).
+        // `None` for languages without a tree-sitter extractor → the per-symbol
+        // regex fallback below, unchanged.
+        let call_map = extract_calls_by_symbol(&file.content, lang);
+
         for symbol in &pr.symbols {
-            let called_names = extract_call_sites_from_source(&file.content, lang, &symbol.name);
+            let called_names = match &call_map {
+                Some(m) => {
+                    let mut names = m.get(&symbol.name).cloned().unwrap_or_default();
+                    names.retain(|c| c != &symbol.name);
+                    names.sort();
+                    names.dedup();
+                    names
+                }
+                None => extract_call_sites_from_source(&file.content, lang, &symbol.name),
+            };
 
             for callee_name in called_names {
                 if callee_name == symbol.name {
@@ -872,6 +1016,31 @@ mod tests {
     }
 
     // --- Call extraction tests ---
+
+    /// Parity guard for the single-parse-per-file fix: the one-pass
+    /// `extract_calls_by_symbol` map must return exactly what the old
+    /// per-symbol `extract_call_sites_from_source` returned, for every symbol
+    /// — including cross-calling siblings, so the quadratic re-parse is gone
+    /// without changing the call graph.
+    #[test]
+    #[cfg(feature = "lang-rust")]
+    fn test_calls_by_symbol_matches_per_symbol_rust() {
+        let source = r#"
+fn alpha() { beta(); helper(); }
+fn beta() { gamma(); helper(); }
+fn gamma() { alpha(); }
+fn helper() {}
+"#;
+        let map = extract_calls_by_symbol(source, "rust").expect("rust map");
+        for sym in ["alpha", "beta", "gamma", "helper"] {
+            let mut via_map = map.get(sym).cloned().unwrap_or_default();
+            via_map.retain(|c| c != sym);
+            via_map.sort();
+            via_map.dedup();
+            let direct = extract_call_sites_from_source(source, "rust", sym);
+            assert_eq!(via_map, direct, "mismatch for symbol {sym}");
+        }
+    }
 
     #[test]
     fn test_extract_calls_rust_detects_function_calls() {

@@ -85,9 +85,59 @@ pub(crate) fn classify_changes(
     let mut modified_paths = HashSet::new();
     let mut removed_paths = HashSet::new();
 
+    // The recursive FileWatcher fires on every path under the root, including
+    // build/noise trees (target/, .cxpak/, node_modules/, dist/, …), binary
+    // assets, lockfiles, and .git internals. The index is built by Scanner::scan,
+    // which excludes all of these — git's ignore rules PLUS BUILTIN_IGNORES and
+    // an optional .cxpakignore. The watcher must apply the *same* exclusion set,
+    // or committed-but-noise files (Cargo.lock, *.png, dist/, *.min.js,
+    // .DS_Store — none of which git ignores) leak into the live index, drift it
+    // away from a fresh scan, and re-trigger a full rebuild on every build.
+    //
+    // git2 covers .gitignore / core.excludesFile / .git/info/exclude (incl.
+    // nested dirs); the ignore-crate matcher covers BUILTIN_IGNORES +
+    // .cxpakignore, built exactly as Scanner::scan builds them. base_path is
+    // always a repo root (Scanner::new requires <root>/.git before any watcher
+    // starts), so `discover` resolves it — and `discover`, not `open`, so a
+    // non-root root can't silently fail-open to no filtering.
+    let repo = git2::Repository::discover(base_path).ok();
+    let noise = {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(base_path);
+        for &pattern in crate::scanner::defaults::BUILTIN_IGNORES {
+            let _ = builder.add_line(None, pattern);
+        }
+        let cxpakignore = base_path.join(".cxpakignore");
+        if cxpakignore.is_file() {
+            let _ = builder.add(&cxpakignore);
+        }
+        builder.build().ok()
+    };
+    let is_ignored = |abs: &Path| -> bool {
+        let Ok(rel) = abs.strip_prefix(base_path) else {
+            return false;
+        };
+        // git never reports .git/ itself as "ignored", but it must never index.
+        if rel.components().any(|c| c.as_os_str() == ".git") {
+            return true;
+        }
+        // BUILTIN_IGNORES / .cxpakignore — Scanner's non-git exclusions.
+        if let Some(gi) = &noise {
+            if gi.matched_path_or_any_parents(rel, false).is_ignore() {
+                return true;
+            }
+        }
+        // .gitignore / global excludes / .git/info/exclude, nested-aware.
+        repo.as_ref()
+            .map(|r| r.is_path_ignored(rel).unwrap_or(false))
+            .unwrap_or(false)
+    };
+
     for change in changes {
         match change {
             FileChange::Created(p) | FileChange::Modified(p) => {
+                if is_ignored(p) {
+                    continue;
+                }
                 if let Ok(rel) = p.strip_prefix(base_path) {
                     // Use a lowercase key so that case-insensitive filesystems
                     // (macOS HFS+, Windows NTFS) don't produce duplicate entries
@@ -96,6 +146,9 @@ pub(crate) fn classify_changes(
                 }
             }
             FileChange::Removed(p) => {
+                if is_ignored(p) {
+                    continue;
+                }
                 if let Ok(rel) = p.strip_prefix(base_path) {
                     removed_paths.insert(rel.to_string_lossy().to_ascii_lowercase());
                 }
@@ -217,6 +270,73 @@ mod tests {
         assert!(modified.contains("b.rs"));
         assert_eq!(removed.len(), 1);
         assert!(removed.contains("c.rs"));
+    }
+
+    #[test]
+    fn test_classify_changes_skips_git_ignored() {
+        // git-ignored trees (target/, .cxpak/) and .git internals must be
+        // dropped so the watcher never ingests them into the index.
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target\n.cxpak/\n").unwrap();
+        let base = dir.path();
+
+        let changes = vec![
+            FileChange::Modified(base.join("src/main.rs")),
+            FileChange::Modified(base.join("target/debug/foo.rs")),
+            FileChange::Created(base.join(".cxpak/cache/root/detail.md")),
+            FileChange::Removed(base.join(".git/index")),
+        ];
+        let (modified, removed) = classify_changes(&changes, base);
+
+        assert!(modified.contains("src/main.rs"), "tracked source kept");
+        assert!(
+            !modified.iter().any(|p| p.starts_with("target")),
+            "target/ dropped: {modified:?}"
+        );
+        assert!(
+            !modified.iter().any(|p| p.contains("cxpak")),
+            ".cxpak/ dropped: {modified:?}"
+        );
+        assert!(removed.is_empty(), ".git/ dropped: {removed:?}");
+    }
+
+    #[test]
+    fn test_classify_changes_skips_builtin_noise_not_gitignored() {
+        // BUILTIN_IGNORES files are committed (NOT git-ignored) but the initial
+        // Scanner excludes them, so the watcher must too — otherwise Cargo.lock
+        // churn on every `cargo build`, images, and minified/dist artifacts leak
+        // into the live index. .gitignore here deliberately lists ONLY /target,
+        // so the git-only filter would have let all of these through.
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
+        let base = dir.path();
+
+        let changes = vec![
+            FileChange::Modified(base.join("Cargo.lock")),
+            FileChange::Modified(base.join("package-lock.json")),
+            FileChange::Created(base.join("assets/logo.png")),
+            FileChange::Created(base.join("web/dist/app.min.js")),
+            FileChange::Created(base.join(".DS_Store")),
+            FileChange::Modified(base.join("src/main.rs")),
+        ];
+        let (modified, _removed) = classify_changes(&changes, base);
+
+        assert!(modified.contains("src/main.rs"), "real source kept");
+        for noise in [
+            "cargo.lock",
+            "package-lock.json",
+            "logo.png",
+            "min.js",
+            "dist/",
+            ".ds_store",
+        ] {
+            assert!(
+                !modified.iter().any(|p| p.contains(noise)),
+                "builtin noise {noise:?} must be dropped: {modified:?}"
+            );
+        }
     }
 
     #[test]

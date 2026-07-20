@@ -1,6 +1,6 @@
 [package]
 name = "cxpak"
-version = "3.1.1"
+version = "3.1.2"
 edition = "2021"
 rust-version = "1.91"
 description = "Spends CPU cycles so you don't spend tokens. The LLM gets a briefing packet instead of a flashlight in a dark room."
