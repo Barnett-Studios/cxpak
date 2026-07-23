@@ -45,8 +45,14 @@ pub struct CodebaseIndex {
     /// [`crate::core_graph::graph::EdgeType::CrossLanguage`] edge so existing
     /// blast-radius / PageRank / auto_context pipelines pick them up.
     pub cross_lang_edges: Vec<CrossLangEdge>,
+    /// Similarity signal #7 (opt-in via `.cxpak.json`; ADR-0186). Wrapped in
+    /// `Arc` (issue #47 / ADR-0205) so cloning a `CodebaseIndex` — which the MCP
+    /// freshness watcher does per edit batch — bumps a refcount instead of
+    /// deep-copying the flat `Vec<f32>` matrix (`EmbeddingIndex::vectors`), the
+    /// dominant `MALLOC_LARGE` allocation class. Nulling to `None` on the
+    /// 6-signal-fallback path (ADR-0200) then drops that single shared ref.
     #[cfg(feature = "embeddings")]
-    pub embedding_index: Option<crate::embeddings::EmbeddingIndex>,
+    pub embedding_index: Option<Arc<crate::embeddings::EmbeddingIndex>>,
     /// Memoized `detect_dead_code(self, None)` result. Populated lazily on
     /// first call to `CodebaseIndex::dead_code_cached` (the orchestration method
     /// defined in `crate`'s index module). Shared across clones via `Arc`, so any

@@ -1141,7 +1141,9 @@ mod tests {
     fn test_embedding_similarity_no_query_embedding() {
         let counter = TokenCounter::new();
         let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
-        index.embedding_index = Some(crate::embeddings::EmbeddingIndex::new(3));
+        index.embedding_index = Some(std::sync::Arc::new(crate::embeddings::EmbeddingIndex::new(
+            3,
+        )));
         let result = embedding_similarity_signal(None, "any.rs", &index);
         assert_eq!(result.score, 0.5);
         assert_eq!(result.detail, "no query embedding");
@@ -1154,7 +1156,7 @@ mod tests {
         let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
         let mut emb = crate::embeddings::EmbeddingIndex::new(3);
         emb.add("src/api.rs", vec![1.0, 0.0, 0.0]);
-        index.embedding_index = Some(emb);
+        index.embedding_index = Some(std::sync::Arc::new(emb));
         let result = embedding_similarity_signal(Some(&[1.0, 0.0, 0.0]), "src/api.rs", &index);
         assert_eq!(result.name, "embedding_similarity");
         assert!(
@@ -1172,7 +1174,7 @@ mod tests {
         let mut index = CodebaseIndex::build(vec![], HashMap::new(), &counter);
         let mut emb = crate::embeddings::EmbeddingIndex::new(3);
         emb.add("src/other.rs", vec![1.0, 0.0, 0.0]);
-        index.embedding_index = Some(emb);
+        index.embedding_index = Some(std::sync::Arc::new(emb));
         let result = embedding_similarity_signal(Some(&[1.0, 0.0, 0.0]), "src/missing.rs", &index);
         assert_eq!(result.score, 0.5);
         assert_eq!(result.detail, "file not in embedding index");

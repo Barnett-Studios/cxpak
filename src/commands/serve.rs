@@ -2454,7 +2454,7 @@ fn publish_ready_enriched(
     emb: crate::embeddings::EmbeddingIndex,
 ) {
     let mut enriched = (**base).clone();
-    enriched.embedding_index = Some(emb);
+    enriched.embedding_index = Some(Arc::new(emb));
     let next = IndexReadiness::ReadyEnriched(Arc::new(enriched));
 
     let mut guard = match readiness.write() {
@@ -2529,25 +2529,6 @@ fn classify_watcher_wait(state: &IndexReadiness) -> WatcherWait {
 /// the full build.
 const WATCHER_WAIT_POLL: Duration = Duration::from_millis(100);
 
-/// Build the `Ready(..)` payload for a watcher republish: snapshot the
-/// mirrored `SharedIndex` and actively clear `embedding_index`.
-///
-/// A delta-rebuilt clone otherwise carries the *stale* enrichment forward —
-/// scoring the 7th signal against pre-edit embedded text would be worse than
-/// not having it (ADR-0200 Consequences). Extracted so the clearing behavior
-/// is unit-testable without a real edit + `FileWatcher` cycle.
-fn republish_watcher_index(shared: &SharedIndex) -> Arc<CodebaseIndex> {
-    let mut idx = match shared.read() {
-        Ok(g) => (**g).clone(),
-        Err(poisoned) => (**poisoned.into_inner()).clone(),
-    };
-    #[cfg(feature = "embeddings")]
-    {
-        idx.embedding_index = None;
-    }
-    Arc::new(idx)
-}
-
 /// Spawn the MCP freshness watcher (Task #18, ADR-0200).
 ///
 /// Owns its lifecycle end to end — it is NOT a verbatim reuse of HTTP `run`'s
@@ -2564,10 +2545,11 @@ fn republish_watcher_index(shared: &SharedIndex) -> Arc<CodebaseIndex> {
 ///    `FileWatcher` + `process_watcher_changes` loop HTTP `run` uses — but
 ///    terminable: `shutdown` is checked at each `recv_timeout(1s)` poll, not
 ///    just at process exit.
-/// 3. Each republish clears `embedding_index` on the rebuilt index (see
-///    [`republish_watcher_index`]) and swaps a fresh `Ready(..)` into
-///    `readiness` — never `ReadyEnriched`; a swap downgrades to the
-///    documented 6-signal fallback until a future re-enrich lands.
+/// 3. Each rebuild clears `embedding_index` before the swap (inside
+///    [`process_watcher_changes`], issue #47 / ADR-0205) and publishes the
+///    same freshly-swapped `Arc` as a `Ready(..)` into `readiness` — never
+///    `ReadyEnriched`; a swap downgrades to the documented 6-signal fallback
+///    until a future re-enrich lands. No second whole-index deep clone.
 ///
 /// `#[doc(hidden)] pub` (not private) so integration tests can drive the real
 /// `FileWatcher` end-to-end without spawning a subprocess, matching the
@@ -2639,12 +2621,14 @@ pub fn spawn_mcp_watcher(
             let mut changes = vec![first];
             std::thread::sleep(Duration::from_millis(50));
             changes.extend(watcher.drain());
-            process_watcher_changes(&changes, &path, &shared);
-
-            let republished = republish_watcher_index(&shared);
-            match readiness.write() {
-                Ok(mut g) => *g = IndexReadiness::Ready(republished),
-                Err(poisoned) => *poisoned.into_inner() = IndexReadiness::Ready(republished),
+            // Publish the exact `Arc` the rebuild swapped into `shared` (already
+            // embeddings-free per ADR-0200). `None` = nothing relevant changed,
+            // so the prior `readiness` cell stands (issue #47 / ADR-0205).
+            if let Some(republished) = process_watcher_changes(&changes, &path, &shared) {
+                match readiness.write() {
+                    Ok(mut g) => *g = IndexReadiness::Ready(republished),
+                    Err(poisoned) => *poisoned.into_inner() = IndexReadiness::Ready(republished),
+                }
             }
         }
     })
@@ -4505,7 +4489,7 @@ pub fn process_watcher_changes(
     changes: &[crate::daemon::watcher::FileChange],
     base_path: &Path,
     shared: &SharedIndex,
-) {
+) -> Option<Arc<CodebaseIndex>> {
     let (modified_paths, removed_paths) = classify_changes(changes, base_path);
 
     // Nothing the index cares about changed — every event was a git-ignored
@@ -4513,7 +4497,7 @@ pub fn process_watcher_changes(
     // the common case for editor/build churn under the watched root. Return
     // before the expensive full-index deep clone below.
     if modified_paths.is_empty() && removed_paths.is_empty() {
-        return;
+        return None;
     }
 
     // Snapshot-then-swap: clone the inner Arc under the read lock (O(1)),
@@ -4523,7 +4507,7 @@ pub fn process_watcher_changes(
     // blocked, never returning torn state.
     let snapshot: Arc<CodebaseIndex> = match shared.read() {
         Ok(g) => Arc::clone(&*g),
-        Err(_) => return, // poisoned lock — nothing to do
+        Err(_) => return None, // poisoned lock — nothing to do
     };
     let mut next: CodebaseIndex = (*snapshot).clone();
     drop(snapshot);
@@ -4531,7 +4515,7 @@ pub fn process_watcher_changes(
     let update_count =
         apply_incremental_update(&mut next, base_path, &modified_paths, &removed_paths);
     if update_count == 0 {
-        return;
+        return None;
     }
     // Edge-delta graph rebuild + warm-started PageRank (ADR-0165/0166): work
     // proportional to the change for the common content-edit case, falling back
@@ -4567,15 +4551,30 @@ pub fn process_watcher_changes(
     next.dead_code_cache = std::sync::Arc::new(std::sync::OnceLock::new());
     next.health_cache = std::sync::Arc::new(std::sync::OnceLock::new());
 
+    // 6-signal fallback (ADR-0200): a delta-rebuilt clone otherwise carries the
+    // *stale* pre-edit enrichment forward — scoring the similarity signal against
+    // pre-edit embedded text is worse than not having it. Clear it HERE, once,
+    // before the swap, so the `shared` mirror and the `readiness` cell the caller
+    // republishes both point at ONE embeddings-free `Arc` (issue #47 / ADR-0205).
+    // This replaces the former `republish_watcher_index`, which produced the same
+    // effect via a redundant second whole-index deep clone every batch.
+    #[cfg(feature = "embeddings")]
+    {
+        next.embedding_index = None;
+    }
+
     let total_files = next.total_files;
     let total_tokens = next.total_tokens;
     let new_arc = Arc::new(next);
     if let Ok(mut g) = shared.write() {
-        *g = new_arc;
+        *g = Arc::clone(&new_arc);
     }
     eprintln!(
         "cxpak: updated {update_count} file(s), {total_files} files / {total_tokens} tokens total"
     );
+    // Hand the freshly-swapped `Arc` back so the watcher publishes exactly this
+    // index into `readiness` — no second deep clone (issue #47 / ADR-0205).
+    Some(new_arc)
 }
 
 fn mcp_error_response(id: Option<Value>, code: i32, message: &str) -> Value {
@@ -4986,26 +4985,110 @@ mod tests {
         ));
     }
 
-    /// finding M5: a watcher republish must actively clear `embedding_index`,
-    /// not carry it forward stale. Exercises `republish_watcher_index`
-    /// directly (the function `spawn_mcp_watcher`'s loop calls on every
-    /// debounced batch) — deterministic, no real edit or `FileWatcher` needed.
+    /// finding M5 + issue #47 / ADR-0205: a watcher rebuild must actively clear
+    /// `embedding_index` (never carry stale enrichment forward, ADR-0200) AND
+    /// publish the *same* freshly-swapped `Arc` it wrote into `shared` — no
+    /// second whole-index deep clone. Drives `process_watcher_changes` (which
+    /// now owns the clearing, replacing the deleted `republish_watcher_index`)
+    /// with a real edit; deterministic, no `FileWatcher` needed.
     #[cfg(feature = "embeddings")]
     #[test]
-    fn mcp_watcher_swap_clears_embedding() {
+    fn process_watcher_changes_clears_embedding_and_publishes_single_arc() {
+        use crate::daemon::watcher::FileChange;
+
+        // Seed `shared` from an enriched index (the first-batch-after-enrich
+        // case: the watcher mirror is seeded from `ReadyEnriched`).
         let mut idx = make_test_index();
         let mut emb = crate::embeddings::EmbeddingIndex::new(3);
         emb.add("src/main.rs".to_string(), vec![0.1, 0.2, 0.3]);
-        idx.embedding_index = Some(emb);
+        idx.embedding_index = Some(Arc::new(emb));
         assert!(idx.has_embedding_index());
         let shared: SharedIndex = Arc::new(RwLock::new(Arc::new(idx)));
 
-        let republished = republish_watcher_index(&shared);
+        // A real, non-ignored edit under the watched root forces a swap.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("added.rs");
+        std::fs::write(&file_path, "fn added() {}").unwrap();
+        let changes = vec![FileChange::Modified(file_path)];
+
+        let published = process_watcher_changes(&changes, dir.path(), &shared)
+            .expect("a real edit must publish a fresh index");
+
+        // ADR-0200: the republished index is the 6-signal fallback.
+        assert!(
+            !published.has_embedding_index(),
+            "a watcher rebuild must clear embedding_index, not carry it stale"
+        );
+        // issue #47: the published Arc IS the one swapped into `shared` — the
+        // caller republishes it verbatim, so there is no second deep clone.
+        let in_shared = Arc::clone(&shared.read().unwrap());
+        assert!(
+            Arc::ptr_eq(&published, &in_shared),
+            "published index must be the exact Arc swapped into `shared`, \
+             not an independent second deep clone"
+        );
+    }
+
+    /// issue #47 / ADR-0205: cloning a `CodebaseIndex` — which
+    /// `process_watcher_changes` does once per edit batch — must NOT deep-copy
+    /// the embedding matrix. With `embedding_index: Option<Arc<EmbeddingIndex>>`
+    /// the clone bumps a refcount; this test proves the matrix is shared, not
+    /// duplicated. (Fails to COMPILE on the pre-fix non-`Arc` field — the
+    /// strongest possible regression guard.)
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn embedding_index_clone_shares_matrix_not_copies() {
+        let mut idx = make_test_index();
+        let mut emb = crate::embeddings::EmbeddingIndex::new(3);
+        emb.add("src/main.rs".to_string(), vec![0.1, 0.2, 0.3]);
+        idx.embedding_index = Some(Arc::new(emb));
+
+        let arc_idx = Arc::new(idx);
+        let inner_emb: Arc<crate::embeddings::EmbeddingIndex> =
+            Arc::clone(arc_idx.embedding_index.as_ref().unwrap());
+        // arc_idx holds one ref, inner_emb holds one → 2.
+        assert_eq!(Arc::strong_count(&inner_emb), 2);
+
+        // The per-batch deep clone of the whole index.
+        let cloned = (*arc_idx).clone();
+        assert_eq!(
+            Arc::strong_count(&inner_emb),
+            3,
+            "cloning CodebaseIndex must bump the embedding Arc refcount, \
+             not deep-copy the Vec<f32> matrix"
+        );
+        drop(cloned);
+        assert_eq!(Arc::strong_count(&inner_emb), 2);
+    }
+
+    /// issue #47 memory ceiling: an ignored-only batch must publish nothing
+    /// (`None`), leaving the prior `readiness`/`shared` Arcs untouched — no new
+    /// index version is allocated per spurious wake. Proven via `Arc::ptr_eq`.
+    #[test]
+    fn process_watcher_changes_ignored_only_publishes_none() {
+        use crate::daemon::watcher::FileChange;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target\n.cxpak/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        let ignored = dir.path().join("target/debug/build-artifact.rs");
+        std::fs::write(&ignored, "fn junk() {}").unwrap();
+
+        let shared = make_shared_index();
+        let before = Arc::clone(&shared.read().unwrap());
+        let changes = vec![FileChange::Modified(ignored)];
+
+        let published = process_watcher_changes(&changes, dir.path(), &shared);
 
         assert!(
-            !republished.has_embedding_index(),
-            "a watcher republish must actively clear embedding_index, not \
-             carry it forward stale"
+            published.is_none(),
+            "an ignored-only batch must publish nothing"
+        );
+        let after = Arc::clone(&shared.read().unwrap());
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an ignored-only batch must not swap (or allocate) a new index version"
         );
     }
 
