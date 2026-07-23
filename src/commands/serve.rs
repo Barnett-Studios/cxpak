@@ -5092,15 +5092,21 @@ mod tests {
         );
     }
 
-    /// issue #47 P1 (ADR-0205): the memory ceiling. The watcher must not
-    /// accumulate index versions across batches. After each real edit,
-    /// `shared` and `readiness` hold the *same* `Arc` (a single publish, no
-    /// second clone), so exactly one index version is live no matter how many
-    /// batches run — `Arc::strong_count` returns to a fixed baseline every
-    /// batch. This is the demonstration (not just assertion) that the footprint
-    /// is bounded. It fails on the pre-fix design, where `process_watcher_changes`
-    /// and `republish_watcher_index` produced two INDEPENDENT deep clones, so
-    /// `shared` and `readiness` diverged (no `ptr_eq`, baseline count of 2 not 3).
+    /// issue #47 P1 (ADR-0205): the single-publish invariant behind the memory
+    /// ceiling. After each real edit, `shared` and `readiness` hold the *same*
+    /// `Arc` (a single publish, no divergent second clone), so the current
+    /// generation has a fixed holder set no matter how many batches run —
+    /// `Arc::strong_count` returns to the same baseline (shared + readiness +
+    /// the local `cur`) and `ptr_eq` confirms the two cells share one pointer.
+    ///
+    /// Scope: this pins the *current-generation* holder count, which is what the
+    /// double-clone bug inflated — it does NOT by itself measure total heap. It
+    /// cannot catch a hypothetical version-history collection or an external
+    /// holder pinning an old `Arc` (ADR-0205 "Revisit if" — a slow MCP handler);
+    /// both would leave this baseline unchanged. It fails on the pre-fix design,
+    /// where `process_watcher_changes` and `republish_watcher_index` produced two
+    /// INDEPENDENT deep clones, so `shared` and `readiness` diverged (no `ptr_eq`,
+    /// baseline count of 2 not 3).
     #[test]
     fn watcher_does_not_accumulate_index_versions_across_batches() {
         use crate::daemon::watcher::FileChange;
