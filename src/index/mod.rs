@@ -90,7 +90,7 @@ impl CodebaseIndex {
                 .map(|d| d.as_secs());
 
             let parse_result = parse_results.get(&file.relative_path).cloned();
-            indexed_files.push(IndexedFile {
+            indexed_files.push(Arc::new(IndexedFile {
                 relative_path: file.relative_path.clone(),
                 language: file.language.clone(),
                 size_bytes: file.size_bytes,
@@ -98,7 +98,7 @@ impl CodebaseIndex {
                 parse_result,
                 content,
                 mtime_secs,
-            });
+            }));
         }
 
         let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
@@ -212,7 +212,7 @@ impl CodebaseIndex {
                 .map(|d| d.as_secs());
 
             let parse_result = parse_results.get(&file.relative_path).cloned();
-            indexed_files.push(IndexedFile {
+            indexed_files.push(Arc::new(IndexedFile {
                 relative_path: file.relative_path.clone(),
                 language: file.language.clone(),
                 size_bytes: file.size_bytes,
@@ -220,7 +220,7 @@ impl CodebaseIndex {
                 parse_result,
                 content: file_content,
                 mtime_secs,
-            });
+            }));
         }
 
         let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
@@ -494,7 +494,7 @@ impl CodebaseIndex {
         self.total_tokens += token_count;
         self.total_bytes += size_bytes;
 
-        self.files.push(IndexedFile {
+        self.files.push(Arc::new(IndexedFile {
             relative_path: relative_path.to_string(),
             language: language.map(|s| s.to_string()),
             size_bytes,
@@ -502,7 +502,7 @@ impl CodebaseIndex {
             parse_result,
             content: content.to_string(),
             mtime_secs,
-        });
+        }));
 
         self.total_files = self.files.len();
         self.term_frequencies
@@ -702,24 +702,26 @@ mod tests {
         let mut idx = CodebaseIndex::empty();
         idx.files = spec
             .iter()
-            .map(|(path, imports)| IndexedFile {
-                relative_path: path.to_string(),
-                language: Some("rust".to_string()),
-                size_bytes: 0,
-                token_count: 0,
-                parse_result: Some(ParseResult {
-                    symbols: vec![],
-                    imports: imports
-                        .iter()
-                        .map(|s| Import {
-                            source: (*s).to_string(),
-                            names: vec![],
-                        })
-                        .collect(),
-                    exports: vec![],
-                }),
-                content: String::new(),
-                mtime_secs: None,
+            .map(|(path, imports)| {
+                Arc::new(IndexedFile {
+                    relative_path: path.to_string(),
+                    language: Some("rust".to_string()),
+                    size_bytes: 0,
+                    token_count: 0,
+                    parse_result: Some(ParseResult {
+                        symbols: vec![],
+                        imports: imports
+                            .iter()
+                            .map(|s| Import {
+                                source: (*s).to_string(),
+                                names: vec![],
+                            })
+                            .collect(),
+                        exports: vec![],
+                    }),
+                    content: String::new(),
+                    mtime_secs: None,
+                })
             })
             .collect();
         idx.total_files = idx.files.len();
@@ -773,7 +775,7 @@ mod tests {
             .iter_mut()
             .find(|f| f.relative_path == "src/a.rs")
         {
-            f.parse_result.as_mut().unwrap().imports = vec![Import {
+            Arc::make_mut(f).parse_result.as_mut().unwrap().imports = vec![Import {
                 source: "crate::c".to_string(),
                 names: vec![],
             }];
@@ -1568,7 +1570,7 @@ mod tests {
             index.files[0].mtime_secs.is_some(),
             "precondition: disk build populates mtime"
         );
-        index.files[0].mtime_secs = None;
+        Arc::make_mut(&mut index.files[0]).mtime_secs = None;
 
         let current = vec![ScannedFile {
             relative_path: "a.rs".into(),

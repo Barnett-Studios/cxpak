@@ -109,16 +109,18 @@ impl IndexBuilder {
         index.files = self
             .files
             .iter()
-            .map(|name| IndexedFile {
-                relative_path: name.clone(),
-                language: Some("rust".to_string()),
-                size_bytes: 0,
-                token_count: 0,
-                parse_result: None,
-                // No `#[cfg(test)]` marker → `has_inline_tests` is false →
-                // every synthetic file is untested (test_penalty = 1.0).
-                content: String::new(),
-                mtime_secs: None,
+            .map(|name| {
+                std::sync::Arc::new(IndexedFile {
+                    relative_path: name.clone(),
+                    language: Some("rust".to_string()),
+                    size_bytes: 0,
+                    token_count: 0,
+                    parse_result: None,
+                    // No `#[cfg(test)]` marker → `has_inline_tests` is false →
+                    // every synthetic file is untested (test_penalty = 1.0).
+                    content: String::new(),
+                    mtime_secs: None,
+                })
             })
             .collect();
         index.total_files = index.files.len();

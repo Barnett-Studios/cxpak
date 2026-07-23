@@ -123,7 +123,7 @@ pub fn find_indexed_file<'a>(
     uri_path: &str,
     index: &'a crate::index::CodebaseIndex,
     repo_root: &Path,
-) -> Option<&'a crate::index::IndexedFile> {
+) -> Option<&'a std::sync::Arc<crate::index::IndexedFile>> {
     let url = Url::parse(uri_path).ok();
     let rel_opt = url.as_ref().and_then(|u| uri_to_rel_path(u, repo_root));
     index.files.iter().find(|f| {

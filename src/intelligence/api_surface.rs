@@ -105,7 +105,7 @@ pub fn extract_public_symbols(
     let mut token_count = 0usize;
 
     // Collect files with public symbols, sorted by pagerank descending.
-    let mut files_with_symbols: Vec<(&crate::core_graph::IndexedFile, f64)> = index
+    let mut files_with_symbols: Vec<(&std::sync::Arc<crate::core_graph::IndexedFile>, f64)> = index
         .files
         .iter()
         .filter(|f| {

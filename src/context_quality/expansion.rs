@@ -563,7 +563,7 @@ pub fn expand_query(query: &str, domains: &HashSet<Domain>) -> HashSet<String> {
 
 /// Detect which domains are present in the given set of indexed files based on
 /// file extensions and path segments.
-pub fn detect_domains(files: &[crate::index::IndexedFile]) -> HashSet<Domain> {
+pub fn detect_domains(files: &[std::sync::Arc<crate::index::IndexedFile>]) -> HashSet<Domain> {
     let mut domains = HashSet::new();
 
     for file in files {
@@ -644,8 +644,8 @@ mod tests {
     use super::*;
 
     // Helper: build a minimal IndexedFile with only a relative_path.
-    fn make_file(path: &str) -> crate::index::IndexedFile {
-        crate::index::IndexedFile {
+    fn make_file(path: &str) -> std::sync::Arc<crate::index::IndexedFile> {
+        std::sync::Arc::new(crate::index::IndexedFile {
             relative_path: path.to_string(),
             language: None,
             size_bytes: 0,
@@ -653,7 +653,7 @@ mod tests {
             parse_result: None,
             content: String::new(),
             mtime_secs: None,
-        }
+        })
     }
 
     // -----------------------------------------------------------------------

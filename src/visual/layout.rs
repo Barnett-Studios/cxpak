@@ -910,7 +910,7 @@ pub fn build_file_layout(
     config: &LayoutConfig,
 ) -> Result<ComputedLayout, LayoutError> {
     // Filter files to this module.
-    let module_files: Vec<&crate::index::IndexedFile> = index
+    let module_files: Vec<&std::sync::Arc<crate::index::IndexedFile>> = index
         .files
         .iter()
         .filter(|f| file_module_prefix(&f.relative_path) == module_prefix)

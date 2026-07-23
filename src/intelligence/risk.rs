@@ -108,7 +108,7 @@ pub fn compute_risk_ranking(index: &CodebaseIndex) -> Vec<RiskEntry> {
                     .files
                     .iter()
                     .find(|f| f.relative_path == path)
-                    .map(has_inline_tests)
+                    .map(|f| has_inline_tests(f))
                     .unwrap_or(false);
             let test_coverage = if has_test { 1.0 } else { 0.0 };
 
@@ -322,9 +322,9 @@ mod tests {
         // Manually store the content so has_inline_tests can read it
         for file in &mut index.files {
             if file.relative_path == "a.rs" {
-                file.content = content_a.to_string();
+                std::sync::Arc::make_mut(file).content = content_a.to_string();
             } else {
-                file.content = content_b.to_string();
+                std::sync::Arc::make_mut(file).content = content_b.to_string();
             }
         }
         // Ensure test_map is empty so the only path to tc=1.0 is inline tests

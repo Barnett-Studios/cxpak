@@ -879,8 +879,8 @@ pub fn process_input(data: String) {
         path: &str,
         content: &str,
         symbols: Vec<crate::parser::language::Symbol>,
-    ) -> crate::core_graph::IndexedFile {
-        crate::core_graph::IndexedFile {
+    ) -> std::sync::Arc<crate::core_graph::IndexedFile> {
+        std::sync::Arc::new(crate::core_graph::IndexedFile {
             relative_path: path.to_string(),
             language: Some("rust".into()),
             size_bytes: content.len() as u64,
@@ -892,7 +892,7 @@ pub fn process_input(data: String) {
             }),
             content: content.to_string(),
             mtime_secs: None,
-        }
+        })
     }
 
     fn make_pub_symbol(name: &str) -> crate::parser::language::Symbol {
@@ -977,7 +977,7 @@ pub fn process_input(data: String) {
             .files
             .push(make_indexed_file("src/routes.js", content, vec![]));
         // Override language to JS so detect_routes matches
-        index.files[0].language = Some("javascript".into());
+        std::sync::Arc::make_mut(&mut index.files[0]).language = Some("javascript".into());
 
         let surface = build_security_surface(&index, DEFAULT_AUTH_PATTERNS, None);
         assert!(

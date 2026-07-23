@@ -49,8 +49,13 @@ fn users_table() -> TableSchema {
     }
 }
 
-fn indexed_file(path: &str, lang: &str, content: &str, symbols: Vec<Symbol>) -> IndexedFile {
-    IndexedFile {
+fn indexed_file(
+    path: &str,
+    lang: &str,
+    content: &str,
+    symbols: Vec<Symbol>,
+) -> std::sync::Arc<IndexedFile> {
+    std::sync::Arc::new(IndexedFile {
         relative_path: path.to_string(),
         language: Some(lang.to_string()),
         size_bytes: content.len() as u64,
@@ -62,7 +67,7 @@ fn indexed_file(path: &str, lang: &str, content: &str, symbols: Vec<Symbol>) -> 
         }),
         content: content.to_string(),
         mtime_secs: None,
-    }
+    })
 }
 
 fn symbol(name: &str, body: &str) -> Symbol {
@@ -80,7 +85,7 @@ fn symbol(name: &str, body: &str) -> Symbol {
 /// A schema + source fixture: a `users` table, a query selecting `email`, an
 /// ORM model with an `email` field, an endpoint handler, and a test — plus a
 /// SEPARATE file that only touches `name`.
-fn fixture() -> (Vec<IndexedFile>, SchemaIndex) {
+fn fixture() -> (Vec<std::sync::Arc<IndexedFile>>, SchemaIndex) {
     let mut schema = SchemaIndex::empty();
     schema.tables.insert("users".to_string(), users_table());
     schema.orm_models.insert(

@@ -68,8 +68,8 @@ use std::collections::HashSet;
 
 /// A Rust `IndexedFile` at `src/{stem}.rs` importing each `imports` stem via
 /// `crate::{stem}` (which `resolve_rust_import` maps back to `src/{stem}.rs`).
-fn rust_file(stem: &str, imports: &[&str]) -> IndexedFile {
-    IndexedFile {
+fn rust_file(stem: &str, imports: &[&str]) -> std::sync::Arc<IndexedFile> {
+    std::sync::Arc::new(IndexedFile {
         relative_path: format!("src/{stem}.rs"),
         language: Some("rust".to_string()),
         size_bytes: 0,
@@ -87,11 +87,11 @@ fn rust_file(stem: &str, imports: &[&str]) -> IndexedFile {
         }),
         content: String::new(),
         mtime_secs: None,
-    }
+    })
 }
 
 /// Build a fresh `CodebaseIndex` over `files` with a full graph (the oracle).
-fn index_from_files(files: Vec<IndexedFile>) -> CodebaseIndex {
+fn index_from_files(files: Vec<std::sync::Arc<IndexedFile>>) -> CodebaseIndex {
     let mut idx = CodebaseIndex::empty();
     idx.total_files = files.len();
     idx.files = files;
@@ -118,7 +118,8 @@ proptest::proptest! {
             UNIVERSE.iter().map(|s| (*s, Some(Vec::new()))).collect();
 
         // Delta index starts as the full base and is maintained incrementally.
-        let base_files: Vec<IndexedFile> = UNIVERSE.iter().map(|s| rust_file(s, &[])).collect();
+        let base_files: Vec<std::sync::Arc<IndexedFile>> =
+            UNIVERSE.iter().map(|s| rust_file(s, &[])).collect();
         let mut delta_idx = index_from_files(base_files);
 
         for (i, action) in &ops {
@@ -157,7 +158,7 @@ proptest::proptest! {
         }
 
         // Oracle: full rebuild over the final state.
-        let final_files: Vec<IndexedFile> = UNIVERSE
+        let final_files: Vec<std::sync::Arc<IndexedFile>> = UNIVERSE
             .iter()
             .filter_map(|s| state[*s].as_ref().map(|imps| rust_file(s, imps)))
             .collect();
@@ -380,7 +381,7 @@ fn cache_is_portable_across_paths() {
 fn delta_with_schema_falls_back_and_preserves_fk_edge() {
     // orders.sql has an FK to customers.sql; app.rs is an unrelated Rust file.
     let files = vec![
-        IndexedFile {
+        std::sync::Arc::new(IndexedFile {
             relative_path: "src/orders.sql".to_string(),
             language: Some("sql".to_string()),
             size_bytes: 0,
@@ -388,8 +389,8 @@ fn delta_with_schema_falls_back_and_preserves_fk_edge() {
             parse_result: None,
             content: String::new(),
             mtime_secs: None,
-        },
-        IndexedFile {
+        }),
+        std::sync::Arc::new(IndexedFile {
             relative_path: "src/customers.sql".to_string(),
             language: Some("sql".to_string()),
             size_bytes: 0,
@@ -397,7 +398,7 @@ fn delta_with_schema_falls_back_and_preserves_fk_edge() {
             parse_result: None,
             content: String::new(),
             mtime_secs: None,
-        },
+        }),
         rust_file("app", &[]),
     ];
 

@@ -3559,7 +3559,7 @@ fn dispatch_capability_op(
                             FileRole::Dependency => 0.5,
                         };
                         indexed_targets.push((
-                            &index.files[idx],
+                            index.files[idx].as_ref(),
                             *role,
                             score,
                             parent.clone(),
@@ -5090,6 +5090,60 @@ mod tests {
             Arc::ptr_eq(&before, &after),
             "an ignored-only batch must not swap (or allocate) a new index version"
         );
+    }
+
+    /// issue #47 P1 (ADR-0205): the memory ceiling. The watcher must not
+    /// accumulate index versions across batches. After each real edit,
+    /// `shared` and `readiness` hold the *same* `Arc` (a single publish, no
+    /// second clone), so exactly one index version is live no matter how many
+    /// batches run — `Arc::strong_count` returns to a fixed baseline every
+    /// batch. This is the demonstration (not just assertion) that the footprint
+    /// is bounded. It fails on the pre-fix design, where `process_watcher_changes`
+    /// and `republish_watcher_index` produced two INDEPENDENT deep clones, so
+    /// `shared` and `readiness` diverged (no `ptr_eq`, baseline count of 2 not 3).
+    #[test]
+    fn watcher_does_not_accumulate_index_versions_across_batches() {
+        use crate::daemon::watcher::FileChange;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = make_shared_index();
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Ready(Arc::clone(
+            &shared.read().unwrap(),
+        ))));
+
+        for i in 0..25 {
+            let f = dir.path().join(format!("f{i}.rs"));
+            std::fs::write(&f, format!("fn g{i}() {{}}")).unwrap();
+            let changes = vec![FileChange::Modified(f)];
+
+            if let Some(published) = process_watcher_changes(&changes, dir.path(), &shared) {
+                match readiness.write() {
+                    Ok(mut g) => *g = IndexReadiness::Ready(published),
+                    Err(p) => *p.into_inner() = IndexReadiness::Ready(published),
+                }
+            }
+
+            // Holders of the current index version: `shared`, `readiness`, and
+            // the local `cur` clone → exactly 3, every batch. A count that
+            // grows with `i` would mean old versions are being retained.
+            let cur = Arc::clone(&shared.read().unwrap());
+            assert_eq!(
+                Arc::strong_count(&cur),
+                3,
+                "batch {i}: exactly one index version must be live \
+                 (shared + readiness + local), found {}",
+                Arc::strong_count(&cur)
+            );
+            match &*readiness.read().unwrap() {
+                IndexReadiness::Ready(r) => assert!(
+                    Arc::ptr_eq(r, &cur),
+                    "batch {i}: `shared` and `readiness` must share ONE Arc \
+                     (single publish, no second deep clone)"
+                ),
+                _ => panic!("batch {i}: readiness must be Ready after an edit"),
+            }
+            drop(cur);
+        }
     }
 
     /// Deterministic: the shutdown signal is already set before the watcher's

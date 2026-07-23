@@ -1,5 +1,6 @@
 use crate::core_graph::IndexedFile;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 // `TestFileRef`/`TestConfidence` are data-model types now in `core_graph`
 // (cxpak 3.0.0 Phase 0 de-cycle); the mapping logic below stays here.
@@ -164,7 +165,7 @@ fn general_test_candidates(filename_no_ext: &str, dir_prefix: &str, ext: &str) -
 /// For each test file (identified by path containing `test`, `spec`, or `__tests__`),
 /// examine imports and resolve them back to source file paths. Returns a map of
 /// source_path -> Vec<TestFileRef>.
-pub fn find_test_files_by_imports(files: &[IndexedFile]) -> HashMap<String, Vec<TestFileRef>> {
+pub fn find_test_files_by_imports(files: &[Arc<IndexedFile>]) -> HashMap<String, Vec<TestFileRef>> {
     // Build a lookup set of all file paths for fast resolution
     let all_paths: HashSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
 
@@ -220,7 +221,7 @@ pub fn find_test_files_by_imports(files: &[IndexedFile]) -> HashMap<String, Vec<
 /// Combines naming-convention matching and import-based matching. When the same
 /// test file is found by both methods, its confidence is upgraded to `Both`.
 pub fn build_test_map(
-    files: &[IndexedFile],
+    files: &[Arc<IndexedFile>],
     all_paths: &HashSet<String>,
 ) -> HashMap<String, Vec<TestFileRef>> {
     let mut map: HashMap<String, Vec<TestFileRef>> = HashMap::new();
@@ -275,8 +276,8 @@ mod tests {
         paths.iter().map(|s| s.to_string()).collect()
     }
 
-    fn make_file(path: &str, imports: Vec<Import>) -> IndexedFile {
-        IndexedFile {
+    fn make_file(path: &str, imports: Vec<Import>) -> Arc<IndexedFile> {
+        Arc::new(IndexedFile {
             relative_path: path.to_string(),
             language: None,
             size_bytes: 0,
@@ -288,7 +289,7 @@ mod tests {
             }),
             content: String::new(),
             mtime_secs: None,
-        }
+        })
     }
 
     fn make_import(source: &str) -> Import {

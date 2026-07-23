@@ -1688,7 +1688,7 @@ pub fn build_dashboard_data(index: &CodebaseIndex) -> DashboardData {
                     .files
                     .iter()
                     .find(|f| f.relative_path == e.path)
-                    .map(crate::intelligence::health::has_inline_tests)
+                    .map(|f| crate::intelligence::health::has_inline_tests(f))
                     .unwrap_or(false);
             let severity = risk_severity(e.risk_score).to_string();
             RiskDisplayEntry {

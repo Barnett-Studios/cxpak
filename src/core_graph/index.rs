@@ -25,7 +25,7 @@ use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone)]
 pub struct CodebaseIndex {
-    pub files: Vec<IndexedFile>,
+    pub files: Vec<Arc<IndexedFile>>,
     pub language_stats: HashMap<String, LanguageStats>,
     pub total_files: usize,
     pub total_bytes: u64,

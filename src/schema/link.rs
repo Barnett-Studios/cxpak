@@ -3,6 +3,7 @@
 use crate::schema::{EdgeConfidence, EdgeType, SchemaIndex};
 use regex::Regex;
 use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 /// Matches a `SELECT ... FROM` projection list. Capture group 1 is the raw
@@ -358,7 +359,7 @@ fn column_name_of(schema_index: &SchemaIndex, table: &str, col: &str) -> String 
 /// - ORM model file → table definition file
 /// - Migration sequence (each migration → its predecessor)
 pub fn build_schema_edges(
-    files: &[crate::core_graph::IndexedFile],
+    files: &[Arc<crate::core_graph::IndexedFile>],
     schema_index: &crate::schema::SchemaIndex,
 ) -> Vec<(String, String, EdgeType, EdgeConfidence)> {
     let mut edges: Vec<(String, String, EdgeType, EdgeConfidence)> = Vec::new();
@@ -609,8 +610,8 @@ mod tests {
         }
     }
 
-    fn make_file_list(files: Vec<IndexedFile>) -> Vec<IndexedFile> {
-        files
+    fn make_file_list(files: Vec<IndexedFile>) -> Vec<Arc<IndexedFile>> {
+        files.into_iter().map(Arc::new).collect()
     }
 
     fn make_table(name: &str, file_path: &str, columns: Vec<ColumnSchema>) -> TableSchema {

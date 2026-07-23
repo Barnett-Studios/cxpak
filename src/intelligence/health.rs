@@ -153,7 +153,7 @@ pub(crate) fn has_inline_tests(file: &crate::core_graph::IndexedFile) -> bool {
 /// uncovered "source files" dilutes the ratio. Files with an unrecognized
 /// or missing `language` are excluded too (can't classify as code).
 fn score_test_coverage(index: &CodebaseIndex) -> f64 {
-    let source_files: Vec<&crate::core_graph::IndexedFile> = index
+    let source_files: Vec<&std::sync::Arc<crate::core_graph::IndexedFile>> = index
         .files
         .iter()
         .filter(|f| {
