@@ -8,6 +8,7 @@ use crate::schema::{
 };
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
@@ -518,7 +519,7 @@ pub fn detect_terraform_schemas(index: &CodebaseIndex, schema: &mut SchemaIndex)
 /// Detect migration chains across all files in the index.
 pub fn detect_migrations(index: &CodebaseIndex) -> Vec<MigrationChain> {
     // Group files by directory
-    let mut dir_groups: HashMap<String, Vec<&crate::core_graph::IndexedFile>> = HashMap::new();
+    let mut dir_groups: HashMap<String, Vec<&Arc<crate::core_graph::IndexedFile>>> = HashMap::new();
     for file in &index.files {
         let dir = parent_dir(&file.relative_path);
         dir_groups.entry(dir).or_default().push(file);
@@ -566,7 +567,7 @@ fn filename(path: &str) -> &str {
 // Rails: db/migrate/ directory, YYYYMMDDHHMMSS_name.rb
 fn try_rails_migrations(
     dir: &str,
-    files: &[&crate::core_graph::IndexedFile],
+    files: &[&Arc<crate::core_graph::IndexedFile>],
 ) -> Option<MigrationChain> {
     if !dir.ends_with("db/migrate") && !dir.contains("db/migrate/") {
         return None;
@@ -602,7 +603,7 @@ fn try_rails_migrations(
 // Alembic: alembic/versions/ directory, hash_name.py, reads revision from content
 fn try_alembic_migrations(
     dir: &str,
-    files: &[&crate::core_graph::IndexedFile],
+    files: &[&Arc<crate::core_graph::IndexedFile>],
 ) -> Option<MigrationChain> {
     if !dir.ends_with("alembic/versions") && !dir.contains("alembic/versions") {
         return None;
@@ -654,7 +655,7 @@ fn try_alembic_migrations(
 // Flyway: any directory, V{N}__name.sql
 fn try_flyway_migrations(
     dir: &str,
-    files: &[&crate::core_graph::IndexedFile],
+    files: &[&Arc<crate::core_graph::IndexedFile>],
 ) -> Option<MigrationChain> {
     let mut entries: Vec<MigrationEntry> = files
         .iter()
@@ -691,7 +692,7 @@ fn try_flyway_migrations(
 // Django: */migrations/ directory, NNNN_name.py
 fn try_django_migrations(
     dir: &str,
-    files: &[&crate::core_graph::IndexedFile],
+    files: &[&Arc<crate::core_graph::IndexedFile>],
 ) -> Option<MigrationChain> {
     if !dir.ends_with("/migrations") && !dir.ends_with("migrations") {
         return None;
@@ -726,7 +727,7 @@ fn try_django_migrations(
 // Knex: migrations/ directory, YYYYMMDDHHMMSS_name.js/.ts
 fn try_knex_migrations(
     dir: &str,
-    files: &[&crate::core_graph::IndexedFile],
+    files: &[&Arc<crate::core_graph::IndexedFile>],
 ) -> Option<MigrationChain> {
     if !dir.ends_with("migrations") {
         return None;
@@ -765,8 +766,8 @@ fn try_knex_migrations(
 //       We need to group by the parent of parent (prisma/migrations)
 fn try_prisma_migrations(
     dir: &str,
-    _files: &[&crate::core_graph::IndexedFile],
-    all_dirs: &HashMap<String, Vec<&crate::core_graph::IndexedFile>>,
+    _files: &[&Arc<crate::core_graph::IndexedFile>],
+    all_dirs: &HashMap<String, Vec<&Arc<crate::core_graph::IndexedFile>>>,
 ) -> Option<MigrationChain> {
     // This function is called with dir = "prisma/migrations/TIMESTAMP_name"
     // We check: does this dir match prisma/migrations/{timestamp}_{name}?
@@ -854,7 +855,7 @@ fn try_prisma_migrations(
 // Drizzle: drizzle/ directory, NNNN_name.sql
 fn try_drizzle_migrations(
     dir: &str,
-    files: &[&crate::core_graph::IndexedFile],
+    files: &[&Arc<crate::core_graph::IndexedFile>],
 ) -> Option<MigrationChain> {
     if !dir.ends_with("drizzle") && !dir.contains("/drizzle/") {
         return None;
@@ -889,7 +890,7 @@ fn try_drizzle_migrations(
 // Generic: any dir with 3+ sequenced SQL files, NNN_name.sql or YYYYMMDDHHMMSS_name.sql
 fn try_generic_migrations(
     dir: &str,
-    files: &[&crate::core_graph::IndexedFile],
+    files: &[&Arc<crate::core_graph::IndexedFile>],
 ) -> Option<MigrationChain> {
     // Match numeric prefix + underscore + name + .sql
     let mut entries: Vec<MigrationEntry> = files
@@ -1058,10 +1059,12 @@ mod tests {
     fn make_index(files: Vec<IndexedFile>) -> CodebaseIndex {
         use crate::core_graph::graph::DependencyGraph;
         use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        let arc_files: Vec<Arc<IndexedFile>> = files.into_iter().map(Arc::new).collect();
         let graph = DependencyGraph::new();
         CodebaseIndex {
-            total_files: files.len(),
-            total_bytes: files.iter().map(|f| f.size_bytes).sum(),
+            total_files: arc_files.len(),
+            total_bytes: arc_files.iter().map(|f| f.size_bytes).sum(),
             total_tokens: 0,
             language_stats: HashMap::new(),
             term_frequencies: HashMap::new(),
@@ -1074,7 +1077,7 @@ mod tests {
             conventions: crate::conventions::ConventionProfile::default(),
             co_changes: Vec::new(),
             cross_lang_edges: Vec::new(),
-            files,
+            files: arc_files,
             #[cfg(feature = "embeddings")]
             embedding_index: None,
             dead_code_cache: std::sync::Arc::new(std::sync::OnceLock::new()),

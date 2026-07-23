@@ -140,7 +140,8 @@ fn embedded_sql_edge_is_inferred() {
         r#"fn list() { db.query("SELECT id FROM products WHERE active = true") }"#,
     );
 
-    let raw_edges = cxpak::schema::link::build_schema_edges(&[rust_file], &schema);
+    let raw_edges =
+        cxpak::schema::link::build_schema_edges(&[std::sync::Arc::new(rust_file)], &schema);
 
     let mut g = DependencyGraph::new();
     for (from, to, etype, conf) in raw_edges {

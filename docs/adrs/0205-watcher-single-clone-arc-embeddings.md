@@ -76,26 +76,44 @@ Adopt Option A.
   `None` on the ignored-only / no-op / poisoned paths. `spawn_mcp_watcher`
   publishes that exact `Arc` into `readiness`. `republish_watcher_index` is
   **deleted** (its clearing responsibility moved into the pre-swap step).
+- **Copy-on-write file storage:** `CodebaseIndex.files: Vec<IndexedFile>` →
+  `Vec<Arc<IndexedFile>>`. Cloning a `CodebaseIndex` now shares every unchanged
+  file as a refcount bump; the surviving per-batch clone copies only the `Vec`
+  spine plus the handful of files the delta actually touches, turning the
+  residual `MALLOC_SMALL` cost from O(codebase) to O(delta). The delta path is
+  copy-on-write by construction: `upsert_file` is `remove_file`
+  (`swap_remove` the whole `Arc`) + `push(Arc::new(..))`, and `remove_file`
+  drops an `Arc` — neither mutates an `IndexedFile` in place, so an old snapshot
+  a reader still holds is never corrupted. Read sites auto-deref through
+  `Arc<IndexedFile>`; nine helper signatures taking `&[IndexedFile]` became
+  `&[Arc<IndexedFile>]` (bodies unchanged).
 
 Covered by `process_watcher_changes_clears_embedding_and_publishes_single_arc`
 (published index is embeddings-free **and** `Arc::ptr_eq` with the `shared`
 mirror — proving a single clone), `embedding_index_clone_shares_matrix_not_copies`
 (`Arc::strong_count` proves the matrix is shared, not copied — and the test
-cannot compile against the pre-fix non-`Arc` field), and
-`process_watcher_changes_ignored_only_publishes_none`. The ADR-0204 parity guards
-(`process_watcher_changes_delta_parity_with_full_rebuild`, `classify_changes`
-tests) remain green.
+cannot compile against the pre-fix non-`Arc` field),
+`process_watcher_changes_ignored_only_publishes_none`, and the memory-ceiling
+proof `watcher_does_not_accumulate_index_versions_across_batches` (drives 25
+real-edit batches and asserts `Arc::strong_count` on the shared/readiness Arc
+returns to a fixed baseline every batch — no version accumulation). The ADR-0204
+parity guards (`process_watcher_changes_delta_parity_with_full_rebuild`,
+`classify_changes` tests) remain green, confirming byte-identical delta output.
 
 ## Consequences
 
 ### Positive
-- **One** whole-index deep clone per real-edit batch instead of two — halves the
-  `MALLOC_SMALL` (file-content) churn on the hot path.
+- **One** whole-index deep clone per real-edit batch instead of two, and that
+  surviving clone is now copy-on-write: unchanged files are shared `Arc`s, so it
+  copies O(delta) file contents, not O(codebase). Together this collapses the
+  `MALLOC_SMALL` (file-content) growth that dominated the 44 GB report.
 - The embedding matrix is never deep-copied on the watcher path: per-batch matrix
   copies drop from three (the two watcher clones plus the enrichment clone) to
   zero — the ~16 GB `MALLOC_LARGE` class is eliminated.
 - The ADR-0200 6-signal-fallback invariant is preserved and now enforced at a
   single, testable point (pre-swap) rather than via a redundant clone.
+- A regression test demonstrates (not merely asserts) the memory ceiling:
+  `Arc::strong_count` returns to a fixed baseline after every batch.
 
 ### Negative
 - The embeddings-clearing responsibility is no longer named by a dedicated
@@ -107,24 +125,24 @@ tests) remain green.
   discard the `Option` — intentional, as they own no `readiness` cell.
 
 ### Neutral
-- The remaining per-batch clone still deep-copies all `IndexedFile.content`
-  (the residual `MALLOC_SMALL` class). Delta rebuilds touch only a handful of
-  files, so this copy is mostly redundant, but bounding it is a separate change.
-- The `Arc::strong_count`-returns-to-baseline assertion demonstrates no *extra*
-  index version survives a batch; it does not, by itself, prove no *external*
-  holder pins an old version (see Revisit if).
+- The per-batch clone still copies the `Vec` spine (one pointer per file) plus
+  the small scalar/`String` fields of *changed* files and the non-file index
+  members (`term_frequencies`, `graph`, `call_graph`). These are far smaller than
+  the file contents now shared via `Arc`; if a profile ever shows them dominating,
+  the same `Arc`/delta treatment applies to `term_frequencies` and `graph`.
+- The `Arc::strong_count`-returns-to-baseline test demonstrates no *extra* index
+  version survives a batch; it does not, by itself, prove no *external* holder
+  pins an old version (see Revisit if).
 
 ## Revisit if
-- **`MALLOC_SMALL` still dominates under load.** The residual full-content clone
-  per batch is the next ceiling. Move to `files: Vec<Arc<IndexedFile>>` (or an
-  immutable/`im::Vector`) copy-on-write so a delta clone shares unchanged files
-  and copies only the changed ones — turning the per-batch cost from
-  O(codebase) to O(delta). Tracked as a separate ticket (issue #47 P2).
 - **An old `Arc<CodebaseIndex>` is pinned by a slow/hung MCP tool handler**
-  (`snapshot_ready_index` hands each call an `Arc::clone`). If a handler stalls
-  it retains a full old index. Audit with `Arc::strong_count` / a heap profiler
-  (`dhat`/`heaptrack`) on a long-lived session; bound concurrent index versions
-  if retention is observed. (issue #47 P1.)
+  (`snapshot_ready_index` hands each call an `Arc::clone`). The ceiling test
+  proves no version accumulates in the watcher/readiness path itself, but a
+  handler that stalls could still retain a full old index for its lifetime. The
+  MCP stdio loop is synchronous/sequential today, so at most one is pinned; if a
+  future concurrent handler model is added, audit with `Arc::strong_count` / a
+  heap profiler (`dhat`/`heaptrack`) on a long-lived session and bound concurrent
+  index versions if retention is observed.
 - **The per-batch `git2::Repository::discover` + gitignore matcher rebuild in
   `classify_changes` shows up in a CPU profile.** It is churn only (freed each
   call, not a memory contributor), but ADR-0204 and this ADR both note it can be

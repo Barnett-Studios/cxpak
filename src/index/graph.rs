@@ -6,6 +6,7 @@ pub use crate::core_graph::graph::{
     BridgeType, DependencyGraph, EdgeConfidence, EdgeType, TypedEdge,
 };
 use std::collections::HashSet;
+use std::sync::Arc;
 
 // ─── Import resolution helpers ────────────────────────────────────────────────
 
@@ -388,7 +389,7 @@ fn resolve_import(
 /// is never needed for the delta and is kept out to avoid a second, divergent
 /// implementation of that logic.
 pub(crate) fn edges_for_file(
-    file: &IndexedFile,
+    file: &Arc<IndexedFile>,
     all_paths: &HashSet<&str>,
 ) -> Vec<(String, EdgeType)> {
     let mut out = Vec::new();
@@ -403,7 +404,7 @@ pub(crate) fn edges_for_file(
 }
 
 pub fn build_dependency_graph(
-    files: &[IndexedFile],
+    files: &[Arc<IndexedFile>],
     schema: Option<&crate::schema::SchemaIndex>,
 ) -> DependencyGraph {
     let all_paths: HashSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
@@ -434,9 +435,9 @@ mod tests {
 
     // ─── helper ──────────────────────────────────────────────────────────────
 
-    fn make_indexed_file(path: &str, lang: &str, imports: Vec<&str>) -> IndexedFile {
+    fn make_indexed_file(path: &str, lang: &str, imports: Vec<&str>) -> Arc<IndexedFile> {
         use crate::parser::language::Import;
-        IndexedFile {
+        Arc::new(IndexedFile {
             relative_path: path.to_string(),
             language: Some(lang.to_string()),
             size_bytes: 0,
@@ -454,7 +455,7 @@ mod tests {
             }),
             content: String::new(),
             mtime_secs: None,
-        }
+        })
     }
 
     // ─── helper tests ─────────────────────────────────────────────────────────

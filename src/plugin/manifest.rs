@@ -179,7 +179,7 @@ mod tests {
         // Build a minimal CodebaseIndex with two files
         let index = CodebaseIndex {
             files: vec![
-                crate::index::IndexedFile {
+                std::sync::Arc::new(crate::index::IndexedFile {
                     relative_path: "src/main.py".to_string(),
                     language: Some("Python".to_string()),
                     size_bytes: 100,
@@ -187,8 +187,8 @@ mod tests {
                     parse_result: None,
                     content: "print('hello')".to_string(),
                     mtime_secs: None,
-                },
-                crate::index::IndexedFile {
+                }),
+                std::sync::Arc::new(crate::index::IndexedFile {
                     relative_path: "src/lib.rs".to_string(),
                     language: Some("Rust".to_string()),
                     size_bytes: 200,
@@ -196,7 +196,7 @@ mod tests {
                     parse_result: None,
                     content: "fn main() {}".to_string(),
                     mtime_secs: None,
-                },
+                }),
             ],
             language_stats: HashMap::new(),
             total_files: 2,
@@ -279,7 +279,7 @@ mod tests {
         use std::collections::HashMap;
 
         let index = CodebaseIndex {
-            files: vec![crate::index::IndexedFile {
+            files: vec![std::sync::Arc::new(crate::index::IndexedFile {
                 relative_path: "src/main.py".to_string(),
                 language: Some("Python".to_string()),
                 size_bytes: 100,
@@ -287,7 +287,7 @@ mod tests {
                 parse_result: None,
                 content: "print('hello')".to_string(),
                 mtime_secs: None,
-            }],
+            })],
             language_stats: HashMap::new(),
             total_files: 1,
             total_bytes: 100,
@@ -329,7 +329,7 @@ mod tests {
         use std::collections::HashMap;
 
         let index = CodebaseIndex {
-            files: vec![crate::index::IndexedFile {
+            files: vec![std::sync::Arc::new(crate::index::IndexedFile {
                 relative_path: "src/main.py".to_string(),
                 language: Some("Python".to_string()),
                 size_bytes: 100,
@@ -337,7 +337,7 @@ mod tests {
                 parse_result: None,
                 content: "print('hello')".to_string(),
                 mtime_secs: None,
-            }],
+            })],
             language_stats: HashMap::new(),
             total_files: 1,
             total_bytes: 100,
@@ -385,7 +385,7 @@ mod tests {
 
         let index = CodebaseIndex {
             files: vec![
-                crate::index::IndexedFile {
+                std::sync::Arc::new(crate::index::IndexedFile {
                     relative_path: "src/main.py".to_string(),
                     language: Some("Python".to_string()),
                     size_bytes: 50,
@@ -393,8 +393,8 @@ mod tests {
                     parse_result: None,
                     content: "x=1".to_string(),
                     mtime_secs: None,
-                },
-                crate::index::IndexedFile {
+                }),
+                std::sync::Arc::new(crate::index::IndexedFile {
                     relative_path: "src/lib.ts".to_string(),
                     language: Some("TypeScript".to_string()),
                     size_bytes: 50,
@@ -402,8 +402,8 @@ mod tests {
                     parse_result: None,
                     content: "export {}".to_string(),
                     mtime_secs: None,
-                },
-                crate::index::IndexedFile {
+                }),
+                std::sync::Arc::new(crate::index::IndexedFile {
                     relative_path: "src/main.rs".to_string(),
                     language: Some("Rust".to_string()),
                     size_bytes: 50,
@@ -411,7 +411,7 @@ mod tests {
                     parse_result: None,
                     content: "fn main() {}".to_string(),
                     mtime_secs: None,
-                },
+                }),
             ],
             language_stats: HashMap::new(),
             total_files: 3,
@@ -458,7 +458,7 @@ mod tests {
 
         let index = CodebaseIndex {
             files: vec![
-                crate::index::IndexedFile {
+                std::sync::Arc::new(crate::index::IndexedFile {
                     relative_path: "src/a.rs".to_string(),
                     language: Some("Rust".to_string()),
                     size_bytes: 10,
@@ -466,8 +466,8 @@ mod tests {
                     parse_result: None,
                     content: "fn a() {}".to_string(),
                     mtime_secs: None,
-                },
-                crate::index::IndexedFile {
+                }),
+                std::sync::Arc::new(crate::index::IndexedFile {
                     relative_path: "src/b.py".to_string(),
                     language: Some("Python".to_string()),
                     size_bytes: 10,
@@ -475,7 +475,7 @@ mod tests {
                     parse_result: None,
                     content: "x=1".to_string(),
                     mtime_secs: None,
-                },
+                }),
             ],
             language_stats: HashMap::new(),
             total_files: 2,

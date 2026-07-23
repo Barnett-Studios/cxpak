@@ -667,7 +667,7 @@ mod tests {
             "src/api/router.rs",
             "src/api/middleware.rs",
         ] {
-            index.files.push(IndexedFile {
+            index.files.push(std::sync::Arc::new(IndexedFile {
                 relative_path: name.to_string(),
                 language: Some("rust".into()),
                 size_bytes: 100,
@@ -675,7 +675,7 @@ mod tests {
                 parse_result: None,
                 content: "fn f() {}".to_string(),
                 mtime_secs: None,
-            });
+            }));
         }
 
         // Add an intra-module edge (both within src/api)
@@ -709,7 +709,7 @@ mod tests {
 
         // Only 2 files in same prefix -> below the "< 3" threshold
         for name in &["src/tiny/a.rs", "src/tiny/b.rs"] {
-            index.files.push(IndexedFile {
+            index.files.push(std::sync::Arc::new(IndexedFile {
                 relative_path: name.to_string(),
                 language: Some("rust".into()),
                 size_bytes: 50,
@@ -717,7 +717,7 @@ mod tests {
                 parse_result: None,
                 content: "fn f() {}".to_string(),
                 mtime_secs: None,
-            });
+            }));
         }
 
         let snap = snapshot_from_index(&index, "2026-04-02T00:00:00Z");
@@ -743,7 +743,7 @@ mod tests {
 
         // 3 files in same module but no edges -> coupling 0, cohesion 0
         for name in &["src/lib/a.rs", "src/lib/b.rs", "src/lib/c.rs"] {
-            index.files.push(IndexedFile {
+            index.files.push(std::sync::Arc::new(IndexedFile {
                 relative_path: name.to_string(),
                 language: Some("rust".into()),
                 size_bytes: 100,
@@ -751,7 +751,7 @@ mod tests {
                 parse_result: None,
                 content: "fn f() {}".to_string(),
                 mtime_secs: None,
-            });
+            }));
         }
 
         let snap = snapshot_from_index(&index, "2026-04-03T00:00:00Z");
@@ -796,7 +796,7 @@ mod tests {
 
         // Create a module with 3 files, mostly cross-module edges -> high coupling
         for name in &["src/hot/a.rs", "src/hot/b.rs", "src/hot/c.rs"] {
-            index.files.push(IndexedFile {
+            index.files.push(std::sync::Arc::new(IndexedFile {
                 relative_path: name.to_string(),
                 language: Some("rust".into()),
                 size_bytes: 100,
@@ -804,7 +804,7 @@ mod tests {
                 parse_result: None,
                 content: "fn f() {}".to_string(),
                 mtime_secs: None,
-            });
+            }));
         }
 
         // All edges are cross-module -> coupling = 1.0 (> 0.6 threshold)
@@ -852,7 +852,7 @@ mod tests {
         // Build report with empty index (different metrics)
         let mut index = CodebaseIndex::empty();
         for name in &["src/mod/a.rs", "src/mod/b.rs", "src/mod/c.rs"] {
-            index.files.push(IndexedFile {
+            index.files.push(std::sync::Arc::new(IndexedFile {
                 relative_path: name.to_string(),
                 language: Some("rust".into()),
                 size_bytes: 100,
@@ -860,7 +860,7 @@ mod tests {
                 parse_result: None,
                 content: "fn f() {}".to_string(),
                 mtime_secs: None,
-            });
+            }));
         }
 
         let report = build_drift_report(&index, dir.path(), false);
@@ -928,7 +928,7 @@ mod tests {
 
         // Module A: 3 files → qualifies
         for name in &["src/a/x.rs", "src/a/y.rs", "src/a/z.rs"] {
-            index.files.push(IndexedFile {
+            index.files.push(std::sync::Arc::new(IndexedFile {
                 relative_path: name.to_string(),
                 language: Some("rust".into()),
                 size_bytes: 100,
@@ -936,11 +936,11 @@ mod tests {
                 parse_result: None,
                 content: "fn f() {}".to_string(),
                 mtime_secs: None,
-            });
+            }));
         }
         // Module B: 2 files → does NOT qualify
         for name in &["src/b/p.rs", "src/b/q.rs"] {
-            index.files.push(IndexedFile {
+            index.files.push(std::sync::Arc::new(IndexedFile {
                 relative_path: name.to_string(),
                 language: Some("rust".into()),
                 size_bytes: 50,
@@ -948,7 +948,7 @@ mod tests {
                 parse_result: None,
                 content: "fn g() {}".to_string(),
                 mtime_secs: None,
-            });
+            }));
         }
 
         index

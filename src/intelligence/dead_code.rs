@@ -3,6 +3,7 @@ use crate::core_graph::IndexedFile;
 use crate::intelligence::api_surface::detect_routes;
 use crate::parser::language::{SymbolKind, Visibility};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 // `DeadSymbol` is part of the data model and now lives in `core_graph`
 // (cxpak 3.0.0 Phase 0 de-cycle); the analysis logic below stays here.
@@ -157,7 +158,7 @@ fn strip_code_noise(src: &str) -> String {
 fn has_string_references(
     symbol_name: &str,
     defining_file: &str,
-    all_files: &[IndexedFile],
+    all_files: &[Arc<IndexedFile>],
 ) -> bool {
     if symbol_name.len() < 3 {
         return true; // too short to search reliably — assume alive
@@ -202,7 +203,7 @@ fn has_string_references(
 fn has_receiver_method_reference(
     file_path: &str,
     symbol_name: &str,
-    all_files: &[IndexedFile],
+    all_files: &[Arc<IndexedFile>],
 ) -> bool {
     if symbol_name.len() < 5 {
         return false;
@@ -257,7 +258,11 @@ fn has_receiver_method_reference(
 /// AND dangerously over-broad — any file that imported anything and
 /// happened to contain `some_other_module::run` would rubber-stamp every
 /// function named `run` in the tree as alive. Removed.
-fn has_qualified_reference(file_path: &str, symbol_name: &str, all_files: &[IndexedFile]) -> bool {
+fn has_qualified_reference(
+    file_path: &str,
+    symbol_name: &str,
+    all_files: &[Arc<IndexedFile>],
+) -> bool {
     let path = std::path::Path::new(file_path);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     // `mod.rs` files qualify under their parent directory name, not "mod".
@@ -1456,8 +1461,8 @@ mod tests {
 
     // ---- has_receiver_method_reference direct tests ----
 
-    fn make_file(path: &str, content: &str) -> IndexedFile {
-        IndexedFile {
+    fn make_file(path: &str, content: &str) -> Arc<IndexedFile> {
+        Arc::new(IndexedFile {
             relative_path: path.to_string(),
             language: Some("rust".to_string()),
             size_bytes: content.len() as u64,
@@ -1465,12 +1470,12 @@ mod tests {
             parse_result: None,
             content: content.to_string(),
             mtime_secs: None,
-        }
+        })
     }
 
     #[test]
     fn has_receiver_method_reference_short_name_returns_false() {
-        let files: Vec<IndexedFile> = vec![make_file("caller.rs", "obj.run(1);")];
+        let files: Vec<Arc<IndexedFile>> = vec![make_file("caller.rs", "obj.run(1);")];
         assert!(!has_receiver_method_reference("def.rs", "run", &files));
     }
 
