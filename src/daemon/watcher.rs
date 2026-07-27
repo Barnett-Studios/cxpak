@@ -26,10 +26,12 @@ const DEBOUNCE_MAX_MS: u64 = 2_000;
 /// Path components that identify well-known noise trees.
 ///
 /// classify_changes (watch.rs) remains the AUTHORITATIVE correctness filter;
-/// this set is a coarse, cheap pre-filter applied at the notify callback so
-/// the noisy paths never enter the bounded channel.  Any component listed here
-/// MUST already be rejected by classify_changes (BUILTIN_IGNORES + .git check)
-/// — the overlap is verified by the unit tests below.
+/// this set is a coarse, cheap pre-filter applied (against the path RELATIVE
+/// to the watch root) at the notify callback so noisy paths never enter the
+/// bounded channel.  Every component here is also in BUILTIN_IGNORES (or the
+/// `.git` check), so the pre-filter can only ever be a subset of what
+/// classify_changes rejects — enforced by
+/// `test_noise_components_are_rejected_by_classify_changes` below.
 const NOISE_COMPONENTS: &[&str] = &[
     ".git",
     "target",
@@ -333,6 +335,26 @@ mod tests {
             !watcher.drain().is_empty(),
             "source event under a noise-named ancestor must NOT be filtered"
         );
+    }
+
+    /// Parity invariant (L1): every NOISE_COMPONENT dropped by the coarse
+    /// pre-filter MUST also be rejected by the authoritative classify_changes for
+    /// a path relative to the repo root. Guards against the pre-filter silently
+    /// dropping events classify_changes would keep. No git repo is needed — with
+    /// `Repository::discover` returning None, classify_changes falls back to the
+    /// BUILTIN_IGNORES matcher, which is exactly what we assert parity against.
+    #[test]
+    fn test_noise_components_are_rejected_by_classify_changes() {
+        use crate::commands::watch::classify_changes;
+        let base = tempfile::TempDir::new().unwrap();
+        for &component in NOISE_COMPONENTS {
+            let abs = base.path().join(component).join("file.txt");
+            let (modified, removed) = classify_changes(&[FileChange::Modified(abs)], base.path());
+            assert!(
+                modified.is_empty() && removed.is_empty(),
+                "NOISE_COMPONENT `{component}` must be rejected by classify_changes"
+            );
+        }
     }
 
     /// collect_debounced collapses duplicate (path, kind) events into one.

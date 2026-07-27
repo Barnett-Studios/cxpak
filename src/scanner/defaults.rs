@@ -9,6 +9,8 @@ pub const BUILTIN_IGNORES: &[&str] = &[
     "build",
     "out",
     ".next",
+    ".cxpak",
+    ".gradle",
     ".DS_Store",
     ".idea",
     ".vscode",
