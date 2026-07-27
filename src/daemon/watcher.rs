@@ -104,13 +104,25 @@ impl FileWatcher {
         let overflow_cb = Arc::clone(&overflow);
         let drop_count_cb = Arc::clone(&drop_count);
 
+        // Owned copy moved into the notify callback. Mirrors classify_changes:
+        // the noise pre-filter matches the path RELATIVE to the watch root, so a
+        // noise-named ANCESTOR of the root (e.g. /opt/build/repo, a `.venv`-parented
+        // checkout, GitLab CI /builds/...) cannot silently drop every source event.
+        let root_filter = root.to_path_buf();
+
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
             let Ok(event) = res else {
                 return;
             };
             for path in event.paths {
-                if is_noise_path(&path) {
-                    continue;
+                // Relativize against the watch root before the noise check. On strip
+                // failure (path not under root — should not happen for a recursive
+                // watch) keep the event and let classify_changes decide, exactly as
+                // classify_changes does (watch.rs: `let Ok(rel) = … else return false`).
+                if let Ok(rel) = path.strip_prefix(&root_filter) {
+                    if is_noise_path(rel) {
+                        continue;
+                    }
                 }
                 let change = match event.kind {
                     EventKind::Create(_) => FileChange::Created(path),
@@ -300,6 +312,27 @@ mod tests {
                 "component `{component}` must be detected as noise"
             );
         }
+    }
+
+    /// A repo checked out UNDER a noise-named ancestor (e.g. `.../build/repo`)
+    /// must still receive source events — the pre-filter relativizes against the
+    /// watch root, so an ancestor component name cannot blind the watcher (M1).
+    #[test]
+    fn test_noise_ancestor_does_not_blind_watcher() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("build").join("repo"); // "build" is a NOISE_COMPONENT
+        fs::create_dir_all(&root).unwrap();
+
+        let watcher = FileWatcher::new(&root).unwrap();
+
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !watcher.drain().is_empty(),
+            "source event under a noise-named ancestor must NOT be filtered"
+        );
     }
 
     /// collect_debounced collapses duplicate (path, kind) events into one.
