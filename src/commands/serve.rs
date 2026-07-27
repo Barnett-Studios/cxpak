@@ -1422,10 +1422,8 @@ pub fn run(
         // rebuild the index from scratch (build_index) rather than trusting the
         // lossy delta, swapping the fresh index into the shared handle.
         loop {
-            let changes = watcher.collect_debounced(
-                Duration::from_secs(1),
-                Duration::from_millis(400),
-            );
+            let changes =
+                watcher.collect_debounced(Duration::from_secs(1), Duration::from_millis(400));
             if watcher.take_overflow() {
                 eprintln!(
                     "cxpak: watcher event buffer overflowed — \
@@ -2647,10 +2645,8 @@ pub fn spawn_mcp_watcher(
         // If the bounded channel overflowed, take_overflow() returns true and
         // we fall back to a full rescan rather than trusting a lossy delta.
         while !shutdown.load(Ordering::Relaxed) {
-            let changes = watcher.collect_debounced(
-                Duration::from_secs(1),
-                Duration::from_millis(400),
-            );
+            let changes =
+                watcher.collect_debounced(Duration::from_secs(1), Duration::from_millis(400));
 
             if watcher.take_overflow() {
                 eprintln!(

@@ -124,7 +124,7 @@ impl FileWatcher {
                         overflow_cb.store(true, Ordering::Relaxed);
                         let prev = drop_count_cb.fetch_add(1, Ordering::Relaxed);
                         // Rate-limited warning: emit once every OVERFLOW_WARN_INTERVAL drops.
-                        if prev % OVERFLOW_WARN_INTERVAL == 0 {
+                        if prev.is_multiple_of(OVERFLOW_WARN_INTERVAL) {
                             eprintln!(
                                 "cxpak: watcher channel full — {} event(s) dropped; \
                                  a full rebuild will be triggered",
@@ -178,11 +178,7 @@ impl FileWatcher {
     /// Returns the coalesced, de-duplicated batch (at most one entry per
     /// `(path, kind)`), or an empty `Vec` if no event arrived within
     /// `first_timeout`.
-    pub fn collect_debounced(
-        &self,
-        first_timeout: Duration,
-        window: Duration,
-    ) -> Vec<FileChange> {
+    pub fn collect_debounced(&self, first_timeout: Duration, window: Duration) -> Vec<FileChange> {
         let first = match self.recv_timeout(first_timeout) {
             Some(e) => e,
             None => return Vec::new(),
@@ -363,8 +359,6 @@ mod tests {
     /// CHANNEL_BOUND is finite; flooding the channel sets the overflow flag.
     #[test]
     fn test_bounded_channel_overflow_sets_flag() {
-        assert!(CHANNEL_BOUND > 0, "CHANNEL_BOUND must be finite and positive");
-
         // Construct a channel with the same bound and flood it.
         let (tx, rx) = mpsc::sync_channel::<FileChange>(CHANNEL_BOUND);
         let overflow = Arc::new(AtomicBool::new(false));
