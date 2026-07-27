@@ -2,6 +2,26 @@ use clap::Parser;
 use cxpak::cli::{parse_token_count, Cli, Commands};
 use cxpak::commands;
 
+// Mechanism A: jemalloc as the global allocator with aggressive decay.
+// Under watcher churn the default system allocator retains freed pages
+// indefinitely, causing RSS to climb to ~35 GB and never return.
+// dirty_decay_ms:1000 — purge dirty pages within 1 s of free.
+// muzzy_decay_ms:0    — purge muzzy (MADV_FREE) pages immediately.
+// background_thread:true — background purge thread on Linux/Docker;
+//   silently ignored on macOS (decay still fires synchronously on free).
+//
+// Symbol is `malloc_conf` (not `_rjem_malloc_conf`) because we enabled
+// `unprefixed_malloc_on_supported_platforms` in Cargo.toml, which strips
+// the `_rjem_` prefix so jemalloc looks for the un-prefixed C symbol.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 fn main() {
     cxpak::dev_maintenance::maybe_sweep();
 

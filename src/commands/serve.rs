@@ -1414,11 +1414,37 @@ pub fn run(
             }
         };
 
+        // Bounded + coalesced + windowed debounce: collect_debounced blocks up
+        // to 1 s for the first event, then drains in 50 ms slices until the
+        // queue has been quiet for 400 ms (capped at 2 s total), and returns a
+        // de-duplicated batch.  If the bounded channel was overwhelmed and
+        // non-noise events were dropped, take_overflow() returns true and we
+        // rebuild the index from scratch (build_index) rather than trusting the
+        // lossy delta, swapping the fresh index into the shared handle.
         loop {
-            if let Some(first) = watcher.recv_timeout(Duration::from_secs(1)) {
-                let mut changes = vec![first];
-                std::thread::sleep(Duration::from_millis(50));
-                changes.extend(watcher.drain());
+            let changes = watcher.collect_debounced(
+                Duration::from_secs(1),
+                Duration::from_millis(400),
+            );
+            if watcher.take_overflow() {
+                eprintln!(
+                    "cxpak: watcher event buffer overflowed — \
+                     delta may be stale; triggering full rebuild"
+                );
+                // Re-index from scratch by swapping in a freshly built index.
+                match build_index(&watcher_path) {
+                    Ok(fresh) => {
+                        let new_arc = Arc::new(fresh);
+                        match watcher_index.write() {
+                            Ok(mut g) => *g = Arc::clone(&new_arc),
+                            Err(p) => *p.into_inner() = Arc::clone(&new_arc),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("cxpak: full rebuild after overflow failed: {e}");
+                    }
+                }
+            } else if !changes.is_empty() {
                 process_watcher_changes(&changes, &watcher_path, &watcher_index);
             }
         }
@@ -2614,13 +2640,46 @@ pub fn spawn_mcp_watcher(
             }
         };
 
+        // Bounded + coalesced + windowed debounce: collect_debounced blocks up
+        // to 1 s for the first event (keeping shutdown polling responsive at
+        // ~1 Hz), then drains in 50 ms slices until the queue has been quiet
+        // for 400 ms (capped at 2 s total), and returns a de-duplicated batch.
+        // If the bounded channel overflowed, take_overflow() returns true and
+        // we fall back to a full rescan rather than trusting a lossy delta.
         while !shutdown.load(Ordering::Relaxed) {
-            let Some(first) = watcher.recv_timeout(Duration::from_secs(1)) else {
+            let changes = watcher.collect_debounced(
+                Duration::from_secs(1),
+                Duration::from_millis(400),
+            );
+
+            if watcher.take_overflow() {
+                eprintln!(
+                    "cxpak: MCP watcher event buffer overflowed — \
+                     delta may be stale; triggering full rebuild"
+                );
+                match build_index(&path) {
+                    Ok(fresh) => {
+                        let new_arc = Arc::new(fresh);
+                        match shared.write() {
+                            Ok(mut g) => *g = Arc::clone(&new_arc),
+                            Err(p) => *p.into_inner() = Arc::clone(&new_arc),
+                        }
+                        match readiness.write() {
+                            Ok(mut g) => *g = IndexReadiness::Ready(new_arc),
+                            Err(p) => *p.into_inner() = IndexReadiness::Ready(new_arc),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("cxpak: full rebuild after MCP overflow failed: {e}");
+                    }
+                }
                 continue;
-            };
-            let mut changes = vec![first];
-            std::thread::sleep(Duration::from_millis(50));
-            changes.extend(watcher.drain());
+            }
+
+            if changes.is_empty() {
+                continue;
+            }
+
             // Publish the exact `Arc` the rebuild swapped into `shared` (already
             // embeddings-free per ADR-0200). `None` = nothing relevant changed,
             // so the prior `readiness` cell stands (issue #47 / ADR-0205).
