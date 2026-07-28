@@ -2,6 +2,39 @@ use clap::Parser;
 use cxpak::cli::{parse_token_count, Cli, Commands};
 use cxpak::commands;
 
+// Mechanism A: jemalloc as the global allocator with aggressive decay.
+// Under watcher churn the default system allocator retains freed pages
+// indefinitely, causing RSS to climb to ~35 GB and never return.
+// dirty_decay_ms:1000 — purge dirty pages within 1 s of free.
+// muzzy_decay_ms:0    — purge muzzy (MADV_FREE) pages immediately.
+// background_thread:true — background purge thread, Linux/Docker only
+//   (cfg-gated below; on macOS decay still fires synchronously on free).
+//
+// Symbol is `malloc_conf` (not `_rjem_malloc_conf`) because we enabled
+// `unprefixed_malloc_on_supported_platforms` in Cargo.toml, which strips
+// the `_rjem_` prefix so jemalloc looks for the un-prefixed C symbol.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// `background_thread` is Linux/pthread-only. Passing it on macOS does not fail
+// quietly — jemalloc prints
+//   <jemalloc>: option background_thread currently supports pthread only
+// to stderr on EVERY start, and `cxpak serve --mcp` is a stdio server whose
+// stderr lands in the client's logs. macOS is the supported platform today
+// (docs/architecture/routing-and-portability.md), so the option is scoped to the
+// targets that actually honour it and the decay settings — which is the part
+// that matters — apply everywhere.
+#[cfg(all(not(target_env = "msvc"), target_os = "linux"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
+#[cfg(all(not(target_env = "msvc"), not(target_os = "linux")))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 fn main() {
     cxpak::dev_maintenance::maybe_sweep();
 

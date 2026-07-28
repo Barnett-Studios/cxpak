@@ -359,9 +359,7 @@ fn header_has_separator_between_brand_and_repo() {
     // rule should distinguish the two header labels.
     let has_separator_glyph = html.contains(r#"class="cxpak-sep""#);
     let has_css_border = html.contains(".cxpak-logo")
-        && html[html.find(".cxpak-logo").unwrap()..]
-            .find("border-right")
-            .is_some();
+        && html[html.find(".cxpak-logo").unwrap()..].contains("border-right");
     assert!(
         has_separator_glyph || has_css_border,
         "header must have a visual separator between brand and repo (either HTML .cxpak-sep span or CSS border-right on .cxpak-logo)"

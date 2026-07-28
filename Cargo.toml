@@ -95,6 +95,16 @@ tokio-postgres-rustls = { version = "0.13", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
 mysql_async = { version = "0.37", optional = true, default-features = false, features = ["minimal", "rustls-tls"] }
 
+# Global allocator (perf/watcher-allocator-debounce, Mechanism A). The default
+# system allocator (macOS libmalloc / glibc) parks freed blocks in per-process
+# free lists under the watcher's per-batch clone churn, so RSS ratchets to tens
+# of GB and never returns. jemalloc with aggressive decay (`dirty_decay_ms` /
+# `muzzy_decay_ms`, see `malloc_conf` in `src/main.rs`) purges those pages back
+# to the OS, capping steady-state RSS near the live set. jemalloc does not build
+# on MSVC, so the dep and the `#[global_allocator]` are both `cfg`-gated off it.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "background_threads"] }
+
 [dev-dependencies]
 # Self dev-dependency so integration tests (tests/*.rs) see `cxpak::test_support`
 # with the `test-support` feature on, while the release build never enables it.
