@@ -1,6 +1,6 @@
 [package]
 name = "cxpak"
-version = "3.1.3"
+version = "3.1.4"
 edition = "2021"
 rust-version = "1.91"
 description = "Spends CPU cycles so you don't spend tokens. The LLM gets a briefing packet instead of a flashlight in a dark room."
@@ -102,8 +102,17 @@ mysql_async = { version = "0.37", optional = true, default-features = false, fea
 # `muzzy_decay_ms`, see `malloc_conf` in `src/main.rs`) purges those pages back
 # to the OS, capping steady-state RSS near the live set. jemalloc does not build
 # on MSVC, so the dep and the `#[global_allocator]` are both `cfg`-gated off it.
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+[target.'cfg(all(not(target_env = "msvc"), target_os = "linux"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "background_threads"] }
+
+# No `background_threads` off Linux. That cargo feature makes tikv-jemallocator
+# define its OWN `malloc_conf` of `background_thread:true`, which jemalloc then
+# rejects on macOS with
+#   <jemalloc>: option background_thread currently supports pthread only
+# printed to stderr on every start — and `cxpak serve --mcp` is a stdio server,
+# so that lands in the client's logs every launch.
+[target.'cfg(all(not(target_env = "msvc"), not(target_os = "linux")))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 
 [dev-dependencies]
 # Self dev-dependency so integration tests (tests/*.rs) see `cxpak::test_support`
