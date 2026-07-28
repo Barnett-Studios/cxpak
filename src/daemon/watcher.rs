@@ -99,7 +99,16 @@ impl FileWatcher {
     /// and a non-noise event cannot be queued, the overflow flag is set; call
     /// [`FileWatcher::take_overflow`] to detect this and trigger a full rebuild.
     pub fn new(root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let (tx, rx) = mpsc::sync_channel(CHANNEL_BOUND);
+        Self::with_bound(root, CHANNEL_BOUND)
+    }
+
+    /// [`FileWatcher::new`] with an explicit channel bound.
+    ///
+    /// Exists so the overflow path can be driven in a test without queueing
+    /// 65 536 real filesystem events. Production always uses
+    /// [`CHANNEL_BOUND`] via [`FileWatcher::new`].
+    pub fn with_bound(root: &Path, bound: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        let (tx, rx) = mpsc::sync_channel(bound);
         let overflow = Arc::new(AtomicBool::new(false));
         let drop_count = Arc::new(AtomicU64::new(0));
 
@@ -110,7 +119,19 @@ impl FileWatcher {
         // the noise pre-filter matches the path RELATIVE to the watch root, so a
         // noise-named ANCESTOR of the root (e.g. /opt/build/repo, a `.venv`-parented
         // checkout, GitLab CI /builds/...) cannot silently drop every source event.
-        let root_filter = root.to_path_buf();
+        //
+        // Canonicalized first, because the pre-filter is only reachable when
+        // `strip_prefix` succeeds. Event paths arrive fully resolved from the OS,
+        // so a root that is relative (`.`) or reached through a symlink (on macOS
+        // `/var/...` resolves to `/private/var/...`) would never match, every
+        // strip would fail, and the filter would silently degrade to a no-op —
+        // passing all the `target/` and `.git/` churn it exists to drop. Both
+        // production callers in serve.rs already canonicalize; this makes the
+        // watcher correct on its own rather than by their good behaviour.
+        // Fall back to the path as given if canonicalization fails (the root may
+        // legitimately not exist yet) — that restores the previous behaviour
+        // rather than failing the watcher.
+        let root_filter = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
             let Ok(event) = res else {
@@ -357,91 +378,104 @@ mod tests {
         }
     }
 
-    /// collect_debounced collapses duplicate (path, kind) events into one.
+    /// `collect_debounced` must return a coalesced batch from a REAL watcher.
+    ///
+    /// The previous version of this test built its own `HashMap` and asserted on
+    /// it, so it passed without ever calling `collect_debounced` — it would have
+    /// stayed green if the function returned `Vec::new()`. This one fails if the
+    /// real coalescing breaks.
     #[test]
-    fn test_coalescing_deduplicates_same_path_same_kind() {
+    fn collect_debounced_returns_one_entry_per_path_and_kind() {
         let dir = tempfile::TempDir::new().unwrap();
         let watcher = FileWatcher::new(dir.path()).unwrap();
 
-        let p = PathBuf::from("/repo/src/lib.rs");
-        // Push five identical Modified events directly into the internal state
-        // by writing the same file rapidly so the OS fires multiple events.
         let file = dir.path().join("lib.rs");
-        for i in 0..5u8 {
-            fs::write(&file, format!("fn v{}() {{}}", i)).unwrap();
+        for i in 0..8u8 {
+            fs::write(&file, format!("fn v{i}() {{}}")).unwrap();
         }
 
-        std::thread::sleep(Duration::from_millis(200));
-        let raw = watcher.drain();
+        let batch = watcher.collect_debounced(Duration::from_secs(3), Duration::from_millis(200));
         assert!(
-            !raw.is_empty(),
-            "OS should have fired at least one event for the rapid writes"
+            !batch.is_empty(),
+            "collect_debounced must return the rapid writes, not an empty batch"
         );
-
-        // Now test the coalescing map logic directly with synthetic duplicates.
-        let mut seen: std::collections::HashMap<(PathBuf, u8), FileChange> =
-            std::collections::HashMap::new();
-        for _ in 0..10 {
-            let fc = FileChange::Modified(p.clone());
-            let key = (fc.path().to_path_buf(), fc.kind_ord());
-            seen.entry(key).or_insert(fc);
-        }
+        let mut keys: Vec<(PathBuf, u8)> = batch
+            .iter()
+            .map(|fc| (fc.path().to_path_buf(), fc.kind_ord()))
+            .collect();
+        let before = keys.len();
+        keys.sort();
+        keys.dedup();
         assert_eq!(
-            seen.len(),
-            1,
-            "ten identical events must coalesce to one entry"
+            keys.len(),
+            before,
+            "collect_debounced returned duplicate (path, kind) entries — coalescing is broken"
         );
+        assert!(
+            batch.iter().any(|fc| fc.path().ends_with("lib.rs")),
+            "the edited file must appear in the batch"
+        );
+        // Deliberately NOT asserting that `lib.rs` is the ONLY entry: the OS also
+        // reports an event for the containing directory, and that is the
+        // watcher's documented behaviour rather than a coalescing failure.
     }
 
-    /// Different kinds on the same path are kept separate.
+    /// `take_overflow` must be set by a REAL watcher whose bounded channel
+    /// filled, and must reset on read.
+    ///
+    /// The previous version constructed its own `sync_channel` and its own
+    /// `AtomicBool`, then asserted that the bool it had just set was set — it
+    /// never touched `FileWatcher` and would have passed with
+    /// `fn take_overflow(&self) -> bool { false }`. This drives the real notify
+    /// callback through a deliberately tiny bound.
     #[test]
-    fn test_coalescing_keeps_distinct_kinds() {
-        let p = PathBuf::from("/repo/src/lib.rs");
-        let mut seen: std::collections::HashMap<(PathBuf, u8), FileChange> =
-            std::collections::HashMap::new();
-
-        for fc in [
-            FileChange::Modified(p.clone()),
-            FileChange::Created(p.clone()),
-            FileChange::Removed(p.clone()),
-        ] {
-            let key = (fc.path().to_path_buf(), fc.kind_ord());
-            seen.entry(key).or_insert(fc);
-        }
-        assert_eq!(seen.len(), 3, "distinct kinds must not coalesce");
-    }
-
-    /// CHANNEL_BOUND is finite; flooding the channel sets the overflow flag.
-    #[test]
-    fn test_bounded_channel_overflow_sets_flag() {
-        // Construct a channel with the same bound and flood it.
-        let (tx, rx) = mpsc::sync_channel::<FileChange>(CHANNEL_BOUND);
-        let overflow = Arc::new(AtomicBool::new(false));
-        let drop_count = Arc::new(AtomicU64::new(0));
-
-        // Fill the channel to capacity.
-        for i in 0..CHANNEL_BOUND {
-            let fc = FileChange::Modified(PathBuf::from(format!("/repo/src/f{i}.rs")));
-            tx.try_send(fc).expect("should fit within bound");
-        }
-
-        // One more must fail with Full.
-        let extra = FileChange::Modified(PathBuf::from("/repo/src/extra.rs"));
-        match tx.try_send(extra) {
-            Err(mpsc::TrySendError::Full(_)) => {
-                overflow.store(true, Ordering::Relaxed);
-                drop_count.fetch_add(1, Ordering::Relaxed);
-            }
-            other => panic!("expected Full, got {:?}", other.err()),
-        }
+    fn take_overflow_is_set_by_a_real_watcher_and_resets_on_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Bound of 1: the second unread non-noise event cannot be queued.
+        let watcher = FileWatcher::with_bound(dir.path(), 1).unwrap();
 
         assert!(
-            overflow.load(Ordering::Relaxed),
-            "overflow flag must be set when channel is full"
+            !watcher.take_overflow(),
+            "a fresh watcher must not report overflow"
         );
-        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
 
-        // Drain the channel so the test doesn't leak.
-        drop(rx);
+        for i in 0..400 {
+            fs::write(dir.path().join(format!("f{i}.rs")), "fn x() {}").unwrap();
+        }
+        // Do NOT drain — the channel must stay full so try_send fails.
+        std::thread::sleep(Duration::from_millis(600));
+
+        assert!(
+            watcher.take_overflow(),
+            "overflow flag must be set once the bounded channel rejects events"
+        );
+        assert!(
+            !watcher.take_overflow(),
+            "take_overflow must reset the flag, so one overflow triggers one rebuild"
+        );
+    }
+
+    /// Noise paths must never reach the channel, so they can never be the cause
+    /// of an overflow-triggered full rebuild.
+    #[test]
+    fn noise_paths_do_not_overflow_the_channel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Bound of 256 with 4 000 noise writes: if the pre-filter were bypassed
+        // the channel would overflow many times over, while leaving enough
+        // headroom that a stray event from a sibling temp dir (the suite runs in
+        // parallel) cannot by itself trip the assertion.
+        let watcher = FileWatcher::with_bound(dir.path(), 256).unwrap();
+        let noisy = dir.path().join("target").join("debug");
+        fs::create_dir_all(&noisy).unwrap();
+
+        for i in 0..4_000 {
+            fs::write(noisy.join(format!("a{i}.o")), "x").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(800));
+
+        assert!(
+            !watcher.take_overflow(),
+            "4 000 target/ writes are pre-filtered and must not overflow a 256-slot channel"
+        );
     }
 }
