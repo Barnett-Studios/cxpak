@@ -2653,6 +2653,30 @@ pub fn spawn_mcp_watcher(
                     "cxpak: MCP watcher event buffer overflowed — \
                      delta may be stale; triggering full rebuild"
                 );
+                // Release BOTH strong references to the current index *before*
+                // building its replacement. Building first and swapping after
+                // keeps two full indexes live at once, and this path fires
+                // precisely during an event storm — the moment the process can
+                // least afford to double its largest allocation.
+                //
+                // The trade is availability for memory, and it is the right way
+                // round here: overflow means events were dropped, so we have
+                // just declared the current index lossy. Answering `Building`
+                // ("indexing in progress, retry") is an honest answer to a
+                // question we can no longer answer correctly, it is the same
+                // state the initial background build publishes (ADR-0185), and
+                // MCP clients already retry on it (#19). Serving data we have
+                // just labelled untrustworthy would be the worse choice.
+                match readiness.write() {
+                    Ok(mut g) => *g = IndexReadiness::Building,
+                    Err(p) => *p.into_inner() = IndexReadiness::Building,
+                }
+                let placeholder = Arc::new(CodebaseIndex::empty());
+                match shared.write() {
+                    Ok(mut g) => *g = placeholder,
+                    Err(p) => *p.into_inner() = placeholder,
+                }
+
                 match build_index(&path) {
                     Ok(fresh) => {
                         let new_arc = Arc::new(fresh);
@@ -2666,7 +2690,16 @@ pub fn spawn_mcp_watcher(
                         }
                     }
                     Err(e) => {
+                        // Must not leave the cell in `Building` — that state means
+                        // "retry shortly", and nothing is coming. Publish `Failed`
+                        // so tool calls get the reason instead of hanging on a
+                        // rebuild that already gave up.
                         eprintln!("cxpak: full rebuild after MCP overflow failed: {e}");
+                        let msg = format!("index rebuild after watcher overflow failed: {e}");
+                        match readiness.write() {
+                            Ok(mut g) => *g = IndexReadiness::Failed(msg),
+                            Err(p) => *p.into_inner() = IndexReadiness::Failed(msg),
+                        }
                     }
                 }
                 continue;
