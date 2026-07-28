@@ -14,6 +14,30 @@ pub fn co_change_weight(days_ago: i64) -> f64 {
     }
 }
 
+/// Commits touching more than this many files are skipped for co-change mining.
+///
+/// Co-change is a *pairwise* signal: a commit touching `F` files contributes
+/// `F*(F-1)/2` pairs, so both time and memory are quadratic in commit size. A
+/// mass-touch commit — initial import, formatter sweep, generated-code or
+/// vendored-dependency refresh, squash-merge of a long branch — links every file
+/// to every other file, which is not evidence that any particular pair is
+/// coupled. Skipping those commits improves the signal and bounds the cost at
+/// the same time (cxpak#53 / #51).
+///
+/// 200 leaves ordinary work untouched (real commits are single-digit files)
+/// while capping one commit at 19 900 pairs instead of the 71 994 000 a
+/// 12 000-file import produced.
+pub const MAX_FILES_PER_COMMIT: usize = 200;
+
+/// Ceiling on distinct tracked pairs, so a long history cannot reintroduce the
+/// blowup one at-cap commit at a time.
+///
+/// On reaching it, already-tracked pairs keep accumulating counts and recency;
+/// only genuinely new pairs are dropped. Deterministic for a given commit order.
+/// Both the skipped-commit and dropped-pair counts are reported on stderr — a
+/// bound that truncates silently would read as "mined everything" when it did not.
+pub const MAX_TRACKED_PAIRS: usize = 2_000_000;
+
 /// Build co-change edges from a list of (commit_files, days_ago) pairs.
 ///
 /// Emits an edge for every pair that co-appears at least once. Threshold
@@ -23,42 +47,90 @@ pub fn co_change_weight(days_ago: i64) -> f64 {
 /// average), per the design spec.
 ///
 /// `commits` is `Vec<(Vec<String>, i64)>` where the i64 is days_ago at index time.
+///
+/// Bounded per [`MAX_FILES_PER_COMMIT`] and [`MAX_TRACKED_PAIRS`]. Paths are
+/// interned to `u32` ids so the pair map stores two integers per entry rather
+/// than two heap-allocated `String`s — the previous implementation cloned both
+/// paths for *every* pair, which is where the multi-GB transient came from.
 pub fn build_co_changes(commits: &[(Vec<String>, i64)]) -> Vec<CoChangeEdge> {
     use std::collections::HashMap;
 
-    // Map (sorted file_a, file_b) -> (count, most_recent_days_ago)
-    let mut pair_data: HashMap<(String, String), (u32, i64)> = HashMap::new();
+    let mut ids: HashMap<&str, u32> = HashMap::new();
+    let mut paths: Vec<&str> = Vec::new();
+    // (interned a, interned b) -> (count, most_recent_days_ago)
+    let mut pair_data: HashMap<(u32, u32), (u32, i64)> = HashMap::new();
+    let mut skipped_commits = 0usize;
+    let mut dropped_pairs = 0usize;
 
     for (files, days_ago) in commits {
         if files.len() < 2 {
             continue;
         }
-        // Build all pairs from the commit's changed files (sorted for dedup)
-        for i in 0..files.len() {
-            for j in (i + 1)..files.len() {
-                let a = files[i].clone();
-                let b = files[j].clone();
-                let key = if a <= b { (a, b) } else { (b, a) };
-                let entry = pair_data.entry(key).or_insert((0, *days_ago));
-                entry.0 += 1;
-                // Track the most recent (smallest days_ago)
-                if *days_ago < entry.1 {
-                    entry.1 = *days_ago;
+        if files.len() > MAX_FILES_PER_COMMIT {
+            skipped_commits += 1;
+            continue;
+        }
+
+        // Intern this commit's paths once, not once per pair.
+        let mut local: Vec<u32> = Vec::with_capacity(files.len());
+        for f in files {
+            let id = match ids.get(f.as_str()) {
+                Some(&id) => id,
+                None => {
+                    let id = paths.len() as u32;
+                    paths.push(f.as_str());
+                    ids.insert(f.as_str(), id);
+                    id
+                }
+            };
+            local.push(id);
+        }
+
+        for i in 0..local.len() {
+            for j in (i + 1)..local.len() {
+                let (a, b) = (local[i], local[j]);
+                // Order by PATH, not by id, so the emitted (file_a, file_b)
+                // ordering is byte-identical to the pre-intern implementation.
+                let key = if paths[a as usize] <= paths[b as usize] {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                match pair_data.get_mut(&key) {
+                    Some(entry) => {
+                        entry.0 += 1;
+                        if *days_ago < entry.1 {
+                            entry.1 = *days_ago;
+                        }
+                    }
+                    None => {
+                        if pair_data.len() >= MAX_TRACKED_PAIRS {
+                            dropped_pairs += 1;
+                            continue;
+                        }
+                        pair_data.insert(key, (1, *days_ago));
+                    }
                 }
             }
         }
     }
 
+    if skipped_commits > 0 || dropped_pairs > 0 {
+        eprintln!(
+            "cxpak: co-change mining skipped {skipped_commits} mass-touch commit(s) \
+             (>{MAX_FILES_PER_COMMIT} files) and dropped {dropped_pairs} new pair(s) \
+             at the {MAX_TRACKED_PAIRS}-pair ceiling"
+        );
+    }
+
     pair_data
         .into_iter()
-        .map(
-            |((file_a, file_b), (count, most_recent_days))| CoChangeEdge {
-                file_a,
-                file_b,
-                count,
-                recency_weight: co_change_weight(most_recent_days),
-            },
-        )
+        .map(|((a, b), (count, most_recent_days))| CoChangeEdge {
+            file_a: paths[a as usize].to_string(),
+            file_b: paths[b as usize].to_string(),
+            count,
+            recency_weight: co_change_weight(most_recent_days),
+        })
         .collect()
 }
 
@@ -178,6 +250,94 @@ pub fn mine_co_changes_from_git(
 
 #[cfg(test)]
 mod tests {
+    // ── cxpak#53: quadratic pair explosion in co-change mining ──────────────
+    //
+    // These are the RED baseline for the 40+ GB reports (#51). A commit
+    // touching F files contributes F*(F-1)/2 pairs, and the pre-fix loop
+    // allocated two `String`s per pair into a `HashMap<(String, String), _>`.
+    // A repo whose history contains one mass-touch commit — initial import,
+    // formatter sweep, generated-code or vendored-dependency refresh,
+    // squash-merge of a long branch — therefore spends multiple GB *before*
+    // any threshold pruning runs.
+    //
+    // Measured on a 12 000-file fixture, `cxpak serve --mcp` peaked at 5 130 MB
+    // with a stack sample landing 6/6 in `build_co_changes`, while the whole
+    // rest of the index build stayed under 500 MB.
+
+    /// A mass-touch commit carries no pairwise signal — it links every file to
+    /// every other file — so it must be skipped rather than expanded.
+    #[test]
+    fn oversized_commits_are_skipped_entirely() {
+        let files: Vec<String> = (0..MAX_FILES_PER_COMMIT + 1)
+            .map(|i| format!("src/f{i}.rs"))
+            .collect();
+        let edges = build_co_changes(&[(files, 0)]);
+        assert!(
+            edges.is_empty(),
+            "a commit above the cap must contribute no pairs; got {}",
+            edges.len()
+        );
+    }
+
+    /// The cap is inclusive: a commit exactly at the limit is still real signal.
+    #[test]
+    fn commits_at_the_cap_are_still_mined() {
+        let files: Vec<String> = (0..MAX_FILES_PER_COMMIT)
+            .map(|i| format!("src/f{i}.rs"))
+            .collect();
+        let edges = build_co_changes(&[(files, 0)]);
+        assert_eq!(
+            edges.len(),
+            MAX_FILES_PER_COMMIT * (MAX_FILES_PER_COMMIT - 1) / 2,
+            "a commit at exactly the cap must still produce every pair"
+        );
+    }
+
+    /// Ordinary commits are untouched — the fix must not change normal results.
+    #[test]
+    fn small_commits_are_unaffected_by_the_cap() {
+        let edges = build_co_changes(&[
+            (vec!["a.rs".into(), "b.rs".into(), "c.rs".into()], 0),
+            (vec!["a.rs".into(), "b.rs".into()], 10),
+        ]);
+        let ab = edges
+            .iter()
+            .find(|e| e.file_a == "a.rs" && e.file_b == "b.rs")
+            .expect("a.rs/b.rs co-change edge must survive");
+        assert_eq!(ab.count, 2, "a.rs and b.rs co-changed in both commits");
+        assert_eq!(
+            edges.len(),
+            3,
+            "3 files in one commit = 3 pairs, plus the repeat"
+        );
+    }
+
+    /// Total tracked pairs are bounded even across many at-cap commits, so a
+    /// long history cannot reintroduce the blowup one commit at a time.
+    #[test]
+    fn total_tracked_pairs_are_bounded_across_commits() {
+        // Each commit is at the cap and touches a disjoint file range, so every
+        // commit contributes entirely NEW pairs — the worst case for the map.
+        let per = MAX_FILES_PER_COMMIT;
+        let commits: Vec<(Vec<String>, i64)> = (0..120)
+            .map(|c| {
+                (
+                    (0..per)
+                        .map(|i| format!("c{c}/f{i}.rs"))
+                        .collect::<Vec<_>>(),
+                    0,
+                )
+            })
+            .collect();
+        let edges = build_co_changes(&commits);
+        assert!(
+            edges.len() <= MAX_TRACKED_PAIRS,
+            "tracked pairs must stay within the ceiling; got {} > {}",
+            edges.len(),
+            MAX_TRACKED_PAIRS
+        );
+    }
+
     use super::*;
 
     #[test]
