@@ -47,17 +47,46 @@ surfaces worth a security researcher's attention:
   to a running Postgres/MySQL over rustls (no OpenSSL), issues a **read-only**
   session, and **never logs or persists the DSN**. Off unless explicitly built
   with the feature.
-- **WASM plugin SDK (`plugins`, off by default)** — plugins run in a wasmtime
-  sandbox with a SHA-256 checksum verified before compilation, plus memory and
-  CPU (epoch-interruption) caps. Only load plugins you trust; the checksum pins
-  what you approved, it does not vouch for the author.
+- **WASM plugin loader (`plugins`, off by default and non-functional)** — see
+  below. It is listed here to be explicit that it is *not* a security surface
+  yet, because it cannot execute plugin code at all.
+
+## The WASM plugin loader does not run plugins
+
+`PluginLoader::load()` reads the module, enforces a 10 MiB size cap, verifies a
+SHA-256 checksum in constant time, compiles it, instantiates it — and then
+returns `Err("WASM plugin loaded (N bytes) but guest function binding not yet
+implemented")`. There is no WIT bridge, so **no guest function has ever been
+callable**. A test asserts exactly that error.
+
+The feature is excluded from `default`, so a stock `cargo install cxpak` cannot
+reach this code path at all.
+
+**Do not read the wasmtime configuration as a security control.** Some of it is
+real — memory growth is capped at 64 MiB by a `ResourceLimiter`, and
+epoch-interruption is enabled with a 10 s deadline. But it has never guarded
+anything, and it is incomplete in ways that matter before it could:
+
+- `table_growing` returns `Ok(true)` unconditionally — table growth is unbounded.
+- Fuel metering is explicitly disabled (`consume_fuel(false)`); the only CPU
+  bound is the epoch deadline.
+- The 1 MiB cap on a plugin's returned value is applied *after* `serde_json`
+  deserialization, so the allocation it is meant to bound has already happened.
+
+Earlier revisions of this document described the sandbox as an active control.
+That was wrong: it described the intended design of a code path that cannot run.
+Those three gaps must be closed, and the guest bridge built, before any of this
+is a control worth reasoning about — tracked in
+[#42](https://github.com/Barnett-Studios/cxpak/issues/42).
 
 ## What is not a vulnerability
 
-- Running an untrusted third-party WASM plugin and having it access repository
-  content — that's the plugin's declared capability; vet plugins before loading.
 - Pointing cxpak at a repository you don't control and disliking what it emits —
   cxpak reports what it finds; it doesn't run the analyzed code.
+- A finding against the `plugins` loader that depends on executing guest code.
+  It cannot execute guest code. Findings about the *loading* path — the size cap,
+  the checksum comparison, module compilation, instantiation — are in scope, and
+  a report there is welcome, because those steps do run.
 
 ## Dependencies
 
