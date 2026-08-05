@@ -6,6 +6,9 @@
 ![Downloads](https://img.shields.io/crates/d/cxpak)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
+**Context plane · Active** — under development; the surface still moves.
+See the [component map](https://github.com/Barnett-Studios) for how this fits the rest.
+
 **Spends CPU cycles so you don't spend tokens.**
 
 cxpak indexes your codebase using tree-sitter across 43 languages, builds a typed dependency graph, and produces token-budgeted context bundles that give LLMs a briefing packet instead of a flashlight in a dark room. It understands your code's architecture, conventions, risk profile, and data layer -- then packs exactly what the LLM needs, nothing more.
@@ -315,13 +318,19 @@ Minimal local config:
 { "embeddings": { "provider": "local" } }
 ```
 
-## WASM Plugin SDK
+## WASM plugin loader — a skeleton, not a working SDK
 
-Extend cxpak with custom analyzers and detectors:
+**You cannot extend cxpak with a WASM plugin today.** `PluginLoader::load()` verifies the module's
+checksum, compiles it, instantiates it, and then returns `guest function binding not yet
+implemented`. The WIT bridge that would make a guest function callable does not exist, so no plugin
+code has ever run.
 
-- Plugin manifest with SHA-256 checksum verification before WASM compilation
-- wasmtime sandbox: epoch interruption (CPU), 64 MB memory cap, capability enforcement
-- File pattern scoping and content access control
+The `plugins` feature is therefore excluded from `default` — a stock `cargo install cxpak` does not
+build it, and the plugin management commands are behind the same gate. What is built out is the
+loading path: a manifest with SHA-256 verification before compilation, a 10 MiB module cap, a 64 MiB
+memory limiter, and a 10 s epoch deadline. Treat none of it as a security boundary until the bridge
+lands and the gaps in [`SECURITY.md`](SECURITY.md#the-wasm-plugin-loader-does-not-run-plugins) are
+closed — [#42](https://github.com/Barnett-Studios/cxpak/issues/42).
 
 ## Workspace support
 
