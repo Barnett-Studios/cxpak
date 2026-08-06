@@ -1,47 +1,67 @@
 //! RED first (cxpak#57): the official Rust client, and the feature boundary that keeps it
 //! out of a default `cargo install`.
 //!
-//! Against `main` this file does not compile: `cxpak::client` does not exist. That is the
-//! failure — an absent module, not a wrong value. The mutation to re-run on revert is
-//! "delete src/client.rs and its `pub mod client;`", which returns this to a compile error.
+//! Against `main` this file compiles to nothing and asserts nothing, because `cxpak` has no
+//! `client` feature at all — `cargo test --features client` fails with "the package 'cxpak'
+//! does not contain this feature: client". That is the RED state.
 //!
-//! The boundary test is the one that matters. cxpak has zero rmcp today and #32 already
-//! records that the default feature set is a kitchen sink; a client that quietly lands in
-//! the default build makes that worse for every user who wants an indexer and not an MCP
-//! client. `cargo build` must not compile this module, which is why the whole file is
-//! gated: under default features it is empty, and that emptiness is the assertion.
+//! Mutation to re-run on revert: delete `src/client.rs` and its `pub mod client;`, and drop
+//! the `client` feature from `Cargo.toml`. This returns to that same error.
+//!
+//! The boundary is the point of the `cfg`. cxpak has zero rmcp references today and #32
+//! already records the default feature set as a kitchen sink; a client that quietly lands in
+//! the default build regresses every user who wants an indexer and not an MCP client. Under
+//! default features this file is empty, and that emptiness is an assertion in its own right.
 #![cfg(feature = "client")]
 
 use cxpak::client::{CxpakClient, RecordedCxpakClient};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
-/// The replay client is what every consumer's tests actually use, so it is the surface
-/// that has to survive the move intact.
+/// The replay client is what every downstream consumer's tests actually construct, so it is
+/// the surface that has to survive the move intact — moving it and changing its shape would
+/// break them at compile time, which is the good case, or silently, which is not.
 #[tokio::test]
-async fn recorded_client_round_trips_a_fixture() {
-    let mut map = HashMap::new();
-    map.insert(
-        ("overview".to_string(), String::new()),
-        r#"{"health":{"score":0.9}}"#.to_string(),
-    );
-    let client = RecordedCxpakClient::new(map);
+async fn recorded_client_replays_a_committed_recording() {
+    let mut recordings = HashMap::new();
+    recordings.insert("overview".to_string(), json!({"health": {"score": 0.9}}));
+
+    let client = RecordedCxpakClient::new(recordings);
     let got = client
-        .call("overview", "")
+        .call("overview", Value::Null)
         .await
-        .expect("a recorded op must replay");
-    assert!(
-        got.contains("\"score\":0.9"),
-        "recorded payload must round-trip verbatim, got: {got}"
+        .expect("a recorded tool must replay rather than miss");
+
+    assert_eq!(
+        got["health"]["score"], 0.9,
+        "the recorded payload must round-trip verbatim, got: {got}"
     );
 }
 
-/// An op with no recording is a miss, not a fabricated empty success — the same
-/// fail-open-vs-fabricate distinction the server side draws.
+/// `None` is the miss signal the whole seam is built on: callers map it to
+/// `Observation::Skipped` rather than to a verdict. A client that fabricated an empty
+/// success here would turn "cxpak was unavailable" into "cxpak found nothing", which is the
+/// silent-false-negative this contract exists to prevent.
 #[tokio::test]
-async fn an_unrecorded_op_is_an_error_not_an_empty_success() {
+async fn an_unrecorded_tool_is_a_miss_not_an_empty_success() {
     let client = RecordedCxpakClient::new(HashMap::new());
+
     assert!(
-        client.call("overview", "").await.is_err(),
-        "an unrecorded op must surface as an error rather than an empty bundle"
+        client.call("overview", Value::Null).await.is_none(),
+        "an unrecorded tool must surface as None, never as an empty-but-present bundle"
+    );
+}
+
+/// `from_dir` is how the framework loads its committed `conformance/recordings/cxpak/`
+/// fixtures. A missing directory is a hard error — that is a misconfiguration, not a miss,
+/// and conflating the two would let a mis-pathed test suite report a clean run over nothing.
+#[tokio::test]
+async fn from_dir_rejects_a_missing_directory_rather_than_returning_an_empty_client() {
+    let missing = std::path::Path::new("/nonexistent/cxpak/recordings");
+
+    assert!(
+        RecordedCxpakClient::from_dir(missing).is_err(),
+        "a missing recordings directory must be an error, not an empty client that \
+         silently misses every tool"
     );
 }
