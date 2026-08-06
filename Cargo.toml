@@ -73,6 +73,11 @@ chrono = { version = "0.4", features = ["serde"] }
 notify = { version = "7", optional = true }
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
+# cxpak#57: the official Rust client. Optional — see the `client` feature.
+rmcp = { version = "2", features = ["client", "transport-child-process"], optional = true }
+async-trait = { version = "0.1", optional = true }
+# client.rs reaps a hung child by PID (SIGKILL) rather than leaking it; unix-only path.
+libc = { version = "0.2", optional = true }
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
@@ -204,6 +209,10 @@ embeddings = [
 ]
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
 e2e-browser = []
+# cxpak#57: NON-default by design. cxpak had zero rmcp before this; #32 already records
+# the default feature set as a kitchen sink, so the client must not ride into
+# `cargo install cxpak`. tests/client_feature_boundary.rs is empty without it.
+client = ["dep:rmcp", "dep:async-trait", "dep:tokio", "dep:libc"]
 plugins = ["dep:wasmtime"]
 # Test-only helpers (`cxpak::test_support`). Off by default → never compiled
 # into a release binary. Integration tests receive it through the self

@@ -4,6 +4,10 @@ pub mod bench;
 pub mod budget;
 pub mod cache;
 pub mod capability;
+/// The official Rust client for a cxpak MCP server (non-default `client` feature:
+/// it pulls rmcp + async-trait, and `cargo install cxpak` stays an indexer — see #32).
+#[cfg(feature = "client")]
+pub mod client;
 pub mod cli;
 pub mod commands;
 pub mod context_quality;
