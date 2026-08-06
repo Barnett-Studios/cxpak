@@ -4,7 +4,7 @@
 ![CI](https://github.com/Barnett-Studios/cxpak/actions/workflows/ci.yml/badge.svg)
 ![Crates.io](https://img.shields.io/crates/v/cxpak)
 ![Downloads](https://img.shields.io/crates/d/cxpak)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
+![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)
 
 **Spends CPU cycles so you don't spend tokens.**
 
@@ -343,7 +343,9 @@ Every architecturally significant decision is recorded as an ADR in [`docs/adrs/
 
 ## License
 
-MIT
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+Unless you explicitly state otherwise, any contribution you intentionally submit for
+inclusion in the work shall be dual-licensed as above, without any additional terms.
 
 ---
 
