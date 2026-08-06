@@ -39,7 +39,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.1
-      - run: cargo clippy --all-targets -- -D warnings
+      # `--features client` because features are ADDITIVE: this still lints everything the
+      # default set covers, and additionally compiles src/client.rs, which no job did before
+      # (#57). Without it the client is shipped unlinted.
+      - run: cargo clippy --all-targets --features client -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -48,7 +51,35 @@ jobs:
       - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2.9.1
-      - run: cargo test --verbose
+      # The `client` gate has two directions and CI has to see both.
+      #
+      # Direction 1 — the client must COMPILE AND RUN. Under default features
+      # `cargo test --test client_feature_boundary` prints "running 0 tests … ok": green,
+      # having asserted nothing, because the whole file is behind #[cfg(feature = "client")].
+      # Features are additive, so `--features client` runs the default suite AND that one.
+      #
+      # Direction 2 — rmcp must STAY OUT of the default build, which is what makes
+      # `cargo install cxpak` an indexer rather than an MCP client (#32). Nothing checked
+      # this either; direction 1 alone is satisfied by deleting the gate.
+      #
+      # The step asserts BOTH halves, so it cannot pass because the grep stopped matching:
+      # rmcp absent by default AND present under the feature. (async-trait is deliberately
+      # not asserted — v0.1.89 is already in the default tree transitively, so it is not a
+      # new build; only rmcp is.)
+      - name: the client feature gate holds in both directions
+        run: |
+          default_tree=$(cargo tree -e normal --prefix none | sort -u)
+          client_tree=$(cargo tree -e normal --prefix none --features client | sort -u)
+          if printf '%s\n' "$default_tree" | grep -q '^rmcp '; then
+            echo "::error::rmcp is in the DEFAULT dependency tree — the client gate leaks and 'cargo install cxpak' now builds an MCP client" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$client_tree" | grep -q '^rmcp '; then
+            echo "::error::rmcp is absent even under --features client, so the check above proves nothing — the probe is broken, not the gate" >&2
+            exit 1
+          fi
+          echo "default tree is rmcp-free; --features client pulls it in"
+      - run: cargo test --verbose --features client
 
   bench:
     # Recall-regression gate (ADR-0172). Two layers:
