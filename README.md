@@ -4,7 +4,7 @@
 ![CI](https://github.com/Barnett-Studios/cxpak/actions/workflows/ci.yml/badge.svg)
 ![Crates.io](https://img.shields.io/crates/v/cxpak)
 ![Downloads](https://img.shields.io/crates/d/cxpak)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
+![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)
 
 **Context plane · Active** — under development; the surface still moves.
 See the [component map](https://github.com/Barnett-Studios) for how this fits the rest.
@@ -340,6 +340,53 @@ For monorepos: `--workspace packages/api` scopes scanning to a subdirectory whil
 
 Parse results cached in `.cxpak/cache/` keyed on file mtime and size. Cache invalidates automatically when tree-sitter grammar versions change. Atomic writes with advisory locking for concurrent process safety. `cxpak clean .` to reset.
 
+## Rust client (non-default `client` feature)
+
+Rust callers can talk to a cxpak MCP server through the official client rather than
+hand-rolling an rmcp session. It is **off by default**, so `cargo install cxpak` still builds
+an indexer and pulls no rmcp:
+
+```toml
+[dependencies]
+cxpak = { version = "3.1", features = ["client"] }
+```
+
+If you want the client without the 43 bundled grammars, `default-features = false, features =
+["client", "daemon"]` builds the library — `daemon` is currently the floor, not `client` alone.
+
+`CxpakClient` is one method, and its return type is the contract:
+
+```rust
+use cxpak::client::{CxpakClient, RmcpCxpakClient};
+use serde_json::json;
+
+let client = RmcpCxpakClient::new(std::env::current_dir()?);
+match client.call("cxpak_context", json!({"op": "overview"})).await {
+    Some(bundle) => use_it(bundle),
+    // NOT "the server looked and found nothing" — the tool was unavailable, errored,
+    // or degraded. Map it to a skipped observation, never to a verdict.
+    None => skip(),
+}
+```
+
+`RmcpCxpakClient` is lazy: no child process is spawned until the first call, spawns are
+backed off after repeated failures, and the child's stderr is nulled so a server banner can
+never contaminate a caller that must not write to stderr (a hook, for instance).
+
+For your own tests, `RecordedCxpakClient` replays a `name → response` map with no I/O, and
+`from_dir` loads a directory of committed `<tool>.json` recordings. A missing directory is an
+**error**, not an empty client — a mis-pathed fixture set reporting a clean run over nothing
+is the failure this constructor refuses to have.
+
+```rust
+use cxpak::client::RecordedCxpakClient;
+let client = RecordedCxpakClient::from_dir(std::path::Path::new("recordings/cxpak"))?;
+```
+
+The feature adds `rmcp`, and only `rmcp`, to what gets built (`async-trait` is already in the
+default tree transitively). CI asserts both directions — that the client compiles and its
+tests run, and that `rmcp` stays out of the default dependency tree.
+
 ## Stable API
 
 v2.0.0 establishes semver for the MCP API. Tool names, parameters, and response structures are stable across 2.x.
@@ -352,7 +399,9 @@ Every architecturally significant decision is recorded as an ADR in [`docs/adrs/
 
 ## License
 
-MIT
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+Unless you explicitly state otherwise, any contribution you intentionally submit for
+inclusion in the work shall be dual-licensed as above, without any additional terms.
 
 ---
 
