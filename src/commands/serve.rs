@@ -9064,12 +9064,17 @@ mod tests {
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
+        let rec = result["recommendation"].as_str().unwrap();
+        // The advertised name, not the deprecated alias: this assertion is what let the
+        // recommendation keep naming a tool `tools/list` stopped offering in 3.0 (cxpak#61).
         assert!(
-            result["recommendation"]
-                .as_str()
-                .unwrap()
-                .contains("cxpak_auto_context"),
-            "no-snapshot recommendation should mention cxpak_auto_context"
+            rec.contains("cxpak_context"),
+            "no-snapshot recommendation should name the advertised context tool: {rec}"
+        );
+        assert!(
+            !rec.contains("cxpak_auto_context"),
+            "recommendation still names the deprecated alias, which tools/list does not \
+             advertise: {rec}"
         );
     }
 
