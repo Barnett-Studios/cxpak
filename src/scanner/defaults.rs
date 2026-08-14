@@ -53,4 +53,40 @@ pub const BUILTIN_IGNORES: &[&str] = &[
     "*.min.js",
     "*.min.css",
     "*.map",
+    // ── Credential material (cxpak#39) ────────────────────────────────────────
+    //
+    // Measured on the published 3.1.4 image: a repo containing `id_rsa`,
+    // `server.key` and `credentials.json` indexed all three, and `credentials.json`
+    // was packed VERBATIM into the `overview` bundle. The only thing standing
+    // between a committed private key and the model was whether the user's
+    // `.gitignore` happened to cover it — `git_global(true)`'s comment already
+    // banked on that ("often excludes .env, *.pem"), which is a hope, not a control.
+    //
+    // These are exact names and key-material extensions, deliberately NOT the
+    // `*secret*` / `*credentials*` globs the ticket proposed. A glob that wide
+    // silently drops `secrets_manager.rs`, `credentials_test.go` and
+    // `SecretScanner.java` out of the index — real source vanishing from context
+    // with no diagnostic, which is the same defect class this list is closing, in
+    // the other direction.
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.jks",
+    "*.keystore",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "credentials.json",
+    "credentials.yml",
+    "credentials.yaml",
+    "secrets.json",
+    "secrets.yml",
+    "secrets.yaml",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
 ];

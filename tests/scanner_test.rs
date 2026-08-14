@@ -206,3 +206,103 @@ fn language_detection_markdown() {
         "README.md should be detected as 'markdown'"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Credential material never reaches the index (cxpak#39)
+// ---------------------------------------------------------------------------
+
+/// Build a throwaway repo containing the named files, each with trivial content.
+fn repo_with(files: &[&str]) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join(".git")).expect("create .git");
+    for f in files {
+        let p = tmp.path().join(f);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(&p, "placeholder\n").expect("write fixture file");
+    }
+    tmp
+}
+
+fn scanned_paths(root: &Path) -> Vec<String> {
+    Scanner::new(root)
+        .expect("scanner")
+        .scan()
+        .expect("scan")
+        .into_iter()
+        .map(|f| f.relative_path)
+        .collect()
+}
+
+#[test]
+fn credential_files_are_never_scanned() {
+    // Measured on the published 3.1.4 image before this list existed: a repo holding
+    // `id_rsa`, `server.key` and `credentials.json` indexed all three, and
+    // `credentials.json` was packed verbatim into the `overview` bundle. The only
+    // protection was whether the user's gitignore happened to cover them.
+    let secrets = [
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "server.key",
+        "server.pem",
+        "bundle.p12",
+        "cert.pfx",
+        "app.jks",
+        "release.keystore",
+        "credentials.json",
+        "credentials.yml",
+        "credentials.yaml",
+        "secrets.json",
+        "secrets.yml",
+        "secrets.yaml",
+        ".env",
+        ".env.production",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        // Nested, because a denylist that only matches at the root is a denylist
+        // anyone defeats by putting the key in `config/`.
+        "config/deploy.key",
+        "deploy/credentials.json",
+    ];
+    let tmp = repo_with(&secrets);
+    let scanned = scanned_paths(tmp.path());
+    let leaked: Vec<&String> = scanned.iter().collect();
+    assert!(
+        leaked.is_empty(),
+        "credential material reached the index: {leaked:?}"
+    );
+}
+
+#[test]
+fn ordinary_source_that_merely_mentions_secrets_is_still_scanned() {
+    // The bound, and the reason this list is exact names rather than the `*secret*` /
+    // `*credentials*` globs the ticket proposed. Those globs drop real source out of the
+    // index with no diagnostic — the same silent-exclusion defect, pointed the other way.
+    //
+    // Without it, `credential_files_are_never_scanned` is satisfied by a scanner that
+    // returns nothing at all.
+    let sources = [
+        "src/secrets_manager.rs",
+        "src/credentials_test.go",
+        "src/SecretScanner.java",
+        "src/keyring.py",
+        "src/env_loader.ts",
+        "docs/secrets.md",
+    ];
+    let tmp = repo_with(&sources);
+    let scanned = scanned_paths(tmp.path());
+    let mut missing: Vec<&str> = sources
+        .iter()
+        .copied()
+        .filter(|s| !scanned.iter().any(|p| p == s))
+        .collect();
+    missing.sort_unstable();
+    assert!(
+        missing.is_empty(),
+        "real source was excluded by the credential denylist: {missing:?}"
+    );
+}
