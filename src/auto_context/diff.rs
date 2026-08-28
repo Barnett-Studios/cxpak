@@ -361,9 +361,9 @@ pub fn no_snapshot_recommendation() -> ContextDelta {
         new_symbols: Vec::new(),
         removed_symbols: Vec::new(),
         graph_changes: Vec::new(),
-        recommendation:
-            "No prior context snapshot. Call cxpak_auto_context first to establish a baseline."
-                .to_string(),
+        recommendation: "No prior context snapshot. Call cxpak_context (op: \"context\") first to \
+             establish a baseline."
+            .to_string(),
     }
 }
 
@@ -441,7 +441,8 @@ fn build_recommendation(
     }
 
     parts.push(
-        "Re-run cxpak_auto_context to refresh the context with the latest changes.".to_string(),
+        "Re-run cxpak_context (op: \"context\") to refresh the context with the latest changes."
+            .to_string(),
     );
 
     parts.join(" ")
@@ -743,8 +744,16 @@ mod tests {
             delta.recommendation
         );
         assert!(
-            delta.recommendation.contains("cxpak_auto_context"),
-            "Recommendation should mention cxpak_auto_context: {}",
+            delta
+                .recommendation
+                .contains("cxpak_context (op: \"context\")"),
+            "no-snapshot recommendation should name the advertised context tool and its op: {}",
+            delta.recommendation
+        );
+        assert!(
+            !delta.recommendation.contains("cxpak_auto_context"),
+            "recommendation still names the deprecated alias, which tools/list does not \
+             advertise: {}",
             delta.recommendation
         );
     }
@@ -807,8 +816,15 @@ mod tests {
             delta.recommendation
         );
         assert!(
-            delta.recommendation.contains("cxpak_auto_context"),
-            "Recommendation should suggest re-running cxpak_auto_context. Got: {}",
+            delta.recommendation.contains("Re-run"),
+            "Recommendation should suggest re-running the context tool. Got: {}",
+            delta.recommendation
+        );
+        assert!(
+            delta
+                .recommendation
+                .contains("cxpak_context (op: \"context\")"),
+            "re-run recommendation should name the advertised context tool and its op: {}",
             delta.recommendation
         );
     }

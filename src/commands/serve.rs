@@ -3508,7 +3508,9 @@ fn dispatch_capability_op(
                     "task": task,
                     "candidates": candidates,
                     "total_files_scored": all_scored.len(),
-                    "hint": "Review candidates and call cxpak_pack_context with selected paths, or use these as-is."
+                    // `cxpak_pack_context` is a 3.0 legacy alias, not a name `tools/list`
+                    // offers; the op lives under the `cxpak_context` intent-tool (cxpak#61).
+                    "hint": "Review candidates and call cxpak_context (op: \"pack_context\") with selected paths, or use these as-is."
                 }))
                 .unwrap_or_default(),
             )
@@ -4461,7 +4463,7 @@ fn dispatch_capability_op(
                 let _ = (visual_type, format, focus, symbol, files_arg);
                 mcp_tool_error(
                     id,
-                    "Error: cxpak_visual requires the 'visual' feature flag. Rebuild with: cargo build --features visual",
+                    "Error: cxpak_insight (op: \"visual\") requires the 'visual' feature flag. Rebuild with: cargo build --features visual",
                 )
             }
         }
@@ -4487,7 +4489,7 @@ fn dispatch_capability_op(
                 let _ = (focus, format);
                 mcp_tool_error(
                     id,
-                    "Error: cxpak_onboard requires the 'visual' feature flag. Rebuild with: cargo build --features visual",
+                    "Error: cxpak_insight (op: \"onboard\") requires the 'visual' feature flag. Rebuild with: cargo build --features visual",
                 )
             }
         }
@@ -9064,12 +9066,17 @@ mod tests {
         let response: Value = serde_json::from_slice(&output).unwrap();
         let content = response["result"]["content"][0]["text"].as_str().unwrap();
         let result: Value = serde_json::from_str(content).unwrap();
+        let rec = result["recommendation"].as_str().unwrap();
+        // The advertised name, not the deprecated alias: this assertion is what let the
+        // recommendation keep naming a tool `tools/list` stopped offering in 3.0 (cxpak#61).
         assert!(
-            result["recommendation"]
-                .as_str()
-                .unwrap()
-                .contains("cxpak_auto_context"),
-            "no-snapshot recommendation should mention cxpak_auto_context"
+            rec.contains("cxpak_context"),
+            "no-snapshot recommendation should name the advertised context tool: {rec}"
+        );
+        assert!(
+            !rec.contains("cxpak_auto_context"),
+            "recommendation still names the deprecated alias, which tools/list does not \
+             advertise: {rec}"
         );
     }
 
