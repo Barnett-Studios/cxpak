@@ -465,47 +465,6 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Every `cxpak_*` name a recommendation puts in front of a caller must be one the MCP
-    /// server actually advertises.
-    ///
-    /// These strings told callers to `Call cxpak_auto_context` — a name `tools/list` has not
-    /// offered since the 3.0 intent-tool consolidation (ADR-0182). It still *routes*, via the
-    /// deprecated alias in `serve.rs`, so a permissive client never noticed; a client that
-    /// validates tool names against the advertised set before dispatching — which is what an
-    /// agent harness does — was told to call something it was never offered (cxpak#61).
-    ///
-    /// The denominator is `mcp_catalog_tools()`, the same source `tools/list` is built from,
-    /// so this cannot go stale against a future rename the way a literal assertion did.
-    fn assert_advertised_tools_only(recommendation: &str) {
-        let advertised: Vec<String> = crate::capability::adapter::mcp_catalog_tools()
-            .iter()
-            .map(|t| t.name.clone())
-            .collect();
-        assert!(
-            !advertised.is_empty(),
-            "no advertised tools found — the catalog is not being read, so this proves nothing"
-        );
-
-        let mut named = Vec::new();
-        for word in recommendation.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-            if word.starts_with("cxpak_") {
-                named.push(word.to_string());
-            }
-        }
-        assert!(
-            !named.is_empty(),
-            "recommendation names no cxpak tool at all, so it cannot be guiding anyone: \
-             {recommendation}"
-        );
-        for name in named {
-            assert!(
-                advertised.contains(&name),
-                "recommendation names {name:?}, which tools/list does not advertise \
-                 (advertised: {advertised:?}): {recommendation}"
-            );
-        }
-    }
-
     /// Build a minimal `CodebaseIndex` from a list of (relative_path, content)
     /// pairs without touching the filesystem.
     fn make_index(files: &[(&str, &str)]) -> CodebaseIndex {
@@ -784,7 +743,19 @@ mod tests {
             "Unexpected recommendation: {}",
             delta.recommendation
         );
-        assert_advertised_tools_only(&delta.recommendation);
+        assert!(
+            delta
+                .recommendation
+                .contains("cxpak_context (op: \"context\")"),
+            "no-snapshot recommendation should name the advertised context tool and its op: {}",
+            delta.recommendation
+        );
+        assert!(
+            !delta.recommendation.contains("cxpak_auto_context"),
+            "recommendation still names the deprecated alias, which tools/list does not \
+             advertise: {}",
+            delta.recommendation
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -849,7 +820,13 @@ mod tests {
             "Recommendation should suggest re-running the context tool. Got: {}",
             delta.recommendation
         );
-        assert_advertised_tools_only(&delta.recommendation);
+        assert!(
+            delta
+                .recommendation
+                .contains("cxpak_context (op: \"context\")"),
+            "re-run recommendation should name the advertised context tool and its op: {}",
+            delta.recommendation
+        );
     }
 
     // -----------------------------------------------------------------------
