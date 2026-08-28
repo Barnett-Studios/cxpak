@@ -45,6 +45,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --user-group cxpak
 
+# libgit2 refuses to open a repository whose owner differs from the running uid, and a
+# bind-mounted host repo never belongs to 10001 — so `cxpak diff` failed with
+# `Owner (-36)` on every documented container invocation (cxpak#60). `overview` does not
+# open the repo through libgit2, which is why the README's headline command worked and
+# this stayed invisible.
+#
+# libgit2 honours the system `safe.directory` and reads /etc/gitconfig itself, so this
+# needs no git binary. Measured on the published 3.1.4 image: with this file the
+# documented `docker run -v "$PWD:/repo" … diff` exits 0 and prints the diff; an
+# otherwise identical rebuild without it exits 1 with `Owner (-36)`.
+#
+# The trust decision is the right one for this image: cxpak is a read-only analyser whose
+# entire job is to open a repo it was explicitly handed on a mount.
+RUN printf '[safe]\n\tdirectory = *\n' > /etc/gitconfig
+
 COPY --from=builder /build/target/release/cxpak /usr/local/bin/cxpak
 
 # Model weights (~30 MB) download on first use to $HOME/.cxpak/models. Mount a
