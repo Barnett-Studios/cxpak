@@ -158,7 +158,15 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
             }
         })
         .collect();
-    churn_30d_vec.sort_by(|a, b| b.modifications.cmp(&a.modifications));
+    // Total order. `modifications` alone leaves every tie to be broken by the
+    // `HashMap` drain order above, which is randomised per process — the source of
+    // cxpak#70's phantom drift, and most visible on exactly the repos where every
+    // file was touched once.
+    churn_30d_vec.sort_by(|a, b| {
+        b.modifications
+            .cmp(&a.modifications)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     let mut churn_180d_vec: Vec<ChurnEntry> = churn_180d
         .into_iter()
@@ -171,7 +179,15 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
             }
         })
         .collect();
-    churn_180d_vec.sort_by(|a, b| b.modifications.cmp(&a.modifications));
+    // Total order. `modifications` alone leaves every tie to be broken by the
+    // `HashMap` drain order above, which is randomised per process — the source of
+    // cxpak#70's phantom drift, and most visible on exactly the repos where every
+    // file was touched once.
+    churn_180d_vec.sort_by(|a, b| {
+        b.modifications
+            .cmp(&a.modifications)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     // Compute the 75th-percentile churn threshold from the 180-day data.
     // This replaces the old absolute threshold of 5.
@@ -460,6 +476,43 @@ mod tests {
         );
         // last_computed should be set
         assert!(profile.last_computed.is_some());
+    }
+
+    /// cxpak#70. Every file touched exactly once is the ordinary shape of a young repo, and
+    /// it is the shape with no tiebreaker: `modifications` alone left the order to the
+    /// `HashMap` drain, which is randomised per process, so two exports of an unchanged tree
+    /// disagreed and `conventions diff` reported drift.
+    #[test]
+    fn churn_entries_with_equal_counts_are_ordered_by_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_repo_with_commits(
+            &dir,
+            &[
+                ("gamma.rs", "fn g() {}", "add gamma"),
+                ("alpha.rs", "fn a() {}", "add alpha"),
+                ("beta.rs", "fn b() {}", "add beta"),
+            ],
+        );
+
+        let profile = extract_git_health(dir.path());
+        for window in [&profile.churn_180d, &profile.churn_30d] {
+            let tied: Vec<&str> = window
+                .iter()
+                .filter(|e| e.modifications == 1)
+                .map(|e| e.path.as_str())
+                .collect();
+            assert!(
+                tied.len() >= 3,
+                "fixture should tie at least 3 files: {tied:?}"
+            );
+            let mut sorted = tied.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                tied, sorted,
+                "entries with equal modification counts must be in path order, or the \
+                 emitted profile is a different permutation on every run"
+            );
+        }
     }
 
     #[test]
