@@ -106,8 +106,15 @@ pub fn run(
             // cache under .cxpak/timeline/ is git-ignorable; snapshots are
             // injected into the render so the emitted bytes never depend on a
             // pre-existing cache (determinism).
-            let mut snaps =
-                crate::visual::timeline::compute_timeline_snapshots(path, 12).unwrap_or_default();
+            // The dashboard is more than its History tab, so a timeline failure degrades this
+            // view rather than failing it — but it is SAID, on stderr, in the same shape as the
+            // cache-persist failure below. `unwrap_or_default()` alone rendered an empty
+            // History tab and exited 0, which is the symptom #71 reports.
+            let mut snaps = crate::visual::timeline::compute_timeline_snapshots(path, 12)
+                .unwrap_or_else(|e| {
+                    eprintln!("cxpak: timeline unavailable, History tab will be empty: {e}");
+                    Vec::new()
+                });
             crate::visual::timeline::enrich_snapshots_with_health(path, &mut snaps);
             if let Err(e) = crate::visual::timeline::save_snapshots(path, &snaps) {
                 eprintln!("cxpak: could not persist timeline cache: {e}");
@@ -128,8 +135,10 @@ pub fn run(
             let mut snapshots =
                 crate::visual::timeline::load_cached_snapshots(path).unwrap_or_default();
             if snapshots.is_empty() {
-                snapshots = crate::visual::timeline::compute_timeline_snapshots(path, 12)
-                    .unwrap_or_default();
+                // `--visual-type=timeline` IS the timeline. There is no degraded version of
+                // this view: rendering it empty on a failed walk is the exact "looks like a
+                // normal successful result and is wrong" the class describes, so it fails.
+                snapshots = crate::visual::timeline::compute_timeline_snapshots(path, 12)?;
                 crate::visual::timeline::enrich_snapshots_with_health(path, &mut snapshots);
                 if let Err(e) = crate::visual::timeline::save_snapshots(path, &snapshots) {
                     eprintln!("cxpak: could not persist timeline cache: {e}");

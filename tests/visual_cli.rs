@@ -48,6 +48,94 @@ mod visual_cli_tests {
         dir
     }
 
+    /// `make_test_repo` plus a second commit, then the FIRST commit's object removed, so the
+    /// revwalk starts fine and fails traversing to a parent that is not there.
+    fn repo_whose_revwalk_fails_partway() -> TempDir {
+        let dir = make_test_repo();
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "t@t.com").unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let tree = head.tree().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&head])
+            .unwrap();
+
+        let first = head.id().to_string();
+        let object = dir
+            .path()
+            .join(".git/objects")
+            .join(&first[..2])
+            .join(&first[2..]);
+        std::fs::remove_file(&object).expect("the parent commit object must exist to be removed");
+        dir
+    }
+
+    /// #71's reported symptom, at the surface that reports it: `--visual-type=timeline` on a
+    /// repository whose commit walk fails must NOT render an empty timeline and exit 0.
+    ///
+    /// This is the half a library-only fix leaves behind — `compute_timeline_snapshots` can
+    /// return the error faithfully and the command still swallow it with `unwrap_or_default()`.
+    #[test]
+    fn timeline_view_fails_loudly_when_the_commit_walk_fails() {
+        let repo = repo_whose_revwalk_fails_partway();
+        let out_dir = TempDir::new().unwrap();
+        let out_file = out_dir.path().join("out.html");
+
+        let output = cxpak()
+            .args([
+                "visual",
+                "--visual-type",
+                "timeline",
+                "--out",
+                out_file.to_str().unwrap(),
+            ])
+            .current_dir(repo.path())
+            .output()
+            .expect("cxpak must run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "a timeline that could not be walked must not exit 0; stderr was: {stderr}"
+        );
+        assert!(
+            stderr.to_lowercase().contains("revwalk") || stderr.to_lowercase().contains("walk"),
+            "the failure must name the walk so the cause is not erased; stderr was: {stderr}"
+        );
+    }
+
+    /// The deliberate asymmetry, pinned so it is a decision rather than an oversight: the
+    /// full dashboard is more than its History tab, so a failed walk degrades that one view
+    /// instead of failing the whole render — but it is SAID on stderr. Silently rendering an
+    /// empty History tab is the same defect as the timeline view exiting 0.
+    #[test]
+    fn full_dashboard_still_renders_when_the_walk_fails_but_says_so() {
+        let repo = repo_whose_revwalk_fails_partway();
+        let out_dir = TempDir::new().unwrap();
+        let out_file = out_dir.path().join("out.html");
+
+        let output = cxpak()
+            .args([
+                "visual",
+                "--visual-type",
+                "all",
+                "--out",
+                out_file.to_str().unwrap(),
+            ])
+            .current_dir(repo.path())
+            .output()
+            .expect("cxpak must run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the dashboard must still render; stderr was: {stderr}"
+        );
+        assert!(
+            stderr.contains("timeline unavailable"),
+            "a degraded History tab must be stated, not silent; stderr was: {stderr}"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // PNG output — binary format validation
     // -------------------------------------------------------------------------
