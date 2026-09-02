@@ -18,7 +18,10 @@
 //!    sorted, deduped union of both sides' edge lines — conflict-free and
 //!    commutative.
 //!
-//! `cxpak hook install` wires both into the target repo idempotently.
+//! `cxpak hook install` wires both into the target repo idempotently. The hook is written
+//! where git will actually read it — `core.hooksPath` when set, else the repository's COMMON
+//! hooks dir, which is what a linked worktree runs. It is NOT written to a `core.hooksPath`
+//! outside the repository, because that directory serves every repo on the machine.
 //!
 //! The canonical artifact is line-oriented (`<from>\t<to>\t<edge_type>\t<confidence>`,
 //! one edge per line, sorted + deduped, `\n`-terminated). Line orientation is
@@ -396,28 +399,100 @@ pub fn merge_driver(_ancestor: &Path, current: &Path, other: &Path) -> Result<()
 }
 
 /// `cxpak hook install [path]` — wire the post-commit hook + the union merge
-/// driver into the TARGET repo. Idempotent (re-install safe); writes only to
-/// the target repo's `.git` and `.gitattributes`, never globally.
+/// driver into the TARGET repo. Idempotent (re-install safe); writes only inside
+/// the target repo (its git storage, `.gitattributes`, and a working-tree
+/// `core.hooksPath` such as `.husky`), never globally.
+///
+/// The two halves can succeed independently, so each reports separately (#86): the merge
+/// driver is repo-local config plus `.gitattributes`, neither of which `core.hooksPath`
+/// touches, while the hook is refused when git's hooks directory is outside this repository.
 pub fn install(path: &Path) -> Result<(), Box<dyn Error>> {
     let repo = git2::Repository::open(path)
         .map_err(|e| format!("not a git repository at {}: {e}", path.display()))?;
 
-    install_post_commit_hook(&repo)?;
+    let hook = install_post_commit_hook(&repo)?;
     install_merge_driver_config(&repo)?;
     install_gitattributes(path)?;
 
+    // The two halves succeed independently — `core.hooksPath` does not touch repo-local config
+    // or `.gitattributes` — so one unqualified success line covering both is how #86 stayed
+    // invisible: users who verified the merge driver had every reason to assume the hook too.
     eprintln!(
-        "cxpak: installed post-commit hook + '{MERGE_DRIVER_NAME}' merge driver into {}",
+        "cxpak: installed '{MERGE_DRIVER_NAME}' merge driver + .gitattributes into {}",
         path.display()
     );
+    match hook {
+        Some(p) => eprintln!("cxpak: installed post-commit hook at {}", p.display()),
+        None => eprintln!(
+            "cxpak: NO post-commit hook installed — core.hooksPath points outside this \
+             repository ({}), which is shared with every repo on this machine. The graph \
+             artifact will NOT rebuild on commit. To wire it up, add this line to that \
+             directory's post-commit hook yourself:\n  cxpak hook post-commit \"$(git \
+             rev-parse --show-toplevel)\" || true",
+            hooks_dir(&repo).display()
+        ),
+    }
     Ok(())
 }
 
 /// Append a fenced, managed block to `.git/hooks/post-commit` (creating the
 /// hook with a shebang if absent), preserving any existing user hook body.
 /// Idempotent: a re-install replaces the managed block in place.
-fn install_post_commit_hook(repo: &git2::Repository) -> Result<(), Box<dyn Error>> {
-    let hooks_dir = repo.path().join("hooks");
+/// Where git will ACTUALLY run hooks from — `git rev-parse --git-path hooks`, in git2.
+///
+/// `repo.path().join("hooks")` is wrong in two ordinary configurations, and both fail the same
+/// silent way: the hook is written somewhere git never reads, `install` reports success, and
+/// the auto-rebuild half never runs (#86).
+///
+/// * **`core.hooksPath`** REPLACES `$GIT_DIR/hooks`; git does not consult both. It is the
+///   mechanism husky, lefthook and pre-commit all use, so it is set in exactly the repos that
+///   already invest in commit-time tooling.
+/// * **A linked worktree's** `repo.path()` is `.git/worktrees/<name>/`. Git reads hooks from
+///   the COMMON dir, which is what [`git2::Repository::commondir`] returns. No configuration
+///   is involved; `git worktree add` alone is enough.
+fn hooks_dir(repo: &git2::Repository) -> std::path::PathBuf {
+    if let Ok(configured) = repo.config().and_then(|c| c.get_path("core.hooksPath")) {
+        if configured.is_absolute() {
+            return configured;
+        }
+        // A relative `core.hooksPath` resolves against the directory hooks are RUN from:
+        // the working-tree root, or `$GIT_DIR` for a bare repo (githooks(5) DESCRIPTION).
+        return repo
+            .workdir()
+            .unwrap_or_else(|| repo.path())
+            .join(configured);
+    }
+    repo.commondir().join("hooks")
+}
+
+/// Is `dir` part of this repository, rather than a directory shared with other repositories?
+///
+/// `install`'s contract is that it "writes only to the target repo's `.git` and
+/// `.gitattributes`, never globally", and honouring `core.hooksPath` naively breaks it: a
+/// machine-wide `core.hooksPath = ~/.git-hooks` (what husky, lefthook and this framework's own
+/// HITL gate all set) would make `cxpak hook install <one repo>` install a hook that fires on
+/// EVERY commit on the machine. A worse defect than the one #86 reports.
+///
+/// The common dir counts as inside: for a linked worktree the hook belongs in the main tree's
+/// `.git/hooks`, which is the same repository, and every worktree of it is the caller's own.
+fn is_inside_repo(repo: &git2::Repository, dir: &Path) -> bool {
+    let owned = [repo.commondir().to_path_buf(), repo.path().to_path_buf()]
+        .into_iter()
+        .chain(repo.workdir().map(Path::to_path_buf));
+    owned.filter_map(|p| p.canonicalize().ok()).any(|p| {
+        dir.canonicalize()
+            .unwrap_or_else(|_| dir.to_path_buf())
+            .starts_with(&p)
+    })
+}
+
+fn install_post_commit_hook(
+    repo: &git2::Repository,
+) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    let hooks_dir = hooks_dir(repo);
+    if !is_inside_repo(repo, &hooks_dir) {
+        return Ok(None);
+    }
     std::fs::create_dir_all(&hooks_dir)?;
     let hook_path = hooks_dir.join("post-commit");
 
@@ -446,7 +521,7 @@ fn install_post_commit_hook(repo: &git2::Repository) -> Result<(), Box<dyn Error
 
     std::fs::write(&hook_path, new_contents)?;
     set_executable(&hook_path)?;
-    Ok(())
+    Ok(Some(hook_path))
 }
 
 /// Register the merge driver in the repo-LOCAL git config. Idempotent: setting
@@ -1114,6 +1189,7 @@ mod tests {
 
     #[test]
     fn install_is_idempotent_and_scoped_to_target_repo() {
+        isolate_git_config();
         let dir = tempfile::TempDir::new().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
         drop(repo);
@@ -1149,9 +1225,240 @@ mod tests {
         );
     }
 
+    /// Point libgit2's config search at an empty directory, once per test binary, so no test
+    /// can see — or write to — this machine's real git configuration.
+    ///
+    /// Not hygiene theatre. Before this existed, a `hooks_dir` that honours `core.hooksPath`
+    /// plus a developer machine whose GLOBAL `core.hooksPath` is `~/.git-hooks` meant the
+    /// install tests wrote a cxpak managed block into the user's shared post-commit hook — one
+    /// that then fires on every commit in every repo on the box. It happened, on this machine,
+    /// while writing this fix.
+    fn isolate_git_config() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let empty = std::env::temp_dir().join(format!("cxpak-nogitcfg-{}", std::process::id()));
+            std::fs::create_dir_all(&empty).unwrap();
+            for level in [
+                git2::ConfigLevel::System,
+                git2::ConfigLevel::XDG,
+                git2::ConfigLevel::Global,
+                git2::ConfigLevel::ProgramData,
+            ] {
+                // SAFETY: libgit2 requires this be called before other threads use it. The
+                // `Once` runs on whichever test thread arrives first, and every test that
+                // opens a repository calls this before doing so.
+                unsafe { git2::opts::set_search_path(level, &empty).unwrap() };
+            }
+        });
+    }
+
+    /// Where git will ACTUALLY look for hooks, asked of git itself. An independent oracle:
+    /// deriving the expectation from the same `core.hooksPath`/commondir reasoning the code
+    /// under test uses would make a green mean "the two agree", not "this is where git looks".
+    ///
+    /// Isolated the same way as [`isolate_git_config`], so both sides of every assertion see
+    /// the same (empty) global configuration.
+    fn git_says_hooks_dir(dir: &Path) -> std::path::PathBuf {
+        let out = std::process::Command::new("git")
+            .args([
+                "-C",
+                &dir.to_string_lossy(),
+                "rev-parse",
+                "--git-path",
+                "hooks",
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git on PATH");
+        assert!(out.status.success(), "git rev-parse failed: {out:?}");
+        let raw = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let path = std::path::PathBuf::from(&raw);
+        // `--git-path` may answer relative to the repo it was asked about.
+        let abs = if path.is_absolute() {
+            path
+        } else {
+            dir.join(path)
+        };
+        std::fs::create_dir_all(&abs).unwrap();
+        abs.canonicalize().unwrap()
+    }
+
+    fn resolved_hooks_dir(dir: &Path) -> std::path::PathBuf {
+        isolate_git_config();
+        let repo = git2::Repository::open(dir).unwrap();
+        let ours = hooks_dir(&repo);
+        std::fs::create_dir_all(&ours).unwrap();
+        ours.canonicalize().unwrap()
+    }
+
+    /// CONTROL: an ordinary repo with nothing set locally already agrees with the oracle —
+    /// so a mismatch in the cases below is the configuration, not the harness.
+    ///
+    /// Deliberately no hard-coded `.git/hooks` here. A machine with a GLOBAL `core.hooksPath`
+    /// (this one has: the dotclaude HITL hook installs `~/.git-hooks`) answers that instead,
+    /// and git is right to. Asserting the literal would have made this suite pass in CI and
+    /// fail on the developer machine the feature is used on.
+    #[test]
+    fn hooks_dir_agrees_with_git_in_a_plain_repo() {
+        isolate_git_config();
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        assert_eq!(
+            resolved_hooks_dir(dir.path()),
+            git_says_hooks_dir(dir.path())
+        );
+    }
+
+    /// `core.hooksPath` REPLACES `$GIT_DIR/hooks`; git does not consult both. This is the
+    /// setting husky, lefthook and pre-commit all use, i.e. it is set in exactly the repos
+    /// that invest in commit-time tooling.
+    #[test]
+    fn hooks_dir_honours_an_absolute_core_hookspath() {
+        isolate_git_config();
+        let dir = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap()
+            .set_str("core.hooksPath", &elsewhere.path().to_string_lossy())
+            .unwrap();
+        drop(repo);
+
+        let resolved = resolved_hooks_dir(dir.path());
+        assert_eq!(resolved, git_says_hooks_dir(dir.path()));
+        assert_eq!(resolved, elsewhere.path().canonicalize().unwrap());
+    }
+
+    /// A relative `core.hooksPath` is resolved against the directory hooks are RUN from —
+    /// the working-tree root for a non-bare repo — not against `$GIT_DIR`.
+    #[test]
+    fn hooks_dir_honours_a_relative_core_hookspath() {
+        isolate_git_config();
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap()
+            .set_str("core.hooksPath", ".husky")
+            .unwrap();
+        drop(repo);
+
+        assert_eq!(
+            resolved_hooks_dir(dir.path()),
+            git_says_hooks_dir(dir.path())
+        );
+    }
+
+    /// A linked worktree's `repo.path()` is `.git/worktrees/<name>/`, which git never consults
+    /// for hooks — it reads the COMMON dir. Reached with no `core.hooksPath` anywhere.
+    #[test]
+    fn hooks_dir_for_a_linked_worktree_is_the_common_dir() {
+        isolate_git_config();
+        let main = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(main.path()).unwrap();
+        std::fs::write(main.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        commit_all(&repo);
+        drop(repo);
+
+        let linked = main.path().join("wt");
+        let out = std::process::Command::new("git")
+            .args([
+                "-C",
+                &main.path().to_string_lossy(),
+                "worktree",
+                "add",
+                "-b",
+                "wtbranch",
+                &linked.to_string_lossy(),
+            ])
+            .output()
+            .expect("git on PATH");
+        assert!(out.status.success(), "git worktree add failed: {out:?}");
+
+        let resolved = resolved_hooks_dir(&linked);
+        assert_eq!(resolved, git_says_hooks_dir(&linked));
+        // The machine-independent property, and the one that was broken: a linked worktree
+        // runs the SAME hooks as its main tree. True whether or not a global `core.hooksPath`
+        // is in play, and false for `repo.path().join("hooks")` under either.
+        assert_eq!(
+            resolved,
+            resolved_hooks_dir(main.path()),
+            "a linked worktree must resolve to the same hooks directory as its main tree"
+        );
+    }
+
+    /// The whole point, end to end: after `install`, the hook is at the path git will run.
+    /// `.husky` in the working tree is the shape husky itself uses, and it is inside the repo,
+    /// so it is the case `install` can serve.
+    #[test]
+    fn install_writes_the_hook_where_git_will_run_it() {
+        isolate_git_config();
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap()
+            .set_str("core.hooksPath", ".husky")
+            .unwrap();
+        drop(repo);
+
+        install(dir.path()).unwrap();
+
+        let live = git_says_hooks_dir(dir.path()).join("post-commit");
+        assert!(
+            live.exists(),
+            "no hook at git's hooks path: {}",
+            live.display()
+        );
+        assert!(std::fs::read_to_string(&live).unwrap().contains(HOOK_BEGIN));
+        assert!(
+            !dir.path().join(".git/hooks/post-commit").exists(),
+            "a hook in .git/hooks is inert here and would read as installed"
+        );
+    }
+
+    /// The safety half. A `core.hooksPath` outside the repository is shared with every other
+    /// repository on the machine, so `install` writes NOTHING there and says so. Fixing #86 by
+    /// following `core.hooksPath` unconditionally would install a hook that fires on every
+    /// commit on the box — which is exactly what this test's absence let happen once.
+    #[test]
+    fn install_refuses_a_hooks_path_outside_the_repo() {
+        isolate_git_config();
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap()
+            .set_str("core.hooksPath", &shared.path().to_string_lossy())
+            .unwrap();
+        drop(repo);
+
+        install(dir.path()).unwrap();
+
+        assert!(
+            !shared.path().join("post-commit").exists(),
+            "install must not write into a hooks directory shared with other repositories"
+        );
+        assert!(
+            !dir.path().join(".git/hooks/post-commit").exists(),
+            "and must not write an inert hook into .git/hooks either — git would never run it"
+        );
+        // The other half still lands: it is repo-local and unaffected by core.hooksPath.
+        let attrs = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
+        assert!(attrs.contains("merge=cxpak-union"));
+    }
+
     /// Install must preserve an existing user post-commit hook body.
     #[test]
     fn install_preserves_existing_user_hook() {
+        isolate_git_config();
         let dir = tempfile::TempDir::new().unwrap();
         git2::Repository::init(dir.path()).unwrap();
         let hooks_dir = dir.path().join(".git/hooks");

@@ -263,7 +263,11 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum HookSubcommand {
-    /// Wire the post-commit hook + union merge driver into the target repo (idempotent)
+    /// Wire the post-commit hook + union merge driver into the target repo (idempotent).
+    /// The hook goes where git will actually run it — `core.hooksPath` if set, else the
+    /// repository's common `hooks` dir (so a linked worktree gets the main tree's). A
+    /// `core.hooksPath` pointing OUTSIDE the repository is shared with every repo on the
+    /// machine: the hook is not installed there, and install says so.
     Install {
         #[arg(default_value = ".")]
         path: PathBuf,
