@@ -52,6 +52,11 @@ pub fn extract_deps(index: &CodebaseIndex) -> DependencyConventions {
         }
     }
 
+    // Total order. `dir_edges` is a `HashMap`, so without this the same three edges are
+    // emitted in a different permutation each run — the same cxpak#70 cause as the churn
+    // lists, reached by a loop that never sorted at all rather than by a partial sort.
+    strict_layers.sort_by(|a, b| a.from.cmp(&b.from).then_with(|| a.to.cmp(&b.to)));
+
     // Detect circular dependencies at directory level
     let circular_deps = detect_circular_deps(&dir_edges);
 
@@ -147,6 +152,37 @@ mod tests {
         }
         index.graph = graph;
         index
+    }
+
+    /// cxpak#70. `dir_edges` is a `HashMap`, and this list was pushed straight out of its
+    /// drain with no sort at all, so the same edges were emitted in a different order each
+    /// run and landed verbatim in the exported profile. Several one-directional edges, so
+    /// the fixture has something to permute.
+    #[test]
+    fn strict_layers_are_ordered_by_the_edge_they_describe() {
+        let index = make_index_with_graph(vec![
+            ("zeta/z.rs", "alpha/a.rs"),
+            ("zeta/z.rs", "beta/b.rs"),
+            ("mid/m.rs", "alpha/a.rs"),
+            ("mid/m.rs", "beta/b.rs"),
+            ("omega/o.rs", "gamma/g.rs"),
+        ]);
+        let deps = extract_deps(&index);
+        let pairs: Vec<(String, String)> = deps
+            .strict_layers
+            .iter()
+            .map(|p| (p.from.clone(), p.to.clone()))
+            .collect();
+        assert!(
+            pairs.len() >= 3,
+            "fixture should produce several edges: {pairs:?}"
+        );
+        let mut sorted = pairs.clone();
+        sorted.sort();
+        assert_eq!(
+            pairs, sorted,
+            "strict_layers must be emitted in a stable order"
+        );
     }
 
     #[test]

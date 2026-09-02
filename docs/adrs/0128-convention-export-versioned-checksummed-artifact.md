@@ -31,6 +31,29 @@ Add `src/conventions/export.rs` defining `ConventionExport { version: "1.0", gen
 ### Neutral
 - `ConventionExport`/`ConventionDiff` and the `.cxpak/conventions.json` artifact are documented in the shipped CLAUDE.md.
 
+## Amendment (cxpak#70) — sorted keys are not sorted arrays
+
+The decision above says the hash must be unaffected by "any non-deterministic field ordering", and
+`compute_checksum` sorted object **keys** only. The lists under those keys kept whatever order their
+producer emitted, and several producers drain a `HashMap` — `churn_30d` / `churn_180d` sorted by
+modification count with no tiebreaker, `strict_layers` and the co-change edges not sorted at all — so
+`HashMap`'s per-process random iteration order reached the artifact. Ten cold exports of an unchanged
+four-file repo produced **ten different checksums**, and `conventions diff` reported drift on every
+run whose cache was cold: a CI drift gate that fires always, which is as useless as one that never
+fires and fails in the direction that gets it switched off.
+
+Two changes, and the pairing is deliberate:
+
+- the producers sort **totally** (count then path; from/to; file_a/file_b), so the emitted artifact
+  is stable for a human diffing two committed files, and ranked lists keep their rank;
+- the canonical image the checksum hashes orders **arrays as well as keys**, so a field that ever
+  becomes non-deterministic again cannot move the checksum. Reordering a list without changing its
+  contents is not drift.
+
+`diff_exports` compares that same canonical image, so the checksum and the field-by-field walk cannot
+disagree. The "checksum differs, fields identical" summary no longer blames `generated_at`, which
+this ADR excludes from the hash by construction and which therefore could never have caused it.
+
 ## Revisit if
 - Per-field (not per-category) diffing is required.
 - The export schema needs a `2.0` version with breaking changes.

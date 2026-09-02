@@ -123,7 +123,11 @@ pub fn build_co_changes(commits: &[(Vec<String>, i64)]) -> Vec<CoChangeEdge> {
         );
     }
 
-    pair_data
+    // Total order on the pair. `pair_data` is a `HashMap`, so this list arrived in a
+    // different permutation on every run and landed verbatim in the exported convention
+    // profile — cxpak#70. Which pairs are dropped at the ceiling is unaffected: that is
+    // decided by insertion order, which follows the commits.
+    let mut edges: Vec<CoChangeEdge> = pair_data
         .into_iter()
         .map(|((a, b), (count, most_recent_days))| CoChangeEdge {
             file_a: paths[a as usize].to_string(),
@@ -131,7 +135,13 @@ pub fn build_co_changes(commits: &[(Vec<String>, i64)]) -> Vec<CoChangeEdge> {
             count,
             recency_weight: co_change_weight(most_recent_days),
         })
-        .collect()
+        .collect();
+    edges.sort_by(|x, y| {
+        x.file_a
+            .cmp(&y.file_a)
+            .then_with(|| x.file_b.cmp(&y.file_b))
+    });
+    edges
 }
 
 /// Alias for `build_co_changes()` taking per-commit dates.
@@ -266,6 +276,40 @@ mod tests {
 
     /// A mass-touch commit carries no pairwise signal — it links every file to
     /// every other file — so it must be skipped rather than expanded.
+    /// cxpak#70. `pair_data` is a `HashMap` and its drain went straight into the returned
+    /// `Vec`, which is stored verbatim in the exported convention profile.
+    #[test]
+    fn co_change_edges_are_emitted_in_a_stable_order() {
+        // Eight files in one commit is 28 pairs. Three files is 3, and a three-element
+        // `HashMap` drains in sorted order often enough that the first version of this test
+        // passed against the unsorted code — a green test measuring nothing. Found by
+        // mutation, not by reading it.
+        let files: Vec<String> = [
+            "zeta", "eta", "mu", "alpha", "theta", "beta", "iota", "gamma",
+        ]
+        .iter()
+        .map(|n| format!("{n}.rs"))
+        .collect();
+        let commits: Vec<(Vec<String>, i64)> = vec![(files.clone(), 0), (files[..4].to_vec(), 1)];
+        let edges = build_co_changes(&commits);
+        assert_eq!(
+            edges.len(),
+            28,
+            "8 files in one commit is 28 pairs: {}",
+            edges.len()
+        );
+        let keys: Vec<(String, String)> = edges
+            .iter()
+            .map(|e| (e.file_a.clone(), e.file_b.clone()))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(
+            keys, sorted,
+            "co-change edges must be emitted in a stable order"
+        );
+    }
+
     #[test]
     fn oversized_commits_are_skipped_entirely() {
         let files: Vec<String> = (0..MAX_FILES_PER_COMMIT + 1)
