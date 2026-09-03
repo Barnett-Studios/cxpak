@@ -246,9 +246,14 @@ pub(crate) fn apply_incremental_update(
     }
 
     for rel_path in &modified {
-        if removed.contains(rel_path) {
-            continue;
-        }
+        // No `removed.contains(..)` skip here. One debounced batch coalesces to
+        // at most one entry per (path, kind), so a delete-then-write inside the
+        // window arrives as Removed(P) AND Created(P) with nothing in the batch
+        // to order them by. Letting the removal win dropped a file that exists
+        // on disk out of the served index until the next full rescan (#77).
+        // The removal loop above has already run, so what decides is the read
+        // below — the only truth available at apply time: a path still on disk
+        // is re-indexed, a path genuinely gone fails to open and stays removed.
         let abs_path = base_path.join(rel_path);
         if let Ok(content) = std::fs::read_to_string(&abs_path) {
             let lang_name = crate::scanner::detect_language(Path::new(rel_path));
@@ -451,19 +456,20 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_incremental_update_skip_removed_from_modified() {
+    fn test_apply_incremental_update_removed_and_gone_from_disk_stays_removed() {
         let dir = tempfile::TempDir::new().unwrap();
 
         let mut index = make_test_index();
 
-        // File is in both modified and removed — should only count as removed
+        // The path is in both sets and is NOT on disk — the delete half of a
+        // remove+recreate batch where nothing came back. The re-read below the
+        // removal loop fails to open it, so the removal stands and only it counts.
         let mut modified = HashSet::new();
         modified.insert("src/main.rs".to_string());
         let mut removed = HashSet::new();
         removed.insert("src/main.rs".to_string());
 
         let count = apply_incremental_update(&mut index, dir.path(), &modified, &removed);
-        // Only the remove counts, not the modify
         assert_eq!(count, 1);
         assert_eq!(index.total_files, 0);
     }
@@ -769,6 +775,112 @@ mod case_preservation_tests {
             stored(&index),
             vec!["README.md".to_string()],
             "removing readme.md took the wrong entry"
+        );
+    }
+
+    /// One debounce batch can legitimately carry both a removal and a
+    /// re-creation of one path: `collect_debounced` coalesces to at most one
+    /// entry per (path, kind), so a delete-then-write inside the window
+    /// produces exactly this pair — the documented contract, not an edge
+    /// case — and the batch carries nothing to break the tie with. What is
+    /// on disk when the update is applied is the only truth available, so the
+    /// update must reflect it rather than let the removal win by construction.
+    #[test]
+    fn a_batch_that_removes_and_recreates_a_file_keeps_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let path = dir.path().join("src/main.rs");
+        std::fs::write(&path, "fn main() { println!(\"rewritten\"); }\n").unwrap();
+
+        let mut index = index_with(&["src/main.rs", "src/other.rs"]);
+        let (modified, removed) = classify_changes(
+            &[
+                FileChange::Removed(path.clone()),
+                FileChange::Created(path.clone()),
+            ],
+            dir.path(),
+        );
+        // Without this the fixture could assert nothing: if classification ever
+        // stopped emitting the path in BOTH sets, the body below would pass
+        // while never reaching the branch under test.
+        assert!(
+            modified.contains("src/main.rs") && removed.contains("src/main.rs"),
+            "fixture must put the path in both sets: modified={modified:?} removed={removed:?}"
+        );
+
+        apply_incremental_update(&mut index, dir.path(), &modified, &removed);
+
+        assert!(
+            stored(&index).contains(&"src/main.rs".to_string()),
+            "a file present on disk when the update was applied is missing from the index: {:?}",
+            stored(&index)
+        );
+    }
+
+    /// The same batch for a mixed-case path, and it is not the lowercase test
+    /// with different letters. This path was exempt by accident before #33 —
+    /// the lowercasing made `remove_file` miss, so the removal half silently
+    /// did nothing and no re-add was ever needed. With that accidental
+    /// exemption gone the removal now lands, which is what makes the defect
+    /// reachable here at all.
+    ///
+    /// The events carry `readme.md` — the spelling a case-insensitive volume
+    /// reports for a file the scanner stored as `README.md` — so the batch also
+    /// runs through `resolve_stored_key`. Asserting the exact stored set pins
+    /// both halves: the file survives, AND it survives under its on-disk case
+    /// rather than forking a second lowercase entry. Resolving the modified
+    /// paths after the removals instead of before fails this test and no other.
+    #[test]
+    fn a_batch_that_removes_and_recreates_a_mixed_case_file_keeps_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# rewritten\n").unwrap();
+        let event_path = dir.path().join("readme.md");
+
+        let mut index = index_with(&["README.md", "src/main.rs"]);
+        let (modified, removed) = classify_changes(
+            &[
+                FileChange::Removed(event_path.clone()),
+                FileChange::Created(event_path.clone()),
+            ],
+            dir.path(),
+        );
+        assert!(
+            modified.contains("readme.md") && removed.contains("readme.md"),
+            "fixture must put the path in both sets: modified={modified:?} removed={removed:?}"
+        );
+
+        apply_incremental_update(&mut index, dir.path(), &modified, &removed);
+
+        assert_eq!(
+            stored(&index),
+            vec!["README.md".to_string(), "src/main.rs".to_string()],
+            "a mixed-case file present on disk was dropped or re-entered under the wrong case"
+        );
+    }
+
+    /// The control for the two above: what decides is the *pair*, not mere
+    /// presence on disk. A removal with no re-creation in the same batch must
+    /// still remove the entry even when a stale file sits at the path — which
+    /// is what a watcher sees when the removal event is delivered before the
+    /// unlink is visible, or when an editor's atomic-save temp file is still
+    /// there. An over-fix that kept anything readable passes both tests above
+    /// and fails only this one.
+    #[test]
+    fn a_removal_alone_still_removes_a_file_that_is_still_on_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# still here\n").unwrap();
+
+        let mut index = index_with(&["README.md", "src/main.rs"]);
+        let (modified, removed) = classify_changes(
+            &[FileChange::Removed(dir.path().join("README.md"))],
+            dir.path(),
+        );
+        apply_incremental_update(&mut index, dir.path(), &modified, &removed);
+
+        assert_eq!(
+            stored(&index),
+            vec!["src/main.rs".to_string()],
+            "a removal with no re-creation in the batch must remove the entry"
         );
     }
 }
