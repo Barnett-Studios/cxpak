@@ -283,16 +283,18 @@ fn render_symbol_source(
             let syms = &by_file[file_path];
             full.push_str(&format!("### {}\n\n", file_path));
             for sym in syms {
-                full.push_str(&format!("```\n{}\n{}\n```\n\n", sym.signature, sym.body));
+                full.push_str(&crate::output::fenced(
+                    &format!("{}\n{}", sym.signature, sym.body),
+                    "",
+                ));
             }
         }
     } else {
         // Fall back: include full content of each matched file
         for file in &index.files {
             if matched_files.contains(file.relative_path.as_str()) {
-                full.push_str(&format!("### {}\n\n```\n", file.relative_path));
-                full.push_str(&file.content);
-                full.push_str("\n```\n\n");
+                full.push_str(&format!("### {}\n\n", file.relative_path));
+                full.push_str(&crate::output::fenced(&file.content, ""));
             }
         }
     }
@@ -331,7 +333,7 @@ fn render_relevant_signatures(
 
         full.push_str(&format!("### {}\n\n", file.relative_path));
         for sym in public_syms {
-            full.push_str(&format!("```\n{}\n```\n\n", sym.signature));
+            full.push_str(&crate::output::fenced(&sym.signature, ""));
         }
     }
 
@@ -706,5 +708,59 @@ mod tests {
             msg.contains("not found in codebase"),
             "error message should mention 'not found in codebase', got: {msg}"
         );
+    }
+
+    /// #43 at the `trace` call site. A symbol body that contains a fence — a doc
+    /// example in a raw string, a heredoc, a markdown parser's own fixtures —
+    /// closed the block
+    /// the same way, and `trace` packs whole file bodies too.
+    #[test]
+    fn a_symbol_body_carrying_a_fence_cannot_close_its_block() {
+        let counter = TokenCounter::new();
+        let sym = Symbol {
+            name: "doc".to_string(),
+            kind: SymbolKind::Function,
+            signature: "fn doc()".to_string(),
+            body: "{ let doc = r#\"\n```rust\nlet x = 1;\n```\n\"#; }".to_string(),
+            visibility: Visibility::Public,
+            start_line: 1,
+            end_line: 4,
+        };
+        let matches = vec![("src/main.rs", &sym)];
+        let out = render_symbol_source(
+            &make_trace_index(),
+            &matches,
+            &HashSet::new(),
+            50_000,
+            &counter,
+        );
+        assert!(out.contains("````\nfn doc()"), "{out:?}");
+        assert!(out.trim_end().ends_with("````"), "{out:?}");
+        assert!(out.contains("let x = 1;"), "the body survives: {out:?}");
+    }
+
+    /// The control: a body with no fence of its own keeps the ordinary one.
+    #[test]
+    fn an_ordinary_symbol_body_keeps_the_three_backtick_fence() {
+        let counter = TokenCounter::new();
+        let sym = Symbol {
+            name: "plain".to_string(),
+            kind: SymbolKind::Function,
+            signature: "fn plain()".to_string(),
+            body: "let x = 1;".to_string(),
+            visibility: Visibility::Public,
+            start_line: 1,
+            end_line: 1,
+        };
+        let matches = vec![("src/main.rs", &sym)];
+        let out = render_symbol_source(
+            &make_trace_index(),
+            &matches,
+            &HashSet::new(),
+            50_000,
+            &counter,
+        );
+        assert!(out.contains("```\nfn plain()"), "{out:?}");
+        assert!(!out.contains("````"), "{out:?}");
     }
 }
