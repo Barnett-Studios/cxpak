@@ -16,7 +16,7 @@ use crate::intelligence::api_surface::{
     detect_routes, extract_graphql_types, extract_grpc_services, RouteEndpoint,
 };
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // `CrossLangEdge` is a data-model type now in `core_graph` (cxpak 3.0.0 Phase 0
 // de-cycle); the detection logic below stays here.
@@ -120,15 +120,21 @@ fn scannable_content<'a>(language: Option<&str>, content: &'a str) -> &'a str {
     content
 }
 
-/// Build a map of every route path → route endpoint, scanning every file in
-/// the index with [`detect_routes`]. Query strings are stripped from keys.
+/// Build a map of every route path → the endpoints serving it, scanning every
+/// file in the index with [`detect_routes`]. Query strings are stripped from
+/// keys.
+///
+/// The value is a `Vec` and not a single endpoint on purpose: several files can
+/// serve one path, and keeping only the first made the graph depend on scan
+/// order (#34). Choosing between them is [`resolve_route`]'s job, and it
+/// declines rather than guesses.
 ///
 /// Only files with a web-framework-capable language are scanned, and test
 /// files are skipped. Inline tests (Rust `#[cfg(test)] mod tests`) are
 /// skipped by truncating the scanned content. This keeps documentation
 /// code examples and test fixtures from polluting the route map.
-fn build_route_map(index: &CodebaseIndex) -> HashMap<String, RouteEndpoint> {
-    let mut map: HashMap<String, RouteEndpoint> = HashMap::new();
+fn build_route_map(index: &CodebaseIndex) -> HashMap<String, Vec<RouteEndpoint>> {
+    let mut map: HashMap<String, Vec<RouteEndpoint>> = HashMap::new();
     for file in &index.files {
         if !is_web_code_language(file.language.as_deref()) {
             continue;
@@ -140,7 +146,7 @@ fn build_route_map(index: &CodebaseIndex) -> HashMap<String, RouteEndpoint> {
         let routes = detect_routes(content, &file.relative_path);
         for r in routes {
             let key = normalize_route_path(&r.path);
-            map.entry(key).or_insert(r);
+            map.entry(key).or_default().push(r);
         }
     }
     map
@@ -157,6 +163,59 @@ fn normalize_route_path(p: &str) -> String {
     }
 }
 
+/// The one value `name` maps to, or `None` when several distinct ones do.
+///
+/// The shape every detector in this module needs (#34). A lookup that answers
+/// with the first of several matches is not resolution, it is a coin toss whose
+/// result is then reported to PageRank and blast-radius as a fact — and whose
+/// outcome moves when file order does.
+fn unique_target<'a, T: PartialEq>(map: &'a HashMap<String, Vec<T>>, name: &str) -> Option<&'a T> {
+    let all = map.get(name)?;
+    let first = all.first()?;
+    // Repeats of the SAME target are one answer, not an ambiguity.
+    if all.iter().all(|v| v == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// The handler a client call reaches, or `None` when the call does not identify
+/// one.
+///
+/// Refusing is the point (#34). A path several handlers answer to does not say
+/// which one a caller reaches, and `or_insert` resolved that by keeping
+/// whichever file the scan reached first — a guess, handed to PageRank and
+/// blast-radius as a fact, and one that changes when file order does.
+///
+/// `method` narrows the field when the client states its verb. `fetch` carries
+/// its verb in an options object this scanner does not read, so it passes
+/// `None` and must resolve on the path alone.
+fn resolve_route<'a>(
+    candidates: &'a [RouteEndpoint],
+    method: Option<&str>,
+    calling_file: &str,
+) -> Option<&'a RouteEndpoint> {
+    // A server calling its own route is not a cross-language edge.
+    let mut viable: Vec<&RouteEndpoint> = candidates
+        .iter()
+        .filter(|r| r.file != calling_file)
+        .collect();
+    if let Some(m) = method {
+        viable.retain(|r| r.method.eq_ignore_ascii_case(m));
+    }
+    let first = *viable.first()?;
+    // Several rows naming the same handler are one answer, not an ambiguity.
+    if viable
+        .iter()
+        .all(|r| r.file == first.file && r.handler == first.handler)
+    {
+        Some(first)
+    } else {
+        None
+    }
+}
+
 /// Detect HTTP client calls that match a known server route.
 ///
 /// Client patterns matched:
@@ -164,21 +223,38 @@ fn normalize_route_path(p: &str) -> String {
 /// - `axios.get("/api/users")` and friends
 /// - `reqwest::Client::new().get("https://…/api/users")` (Rust)
 ///
-/// Any match whose URL normalizes to a known route in [`build_route_map`]
-/// emits a [`CrossLangEdge`] of [`BridgeType::HttpCall`] from the calling
-/// file to the route's handler file.
+/// A match whose URL normalizes to a known route emits a [`CrossLangEdge`] of
+/// [`BridgeType::HttpCall`] from the calling file to the route's handler file —
+/// but only when that route names exactly one handler. Where several do, the
+/// call does not say which is reached and no edge is emitted; see
+/// [`resolve_route`].
 pub fn detect_http_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
     let route_map = build_route_map(index);
     if route_map.is_empty() {
         return Vec::new();
     }
 
-    // Compiled once; shared across the file scan.
-    let fetch_re = Regex::new(r#"fetch\s*\(\s*["'`](/[^"'`\s?]+)"#).ok();
-    let axios_re =
-        Regex::new(r#"axios\.(?:get|post|put|delete|patch)\s*\(\s*["'`](/[^"'`\s?]+)"#).ok();
-    // reqwest patterns: .get("…/api/users"), Client::new().get("…"), http::Request::get("…")
-    let reqwest_re = Regex::new(r#"(?:reqwest::|Client::new\(\)\.)[^(]*(?:get|post|put|delete|patch)\s*\(\s*["'](?:https?://[^/"']+)?(/[^"'\s?]+)"#).ok();
+    // Compiled once; shared across the file scan. Each entry is
+    // (pattern, HTTP-verb capture group, path capture group). `fetch` states no
+    // verb here — it carries one in an options object this scanner does not
+    // read — so its verb group is `None` and it resolves on the path alone.
+    let patterns: Vec<(Regex, Option<usize>, usize)> = [
+        (r#"fetch\s*\(\s*["'`](/[^"'`\s?]+)"#, None, 1usize),
+        (
+            r#"axios\.(get|post|put|delete|patch)\s*\(\s*["'`](/[^"'`\s?]+)"#,
+            Some(1),
+            2,
+        ),
+        // reqwest: .get("…/api/users"), Client::new().get("…"), http::Request::get("…")
+        (
+            r#"(?:reqwest::|Client::new\(\)\.)[^(]*(get|post|put|delete|patch)\s*\(\s*["'](?:https?://[^/"']+)?(/[^"'\s?]+)"#,
+            Some(1),
+            2,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(pat, verb, path)| Regex::new(pat).ok().map(|re| (re, verb, path)))
+    .collect();
 
     let mut out = Vec::new();
 
@@ -198,23 +274,20 @@ pub fn detect_http_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
         // test fixtures doesn't register as a real HTTP call.
         let content = scannable_content(file.language.as_deref(), &file.content);
 
-        for re in [fetch_re.as_ref(), axios_re.as_ref(), reqwest_re.as_ref()]
-            .into_iter()
-            .flatten()
-        {
+        for (re, verb_group, path_group) in &patterns {
             for cap in re.captures_iter(content) {
-                let Some(url_match) = cap.get(1) else {
+                let Some(url_match) = cap.get(*path_group) else {
                     continue;
                 };
                 let raw_url = url_match.as_str();
                 let normalized = normalize_route_path(raw_url);
-                let Some(route) = route_map.get(&normalized) else {
+                let Some(candidates) = route_map.get(&normalized) else {
                     continue;
                 };
-                // Don't link a route to itself (server-local call).
-                if route.file == file.relative_path {
+                let method = verb_group.and_then(|g| cap.get(g)).map(|m| m.as_str());
+                let Some(route) = resolve_route(candidates, method, &file.relative_path) else {
                     continue;
-                }
+                };
                 let target_language = index
                     .files
                     .iter()
@@ -266,18 +339,48 @@ fn dedup(edges: Vec<CrossLangEdge>) -> Vec<CrossLangEdge> {
 // FFI bridge detection
 // ---------------------------------------------------------------------------
 
+/// The single C/C++ file defining `name`, or `None` when none or several do.
+///
+/// A bare symbol name is not a binding (#34). `init`, `run`, `start` and their
+/// kind are defined in most native code bases more than once, and an
+/// `extern "C" { fn init(); }` says nothing about which. Linking to every
+/// candidate manufactures one true edge and N-1 false ones; linking to the
+/// first manufactures a guess. Neither is knowable from the declaration, so
+/// this returns nothing and no edge is emitted.
+fn unique_native_target<'a>(
+    symbol_index: &'a HashMap<String, Vec<(String, String)>>,
+    name: &str,
+) -> Option<&'a (String, String)> {
+    let mut native = symbol_index
+        .get(name)?
+        .iter()
+        .filter(|(_, lang)| lang == "c" || lang == "cpp");
+    let first = native.next()?;
+    // The same name twice in ONE file is one target, not an ambiguity.
+    match native.find(|(f, _)| *f != first.0) {
+        Some(_) => None,
+        None => Some(first),
+    }
+}
+
 /// Detect FFI bindings where one language declares an extern symbol that is
 /// defined in another language.
 ///
 /// Patterns matched:
-/// - Rust: `extern "C" { fn name(...); }` — links to any C/C++ file exporting
-///   a function with the same name.
+/// - Rust: `extern "C" { fn name(...); }` — links to the C/C++ file exporting
+///   a function with that name, and to nothing at all when more than one file
+///   exports it (#34). Every `fn` in the block is read, not only the first.
 /// - Python: `ctypes.CDLL("libfoo").name` or `ctypes.CFUNCTYPE(...)` with a
 ///   following attribute access — links to matching C symbols.
 /// - napi / Node native modules: `napi::bindgen_prelude` in Rust with a
 ///   matching symbol name in JS/TS.
 pub fn detect_ffi_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
-    let rust_extern_re = Regex::new(r#"extern\s+"C"\s*\{[^}]*?fn\s+([A-Za-z_][A-Za-z0-9_]*)"#).ok();
+    // The block first, then every `fn` inside it. Anchoring the NAME on
+    // `extern "C" {` meant `captures_iter` could only ever return the first
+    // declaration in a block — the second has no `extern "C" {` of its own left
+    // to match, so every later one was dropped in silence (#34).
+    let rust_extern_block_re = Regex::new(r#"extern\s+"C"\s*\{([^}]*)\}"#).ok();
+    let extern_fn_re = Regex::new(r#"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)"#).ok();
     let python_ctypes_re =
         Regex::new(r#"(?:CDLL|WinDLL|cdll\.LoadLibrary)\s*\([^)]*\)\.([A-Za-z_][A-Za-z0-9_]*)"#)
             .ok();
@@ -305,27 +408,29 @@ pub fn detect_ffi_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
 
         // Rust extern "C" { fn name; }
         if source_lang == "rust" {
-            if let Some(re) = rust_extern_re.as_ref() {
-                for cap in re.captures_iter(&file.content) {
-                    let name = cap[1].to_string();
-                    if let Some(targets) = symbol_index.get(&name) {
-                        for (target_file, target_lang) in targets {
-                            if *target_lang == "c" || *target_lang == "cpp" {
-                                let caller = guess_containing_symbol(
-                                    file,
-                                    cap.get(0).map(|m| m.start()).unwrap_or(0),
-                                );
-                                out.push(CrossLangEdge {
-                                    source_file: file.relative_path.clone(),
-                                    source_symbol: caller,
-                                    source_language: source_lang.clone(),
-                                    target_file: target_file.clone(),
-                                    target_symbol: name.clone(),
-                                    target_language: target_lang.clone(),
-                                    bridge_type: BridgeType::FfiBinding,
-                                });
-                            }
-                        }
+            if let (Some(block_re), Some(fn_re)) =
+                (rust_extern_block_re.as_ref(), extern_fn_re.as_ref())
+            {
+                for block in block_re.captures_iter(&file.content) {
+                    let Some(body) = block.get(1) else { continue };
+                    for cap in fn_re.captures_iter(body.as_str()) {
+                        let name = cap[1].to_string();
+                        let Some((target_file, target_lang)) =
+                            unique_native_target(&symbol_index, &name)
+                        else {
+                            continue;
+                        };
+                        let offset = body.start() + cap.get(0).map(|m| m.start()).unwrap_or(0);
+                        let caller = guess_containing_symbol(file, offset);
+                        out.push(CrossLangEdge {
+                            source_file: file.relative_path.clone(),
+                            source_symbol: caller,
+                            source_language: source_lang.clone(),
+                            target_file: target_file.clone(),
+                            target_symbol: name.clone(),
+                            target_language: target_lang.clone(),
+                            bridge_type: BridgeType::FfiBinding,
+                        });
                     }
                 }
             }
@@ -336,25 +441,22 @@ pub fn detect_ffi_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
             if let Some(re) = python_ctypes_re.as_ref() {
                 for cap in re.captures_iter(&file.content) {
                     let name = cap[1].to_string();
-                    if let Some(targets) = symbol_index.get(&name) {
-                        for (target_file, target_lang) in targets {
-                            if *target_lang == "c" || *target_lang == "cpp" {
-                                let caller = guess_containing_symbol(
-                                    file,
-                                    cap.get(0).map(|m| m.start()).unwrap_or(0),
-                                );
-                                out.push(CrossLangEdge {
-                                    source_file: file.relative_path.clone(),
-                                    source_symbol: caller,
-                                    source_language: source_lang.clone(),
-                                    target_file: target_file.clone(),
-                                    target_symbol: name.clone(),
-                                    target_language: target_lang.clone(),
-                                    bridge_type: BridgeType::FfiBinding,
-                                });
-                            }
-                        }
-                    }
+                    let Some((target_file, target_lang)) =
+                        unique_native_target(&symbol_index, &name)
+                    else {
+                        continue;
+                    };
+                    let caller =
+                        guess_containing_symbol(file, cap.get(0).map(|m| m.start()).unwrap_or(0));
+                    out.push(CrossLangEdge {
+                        source_file: file.relative_path.clone(),
+                        source_symbol: caller,
+                        source_language: source_lang.clone(),
+                        target_file: target_file.clone(),
+                        target_symbol: name.clone(),
+                        target_language: target_lang.clone(),
+                        bridge_type: BridgeType::FfiBinding,
+                    });
                 }
             }
         }
@@ -371,22 +473,27 @@ pub fn detect_ffi_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
 /// file's symbol set.
 ///
 /// Matching client-call patterns: `<lowercase-name>Client.<MethodName>(`
-/// or `<PascalCase>Client.<MethodName>(`. Each match looks up the method
-/// name in the set of proto service methods extracted via
-/// [`extract_grpc_services`].
+/// or `<PascalCase>Client.<MethodName>(`. The identifier before `Client` must
+/// name a service extracted via [`extract_grpc_services`] (compared without
+/// case), and that service must declare the method. Matching on the method name
+/// alone linked `httpClient.Get(` and `redisClient.List(` to any proto that
+/// happened to share the spelling (#34).
 pub fn detect_grpc_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
     let services = extract_grpc_services(index, None);
     if services.is_empty() {
         return Vec::new();
     }
 
-    // method_name -> (proto_file, service_name)
-    let mut method_map: HashMap<String, (String, String)> = HashMap::new();
+    // The stub identifier decides the service; the method name alone never did.
+    // Keyed on the lowercased service name so `userServiceClient` resolves to
+    // `UserService` and `httpClient` resolves to nothing (#34).
+    let mut by_service: HashMap<String, (String, String, HashSet<String>)> = HashMap::new();
     for svc in &services {
+        let entry = by_service
+            .entry(svc.name.to_ascii_lowercase())
+            .or_insert_with(|| (svc.file.clone(), svc.name.clone(), HashSet::new()));
         for m in &svc.methods {
-            method_map
-                .entry(m.clone())
-                .or_insert((svc.file.clone(), svc.name.clone()));
+            entry.2.insert(m.clone());
         }
     }
 
@@ -403,10 +510,14 @@ pub fn detect_grpc_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
         }
         let source_lang = file.language.clone().unwrap_or_else(|| "unknown".into());
         for cap in re.captures_iter(&file.content) {
+            let stub = cap[1].to_ascii_lowercase();
             let method = cap[2].to_string();
-            let Some((target_file, service_name)) = method_map.get(&method) else {
+            let Some((target_file, service_name, methods)) = by_service.get(&stub) else {
                 continue;
             };
+            if !methods.contains(&method) {
+                continue;
+            }
             let caller = guess_containing_symbol(file, cap.get(0).map(|m| m.start()).unwrap_or(0));
             out.push(CrossLangEdge {
                 source_file: file.relative_path.clone(),
@@ -433,9 +544,15 @@ pub fn detect_graphql_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
     if types.is_empty() {
         return Vec::new();
     }
-    let mut type_map: HashMap<String, String> = HashMap::new(); // name -> file
+    // name -> every schema file declaring it. Keeping only the first linked a
+    // query to whichever schema was scanned first when two declared the same
+    // type name (#34).
+    let mut type_map: HashMap<String, Vec<String>> = HashMap::new();
     for t in &types {
-        type_map.entry(t.name.clone()).or_insert(t.file.clone());
+        type_map
+            .entry(t.name.clone())
+            .or_default()
+            .push(t.file.clone());
     }
 
     let query_re =
@@ -452,7 +569,7 @@ pub fn detect_graphql_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
         let source_lang = file.language.clone().unwrap_or_else(|| "unknown".into());
         for cap in re.captures_iter(&file.content) {
             let name = cap[1].to_string();
-            let Some(target_file) = type_map.get(&name) else {
+            let Some(target_file) = unique_target(&type_map, &name) else {
                 continue;
             };
             let caller = guess_containing_symbol(file, cap.get(0).map(|m| m.start()).unwrap_or(0));
@@ -537,11 +654,15 @@ pub fn detect_shared_schema_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge>
 pub fn detect_command_exec_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
     // Build a set of file basenames (no extension) so we can match command
     // literals like "my-binary" against files like "bin/my-binary.sh".
-    let mut basename_map: HashMap<String, (String, String)> = HashMap::new(); // basename -> (path, language)
+    // basename -> every file with that stem. `main`, `test`, `build` and `run`
+    // are stems most repositories carry several of, so keeping only the first
+    // attributed `exec.Command("main")` to whichever file was scanned first
+    // (#34).
+    let mut basename_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for file in &index.files {
         let path = std::path::Path::new(&file.relative_path);
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            basename_map.entry(stem.to_string()).or_insert((
+            basename_map.entry(stem.to_string()).or_default().push((
                 file.relative_path.clone(),
                 file.language.clone().unwrap_or_else(|| "unknown".into()),
             ));
@@ -567,7 +688,8 @@ pub fn detect_command_exec_bridges(index: &CodebaseIndex) -> Vec<CrossLangEdge> 
                     .and_then(|s| s.to_str())
                     .unwrap_or(&cmd)
                     .to_string();
-                let Some((target_file, target_lang)) = basename_map.get(&cmd_basename) else {
+                let Some((target_file, target_lang)) = unique_target(&basename_map, &cmd_basename)
+                else {
                     continue;
                 };
                 if *target_file == file.relative_path {
@@ -1544,5 +1666,468 @@ subprocess.run(["my-binary", "--arg"])
             "<module>",
             "an offset outside every symbol's line range must fall back to <module>"
         );
+    }
+
+    // ── #34: an edge asserts a binding, so a name more than one thing answers
+    //    to must produce none ──────────────────────────────────────────────
+    //
+    // Every defect in this ticket is one move: a bare name is matched, several
+    // things answer to it, and one is chosen by iteration order. The choice is
+    // then handed to PageRank and blast-radius as a fact. Each test below is
+    // paired with a control, because "emit nothing when ambiguous" is trivially
+    // satisfied by emitting nothing at all.
+
+    /// `build_index` above hardcodes every file's symbol to `module_fn`, which
+    /// cannot express a name collision — the subject of every test here.
+    /// (relative path, language, content, the symbols the file declares).
+    type FileSpec<'a> = (&'a str, &'a str, &'a str, &'a [(&'a str, SymbolKind)]);
+
+    fn index_with_symbols(files: &[FileSpec<'_>]) -> CodebaseIndex {
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut scanned = Vec::new();
+        let mut parse_results = HashMap::new();
+        let mut content_map = HashMap::new();
+
+        for (path, language, content, symbols) in files {
+            let abs = dir.path().join(path);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, content).unwrap();
+            scanned.push(ScannedFile {
+                relative_path: (*path).into(),
+                absolute_path: abs,
+                language: Some((*language).into()),
+                size_bytes: content.len() as u64,
+            });
+            parse_results.insert(
+                (*path).to_string(),
+                ParseResult {
+                    symbols: symbols
+                        .iter()
+                        .map(|(n, k)| Symbol {
+                            name: (*n).into(),
+                            kind: k.clone(),
+                            visibility: Visibility::Public,
+                            signature: format!("fn {n}()"),
+                            body: "{}".into(),
+                            start_line: 1,
+                            end_line: content.lines().count().max(1),
+                        })
+                        .collect(),
+                    imports: vec![],
+                    exports: vec![],
+                },
+            );
+            content_map.insert((*path).to_string(), (*content).to_string());
+        }
+        CodebaseIndex::build_with_content(scanned, parse_results, &counter, content_map)
+    }
+
+    const F: SymbolKind = SymbolKind::Function;
+
+    // ---- FFI -------------------------------------------------------------
+
+    #[test]
+    fn every_extern_fn_in_one_block_resolves_not_only_the_first() {
+        let index = index_with_symbols(&[
+            (
+                "src/ffi.rs",
+                "rust",
+                "extern \"C\" {\n    fn alpha(x: i32) -> i32;\n    fn beta(y: i32) -> i32;\n}\n",
+                &[("call_it", F)],
+            ),
+            (
+                "native/lib.c",
+                "c",
+                "int alpha(int x) { return x; }\nint beta(int y) { return y; }\n",
+                &[("alpha", F), ("beta", F)],
+            ),
+        ]);
+        let mut names: Vec<String> = detect_ffi_bridges(&index)
+            .into_iter()
+            .map(|e| e.target_symbol)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["alpha".to_string(), "beta".to_string()],
+            "the block declares two externs; a pattern anchored on the opening brace can only \
+             ever capture the first, and every later declaration is dropped in silence"
+        );
+    }
+
+    #[test]
+    fn an_extern_name_two_c_files_answer_to_creates_no_ffi_edge() {
+        let index = index_with_symbols(&[
+            (
+                "src/ffi.rs",
+                "rust",
+                "extern \"C\" {\n    fn init();\n}\n",
+                &[("call_it", F)],
+            ),
+            (
+                "native/audio.c",
+                "c",
+                "int init(void) { return 0; }\n",
+                &[("init", F)],
+            ),
+            (
+                "native/video.c",
+                "c",
+                "int init(void) { return 1; }\n",
+                &[("init", F)],
+            ),
+        ]);
+        let edges = detect_ffi_bridges(&index);
+        assert!(
+            edges.is_empty(),
+            "two C files define `init` and nothing in the Rust declaration says which is meant, \
+             so any edge here is a guess reported as a fact — got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn an_extern_name_exactly_one_c_file_answers_to_still_resolves() {
+        let index = index_with_symbols(&[
+            (
+                "src/ffi.rs",
+                "rust",
+                "extern \"C\" {\n    fn init();\n}\n",
+                &[("call_it", F)],
+            ),
+            (
+                "native/audio.c",
+                "c",
+                "int init(void) { return 0; }\n",
+                &[("init", F)],
+            ),
+            (
+                "native/video.c",
+                "c",
+                "int teardown(void) { return 1; }\n",
+                &[("teardown", F)],
+            ),
+        ]);
+        let edges = detect_ffi_bridges(&index);
+        assert_eq!(
+            edges.len(),
+            1,
+            "one unambiguous target must still resolve, or the fix is just silence — got {edges:?}"
+        );
+        assert_eq!(edges[0].target_file, "native/audio.c");
+    }
+
+    // ---- HTTP routes -----------------------------------------------------
+
+    #[test]
+    fn two_backends_serving_one_path_create_no_http_edge() {
+        let index = index_with_symbols(&[
+            (
+                "web/app.ts",
+                "typescript",
+                "async function ping() { return fetch(\"/api/health\"); }",
+                &[("ping", F)],
+            ),
+            (
+                "svc_a/main.py",
+                "python",
+                "from fastapi import FastAPI\n@app.get(\"/api/health\")\ndef health_a():\n    return {}\n",
+                &[("health_a", F)],
+            ),
+            (
+                "svc_b/main.py",
+                "python",
+                "from fastapi import FastAPI\n@app.get(\"/api/health\")\ndef health_b():\n    return {}\n",
+                &[("health_b", F)],
+            ),
+        ]);
+        let edges = detect_http_bridges(&index);
+        assert!(
+            edges.is_empty(),
+            "both services answer GET /api/health; which one the client reaches is not knowable \
+             from the path, and first-insertion-wins makes the answer depend on scan order — \
+             got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn one_backend_serving_the_path_still_creates_an_http_edge() {
+        let index = index_with_symbols(&[
+            (
+                "web/app.ts",
+                "typescript",
+                "async function ping() { return fetch(\"/api/health\"); }",
+                &[("ping", F)],
+            ),
+            (
+                "svc_a/main.py",
+                "python",
+                "from fastapi import FastAPI\n@app.get(\"/api/health\")\ndef health_a():\n    return {}\n",
+                &[("health_a", F)],
+            ),
+        ]);
+        let edges = detect_http_bridges(&index);
+        assert_eq!(
+            edges.len(),
+            1,
+            "an unambiguous route must still link — got {edges:?}"
+        );
+        assert_eq!(edges[0].target_file, "svc_a/main.py");
+    }
+
+    #[test]
+    fn a_get_call_is_not_ambiguous_against_a_same_path_post_handler() {
+        // A control for the refusal above: same path, different verbs, and the
+        // client states its verb. Refusing here would trade a false edge for a
+        // lost one.
+        let index = index_with_symbols(&[
+            (
+                "web/app.ts",
+                "typescript",
+                "async function load() { return axios.get(\"/api/items\"); }",
+                &[("load", F)],
+            ),
+            (
+                "svc_read/main.py",
+                "python",
+                "from fastapi import FastAPI\n@app.get(\"/api/items\")\ndef list_items():\n    return []\n",
+                &[("list_items", F)],
+            ),
+            (
+                "svc_write/main.py",
+                "python",
+                "from fastapi import FastAPI\n@app.post(\"/api/items\")\ndef create_item():\n    return {}\n",
+                &[("create_item", F)],
+            ),
+        ]);
+        let edges = detect_http_bridges(&index);
+        assert_eq!(
+            edges.len(),
+            1,
+            "the verb disambiguates these two — got {edges:?}"
+        );
+        assert_eq!(edges[0].target_file, "svc_read/main.py");
+    }
+
+    // ---- gRPC ------------------------------------------------------------
+
+    #[test]
+    fn a_client_identifier_naming_no_service_creates_no_grpc_edge() {
+        let index = index_with_symbols(&[
+            (
+                "client/main.go",
+                "go",
+                "package main\nfunc run() { httpClient.Get(url) }\n",
+                &[("run", F)],
+            ),
+            (
+                "proto/user.proto",
+                "protobuf",
+                "service UserService { rpc Get (Req) returns (Res); }\n",
+                &[
+                    ("UserService", SymbolKind::Service),
+                    ("Get", SymbolKind::Method),
+                ],
+            ),
+        ]);
+        let edges = detect_grpc_bridges(&index);
+        assert!(
+            edges.is_empty(),
+            "`httpClient` is not a stub for `UserService`; the only thing linking them is that \
+             both have a method spelled `Get` — got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_stub_client_naming_its_service_still_creates_a_grpc_edge() {
+        let index = index_with_symbols(&[
+            (
+                "client/main.go",
+                "go",
+                "package main\nfunc run() { userServiceClient.Get(ctx) }\n",
+                &[("run", F)],
+            ),
+            (
+                "proto/user.proto",
+                "protobuf",
+                "service UserService { rpc Get (Req) returns (Res); }\n",
+                &[
+                    ("UserService", SymbolKind::Service),
+                    ("Get", SymbolKind::Method),
+                ],
+            ),
+        ]);
+        let edges = detect_grpc_bridges(&index);
+        assert_eq!(
+            edges.len(),
+            1,
+            "a real stub call must still link — got {edges:?}"
+        );
+        assert_eq!(edges[0].target_symbol, "UserService.Get");
+    }
+
+    #[test]
+    fn a_stub_calling_a_method_its_service_does_not_declare_creates_no_edge() {
+        // Resolving the stub is half the check. `UserService` has no `Delete`,
+        // so naming the right service does not make this a call to it.
+        let index = index_with_symbols(&[
+            (
+                "client/main.go",
+                "go",
+                "package main\nfunc run() { userServiceClient.Delete(ctx) }\n",
+                &[("run", F)],
+            ),
+            (
+                "proto/user.proto",
+                "protobuf",
+                "service UserService { rpc Get (Req) returns (Res); }\n",
+                &[
+                    ("UserService", SymbolKind::Service),
+                    ("Get", SymbolKind::Method),
+                ],
+            ),
+        ]);
+        let edges = detect_grpc_bridges(&index);
+        assert!(
+            edges.is_empty(),
+            "the service resolves but does not declare `Delete` — got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn two_rows_naming_one_handler_are_one_answer_not_an_ambiguity() {
+        // The refusal is about not knowing WHICH handler, so two rows that name
+        // the same handler must still resolve. Asserted on the helper directly:
+        // producing a duplicate row through `detect_routes` depends on framework
+        // syntax this test has no business pinning.
+        let same = |method: &str| RouteEndpoint {
+            method: method.to_string(),
+            path: "/api/items".to_string(),
+            handler: "list_items".to_string(),
+            file: "svc/main.py".to_string(),
+            line: 1,
+        };
+        let candidates = vec![same("GET"), same("HEAD")];
+        let got = resolve_route(&candidates, None, "web/app.ts");
+        assert!(
+            got.is_some(),
+            "both rows point at svc/main.py::list_items, so the handler is not in doubt"
+        );
+
+        let elsewhere = RouteEndpoint {
+            file: "other/main.py".to_string(),
+            handler: "other_items".to_string(),
+            ..same("GET")
+        };
+        assert!(
+            resolve_route(&[same("GET"), elsewhere], None, "web/app.ts").is_none(),
+            "two different handlers is the case that must refuse"
+        );
+    }
+
+    // ---- the two detectors #34 does not name, same defect ----------------
+
+    #[test]
+    fn a_graphql_type_two_schemas_declare_creates_no_edge() {
+        let index = index_with_symbols(&[
+            (
+                "web/query.ts",
+                "typescript",
+                "const q = gql`query GetUser { user { id } }`;\n",
+                &[("q", F)],
+            ),
+            (
+                "schema/a.graphql",
+                "graphql",
+                "type GetUser { id: ID }\n",
+                &[("GetUser", SymbolKind::Type)],
+            ),
+            (
+                "schema/b.graphql",
+                "graphql",
+                "type GetUser { id: ID }\n",
+                &[("GetUser", SymbolKind::Type)],
+            ),
+        ]);
+        let edges = detect_graphql_bridges(&index);
+        assert!(
+            edges.is_empty(),
+            "two schemas declare `GetUser`; the query does not say which — got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_graphql_type_one_schema_declares_still_creates_an_edge() {
+        let index = index_with_symbols(&[
+            (
+                "web/query.ts",
+                "typescript",
+                "const q = gql`query GetUser { user { id } }`;\n",
+                &[("q", F)],
+            ),
+            (
+                "schema/a.graphql",
+                "graphql",
+                "type GetUser { id: ID }\n",
+                &[("GetUser", SymbolKind::Type)],
+            ),
+        ]);
+        let edges = detect_graphql_bridges(&index);
+        assert_eq!(
+            edges.len(),
+            1,
+            "an unambiguous type must still link — got {edges:?}"
+        );
+        assert_eq!(edges[0].target_file, "schema/a.graphql");
+    }
+
+    #[test]
+    fn a_command_basename_two_files_answer_to_creates_no_edge() {
+        let index = index_with_symbols(&[
+            (
+                "svc/app.py",
+                "python",
+                "import subprocess\ndef go():\n    subprocess.run([\"helper\"])\n",
+                &[("go", F)],
+            ),
+            (
+                "tools/helper.sh",
+                "shell",
+                "#!/bin/sh\necho a\n",
+                &[("main", F)],
+            ),
+            ("bin/helper.py", "python", "print('b')\n", &[("main", F)]),
+        ]);
+        let edges = detect_command_exec_bridges(&index);
+        assert!(
+            edges.is_empty(),
+            "`helper` is the stem of two files and the literal says nothing about which is \
+             executed — got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_basename_one_file_answers_to_still_creates_an_edge() {
+        let index = index_with_symbols(&[
+            (
+                "svc/app.py",
+                "python",
+                "import subprocess\ndef go():\n    subprocess.run([\"helper\"])\n",
+                &[("go", F)],
+            ),
+            (
+                "tools/helper.sh",
+                "shell",
+                "#!/bin/sh\necho a\n",
+                &[("main", F)],
+            ),
+        ]);
+        let edges = detect_command_exec_bridges(&index);
+        assert_eq!(
+            edges.len(),
+            1,
+            "one unambiguous binary must still link — got {edges:?}"
+        );
+        assert_eq!(edges[0].target_file, "tools/helper.sh");
     }
 }
