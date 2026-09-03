@@ -1,7 +1,7 @@
 ---
 id: '0135'
 title: Spill MCP visual HTML responses over 1MB to disk, return file path
-status: ACCEPTED
+status: SUPERSEDED by ADR-0208
 date: 2026-04-01
 triggered_by: cxpak_visual MCP tool response sizing (Task 15)
 loop: implementation
@@ -10,6 +10,11 @@ loop: implementation
 # ADR-0135: Spill MCP visual HTML responses over 1MB to disk, return file path
 
 ## Context
+
+> **SUPERSEDED by [ADR-0208](0208-the-mcp-visual-ceiling-is-a-context-budget.md) (cxpak#62).**
+> The spill mechanism below is kept. The 1 MB threshold and the `format == "html"` gate are not:
+> the limit was a transport figure applied to a context problem, and a 340 KB dashboard from a
+> three-file repository passed under it. Read 0208 for what runs today.
 
 Shipped in v2.0.0. Returning large self-contained HTML inline through the MCP tool channel can blow context/transport limits. The `cxpak_visual` tool (Task 15) needed a threshold strategy to keep payloads bounded.
 
