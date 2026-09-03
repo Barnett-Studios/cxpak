@@ -55,6 +55,12 @@ fn shared_index_swap_does_not_disturb_in_flight_snapshot() {
     use cxpak::index::CodebaseIndex;
     use cxpak::scanner::ScannedFile;
     let counter = TokenCounter::new();
+    // Content via the map (#40). These paths are fabricated; without content
+    // both indexes build EMPTY, `original_total` and `new_total` are both 0,
+    // and every assertion below reads 0 == 0 — green even if the swap never
+    // happened. The counts are the whole discriminator here.
+    let mut orig_content = std::collections::HashMap::new();
+    orig_content.insert("src/orig.rs".to_string(), "fn orig() {}\n".to_string());
     let original = CodebaseIndex::build_with_content(
         vec![ScannedFile {
             relative_path: "src/orig.rs".into(),
@@ -64,7 +70,7 @@ fn shared_index_swap_does_not_disturb_in_flight_snapshot() {
         }],
         std::collections::HashMap::new(),
         &counter,
-        std::collections::HashMap::new(),
+        orig_content,
     );
     let original_total = original.total_files;
     let shared: Arc<RwLock<Arc<CodebaseIndex>>> = Arc::new(RwLock::new(Arc::new(original)));
@@ -77,6 +83,9 @@ fn shared_index_swap_does_not_disturb_in_flight_snapshot() {
     assert_eq!(snapshot.total_files, original_total);
 
     // Writer swaps in a brand-new index with different shape.
+    let new_content: std::collections::HashMap<String, String> = (0..5)
+        .map(|i| (format!("src/new_{i}.rs"), format!("fn new_{i}() {{}}\n")))
+        .collect();
     let new_idx = CodebaseIndex::build_with_content(
         (0..5)
             .map(|i| ScannedFile {
@@ -88,7 +97,7 @@ fn shared_index_swap_does_not_disturb_in_flight_snapshot() {
             .collect(),
         std::collections::HashMap::new(),
         &counter,
-        std::collections::HashMap::new(),
+        new_content,
     );
     let new_total = new_idx.total_files;
     {

@@ -174,7 +174,10 @@ fn find_indexed_file_rejects_unbounded_suffix_match() {
         language: Some("rust".into()),
         size_bytes: 0,
     }];
-    let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, HashMap::new());
+    // Content via the map: this path is fabricated, and the fixture relied on an unreadable file being indexed as empty (#40).
+    let mut content = HashMap::new();
+    content.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
+    let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content);
     let root = std::path::Path::new("/Users/me/other_repo");
 
     // Correct URI inside repo_root resolves cleanly via the primary path.
@@ -206,7 +209,10 @@ fn blast_radius_errors_on_unknown_file() {
         language: Some("rust".into()),
         size_bytes: 0,
     }];
-    let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, HashMap::new());
+    // Content via the map (#40). Without it `src/real.rs` is skipped and this asserts "unknown file errors" against an EMPTY index — still green, but no longer contrasting a known file against an unknown one, which is the whole claim.
+    let mut content = HashMap::new();
+    content.insert("src/real.rs".to_string(), "fn real() {}\n".to_string());
+    let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content);
     let r = cxpak::lsp::methods::handle_custom_method(
         "cxpak/blastRadius",
         serde_json::json!({"file": "src/typo.rs"}),

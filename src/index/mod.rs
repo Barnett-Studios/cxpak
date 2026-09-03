@@ -49,6 +49,69 @@ impl CodebaseIndex {
     }
 }
 
+/// The largest file cxpak will read into memory, from `CXPAK_MAX_FILE_BYTES`.
+pub(crate) fn max_file_bytes() -> u64 {
+    parse_cap(std::env::var("CXPAK_MAX_FILE_BYTES").ok().as_deref())
+}
+
+/// Parse the cap, falling back to the default on anything unusable.
+///
+/// Separated from the env read so it can be tested without touching process
+/// state. Default 5 MiB: comfortably above any hand-written source file, and
+/// far below the checked-in multi-GB generated `.sql`/`.json` this exists to
+/// stop. Zero and unparseable values take the default rather than disabling the
+/// cap — a limit that silently becomes infinite is the failure being guarded
+/// against, not a way to opt out of it.
+pub(crate) fn parse_cap(raw: Option<&str>) -> u64 {
+    const DEFAULT: u64 = 5 * 1024 * 1024;
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// A scanned file's content, or `None` when it cannot be represented (#40).
+///
+/// Never returns an empty string for a file that could not be read.
+/// `read_to_string(..).unwrap_or_default()` made four different conditions —
+/// a permission error, a non-UTF-8 encoding, a file too large to hold, and a
+/// genuinely empty file — indistinguishable, and the first three then entered
+/// the index carrying real `size_bytes` and zero tokens.
+///
+/// The consequence was not one bad run. `serve` hashed that empty content into
+/// the stat-index under the file's REAL `(mtime_ns, size_bytes)` key, so a
+/// later successful read with unchanged stat hit the index, reused
+/// `sha256("")`, left the fingerprint unchanged, and the derived cache went on
+/// serving analysis built over a file cxpak had never read.
+///
+/// A caller receiving `None` must skip the file entirely rather than index it
+/// as empty: an unreadable file is not in the index, and contributes to neither
+/// `total_files`, `total_bytes`, nor the language stats. Anything else keeps the
+/// two states confusable, which is the defect.
+pub(crate) fn read_indexable(
+    path: &std::path::Path,
+    size_bytes: u64,
+    cap_bytes: u64,
+) -> Option<String> {
+    if size_bytes > cap_bytes {
+        eprintln!(
+            "cxpak: warning: skipping {}: {size_bytes} bytes is over the {cap_bytes} byte cap \
+             (raise CXPAK_MAX_FILE_BYTES to index it)",
+            path.display()
+        );
+        return None;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        // Covers both the IO failure and `InvalidData` for content that is not
+        // UTF-8, which is why the message carries the OS error rather than a
+        // category of our own.
+        Err(e) => {
+            eprintln!("cxpak: warning: skipping {}: {e}", path.display());
+            None
+        }
+    }
+}
+
 impl CodebaseIndex {
     pub fn build(
         files: Vec<ScannedFile>,
@@ -61,8 +124,12 @@ impl CodebaseIndex {
         let mut total_bytes = 0u64;
         let mut term_frequencies = HashMap::new();
 
+        let cap_bytes = max_file_bytes();
         for file in &files {
-            let content = std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
+            let Some(content) = read_indexable(&file.absolute_path, file.size_bytes, cap_bytes)
+            else {
+                continue;
+            };
             let token_count = counter.count_or_zero(&content);
             total_tokens += token_count;
             total_bytes += file.size_bytes;
@@ -178,13 +245,20 @@ impl CodebaseIndex {
         let mut total_bytes = 0u64;
         let mut term_frequencies = HashMap::new();
 
+        let cap_bytes = max_file_bytes();
         for file in &files {
-            let file_content = content
-                .get(&file.relative_path)
-                .cloned()
-                .unwrap_or_else(|| {
-                    std::fs::read_to_string(&file.absolute_path).unwrap_or_default()
-                });
+            // The content map is the caller's already-successful read. Only the
+            // miss falls through to disk, and only that path can fail.
+            let file_content = match content.get(&file.relative_path).cloned() {
+                Some(c) => c,
+                None => {
+                    let Some(c) = read_indexable(&file.absolute_path, file.size_bytes, cap_bytes)
+                    else {
+                        continue;
+                    };
+                    c
+                }
+            };
             let token_count = counter.count_or_zero(&file_content);
             total_tokens += token_count;
             total_bytes += file.size_bytes;
@@ -415,7 +489,11 @@ impl CodebaseIndex {
             };
 
             if needs_update {
-                let content = std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
+                let Some(content) =
+                    read_indexable(&file.absolute_path, file.size_bytes, max_file_bytes())
+                else {
+                    continue;
+                };
                 let parse_result = parse_results.get(&file.relative_path).cloned();
                 self.upsert_file(
                     &file.relative_path,
@@ -1689,5 +1767,199 @@ mod tests {
                 .expect("contextual-mode embedding index should build successfully");
         assert!(!contextual.is_empty());
         assert_eq!(contextual.len(), 1);
+    }
+
+    // ── #40: an unread file is not an empty one ───────────────────────────
+    //
+    // `read_to_string(..).unwrap_or_default()` collapsed four states into one
+    // empty string: a permission error, a non-UTF-8 encoding, a file over any
+    // sane size, and a file that is genuinely empty. The first three then
+    // entered the index carrying real `size_bytes` and zero tokens, and `serve`
+    // hashed that emptiness into the stat-index under the file's real
+    // (mtime, size) key — so the emptiness stuck across later good reads.
+    //
+    // `an_empty_file_is_still_indexed` is the control that keeps the fix from
+    // being "skip more things": the whole point is telling the fourth state
+    // apart from the first three, not lumping it in with them.
+
+    fn scanned(dir: &std::path::Path, rel: &str, bytes: &[u8]) -> ScannedFile {
+        let abs = dir.join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&abs, bytes).unwrap();
+        ScannedFile {
+            relative_path: rel.to_string(),
+            absolute_path: abs,
+            language: Some("rust".to_string()),
+            size_bytes: bytes.len() as u64,
+        }
+    }
+
+    fn built(files: Vec<ScannedFile>) -> CodebaseIndex {
+        CodebaseIndex::build(files, HashMap::new(), &TokenCounter::new())
+    }
+
+    #[test]
+    fn a_non_utf8_file_is_skipped_not_indexed_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 0xFF is not valid UTF-8 anywhere, so `read_to_string` fails with
+        // InvalidData on every platform — no permission bits, no root caveat.
+        let bad = scanned(tmp.path(), "src/latin1.rs", b"let s = \"caf\xFF\";\n");
+        let good = scanned(tmp.path(), "src/ok.rs", b"fn main() {}\n");
+        let idx = built(vec![bad, good]);
+
+        let paths: Vec<&str> = idx.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(
+            !paths.contains(&"src/latin1.rs"),
+            "a file cxpak could not read must not enter the index at all — got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/ok.rs"),
+            "the control must not pass by indexing nothing — got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_does_not_contribute_to_the_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = scanned(tmp.path(), "src/latin1.rs", b"\xFF\xFE\xFD\xFC\xFB\n");
+        let good = scanned(tmp.path(), "src/ok.rs", b"fn main() {}\n");
+        let good_bytes = good.size_bytes;
+        let idx = built(vec![bad, good]);
+
+        assert_eq!(idx.total_files, 1, "the skipped file must not be counted");
+        assert_eq!(
+            idx.total_bytes, good_bytes,
+            "counting bytes for content cxpak never read is the inconsistency this fixes: \
+             real size_bytes beside zero tokens"
+        );
+        assert_eq!(
+            idx.language_stats.get("rust").map(|s| s.file_count),
+            Some(1),
+            "per-language stats must not count it either"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_still_indexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = scanned(tmp.path(), "src/empty.rs", b"");
+        let idx = built(vec![empty]);
+
+        let paths: Vec<&str> = idx.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(
+            paths.contains(&"src/empty.rs"),
+            "an empty file was read successfully and IS empty; skipping it would re-merge the \
+             two states this change exists to separate — got {paths:?}"
+        );
+        assert_eq!(idx.total_files, 1);
+    }
+
+    #[test]
+    fn the_cap_is_applied_to_the_declared_size_before_the_file_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("small.rs");
+        std::fs::write(&path, b"fn main() {}\n").unwrap();
+
+        // The file is tiny; the DECLARED size is over the cap. If the cap were
+        // applied to what was read rather than to the stat, this would return
+        // Some — and a multi-GB file would already be in memory by then.
+        assert!(
+            read_indexable(&path, 10_000_000, 1_000).is_none(),
+            "the cap must be decided from size_bytes, before the read"
+        );
+        assert_eq!(
+            read_indexable(&path, 13, 1_000).as_deref(),
+            Some("fn main() {}\n"),
+            "a file under the cap must still be read"
+        );
+    }
+
+    #[test]
+    fn the_cap_takes_the_default_for_absent_zero_and_unparseable_values() {
+        const DEFAULT: u64 = 5 * 1024 * 1024;
+        assert_eq!(parse_cap(None), DEFAULT, "absent");
+        assert_eq!(parse_cap(Some("")), DEFAULT, "empty");
+        assert_eq!(parse_cap(Some("  ")), DEFAULT, "whitespace");
+        assert_eq!(parse_cap(Some("banana")), DEFAULT, "unparseable");
+        assert_eq!(parse_cap(Some("-1")), DEFAULT, "negative");
+        assert_eq!(
+            parse_cap(Some("0")),
+            DEFAULT,
+            "zero must not disable the cap — a limit that silently becomes infinite is the \
+             failure being guarded against, not a way to opt out of it"
+        );
+        assert_eq!(parse_cap(Some("4096")), 4096, "a usable value is honoured");
+        assert_eq!(parse_cap(Some(" 4096 ")), 4096, "and is trimmed");
+    }
+
+    #[test]
+    fn a_content_map_hit_is_not_re_read_from_disk() {
+        // build_with_content's fallback is the second read the issue thread
+        // found: skipping at the caller landed on the same default one frame
+        // down. A file whose content the caller already supplied must be
+        // indexed from that content even when the path on disk is unreadable.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = scanned(tmp.path(), "src/latin1.rs", b"\xFF\xFE\n");
+        let mut content = HashMap::new();
+        content.insert("src/latin1.rs".to_string(), "fn decoded() {}\n".to_string());
+        let idx = CodebaseIndex::build_with_content(
+            vec![f],
+            HashMap::new(),
+            &TokenCounter::new(),
+            content,
+        );
+
+        let paths: Vec<&str> = idx.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(
+            paths.contains(&"src/latin1.rs"),
+            "the caller's successful read is the content; only a MISS may fall through to disk \
+             — got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_content_map_miss_falls_through_and_still_skips_an_unreadable_file() {
+        // The other half of the fallback: a miss DOES go to disk, and that read
+        // is the one the issue thread found landing on the same empty default
+        // one frame below the caller.
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = scanned(tmp.path(), "src/latin1.rs", b"\xFF\xFE\n");
+        let good = scanned(tmp.path(), "src/ok.rs", b"fn main() {}\n");
+        let idx = CodebaseIndex::build_with_content(
+            vec![bad, good],
+            HashMap::new(),
+            &TokenCounter::new(),
+            HashMap::new(),
+        );
+
+        let paths: Vec<&str> = idx.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(
+            !paths.contains(&"src/latin1.rs"),
+            "an unreadable file must not survive the content-map miss — got {paths:?}"
+        );
+        assert!(paths.contains(&"src/ok.rs"), "control — got {paths:?}");
+    }
+
+    #[test]
+    fn an_incremental_rebuild_does_not_upsert_an_unreadable_file_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = scanned(tmp.path(), "src/ok.rs", b"fn main() {}\n");
+        let mut idx = built(vec![good.clone()]);
+        assert_eq!(
+            idx.total_files, 1,
+            "premise: the index starts with one file"
+        );
+
+        let bad = scanned(tmp.path(), "src/latin1.rs", b"\xFF\xFE\xFD\n");
+        idx.incremental_rebuild(&[good, bad], &HashMap::new(), &TokenCounter::new());
+
+        let paths: Vec<&str> = idx.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(
+            !paths.contains(&"src/latin1.rs"),
+            "the incremental path reads too, and had the same default — got {paths:?}"
+        );
+        assert!(paths.contains(&"src/ok.rs"), "control — got {paths:?}");
     }
 }
