@@ -94,7 +94,16 @@ impl Scanner {
             .git_ignore(true) // respect .gitignore
             .git_global(true) // honor ~/.gitignore_global (often excludes .env, *.pem, etc.)
             .git_exclude(true) // honor .git/info/exclude (per-repo exclusions)
-            .hidden(true) // visit hidden files (we handle .git via overrides)
+            // `hidden(true)` SKIPS hidden entries — the comment here used to say
+            // "visit hidden files", which is what was intended and the opposite of
+            // what it did (#39). Every dotfile was silently absent from every
+            // bundle: `.github/workflows`, `.editorconfig`, `.eslintrc`, the files
+            // that say how a project builds and what conventions it holds.
+            //
+            // Walking them is only safe because the credential denylist landed
+            // first: `.env` used to be excluded incidentally, by being hidden, and
+            // this line is what removed that accident. See BUILTIN_IGNORES.
+            .hidden(false)
             .overrides(overrides);
 
         // Load .cxpakignore if present.
@@ -634,5 +643,125 @@ mod tests {
 
         let override_err = ScanError::Override("bad pattern".to_string());
         assert!(format!("{override_err}").contains("override builder error"));
+    }
+
+    // ── #39 half 1: a dotfile is context, a tool cache is not ──────────────
+    //
+    // `hidden(true)` in the `ignore` crate SKIPS hidden entries; the comment
+    // beside it said "visit hidden files". Code and comment disagreed, and the
+    // code won, so every dotfile was silently absent from every bundle.
+    //
+    // The security half of #39 landed first, deliberately (see the issue): with
+    // no denylist, walking dotfiles would have exposed `.env` on every repo.
+    // `unhiding_dotfiles_does_not_unhide_credentials` is the test that pins that
+    // ordering, and it must pass on BOTH sides of this change.
+
+    fn scan_paths(dir: &Path) -> Vec<String> {
+        let scanner = Scanner::new(dir).unwrap();
+        scanner
+            .scan()
+            .unwrap()
+            .iter()
+            .map(|f| f.relative_path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_dotfile_the_project_configures_itself_with_is_scanned() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_git_repo(tmp.path());
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        fs::write(
+            tmp.path().join(".github/workflows/ci.yml"),
+            "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join(".editorconfig"), "root = true\n").unwrap();
+
+        let paths = scan_paths(tmp.path());
+        assert!(
+            paths.iter().any(|p| p == ".github/workflows/ci.yml"),
+            "how a project builds and tests itself is context, and it lives in a dotfile — got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == ".editorconfig"),
+            "convention files are the thing cxpak claims to surface — got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn unhiding_dotfiles_does_not_unhide_credentials() {
+        // The interaction the issue warns about: `.env` was excluded only
+        // incidentally, by being hidden. Once hidden entries are walked, the
+        // denylist is the only thing standing between a committed secret and a
+        // context bundle. This test fails the moment that stops being true.
+        let tmp = tempfile::tempdir().unwrap();
+        setup_git_repo(tmp.path());
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        fs::write(tmp.path().join(".env"), "API_TOKEN=not-a-real-value\n").unwrap();
+        fs::write(tmp.path().join(".env.local"), "API_TOKEN=also-not-real\n").unwrap();
+        fs::write(tmp.path().join("id_rsa"), "NOT-A-REAL-KEY\n").unwrap();
+        fs::write(tmp.path().join("server.key"), "NOT-A-REAL-KEY\n").unwrap();
+
+        let paths = scan_paths(tmp.path());
+        for secret in [".env", ".env.local", "id_rsa", "server.key"] {
+            assert!(
+                !paths.iter().any(|p| p == secret),
+                "{secret} reached the scan; the denylist is the only control here — got {paths:?}"
+            );
+        }
+        assert!(
+            paths.iter().any(|p| p == "main.rs"),
+            "the control must not pass by scanning nothing — got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn unhiding_dotfiles_does_not_walk_tool_caches() {
+        // These directories are reachable only once hidden entries are walked,
+        // and they are pure noise competing for the token budget. Excluding them
+        // is part of this change, not a separate concern.
+        let tmp = tempfile::tempdir().unwrap();
+        setup_git_repo(tmp.path());
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        for cache in [
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".tox",
+            ".terraform",
+            ".turbo",
+        ] {
+            fs::create_dir_all(tmp.path().join(cache)).unwrap();
+            fs::write(tmp.path().join(cache).join("junk.py"), "x = 1\n").unwrap();
+        }
+
+        let paths = scan_paths(tmp.path());
+        let leaked: Vec<&String> = paths.iter().filter(|p| p.starts_with('.')).collect();
+        assert!(
+            leaked.is_empty(),
+            "tool caches became reachable when dotfiles were unhidden — got {leaked:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "main.rs"),
+            "the control must not pass by scanning nothing — got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn the_git_directory_stays_out_when_dotfiles_are_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_git_repo(tmp.path());
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        fs::write(tmp.path().join(".git/config"), "[core]\n").unwrap();
+        fs::create_dir_all(tmp.path().join(".git/objects")).unwrap();
+        fs::write(tmp.path().join(".git/objects/blob"), "binary-ish\n").unwrap();
+
+        let paths = scan_paths(tmp.path());
+        assert!(
+            !paths.iter().any(|p| p.starts_with(".git/")),
+            "the override that keeps .git out must survive unhiding — got {paths:?}"
+        );
     }
 }
