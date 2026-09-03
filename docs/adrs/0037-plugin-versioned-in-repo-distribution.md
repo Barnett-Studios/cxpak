@@ -38,5 +38,23 @@ The plugin version is held in lockstep with the crate across `plugin/.claude-plu
 ### Neutral
 - The shipped repo carries a `.claude-plugin/marketplace.json` listing and a `plugin/.claude-plugin/plugin.json`, both kept in lockstep with the crate version (2.2.1 at time of inspection).
 
+### Enforcement (added after #91)
+
+Lockstep was prose until `v3.1.4` shipped with `Cargo.toml` at `3.1.4` and every other
+declaration at `3.1.3`, so `ensure-cxpak` rejected the binary its own release published — the MCP
+server, four commands, two skills and both git hook wrappers with it. The cost of Option A was
+paid and its benefit was not received.
+
+`tests/version_lockstep.rs` now asserts it. Two things worth recording here rather than only in
+the test:
+
+- **There are three declarations, not the two this ADR names.** `plugin/lib/ensure-cxpak`'s
+  `REQUIRED_VERSION` postdates this decision (ADR-0033 made it the single binary resolver) and is
+  the one that actually refuses to run. It is the site the ADR's own file list would have let you
+  miss.
+- **The list is enumerated from this document, not discovered by scanning.** A check that finds
+  its own denominator can only confirm that the files it happened to find agree with each other.
+  So a fourth declaration means editing that list — here and in the test.
+
 ## Revisit if
 - An independent plugin release cadence becomes necessary (e.g., plugin-only fixes that should not wait on a CLI release).
