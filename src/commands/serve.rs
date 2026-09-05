@@ -204,8 +204,18 @@ pub fn build_index_with_workspace(
     // build_with_content.  These feed the stat-index to skip re-hashing
     // files whose (mtime_ns, size_bytes) are unchanged (Task 0.2).
     let mut file_stats: HashMap<String, (u64, u64)> = HashMap::new();
+    let cap_bytes = crate::index::max_file_bytes();
     for file in &files {
-        let source = std::fs::read_to_string(&file.absolute_path).unwrap_or_default();
+        // An unreadable file leaves no trace here: no parse, no content-map
+        // entry, and no stat-index row. `fp_files` below is built from
+        // `index.files`, so dropping it in `build_with_content` keeps it out of
+        // the fingerprint too — which is what stops `sha256("")` being stored
+        // under the file's real (mtime, size) key and served back later (#40).
+        let Some(source) =
+            crate::index::read_indexable(&file.absolute_path, file.size_bytes, cap_bytes)
+        else {
+            continue;
+        };
         if let Some(lang_name) = &file.language {
             if let Some(lang) = registry.get(lang_name) {
                 let ts_lang = lang.ts_language();

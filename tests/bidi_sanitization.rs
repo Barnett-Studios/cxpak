@@ -106,7 +106,13 @@ fn search_index_sanitises_file_path_with_rlo() {
         language: Some("rust".into()),
         size_bytes: 0,
     }];
-    let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, HashMap::new());
+    // Content through the map, as the symbol-sanitisation test further down
+    // already does: this path has never existed on disk, and the fixture relied
+    // on an unreadable file being indexed as empty (#40). The subject here is
+    // bidi sanitisation of the path, not reading it.
+    let mut content = HashMap::new();
+    content.insert(evil_path.to_string(), "fn admin() {}\n".to_string());
+    let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content);
     let entries = cxpak::visual::search_index::build_search_index(&idx);
     let file_entry = entries
         .iter()
@@ -164,7 +170,12 @@ fn search_index_sanitises_symbol_name_with_zwj() {
             exports: vec![],
         },
     );
-    let idx = CodebaseIndex::build_with_content(files, parses, &counter, HashMap::new());
+    let mut content = HashMap::new();
+    content.insert(
+        "src/auth.rs".to_string(),
+        "fn admin_check() {}\n".to_string(),
+    );
+    let idx = CodebaseIndex::build_with_content(files, parses, &counter, content);
     let entries = cxpak::visual::search_index::build_search_index(&idx);
     let sym_entry = entries
         .iter()

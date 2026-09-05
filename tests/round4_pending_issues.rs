@@ -66,8 +66,21 @@ fn architecture_module_prefix_is_bidi_sanitised() {
             size_bytes: 0,
         },
     ];
-    let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, HashMap::new());
+    // Content via the map (#40): both paths are fabricated, and without it the
+    // index is empty, so `map.modules` is empty and the loop below asserts over
+    // nothing.
+    let mut content = HashMap::new();
+    content.insert(evil.to_string(), "fn legit() {}\n".to_string());
+    content.insert(
+        format!("{}/x.rs", evil.split('/').next().unwrap_or("src")),
+        "fn x() {}\n".to_string(),
+    );
+    let idx = CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content);
     let map = cxpak::intelligence::architecture::build_architecture_map(&idx, 2);
+    assert!(
+        !map.modules.is_empty(),
+        "the loop below must have something to assert over"
+    );
     for module in &map.modules {
         assert!(
             !module

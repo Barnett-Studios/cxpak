@@ -823,11 +823,18 @@ mod tests {
             language: Some("rust".to_string()),
             size_bytes: 100,
         }];
+        // The content comes through the content map, as it does at all twelve
+        // production call sites. This path has never existed on disk, and the
+        // fixture relied on an unreadable file being admitted as empty (#40).
+        // Supplying it changes nothing this test asserts: the subject is
+        // `uri_to_rel_path`, not file reading.
+        let mut content = std::collections::HashMap::new();
+        content.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
         let index = CodebaseIndex::build_with_content(
             files,
             std::collections::HashMap::new(),
             &counter,
-            std::collections::HashMap::new(),
+            content,
         );
         let root = std::path::Path::new("/Users/me/repo");
         let result = code_lens_for_file("file:///Users/me/repo/src/main.rs", &index, root);
@@ -847,11 +854,18 @@ mod tests {
             language: Some("rust".to_string()),
             size_bytes: 100,
         }];
+        // The content comes through the content map, as it does at all twelve
+        // production call sites. This path has never existed on disk, and the
+        // fixture relied on an unreadable file being admitted as empty (#40).
+        // Supplying it changes nothing this test asserts: the subject is
+        // `uri_to_rel_path`, not file reading.
+        let mut content = std::collections::HashMap::new();
+        content.insert("src/lib.rs".to_string(), "pub fn lib() {}\n".to_string());
         let index = CodebaseIndex::build_with_content(
             files,
             std::collections::HashMap::new(),
             &counter,
-            std::collections::HashMap::new(),
+            content,
         );
         let root = std::path::Path::new("/Users/me/repo");
         // diagnostics_for_file returns empty (no real diagnostics yet) but must
