@@ -48,8 +48,20 @@ pub fn compute_timeline_snapshots(
         .set_sorting(git2::Sort::TIME)
         .map_err(|e| e.to_string())?;
 
-    let oids: Vec<git2::Oid> = revwalk.filter_map(|r| r.ok()).collect();
+    // NOT `filter_map(|r| r.ok())`. Every other fallible call in this function propagates with
+    // `?`, and the doc comment above already promises the caller an error when the revwalk
+    // fails — dropping the errors here made a walk that failed mid-traversal indistinguishable
+    // from one that simply ran out of commits, and a walk that failed on its first step
+    // indistinguishable from an empty repository. The caller then rendered an empty timeline
+    // and exited 0, so the failure erased its own cause (#71).
+    let oids: Vec<git2::Oid> = revwalk
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("revwalk failed while walking commits from HEAD: {e}"))?;
 
+    // Defensive, and deliberately kept despite being unreachable today: `push_head` fails on
+    // an unborn HEAD, so a walk that got here yields at least the tip. No test can kill a
+    // mutation of this branch, and that is recorded rather than hidden by deleting it — an
+    // error-handling guard is not the place to trade a cheap check for a tidier mutation score.
     if oids.is_empty() {
         return Ok(vec![]);
     }
@@ -407,6 +419,120 @@ mod tests {
         let deserialized: TimelineSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.commit_sha, "abc123");
         assert_eq!(deserialized.files.len(), 1);
+    }
+
+    /// Build a repo whose revwalk genuinely fails partway: two commits, then the parent's
+    /// object file removed. `push_head` still succeeds (HEAD's own object is intact), the walk
+    /// yields the tip, and then errors trying to traverse to a parent that is not there — git
+    /// itself reports `fatal: Failed to traverse parents of commit` on the same fixture.
+    ///
+    /// This is the shape the issue could not isolate: a walk that starts fine and fails mid-way
+    /// is indistinguishable, to `filter_map(|r| r.ok())`, from a walk that simply ended.
+    fn repo_whose_revwalk_fails_partway() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git must run");
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "--quiet"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "first",
+        ]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "second",
+        ]);
+        let parent = git(&["rev-parse", "HEAD~1"]);
+        let object = dir
+            .path()
+            .join(".git/objects")
+            .join(&parent[..2])
+            .join(&parent[2..]);
+        std::fs::remove_file(&object).expect("the parent object must exist to be removed");
+        dir
+    }
+
+    /// The defect: `filter_map(|r| r.ok())` turned a failed walk into a short list, and the
+    /// function returned it as success. The documented contract eleven lines above the code
+    /// already promised the error — this asserts the code keeps that promise.
+    /// The empty that IS reachable, and must stay a success: the caller asked for none. The
+    /// fix propagates walk errors, and this pins that it did not turn every empty result into
+    /// one — "report the failure" and "call success a failure" are different changes.
+    #[test]
+    fn asking_for_zero_snapshots_is_an_empty_success_not_an_error() {
+        let path = std::path::Path::new(".");
+        let snapshots = compute_timeline_snapshots(path, 0)
+            .expect("asking for zero snapshots of a healthy repo is not a failure");
+        assert!(
+            snapshots.is_empty(),
+            "zero requested, {} returned",
+            snapshots.len()
+        );
+    }
+
+    #[test]
+    fn a_failed_revwalk_is_an_error_not_a_silently_shortened_list() {
+        let dir = repo_whose_revwalk_fails_partway();
+        let result = compute_timeline_snapshots(dir.path(), 10);
+        let err = match result {
+            Err(e) => e,
+            Ok(snapshots) => panic!(
+                "a walk that could not traverse its parents returned Ok({}) — the caller \
+                 cannot tell this from a repository that simply has {} commits",
+                snapshots.len(),
+                snapshots.len()
+            ),
+        };
+        assert!(
+            err.to_lowercase().contains("revwalk") || err.to_lowercase().contains("walk"),
+            "the error must name the walk as the thing that failed, so the next occurrence \
+             carries its cause instead of a bare empty list; got: {err}"
+        );
+    }
+
+    /// The other empty, which must stay `Ok`: a repository with no commits at all has nothing
+    /// to walk and that is not a failure. Without this, "propagate the error" could be
+    /// satisfied by making every empty result an error, which is a different defect.
+    #[test]
+    fn a_repository_with_no_commits_is_still_ok_and_empty() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["init", "--quiet"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git must run");
+        assert!(out.status.success(), "git init failed");
+        // `push_head` on a repo with no HEAD commit is itself an error, so the honest answer
+        // here is an Err naming that — what must NOT happen is a bare `Ok(vec![])` that reads
+        // as "walked fine, found nothing".
+        match compute_timeline_snapshots(dir.path(), 10) {
+            Ok(s) => assert!(s.is_empty(), "an unborn HEAD cannot yield snapshots: {s:?}"),
+            Err(e) => assert!(!e.is_empty(), "an error must carry a reason"),
+        }
     }
 
     #[test]
