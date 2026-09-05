@@ -74,6 +74,15 @@ pub enum LspMethodError {
 /// Example: `file:///Users/me/repo/src/main.rs` + `/Users/me/repo` → `src/main.rs`
 pub fn uri_to_rel_path(uri: &Url, repo_root: &Path) -> Option<String> {
     let abs = uri.to_file_path().ok()?;
+    if let Ok(rel) = abs.strip_prefix(repo_root) {
+        return Some(rel.to_string_lossy().into_owned());
+    }
+    // A client and this server can name the same directory by different paths
+    // when a symlink is in the way — on macOS a client's `/var/folders/…` is
+    // the server's canonical `/private/var/folders/…`. Retry canonicalised
+    // rather than declaring the file foreign. Canonicalising fails for a path
+    // that does not exist, and `None` is the right answer for that anyway.
+    let abs = std::fs::canonicalize(&abs).ok()?;
     let rel = abs.strip_prefix(repo_root).ok()?;
     Some(rel.to_string_lossy().into_owned())
 }
@@ -113,23 +122,33 @@ pub fn extract_word_at(content: &str, line_idx: usize, char_idx: usize) -> Strin
 
 /// Resolve a URI or uri-ish string to an indexed file.
 ///
-/// Primary strategy: parse as file:// URL, strip `repo_root`, exact-match on
-/// `IndexedFile.relative_path`.  Fallback: path-bounded suffix match — the
-/// URI must end with `/<relative_path>` or be exactly `<relative_path>`.
-/// A plain `ends_with(relative_path)` without the separator bound would
-/// falsely match `src/main.rs` against URIs in unrelated crates whose paths
-/// happen to end in `main.rs` (e.g., `my_src/main.rs`).
+/// **A well-formed `file://` URI is resolved against `repo_root` and nothing
+/// else.** If it does not live under the root, it is not this server's file and
+/// the answer is `None` — the server never indexed it and has nothing true to
+/// say about it.
+///
+/// The separator-bounded suffix match that used to back every lookup aligned a
+/// match to *a* directory boundary, not to *this workspace's* root, so a server
+/// rooted at `/repo` answered for `/other/src/main.rs` with `/repo`'s analysis:
+/// another project's token count, a suppressed real warning, and a dead-code
+/// diagnostic on a symbol called two lines below its definition (#76). The
+/// request succeeded and the response was well-formed; only the subject was
+/// wrong.
+///
+/// The suffix match survives for **uri-ish input that is not a URL at all** —
+/// a bare `src/main.rs` handed in by a non-LSP caller, which carries no root to
+/// resolve against. Its separator bound is still needed there so `src/main.rs`
+/// does not match `my_src/main.rs`.
 pub fn find_indexed_file<'a>(
     uri_path: &str,
     index: &'a crate::index::CodebaseIndex,
     repo_root: &Path,
 ) -> Option<&'a std::sync::Arc<crate::index::IndexedFile>> {
-    let url = Url::parse(uri_path).ok();
-    let rel_opt = url.as_ref().and_then(|u| uri_to_rel_path(u, repo_root));
+    if let Some(url) = Url::parse(uri_path).ok().filter(|u| u.scheme() == "file") {
+        let rel = uri_to_rel_path(&url, repo_root)?;
+        return index.files.iter().find(|f| f.relative_path == rel);
+    }
     index.files.iter().find(|f| {
-        if rel_opt.as_deref().is_some_and(|r| f.relative_path == r) {
-            return true;
-        }
         // Path-bounded suffix match: require a leading `/` or exact equality
         // so the match aligns to a directory boundary. `src/main.rs` MUST NOT
         // match `my_src/main.rs`.
@@ -332,6 +351,15 @@ pub fn workspace_symbols(
         let Some(pr) = &file.parse_result else {
             continue;
         };
+        // Build the location URI ONCE per file, and skip the file when it
+        // cannot be built. The previous `unwrap_or_else(|_| "file:///unknown")`
+        // turned a construction failure into a well-formed lie: `location.uri`
+        // is the only field a client uses to open a symbol, so "Go to Symbol in
+        // Workspace" listed every correct name and opened none of them (#75).
+        // An omitted symbol is a visible gap; a placeholder is not.
+        let Ok(file_uri) = Url::from_file_path(repo_root.join(&file.relative_path)) else {
+            continue;
+        };
         for sym in &pr.symbols {
             if !query.is_empty() && !sym.name.to_lowercase().contains(&query_lower) {
                 continue;
@@ -356,8 +384,7 @@ pub fn workspace_symbols(
                 tags: None,
                 deprecated: None,
                 location: Location {
-                    uri: Url::from_file_path(repo_root.join(&file.relative_path))
-                        .unwrap_or_else(|_| Url::parse("file:///unknown").unwrap()),
+                    uri: file_uri.clone(),
                     range: tower_lsp::lsp_types::Range {
                         start: Position {
                             line: sym.start_line.saturating_sub(1) as u32,

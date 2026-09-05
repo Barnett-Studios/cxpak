@@ -541,3 +541,203 @@ fn lsp_sigterm_drains_in_flight_response() {
         "exit must be clean (status 0) after grace; got: {exit_status:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Workspace-root anchoring (#75, #76)
+//
+// Both defects follow from one absence: the server never establishes an
+// ABSOLUTE workspace root. `cxpak lsp` takes `[PATH] [default: .]`, and a
+// relative root makes `Url::from_file_path` fail (#75: every symbol gets the
+// `file:///unknown` placeholder) and `strip_prefix` fail (#76: every URI
+// resolution falls through to a suffix match with no root bound).
+//
+// These drive the real server over stdio, because both are only reachable
+// through the invocation — a unit test that hands the functions an absolute
+// root cannot see either.
+// ---------------------------------------------------------------------------
+
+/// Send `initialize` + `initialized`, returning nothing. Every test below needs
+/// the handshake before the surface answers.
+fn handshake(
+    stdin: &mut process::ChildStdin,
+    reader: &mut BufReader<process::ChildStdout>,
+    root: &std::path::Path,
+) {
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": format!("file://{}", root.to_str().unwrap()),
+                "capabilities": {}
+            }
+        })
+        .to_string(),
+    );
+    read_response_for_id(reader, 1).expect("initialize response");
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}).to_string(),
+    );
+}
+
+/// #75 — at the DOCUMENTED DEFAULT path, every workspace symbol must carry a URI
+/// that names a real file.
+///
+/// `location.uri` is the only field a client uses to open a symbol, so
+/// `file:///unknown` is not a degraded answer: it is a well-formed lie that
+/// makes "Go to Symbol in Workspace" list the right names and open none of
+/// them. Spawned with NO path argument and `current_dir` set to the repo,
+/// which is both the documented default and what an editor produces.
+#[test]
+fn workspace_symbols_at_the_default_path_carry_openable_uris() {
+    let repo = make_test_repo();
+    let mut child = process::Command::new(cargo_bin!("cxpak"))
+        .arg("lsp") // no PATH argument -> `.`
+        .current_dir(repo.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cxpak binary should spawn for lsp");
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "workspace/symbol",
+            "params": {"query": "main"}
+        })
+        .to_string(),
+    );
+    let resp = read_response_for_id(&mut reader, 2).expect("workspace/symbol response");
+    let syms = resp["result"].as_array().cloned().unwrap_or_default();
+
+    // Positive control. Without this the assertion below passes vacuously on a
+    // server that returned nothing at all, which is the failure this whole
+    // file exists to distinguish from a correct empty answer.
+    assert!(
+        !syms.is_empty(),
+        "the default-path server found no symbol matching `main` — the search itself is broken, \
+         so the URI assertion below would prove nothing: {resp}"
+    );
+
+    for s in &syms {
+        let uri = s["location"]["uri"].as_str().unwrap_or_default();
+        assert_ne!(
+            uri, "file:///unknown",
+            "symbol {:?} carries the placeholder URI: {s}",
+            s["name"]
+        );
+        let path = uri.strip_prefix("file://").unwrap_or_default();
+        assert!(
+            !path.is_empty() && std::path::Path::new(path).exists(),
+            "symbol {:?} has uri {uri:?}, which names no file on disk",
+            s["name"]
+        );
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// #76 — a file OUTSIDE the workspace root is not this server's file, even when
+/// its path ends in the same segments as an indexed one.
+///
+/// The resolver's separator bound aligns a match to *a* directory boundary, not
+/// to *this workspace's* root, so `/other/src/main.rs` matches an index whose
+/// only file is `src/main.rs`. The response is well-formed and the subject is
+/// wrong — a lens with another project's token count, and (in the reported
+/// case) a dead-code warning on a symbol called two lines below.
+#[test]
+fn a_file_outside_the_workspace_root_gets_no_answer() {
+    let repo = make_test_repo();
+    let other = make_test_repo(); // same shape: <other>/src/main.rs
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    let lens_for = |id: u64, p: std::path::PathBuf| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "textDocument/codeLens",
+            "params": {"textDocument": {"uri": format!("file://{}", p.to_str().unwrap())}}
+        })
+        .to_string()
+    };
+
+    // The control FIRST, so a server that answers nothing at all cannot pass
+    // the real assertion by accident.
+    write_lsp_message(stdin, &lens_for(2, repo.path().join("src/main.rs")));
+    let inside = read_response_for_id(&mut reader, 2).expect("codeLens response (in-root)");
+    assert!(
+        !inside["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the server gave no lens for its OWN indexed file, so the out-of-root assertion below \
+         would pass vacuously: {inside}"
+    );
+
+    write_lsp_message(stdin, &lens_for(3, other.path().join("src/main.rs")));
+    let outside = read_response_for_id(&mut reader, 3).expect("codeLens response (out-of-root)");
+    assert!(
+        outside["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "a server rooted at {:?} answered for {:?}, a file in a different project it never \
+         indexed: {outside}",
+        repo.path(),
+        other.path().join("src/main.rs")
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// #76's second half — a path INSIDE the root that names no indexed file must
+/// also get nothing. `<repo>/sub/main.rs` does not exist, but it ends in
+/// `main.rs`, and the suffix match does not care.
+#[test]
+fn a_nonexistent_path_inside_the_root_gets_no_answer() {
+    let repo = make_test_repo();
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "textDocument/codeLens",
+            "params": {"textDocument": {
+                "uri": format!("file://{}", repo.path().join("sub/src/main.rs").to_str().unwrap())
+            }}
+        })
+        .to_string(),
+    );
+    let resp = read_response_for_id(&mut reader, 2).expect("codeLens response");
+    assert!(
+        resp["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the server answered for sub/src/main.rs, which does not exist: {resp}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}

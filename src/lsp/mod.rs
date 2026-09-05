@@ -3,9 +3,30 @@ pub mod methods;
 
 pub use backend::CxpakLspBackend;
 
+/// The absolute workspace root the server anchors on.
+///
+/// `cxpak lsp` takes `[PATH] [default: .]`, and a RELATIVE root is not merely
+/// untidy — it makes two separate things fail silently. `Url::from_file_path`
+/// returns `Err` for a non-absolute path, so every `workspace/symbol` location
+/// fell back to a `file:///unknown` placeholder (#75); and
+/// `abs.strip_prefix(repo_root)` cannot match an absolute `file://` URI against
+/// `.`, so every codeLens/diagnostic/hover resolution fell through to a suffix
+/// match with no root bound (#76). One absolute root is the fix for the first
+/// and the precondition for the second.
+///
+/// Canonicalising also resolves symlinks, which matters on macOS where a
+/// client's `/var/folders/...` and the server's own view `/private/var/...`
+/// name the same directory by different paths.
+pub fn workspace_root(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(path)
+}
+
 /// Entry point for `cxpak lsp` — runs the LSP server over stdio until stdin closes.
 pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     use tower_lsp::{LspService, Server};
+    // Anchor before indexing: a root that cannot be resolved is an error the
+    // caller should see, not a placeholder to serve wrong answers from.
+    let path = &workspace_root(path)?;
     let index = crate::commands::serve::build_index(path)?;
     // Inner Arc so the LSP dispatch can take an O(1) snapshot and run
     // long-running custom methods without holding the lock — see

@@ -19,6 +19,9 @@ pub struct CxpakLspBackend {
     pub index: SharedIndex,
     pub path: SharedPath,
     pub documents: SharedDocuments,
+    /// Set by `initialize` when the client's `rootUri` names a different tree
+    /// than the one this server indexed; reported by `initialized`.
+    root_mismatch: Arc<RwLock<Option<String>>>,
 }
 
 impl CxpakLspBackend {
@@ -28,6 +31,7 @@ impl CxpakLspBackend {
             index,
             path,
             documents: Arc::new(RwLock::new(HashMap::new())),
+            root_mismatch: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -214,7 +218,38 @@ impl CxpakLspBackend {
 
 #[async_trait]
 impl LanguageServer for CxpakLspBackend {
-    async fn initialize(&self, _params: InitializeParams) -> LspResult<InitializeResult> {
+    /// The client's `rootUri` is READ but does not win.
+    ///
+    /// The index is built from the CLI path before the handshake happens, so
+    /// re-anchoring on a `rootUri` that names a different tree would serve one
+    /// project's analysis under another project's URIs — which is exactly the
+    /// defect #76 reports, reintroduced from the other end. The CLI path stays
+    /// authoritative and a disagreement is reported instead of absorbed, so an
+    /// editor that spawned the server from the wrong directory sees why its
+    /// answers look foreign rather than trusting them. ADR-0209.
+    async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
+        #[allow(deprecated)]
+        let client_root = params
+            .workspace_folders
+            .as_ref()
+            .and_then(|f| f.first())
+            .map(|f| f.uri.clone())
+            .or(params.root_uri);
+        if let Some(url) = client_root {
+            let differs = url
+                .to_file_path()
+                .ok()
+                .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+                .is_none_or(|p| p != *self.path.as_path());
+            if differs {
+                if let Ok(mut slot) = self.root_mismatch.write() {
+                    *slot = Some(format!(
+                        "cxpak: the client's workspace root {url} is not the tree this server                          indexed ({}). Every answer describes the indexed tree; restart the                          server with that path to analyse the client's.",
+                        self.path.display()
+                    ));
+                }
+            }
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -267,6 +302,13 @@ impl LanguageServer for CxpakLspBackend {
                 format!("cxpak LSP initialized for {}", self.path.display()),
             )
             .await;
+
+        // Emitted here rather than from `initialize`: the spec does not promise
+        // a client is listening for notifications before the handshake ends.
+        let mismatch = self.root_mismatch.read().ok().and_then(|g| g.clone());
+        if let Some(msg) = mismatch {
+            self.client.log_message(MessageType::WARNING, msg).await;
+        }
 
         let path = Arc::clone(&self.path);
         let index = Arc::clone(&self.index);
