@@ -38,3 +38,35 @@ Apply three ordered ignore layers — `.gitignore`, a built-in defaults list (`B
 ## Revisit if
 - Users need to index non-git directories.
 - Built-in defaults drift from real-world project layouts.
+
+## Amended (#39) — hidden entries are walked, and `BUILTIN_IGNORES` now carries three purposes
+
+This ADR recorded the three *sources* of ignore rules and never said what happened to hidden
+entries. The `WalkBuilder` carried `.hidden(true)` beside a comment reading "visit hidden files".
+In the `ignore` crate `hidden(true)` **skips** hidden entries, so the code did the opposite of its
+comment and every dotfile was silently absent from every bundle — `.github/workflows`,
+`.editorconfig`, `.eslintrc`: the files that state how a project builds and what conventions it
+holds. Nothing here or anywhere else recorded a decision to exclude them, so this is corrected to
+`.hidden(false)` and the stated intent now holds.
+
+The order the two halves of #39 landed in was not incidental. `.env` was excluded only *because it
+was hidden*, so unhiding first would have exposed it on every repo in the window between the
+changes. The credential denylist landed first (#67 and `3b8bbc52`), and only then this.
+
+`BUILTIN_IGNORES` consequently now serves three distinct purposes, worth naming because they age
+differently:
+
+1. **Noise** — `node_modules`, `target`, lock files, binary and media extensions. The original list.
+2. **Credential material** — exact filenames and key-material extensions. A *control*, not a
+   convenience: before it, the only thing between a committed private key and a context bundle was
+   whether the user's gitignore happened to cover it.
+3. **Tool caches** — `.mypy_cache`, `.pytest_cache`, `.tox`, `.terraform` and kin. Reachable only
+   since `hidden(false)`; while dotfiles were skipped wholesale these cost nothing.
+
+`.cache` and `.yarn` are deliberately absent from (3): both are broad enough to hold real source
+(Yarn PnP keeps `.yarn/patches` and `.yarn/releases`), and excluding real source silently is the
+same defect as excluding dotfiles silently.
+
+The "Revisit if" below gains one: **hidden-entry walking makes `BUILTIN_IGNORES` load-bearing for
+directories it never had to cover.** A cache directory absent from the list is now indexed rather
+than skipped, and the symptom is only a budget quietly spent on the wrong files.
