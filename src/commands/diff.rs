@@ -325,10 +325,8 @@ pub fn run(
     let render_start = std::time::Instant::now();
     let mut full_diff = String::new();
     for change in &changes {
-        full_diff.push_str(&format!(
-            "### {}\n\n```diff\n{}\n```\n\n",
-            change.path, change.diff_text
-        ));
+        full_diff.push_str(&format!("### {}\n\n", change.path));
+        full_diff.push_str(&crate::output::fenced(&change.diff_text, "diff"));
     }
 
     // 9. Budget: diff first, then context signatures with the remainder
@@ -424,7 +422,7 @@ fn render_context_signatures(
 
         full.push_str(&format!("### {}\n\n", file.relative_path));
         for sym in public_syms {
-            full.push_str(&format!("```\n{}\n```\n\n", sym.signature));
+            full.push_str(&crate::output::fenced(&sym.signature, ""));
         }
     }
 
