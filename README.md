@@ -184,7 +184,10 @@ Your AI tool gets five intent-parameterized tools; each selects a capability via
 | **`cxpak_review`** | `review`, `diff`, `verify` |
 | **`cxpak_insight`** | `health`, `risks`, `architecture`, `conventions`, `security_surface`, `drift`, `visual`, `onboard` |
 
-The v2.x per-tool names (`cxpak_auto_context`, `cxpak_health`, ...) remain callable as deprecated aliases for one release. See [`docs/MIGRATION-3.0.md`](docs/MIGRATION-3.0.md).
+<!-- advertised-tool-names: exempt — this paragraph's subject IS the pre-3.0 names, so naming
+     them is its job. The exemption is declared here rather than hardcoded in the test, so moving
+     or deleting this paragraph removes the exemption with it. -->
+The v2.x per-tool names (`cxpak_auto_context`, `cxpak_health`, ...) remain callable as deprecated aliases; **`tools/list` does not advertise them**, so a client that builds its callable set from the advertised surface will not find them. No removal release is set. See [`docs/MIGRATION-3.0.md`](docs/MIGRATION-3.0.md).
 
 On large repositories, `cxpak serve --mcp` answers the MCP `initialize` handshake immediately and builds the index in the background -- fixing the startup timeout. Tool calls that arrive before the index is ready get a graceful retry status, then byte-identical results once it is built.
 

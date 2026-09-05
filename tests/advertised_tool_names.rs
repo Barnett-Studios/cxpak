@@ -196,3 +196,138 @@ fn every_tool_name_in_a_string_literal_is_advertised() {
         violations.join("\n  ")
     );
 }
+
+/// Markdown that a user reads to learn the CURRENT surface must name only tools
+/// `tools/list` advertises.
+///
+/// cxpak#64: `plugin/README.md` was headed "MCP Tools (13)" and listed the whole
+/// v2.x surface — **not one** of those 13 names has been advertised since the 3.0
+/// consolidation (ADR-0182). It is the README of the plugin a user *installs*, so
+/// it is what they read to learn what they just got. `README.md` carried two more.
+///
+/// The names still *route*, through the 26-arm alias table, so a permissive client
+/// that copies one out of the doc succeeds and nothing fails loudly. A client that
+/// builds its callable set from `tools/list` — which is what an agent harness does
+/// — gets none of them. The doc was wrong in the one direction the alias hides.
+///
+/// ## Why the denominator is the tree and the exemption is in the file
+///
+/// This is a DRIFT claim, so the expectation is deliberately *shared* with the
+/// thing it checks: `mcp_catalog_tools()` is the same function `tools/list` is
+/// built from, and a rename must move both sides together. (A completeness claim
+/// would need the opposite — an independent enumeration — which is why the sibling
+/// test over `src/` derives its site set from the source rather than from a list.)
+///
+/// Every `.md` in the tree is scanned, so a new document is covered the day it is
+/// added rather than the day someone remembers to list it. Two escapes, and the
+/// difference between them matters:
+///
+/// * `docs/adrs/` is excluded **by rule**. An ADR is a dated record of a decision
+///   taken when those names existed; rewriting one to use today's names would
+///   falsify history, and there is no version of this guard an ADR should pass.
+/// * Anything else opts out with `advertised-tool-names: exempt` **in the file**,
+///   next to the text it excuses. Two documents legitimately name the dead surface
+///   — the migration table, whose subject is the mapping, and README's deprecation
+///   paragraph. Declaring it in the document means deleting the paragraph deletes
+///   the exemption; a path list in this file would outlive the reason for it.
+#[test]
+fn every_tool_name_in_current_docs_is_advertised() {
+    let advertised = cxpak::capability::adapter::mcp_catalog_tools();
+    assert!(
+        !advertised.is_empty(),
+        "no advertised tools — the catalog is not being read, so this proves nothing"
+    );
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut docs = Vec::new();
+    markdown_files(root, &mut docs);
+
+    let mut scanned = 0usize;
+    let mut checked = 0usize;
+    let mut exempt = 0usize;
+    let mut violations = Vec::new();
+
+    for doc in &docs {
+        let rel = doc.strip_prefix(root).unwrap_or(doc);
+        // By rule: an ADR records what was decided then, not what runs now.
+        if rel.starts_with("docs/adrs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(doc).unwrap_or_else(|e| panic!("read {doc:?}: {e}"));
+        if text.contains("advertised-tool-names: exempt") {
+            exempt += 1;
+            continue;
+        }
+        scanned += 1;
+        for (n, line) in text.lines().enumerate() {
+            for (pos, _) in line.match_indices("cxpak_") {
+                let name: String = line[pos..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                checked += 1;
+                if !advertised.iter().any(|t| t.name == name) {
+                    violations.push(format!(
+                        "{}:{} names {name:?}, which tools/list does not advertise",
+                        rel.display(),
+                        n + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    // Positive controls, and `checked > 0` is the one that bears the weight.
+    //
+    // Measured rather than assumed: mutating the exclusion rule to swallow
+    // `docs/` + `plugin/`, and separately exempting BOTH documents that name a
+    // tool, are each caught by `checked > 0` and NEITHER by `scanned`. There are
+    // ~17 other markdown files in the tree that mention no tool at all, so the
+    // file count stays healthy while the guard has stopped checking anything.
+    //
+    // `scanned` is kept for the one thing it does catch that `checked` cannot —
+    // a moved or renamed root, where nothing is read at all.
+    assert!(
+        scanned >= 2,
+        "only {scanned} current-surface doc(s) scanned under {root:?} ({exempt} exempt) — the \
+         scan is not looking where it thinks it is"
+    );
+    assert!(
+        checked > 0,
+        "scanned {scanned} document(s) and found no cxpak_* name in any of them — this guard is \
+         not exercised by anything, so it proves nothing"
+    );
+    assert!(
+        exempt > 0,
+        "no document claims the exemption, so the exemption path is untested — if it has been \
+         removed, say so here rather than leaving dead machinery"
+    );
+
+    assert!(
+        violations.is_empty(),
+        "{} line(s) in current-surface documentation name a tool the server does not \
+         advertise:\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+}
+
+fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            // Build output and vendored trees are not this repo's documentation.
+            if name == "target" || name == ".git" || name == "node_modules" {
+                continue;
+            }
+            markdown_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            out.push(path);
+        }
+    }
+}

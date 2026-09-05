@@ -1,3 +1,8 @@
+<!-- advertised-tool-names: exempt — this document's SUBJECT is the pre-3.0 tool names and
+     what they map onto. A guard that required every name here to be advertised would require
+     this file to stop being a migration guide. Declared here rather than as a path in the
+     test, so the exemption cannot outlive the document. -->
+
 # Migrating to cxpak 3.0.0 — MCP tool consolidation (BREAKING)
 
 cxpak 3.0.0 replaces the 26 hand-rolled MCP tools with **five intent-parameterized
