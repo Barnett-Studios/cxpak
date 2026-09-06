@@ -805,6 +805,38 @@ pub fn normalize_symbol_param(value: &str) -> Result<String, (StatusCode, Json<V
     Ok(value.to_string())
 }
 
+/// The token ceiling for `cxpak_insight op=visual` before the payload is written
+/// to disk instead of returned (#62).
+///
+/// Deliberately the same number as [`MAX_MCP_CONVENTIONS_TOKENS`] — `visual` is
+/// one entry in a menu of eight ops, and an agent picking it off that list should
+/// not pay two orders of magnitude more than its neighbours cost. It is a
+/// default, not a cap: a caller that wants the whole artifact inline passes a
+/// larger `tokens`.
+pub const MAX_MCP_VISUAL_TOKENS: usize = crate::conventions::render::MAX_MCP_CONVENTIONS_TOKENS;
+
+/// The file extension for a spilled `visual` payload.
+///
+/// The spill used to hardcode `.html` because it only ever fired for HTML. Now
+/// that every format can spill, a mermaid graph saved as `.html` is a file no
+/// tool will open — the extension is the only thing telling the human what they
+/// have.
+///
+/// The `_` arm is `html` to match the renderer's own default (`format` is
+/// free-form and anything unrecognised falls through to HTML there), so the two
+/// cannot disagree about what was written.
+pub fn visual_format_extension(format: &str) -> &'static str {
+    match format {
+        "mermaid" => "mmd",
+        "svg" => "svg",
+        "c4" => "dsl",
+        "json" => "json",
+        "cypher" => "cypher",
+        "graphml" => "graphml",
+        _ => "html",
+    }
+}
+
 pub fn validate_visual_type_slug(s: &str) -> Result<&'static str, String> {
     match s {
         "dashboard" => Ok("dashboard"),
@@ -4433,15 +4465,59 @@ fn dispatch_capability_op(
                         _ => html, // html is the default
                     };
 
-                const MCP_INLINE_LIMIT: usize = 1_048_576; // 1 MB
-                if format == "html" && content.len() > MCP_INLINE_LIMIT {
+                // #62: the ceiling is a CONTEXT budget, not a transport one.
+                //
+                // The spill-to-file path below already existed. What it was
+                // measured against was `1_048_576` bytes — a number from the
+                // memory/transport domain, three orders of magnitude past what
+                // a caller's context window can take. A 340 KB dashboard on a
+                // THREE-FILE repository sailed under it and went straight into
+                // the caller's context, next to sibling ops that return ~1 KB.
+                //
+                // Two things were wrong and they are one defect: the limit came
+                // from the wrong domain, and `format == "html"` applied it to
+                // one of eight formats. `graphml` and `json` over a large graph
+                // are not small either, and neither was bounded at all.
+                //
+                // The budget is the same 5 000 tokens the `conventions` op caps
+                // at, deliberately: an op that is one item in a menu of eight
+                // should not cost two orders of magnitude more than its
+                // neighbours just because a caller picked it off the list.
+                //
+                // SPILL, NOT TRUNCATE. Every format here is structured — HTML,
+                // SVG, mermaid, C4, JSON, Cypher, GraphML — and half of a
+                // structured document is not a smaller document, it is a broken
+                // one. `conventions` truncates because its payload degrades
+                // gracefully; this one does not, so it writes the whole artifact
+                // and returns where it went. That also matches what the CLI's
+                // `--out` says this command is for.
+                let token_budget = args
+                    .get("tokens")
+                    .and_then(|t| t.as_str())
+                    .and_then(|t| crate::cli::parse_token_count(t).ok())
+                    .or_else(|| {
+                        args.get("tokens")
+                            .and_then(|t| t.as_u64())
+                            .map(|n| n as usize)
+                    })
+                    .unwrap_or(MAX_MCP_VISUAL_TOKENS);
+
+                let counter = TokenCounter::new();
+                let used = counter.count(&content);
+                if used > token_budget {
                     let validated_slug = match validate_visual_type_slug(visual_type) {
                         Ok(s) => s,
                         Err(e) => return mcp_tool_error(id, &format!("Error: {e}")),
                     };
+                    let ext = visual_format_extension(format);
                     let visual_dir = repo_path.join(".cxpak/visual");
-                    std::fs::create_dir_all(&visual_dir).ok();
-                    let filepath = visual_dir.join(format!("cxpak-{validated_slug}.html"));
+                    if let Err(e) = std::fs::create_dir_all(&visual_dir) {
+                        return mcp_tool_error(
+                            id,
+                            &format!("Error creating {}: {e}", visual_dir.display()),
+                        );
+                    }
+                    let filepath = visual_dir.join(format!("cxpak-{validated_slug}.{ext}"));
                     let canon_dir = match visual_dir.canonicalize() {
                         Ok(d) => d,
                         Err(e) => return mcp_tool_error(id, &format!("canonicalize failed: {e}")),
@@ -4454,13 +4530,23 @@ fn dispatch_capability_op(
                         return mcp_tool_error(id, "Error: path escape detected");
                     }
                     match std::fs::write(&filepath, &content) {
+                        // Machine-readable, because the caller has to decide what
+                        // to do next and a prose sentence makes it guess. It also
+                        // states the budget it was measured against, so a caller
+                        // that wants the payload inline knows what to raise.
                         Ok(()) => mcp_tool_result(
                             id,
-                            &format!(
-                                "Output written to {} ({} bytes)",
-                                filepath.display(),
-                                content.len()
-                            ),
+                            &serde_json::to_string_pretty(&json!({
+                                "path": filepath.display().to_string(),
+                                "bytes": content.len(),
+                                "tokens": used,
+                                "token_budget": token_budget,
+                                "format": format,
+                                "note": "Payload exceeded the token budget and was written to \
+                                         disk instead of returned. Open the file, or re-run with \
+                                         a larger `tokens` value to receive it inline.",
+                            }))
+                            .unwrap_or_default(),
                         ),
                         Err(e) => mcp_tool_error(id, &format!("Error writing output: {e}")),
                     }
@@ -10751,6 +10837,154 @@ mod tests {
         assert!(
             resp["error"]["message"].as_str().unwrap().contains("Batch"),
             "batch request error message must mention Batch"
+        );
+    }
+
+    // --- #62: a dashboard is a file, not a context ---
+
+    /// The measured defect. The ticket recorded **340,432 bytes** from a
+    /// three-file repository, under a 1 MB ceiling, straight into the caller's
+    /// context — beside sibling ops returning 57 to 3,916 bytes.
+    ///
+    /// This asserts the shape of the answer, not the size of the dashboard: the
+    /// payload does not come back inline, and what does come back tells the
+    /// caller where it went and what budget it failed.
+    #[test]
+    #[cfg(feature = "visual")]
+    fn an_over_budget_visual_is_written_to_disk_not_returned() {
+        let dir = std::env::temp_dir().join("cx62_spill_html");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(1)),
+            "cxpak_visual",
+            &json!({"type": "dashboard", "format": "html"}),
+            &index,
+            &dir,
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("<script"),
+            "the d3 bundle reached the caller's context: {} bytes",
+            text.len()
+        );
+
+        let v: Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("the spill answer must be machine-readable: {e}; {text}"));
+        assert_eq!(v["token_budget"], json!(MAX_MCP_VISUAL_TOKENS), "{text}");
+        assert!(
+            v["tokens"].as_u64().unwrap() > MAX_MCP_VISUAL_TOKENS as u64,
+            "it spilled, so it must report exceeding the budget: {text}"
+        );
+        let path = std::path::PathBuf::from(v["path"].as_str().unwrap());
+        assert!(path.is_file(), "the artifact must exist at {path:?}");
+        assert_eq!(path.extension().unwrap(), "html", "{path:?}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            v["bytes"].as_u64().unwrap(),
+            "the reported byte count must be the file's: {text}"
+        );
+    }
+
+    /// The control, and the one that stops "return nothing" passing as a fix.
+    /// A payload inside the budget must still come back INLINE — spilling
+    /// everything would satisfy the test above and destroy the op.
+    #[test]
+    #[cfg(feature = "visual")]
+    fn a_within_budget_visual_is_still_returned_inline() {
+        let dir = std::env::temp_dir().join("cx62_inline_mermaid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(2)),
+            "cxpak_visual",
+            &json!({"type": "dashboard", "format": "mermaid"}),
+            &index,
+            &dir,
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("\"path\""),
+            "a small payload must not be spilled: {text}"
+        );
+        assert!(
+            !dir.join(".cxpak/visual").exists(),
+            "nothing should have been written for an in-budget payload"
+        );
+    }
+
+    /// `tokens` is the caller's lever. Before #62 there was none, which is half
+    /// of what the issue is about — the other half being that the ceiling that
+    /// did exist was a transport number.
+    #[test]
+    #[cfg(feature = "visual")]
+    fn a_larger_tokens_budget_returns_the_payload_inline() {
+        let dir = std::env::temp_dir().join("cx62_budget_raised");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let index = make_test_index();
+        let snap = make_shared_snapshot();
+        let resp = handle_tool_call(
+            Some(json!(3)),
+            "cxpak_visual",
+            &json!({"type": "dashboard", "format": "html", "tokens": 5_000_000u64}),
+            &index,
+            &dir,
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("<script") || text.contains("<html"),
+            "a caller that asked for it must get it: {}",
+            &text[..text.len().min(200)]
+        );
+    }
+
+    /// Every format can spill now, so the extension has to say what the file is.
+    /// A mermaid graph written as `.html` is a file nothing will open.
+    #[test]
+    fn every_visual_format_spills_under_its_own_extension() {
+        // Hand-written from the CLI's documented `--format` set, not read back
+        // from the function — a table derived from the code under test can only
+        // confirm it agrees with itself.
+        for (format, want) in [
+            ("html", "html"),
+            ("mermaid", "mmd"),
+            ("svg", "svg"),
+            ("c4", "dsl"),
+            ("json", "json"),
+            ("cypher", "cypher"),
+            ("graphml", "graphml"),
+        ] {
+            assert_eq!(
+                visual_format_extension(format),
+                want,
+                "format {format:?} must spill as .{want}"
+            );
+        }
+        // Unrecognised falls through to HTML, matching the renderer's own
+        // default — so the extension cannot disagree with what was written.
+        assert_eq!(visual_format_extension("png"), "html");
+        assert_eq!(visual_format_extension(""), "html");
+    }
+
+    /// The budget is not a number invented for this op. It is the same ceiling
+    /// `conventions` uses, which is the point: `visual` sits in a menu of eight
+    /// and must not cost orders of magnitude more than the ops beside it.
+    #[test]
+    fn the_visual_budget_matches_the_other_capped_op() {
+        assert_eq!(
+            MAX_MCP_VISUAL_TOKENS,
+            crate::conventions::render::MAX_MCP_CONVENTIONS_TOKENS
         );
     }
 }

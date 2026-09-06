@@ -259,16 +259,43 @@ mod mcp_visual_onboard_tests {
             .as_str()
             .expect("result.content[0].text must be a string");
 
-        // Large HTML may be written to file; we accept either:
-        // (a) inline HTML starting with <!DOCTYPE html>
-        // (b) a message containing "Output written to" (MCP 1 MB limit)
+        // Either the artifact or a pointer to it. Which one depends on the token
+        // budget (#62, ADR-0208) — on a repo this small the d3 bundle alone puts
+        // the dashboard well over the default, so in practice this takes the
+        // pointer branch; the test accepts both so it stays about the CONTRACT
+        // and not about how big the fixture happens to be.
+        //
+        // The pointer used to be the prose "Output written to <path> (N bytes)"
+        // and is now JSON, because the caller has to decide what to do next. That
+        // is the change #62 makes here, and matching on the sentence is what made
+        // this test the one place in the tree that noticed.
         let is_html = text.contains("<!DOCTYPE html>");
-        let is_file_ref = text.contains("Output written to");
+        let pointer: Option<Value> = serde_json::from_str(text).ok();
+        let is_file_ref = pointer
+            .as_ref()
+            .is_some_and(|v| v.get("path").and_then(|p| p.as_str()).is_some());
         assert!(
             is_html || is_file_ref,
-            "cxpak_visual dashboard must return HTML or a file reference, got first 200 chars: {}",
+            "cxpak_visual dashboard must return the HTML or a machine-readable pointer to it, \
+             got first 200 chars: {}",
             &text[..text.len().min(200)]
         );
+
+        // If it spilled, the pointer must name a file that is really there and
+        // say what it cost — a path the caller cannot open is not a pointer.
+        if let Some(v) = pointer.filter(|_| is_file_ref) {
+            let path = std::path::PathBuf::from(v["path"].as_str().unwrap());
+            assert!(path.is_file(), "spill pointer names no file: {v}");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                v["bytes"].as_u64().expect("bytes must be reported"),
+                "the reported size must be the file's: {v}"
+            );
+            assert!(
+                v["tokens"].as_u64().unwrap() > v["token_budget"].as_u64().unwrap(),
+                "it spilled, so it must report exceeding the budget: {v}"
+            );
+        }
     }
 
     #[test]

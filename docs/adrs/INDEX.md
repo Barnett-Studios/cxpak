@@ -138,7 +138,7 @@
 | [0132](0132-edgetype-relocation-cross-language-variant.md) | Relocate EdgeType/TypedEdge into index::graph and add CrossLanguage(BridgeType) variant | ACCEPTED | 2026-04-01 |
 | [0133](0133-incremental-rebuild-mtime-tracking.md) | Incremental index rebuild via mtime/size tracking on IndexedFile | ACCEPTED | 2026-04-01 |
 | [0134](0134-lsp-server-tower-lsp-feature-gated.md) | LSP server over stdio via tower-lsp behind an lsp feature flag, with 4 standard + 14 custom methods | ACCEPTED | 2026-04-01 |
-| [0135](0135-mcp-html-inline-1mb-spill-to-disk.md) | Spill MCP visual HTML responses over 1MB to disk, return file path | ACCEPTED | 2026-04-01 |
+| [0135](0135-mcp-html-inline-1mb-spill-to-disk.md) | Spill MCP visual HTML responses over 1MB to disk, return file path | SUPERSEDED by 0208 | 2026-04-01 |
 | [0136](0136-monorepo-workspace-prefix-scoping.md) | Monorepo workspace support via path-prefix scoping and per-workspace cache namespaces | ACCEPTED | 2026-04-01 |
 | [0137](0137-onboarding-canonical-in-intelligence-thin-visual-layer.md) | Canonical onboarding logic in intelligence module; visual layer is render-only | ACCEPTED | 2026-04-01 |
 | [0138](0138-onboarding-topo-order-kahn-lexicographic-cyclebreak.md) | Dependency-first onboarding order via Kahn topological sort with lexicographic cycle-break | ACCEPTED | 2026-04-01 |
@@ -209,4 +209,5 @@
 | [0203](0203-self-package-import-resolution-deferred.md) | Self-package import resolution (`use <own-crate>::`) — deferred, limitation documented | ACCEPTED | 2026-07-16 |
 | [0206](0206-an-unread-file-is-not-an-empty-one.md) | An unread file leaves the index rather than entering it empty — `read_indexable` returns `Option`, unreadable/non-UTF-8/over-cap files are skipped with a stderr reason and excluded from totals and the fingerprint; `CXPAK_MAX_FILE_BYTES` (default 5 MiB) decides from `size_bytes` before the read; a genuinely empty file is still indexed | ACCEPTED | 2026-09-03 |
 | [0207](0207-repo-text-is-untrusted-at-the-point-it-becomes-output.md) | Repo text is untrusted at the point it becomes output — one control-char policy across renderers, content-sized fences at all six packing sites | ACCEPTED | 2026-09-03 |
+| [0208](0208-the-mcp-visual-ceiling-is-a-context-budget.md) | The MCP `visual` ceiling is a context budget, not a transport limit — token-based, caller-overridable, all formats (supersedes 0135) | ACCEPTED | 2026-09-03 |
 | [0209](0209-the-lsp-server-anchors-on-an-absolute-root.md) | The LSP server anchors on an absolute canonical root — a `file://` URI resolves against the root or not at all, no placeholder URIs, and the CLI path wins over the client's `rootUri` because the index predates the handshake | ACCEPTED | 2026-09-05 |

@@ -83,7 +83,7 @@ be **removed in a future release**. Migrate to the intent-tool + `op` form.
 | `cxpak_security_surface` | `cxpak_insight` | `security_surface` | add `op`; params unchanged (`focus`) |
 | `cxpak_data_flow` | `cxpak_graph` | `data_flow` | add `op`; params unchanged (`symbol`, `sink`, `depth`, `focus`) |
 | `cxpak_cross_lang` | `cxpak_graph` | `cross_lang` | add `op`; params unchanged (`file`, `focus`) |
-| `cxpak_visual` | `cxpak_insight` | `visual` | add `op`; params unchanged (`type`, `format`, `focus`, `symbol`, `files`) |
+| `cxpak_visual` | `cxpak_insight` | `visual` | add `op`; params `type`, `format`, `focus`, `symbol`, `files` unchanged, **plus `tokens`** (cxpak#62) — a payload over the budget is written under `.cxpak/visual/` and the call returns `{path, bytes, tokens, token_budget, format}` instead of the artifact. Default 5 000 tokens, the same ceiling `conventions` uses |
 | `cxpak_onboard` | `cxpak_insight` | `onboard` | add `op`; params unchanged (`focus`, `format`) |
 
 ### New / re-keyed ops with a sub-selector

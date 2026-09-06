@@ -86,17 +86,40 @@ fn invariant_onboarding_excludes_test_files() {
     );
 }
 
+/// The `visual` spill invariant, repointed from ADR-0135 to ADR-0208 (#62).
+///
+/// This test did its job: it is the tripwire that noticed `MCP_INLINE_LIMIT`
+/// leaving the tree, which is exactly what a pinned invariant is for. What it
+/// pinned is what changed — the ceiling is now a TOKEN budget rather than a
+/// 1 MiB byte threshold, because 1 MiB is a transport figure and a 340 KB
+/// dashboard from a three-file repo sailed under it into a caller's context.
+///
+/// Deliberately NOT deleted along with the constant. The mechanism it guards —
+/// spill to `.cxpak/visual/`, do not stream an artifact into a context window —
+/// survived; only the number and the units moved. Removing the guard because
+/// the constant was renamed would retire a real invariant on a technicality.
+///
+/// It stays a grep over the source for the same reason it always was: it
+/// catches ACCIDENTAL REMOVAL, which a behavioural test cannot, because a
+/// behavioural test for "the limit still exists" passes on any limit at all.
 #[test]
-fn invariant_mcp_inline_limit_constant_present() {
-    // Grep-style check against the source file — this test catches accidental removal.
+fn invariant_mcp_visual_token_ceiling_present() {
     let src = std::fs::read_to_string("src/commands/serve.rs").unwrap();
     assert!(
-        src.contains("MCP_INLINE_LIMIT"),
-        "MCP_INLINE_LIMIT must remain defined in serve.rs"
+        src.contains("MAX_MCP_VISUAL_TOKENS"),
+        "the visual token ceiling must remain defined in serve.rs (ADR-0208)"
     );
-    assert!(src.contains("1_048_576"), "1 MiB threshold must remain");
+    assert!(
+        !src.contains("MCP_INLINE_LIMIT"),
+        "the superseded byte threshold must not come back alongside the token one — \
+         two ceilings on one payload is how they drift"
+    );
     assert!(
         src.contains(".cxpak/visual"),
         "write-to-file target directory must remain"
+    );
+    assert!(
+        src.contains("visual_format_extension"),
+        "a spilled artifact must carry the extension of what was written"
     );
 }
