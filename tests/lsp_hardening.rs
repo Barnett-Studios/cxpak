@@ -357,3 +357,78 @@ fn dead_code_cached_is_stable_across_calls() {
     let p2 = idx.dead_code_cached().as_ptr();
     assert_eq!(p1, p2, "repeated calls must return the same cached slice");
 }
+
+/// #75, the half the subprocess tests cannot reach: a symbol whose location URI
+/// cannot be built is OMITTED, never faked.
+///
+/// The server now canonicalises its root at startup, so in production
+/// `Url::from_file_path` always succeeds and the failure branch is unreachable
+/// from an end-to-end test — which is exactly why this one is a unit test.
+/// Restoring `unwrap_or_else(|_| "file:///unknown")` survived the whole
+/// subprocess suite; nothing observed the difference until this existed.
+///
+/// It matters because the two are not degraded-vs-worse, they are gap-vs-lie:
+/// `location.uri` is the only field a client uses to open a symbol, so a
+/// placeholder makes "Go to Symbol in Workspace" list a correct name that opens
+/// nothing, while an omission is visibly missing.
+#[test]
+fn a_symbol_whose_uri_cannot_be_built_is_omitted_not_faked() {
+    let counter = TokenCounter::new();
+    let file = ScannedFile {
+        relative_path: "src/main.rs".into(),
+        absolute_path: "/tmp/src/main.rs".into(),
+        language: Some("rust".into()),
+        size_bytes: 0,
+    };
+    let mut parses = HashMap::new();
+    parses.insert(
+        "src/main.rs".into(),
+        ParseResult {
+            symbols: vec![Symbol {
+                name: "main".into(),
+                kind: SymbolKind::Function,
+                visibility: Visibility::Public,
+                signature: "fn main()".into(),
+                body: "{}".into(),
+                start_line: 1,
+                end_line: 2,
+            }],
+            imports: vec![],
+            exports: vec![],
+        },
+    );
+    let mut content = HashMap::new();
+    content.insert("src/main.rs".into(), "fn main() {}\n".into());
+    let idx = CodebaseIndex::build_with_content(vec![file], parses, &counter, content);
+
+    // Positive control FIRST. An absolute root must still yield the symbol, so a
+    // `workspace_symbols` that returned nothing at all — or that had lost the
+    // ability to match this query — could not pass the assertion below by
+    // accident.
+    let ok = cxpak::lsp::methods::workspace_symbols("main", &idx, std::path::Path::new("/tmp"));
+    assert_eq!(
+        ok.len(),
+        1,
+        "control: an absolute root must resolve this symbol, got {ok:?}"
+    );
+    assert_eq!(ok[0].location.uri.as_str(), "file:///tmp/src/main.rs");
+
+    // `Url::from_file_path` requires an absolute path and errs on anything else.
+    let syms = cxpak::lsp::methods::workspace_symbols(
+        "main",
+        &idx,
+        std::path::Path::new("a/relative/root"),
+    );
+    for s in &syms {
+        assert_ne!(
+            s.location.uri.as_str(),
+            "file:///unknown",
+            "symbol {:?} was published with a placeholder URI instead of being omitted",
+            s.name
+        );
+    }
+    assert!(
+        syms.is_empty(),
+        "a location that cannot be built means the symbol is not publishable; got {syms:?}"
+    );
+}
