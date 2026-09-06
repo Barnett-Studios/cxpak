@@ -322,7 +322,20 @@ fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let name = name.to_string_lossy();
         if path.is_dir() {
             // Build output and vendored trees are not this repo's documentation.
-            if name == "target" || name == ".git" || name == "node_modules" {
+            //
+            // `.cxpak/` is this tool's OWN generated context packs, and it is gitignored
+            // (`.gitignore:7`) — untracked build output, the same category as `target`, and it
+            // was missed. `modules.md` and `signatures.md` index every identifier in the repo,
+            // so they name Rust test functions (`cxpak_diff_respects_max_files_and_per_file_byte_cap`,
+            // `cxpak_cleaned_on_single_file_mode`) and every historical tool name the source
+            // still mentions. That is not documentation a user reads to learn the current
+            // surface — it is a machine index of this repo's identifiers — and this guard was
+            // failing on `main` because of it, which made every PR look partly red.
+            //
+            // It has to be a RULE and cannot be the in-file `advertised-tool-names: exempt`
+            // marker: these files are regenerated, so any marker written into one is erased the
+            // next time cxpak runs on itself.
+            if name == "target" || name == ".git" || name == "node_modules" || name == ".cxpak" {
                 continue;
             }
             markdown_files(&path, out);
