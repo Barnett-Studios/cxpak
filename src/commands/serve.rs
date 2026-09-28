@@ -330,7 +330,7 @@ pub fn build_index_with_workspace(
 // this module. Re-exported so `commands::serve::*` paths keep working.
 pub use crate::cache::cache_namespace;
 pub use crate::git::git_head_oid;
-pub(crate) use crate::git::working_tree_clean;
+use crate::git::working_tree_clean;
 
 type SharedPath = Arc<std::path::PathBuf>;
 

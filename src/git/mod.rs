@@ -90,7 +90,7 @@ pub fn git_head_oid(path: &Path) -> String {
 /// This is the truth condition behind a `base_commit = Some(HEAD)` stamp: the
 /// stamp promises "graph == committed tree at this SHA", which only holds when
 /// the working tree the graph was built from equals HEAD's tree (ADR-0179).
-pub fn working_tree_clean(repo: &git2::Repository) -> bool {
+pub(crate) fn working_tree_clean(repo: &git2::Repository) -> bool {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(false)
         .include_ignored(false)
