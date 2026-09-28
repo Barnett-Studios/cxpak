@@ -235,7 +235,7 @@ fn build_artifact(repo_path: &Path) -> Result<(String, RebuildKind), Box<dyn Err
         None => (HashSet::new(), HashSet::new(), None),
     };
 
-    let cache_dir = repo_path.join(crate::commands::serve::cache_namespace(repo_path, None));
+    let cache_dir = repo_path.join(crate::cache::cache_namespace(repo_path, None));
 
     // The delta is applied from `diff(parent, HEAD)`, but the artifact is built
     // from the WORKING TREE (`index`). Those only agree when the working tree is
@@ -247,7 +247,7 @@ fn build_artifact(repo_path: &Path) -> Result<(String, RebuildKind), Box<dyn Err
     // artifact would silently diverge. A status error degrades to "dirty" (Full).
     let tree_clean = repo
         .as_ref()
-        .map(crate::commands::serve::working_tree_clean)
+        .map(crate::git::working_tree_clean)
         .unwrap_or(false);
 
     // THE CORRECTNESS INVARIANT: apply the delta ONLY IF the cached graph was
@@ -298,7 +298,7 @@ fn persist_derived_cache(repo_path: &Path, cache_dir: &Path, index: &mut Codebas
     index.conventions = crate::conventions::build_convention_profile(index, repo_path);
     index.co_changes = index.conventions.git_health.co_changes.clone();
 
-    let head_oid = crate::commands::serve::git_head_oid(repo_path);
+    let head_oid = crate::git::git_head_oid(repo_path);
     let fp_files: Vec<(String, String)> = index
         .files
         .iter()
@@ -315,7 +315,7 @@ fn persist_derived_cache(repo_path: &Path, cache_dir: &Path, index: &mut Codebas
         None
     } else {
         match git2::Repository::open(repo_path) {
-            Ok(repo) if crate::commands::serve::working_tree_clean(&repo) => Some(head_oid),
+            Ok(repo) if crate::git::working_tree_clean(&repo) => Some(head_oid),
             _ => None,
         }
     };
@@ -615,7 +615,7 @@ mod tests {
 
     /// Repo-relative cache dir the post-commit derived cache is written to.
     fn cache_dir_of(dir: &Path) -> std::path::PathBuf {
-        dir.join(crate::commands::serve::cache_namespace(dir, None))
+        dir.join(crate::cache::cache_namespace(dir, None))
     }
 
     /// Overwrite the persisted derived cache's `base_commit` in place (loads it
@@ -644,7 +644,7 @@ mod tests {
                 )
             })
             .collect();
-        let head_oid = crate::commands::serve::git_head_oid(dir);
+        let head_oid = crate::git::git_head_oid(dir);
         crate::cache::content_fingerprint(&pairs, &head_oid)
     }
 

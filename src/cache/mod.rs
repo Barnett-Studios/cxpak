@@ -162,6 +162,18 @@ impl Default for StatIndex {
     }
 }
 
+/// Returns a cache directory name scoped to the given workspace.
+///
+/// When workspace is None: ".cxpak/cache/root"
+/// When workspace is Some("packages/api"): ".cxpak/cache/packages_api"
+pub fn cache_namespace(repo_root: &std::path::Path, workspace: Option<&str>) -> String {
+    let _ = repo_root;
+    match workspace {
+        None => ".cxpak/cache/root".to_string(),
+        Some(ws) => format!(".cxpak/cache/{}", ws.replace('/', "_")),
+    }
+}
+
 /// Return the mtime of `path` as nanoseconds since UNIX epoch, or 0 on failure.
 /// Used to populate the stat-index key.
 pub fn file_mtime_ns(path: &std::path::Path) -> u64 {
