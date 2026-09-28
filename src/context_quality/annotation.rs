@@ -15,7 +15,7 @@ pub fn comment_syntax(language: &str) -> (&'static str, &'static str) {
         "python" | "ruby" | "bash" | "perl" | "r" | "julia" | "elixir" | "yaml" | "toml"
         | "makefile" | "dockerfile" | "hcl" => ("# ", ""),
         "clojure" => (";; ", ""),
-        "haskell" | "lua" | "sql" | "ocaml" | "ocaml_interface" => ("-- ", ""),
+        "haskell" | "lua" | "luau" | "sql" | "ocaml" | "ocaml_interface" => ("-- ", ""),
         "html" | "xml" | "svelte" | "markdown" => ("<!-- ", " -->"),
         "css" | "scss" => ("/* ", " */"),
         "matlab" => ("% ", ""),
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn comment_syntax_double_dash_languages() {
-        for lang in &["haskell", "lua", "sql", "ocaml", "ocaml_interface"] {
+        for lang in &["haskell", "lua", "luau", "sql", "ocaml", "ocaml_interface"] {
             let (pre, suf) = comment_syntax(lang);
             assert_eq!(pre, "-- ", "wrong prefix for {lang}");
             assert_eq!(suf, "", "wrong suffix for {lang}");

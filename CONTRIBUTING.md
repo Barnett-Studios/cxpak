@@ -13,7 +13,7 @@ by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 - **Report a bug** — use the [bug report](.github/ISSUE_TEMPLATE/bug_report.yml) form.
 - **Request a feature** — use the [feature request](.github/ISSUE_TEMPLATE/feature_request.yml) form.
-- **Add a language** — cxpak supports 43 languages; adding one is a well-scoped
+- **Add a language** — cxpak supports 44 languages; adding one is a well-scoped
   contribution with a [dedicated template](.github/ISSUE_TEMPLATE/language_support.yml)
   and a recipe [below](#adding-a-language).
 - **Improve docs** — the README, the ADRs, or this guide.
