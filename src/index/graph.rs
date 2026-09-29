@@ -427,7 +427,9 @@ fn resolve_lua_import(
         .strip_prefix("(script :: any)")
         .or_else(|| import_source.strip_prefix("script"));
     if let Some(rest) = anchored {
-        let hit = resolve_lua_instance_path(source_path, rest, all_paths);
+        // A walk that lands on the requiring file itself (a bare `script`) names no dependency.
+        let hit = resolve_lua_instance_path(source_path, rest, all_paths)
+            .filter(|target| target != source_path);
         if hit.is_some() || !source_path.ends_with(".lua") {
             return hit;
         }
@@ -1668,5 +1670,15 @@ mod tests {
             resolve_import("lib/main.lua", "script.util", &all),
             Some("script/util.lua".to_string())
         );
+    }
+
+    #[test]
+    fn test_resolve_lua_bare_script_is_not_a_self_edge() {
+        let all = lua_paths(&["main.lua", "script.lua", "src/X.luau"]);
+        assert_eq!(
+            resolve_import("main.lua", "script", &all),
+            Some("script.lua".to_string())
+        );
+        assert_eq!(resolve_import("src/X.luau", "script", &all), None);
     }
 }
