@@ -353,6 +353,41 @@ fn lua_instance_of(source_path: &str) -> Vec<&str> {
     parts
 }
 
+/// Walk a Roblox instance path (`.Parent`, `.Name`, `:WaitForChild("Name")`,
+/// `:FindFirstChild("Name")`) from the requiring file's instance, to a file.
+fn resolve_lua_instance_path(
+    source_path: &str,
+    mut rest: &str,
+    all_paths: &HashSet<&str>,
+) -> Option<String> {
+    let mut at = lua_instance_of(source_path);
+    while !rest.is_empty() {
+        let (step, tail) = if let Some(r) = rest.strip_prefix('.') {
+            let end = r.find(['.', ':']).unwrap_or(r.len());
+            (&r[..end], &r[end..])
+        } else if let Some(r) = rest.strip_prefix(':') {
+            let open = r.find("(\"")?;
+            if !matches!(&r[..open], "WaitForChild" | "FindFirstChild") {
+                return None;
+            }
+            let args = &r[open + 2..];
+            let close = args.find("\")")?;
+            (&args[..close], &args[close + 2..])
+        } else {
+            return None;
+        };
+        match step {
+            "" => return None,
+            "Parent" => {
+                at.pop()?;
+            }
+            name => at.push(name),
+        }
+        rest = tail;
+    }
+    try_candidates(&lua_candidates(&at.join("/")), all_paths)
+}
+
 /// Resolve a Lua / Luau `require` argument, as the parsers record it, to a file.
 ///
 /// - `./x`, `../x`: a path relative to the requiring file's directory.
@@ -385,36 +420,17 @@ fn resolve_lua_import(
         return try_candidates(&lua_candidates(&dir.join("/")), all_paths);
     }
 
+    // The walk refuses anything after `script` but `.` or `:`, so `scripts.util` places no
+    // instance. In a `.lua` file a `script…` argument that places none falls through to the
+    // dotted-module reading, which `require("scripts.util")` or `require("script.util")` means.
     let anchored = import_source
         .strip_prefix("(script :: any)")
         .or_else(|| import_source.strip_prefix("script"));
-    if let Some(mut rest) = anchored {
-        let mut at = lua_instance_of(source_path);
-        while !rest.is_empty() {
-            let (step, tail) = if let Some(r) = rest.strip_prefix('.') {
-                let end = r.find(['.', ':']).unwrap_or(r.len());
-                (&r[..end], &r[end..])
-            } else if let Some(r) = rest.strip_prefix(':') {
-                let open = r.find("(\"")?;
-                if !matches!(&r[..open], "WaitForChild" | "FindFirstChild") {
-                    return None;
-                }
-                let args = &r[open + 2..];
-                let close = args.find("\")")?;
-                (&args[..close], &args[close + 2..])
-            } else {
-                return None;
-            };
-            match step {
-                "" => return None,
-                "Parent" => {
-                    at.pop()?;
-                }
-                name => at.push(name),
-            }
-            rest = tail;
+    if let Some(rest) = anchored {
+        let hit = resolve_lua_instance_path(source_path, rest, all_paths);
+        if hit.is_some() || !source_path.ends_with(".lua") {
+            return hit;
         }
-        return try_candidates(&lua_candidates(&at.join("/")), all_paths);
     }
 
     // In Luau a dotted argument is an expression (`Shared.Typed`, a local), recorded verbatim;
@@ -1626,6 +1642,31 @@ mod tests {
                 &all
             ),
             None
+        );
+    }
+
+    #[test]
+    fn test_resolve_lua_script_is_a_whole_word_and_plain_lua_falls_back() {
+        let all = lua_paths(&[
+            "main.lua",
+            "scripts/util.lua",
+            "scriptFoo/Bar.lua",
+            "lib/main.lua",
+            "script/util.lua",
+        ]);
+        // `scripts` / `scriptFoo` are module names, not the `script` global.
+        assert_eq!(
+            resolve_import("main.lua", "scripts.util", &all),
+            Some("scripts/util.lua".to_string())
+        );
+        assert_eq!(
+            resolve_import("main.lua", "scriptFoo.Bar", &all),
+            Some("scriptFoo/Bar.lua".to_string())
+        );
+        // In plain Lua, a `script.x` that places no instance is read as the module `script/x`.
+        assert_eq!(
+            resolve_import("lib/main.lua", "script.util", &all),
+            Some("script/util.lua".to_string())
         );
     }
 }
