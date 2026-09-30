@@ -3,8 +3,19 @@
 #   docker run --rm -v "$(pwd):/repo" ghcr.io/barnett-studios/cxpak overview .
 # This Dockerfile is for building from a local checkout (development / forks).
 
+# Base images are named, not hard-coded, because the names below are
+# unqualified.  Docker resolves an unqualified name against docker.io; rootless
+# podman ships no `unqualified-search-registries` by default, so the same line
+# fails to resolve there.  Overriding the ARG lets such a host pass a fully
+# qualified name without editing this file:
+#   podman build --build-arg RUST_IMAGE=docker.io/library/rust:1.91-slim-bookworm ...
+# The digests pin what the defaults resolve to; an override replaces both name
+# and digest, so a caller who overrides takes on the pinning.
+ARG RUST_IMAGE=rust:1.91-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65
+ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+
 # ── Builder ───────────────────────────────────────────────────────────────────
-FROM rust:1.91-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65 AS builder
+FROM ${RUST_IMAGE} AS builder
 
 # build-essential: C toolchain for ring (rustls) and the tree-sitter grammar crates.
 # pkg-config: probed by some *-sys build scripts.
@@ -17,19 +28,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Cache dependency compilation separately from source changes.
 # assets/ must be present because src/ embeds it via include_str! at compile time.
+# vendor/ carries the patched grammars named by [patch.crates-io] in Cargo.toml;
+# without it `cargo build` cannot resolve the manifest.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY assets/ ./assets/
-RUN mkdir src && echo 'fn main() {}' > src/main.rs \
-    && cargo build --release \
-    && rm -rf src
-
+COPY vendor/ ./vendor/
 COPY src/ ./src/
-RUN cargo build --release
+
+# Dependency caching is a cache mount rather than the usual stub-main.rs stage.
+# That stage builds the dependencies once and the real stage builds again, and
+# each commits /build/target as an image layer -- several GB written twice, which
+# on a host near capacity fails AFTER a successful compile:
+#   writing blob: ... (write /build/target/release/deps/libtracing_core-*.rlib:
+#   no space left on device)
+# A cache mount is not part of the image, so it commits nothing and the
+# artifacts also survive between builds.  Because `COPY --from` cannot reach a
+# cache mount, the binary is copied out to /out inside this same RUN.
+RUN --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    cargo build --release \
+    && mkdir -p /out && cp target/release/cxpak /out/cxpak
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+FROM ${RUNTIME_IMAGE}
 
 LABEL org.opencontainers.image.source="https://github.com/Barnett-Studios/cxpak" \
       org.opencontainers.image.description="Token-budgeted codebase context for LLMs" \
@@ -60,7 +82,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # entire job is to open a repo it was explicitly handed on a mount.
 RUN printf '[safe]\n\tdirectory = *\n' > /etc/gitconfig
 
-COPY --from=builder /build/target/release/cxpak /usr/local/bin/cxpak
+COPY --from=builder /out/cxpak /usr/local/bin/cxpak
 
 # Model weights (~30 MB) download on first use to $HOME/.cxpak/models. Mount a
 # named volume at /home/cxpak/.cxpak to persist them across runs.

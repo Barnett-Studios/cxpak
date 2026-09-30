@@ -6,3 +6,9 @@ examples/
 scripts/
 .github/
 *.md
+
+# vendor/ holds the patched grammar crates named by [patch.crates-io] in
+# Cargo.toml, so the build cannot resolve the manifest without it.  Re-included
+# wholesale because the `*.md` rule above would otherwise strip each crate's
+# README, and `docs/` its own subdirectories.
+!vendor/**

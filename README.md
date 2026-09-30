@@ -339,6 +339,24 @@ closed — [#42](https://github.com/Barnett-Studios/cxpak/issues/42).
 
 For monorepos: `--workspace packages/api` scopes scanning to a subdirectory while keeping the full repo as the git root.
 
+## Excluding files
+
+Scanning honours `.gitignore` and, on top of it, an optional `.cxpakignore` at the
+repository root. It takes the same syntax as `.gitignore`:
+
+```gitignore
+# Generated code
+generated/
+*.generated.ts
+
+# Large test fixtures
+tests/fixtures/large/
+```
+
+Use it for files that belong in the repository but not in the context pack —
+generated output, vendored trees, fixtures — or to skip a single file that a
+grammar parses badly. `.cxpakignore.example` in this repo is a starting point.
+
 ## Caching
 
 Parse results cached in `.cxpak/cache/` keyed on file mtime and size. Cache invalidates automatically when tree-sitter grammar versions change. Atomic writes with advisory locking for concurrent process safety. `cxpak clean .` to reset.

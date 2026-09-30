@@ -361,6 +361,75 @@ MIT
         }
     }
 
+    /// Regression: one markdown file used to take the whole process down.
+    ///
+    /// The external scanner in `tree-sitter-markdown-updated` wrote its parse
+    /// state into tree-sitter's 1024-byte serialization buffer and checked that
+    /// it fit *afterwards*, so a document producing more state than the budget
+    /// overran the buffer and then threw from the too-late assert. The scanner
+    /// is `extern "C"`, so that exception could not reach the host and the
+    /// process died in `std::terminate` — `cxpak serve` exited at startup with
+    /// no indication of which file was responsible.
+    ///
+    /// Both shapes below crossed the threshold, each at an exact and repeatable
+    /// point: 56 levels of nesting parsed and 57 aborted; a link whose text ran
+    /// past roughly a kilobyte aborted. They are kept well clear of those
+    /// thresholds here so the test still bites if the budget is retuned.
+    ///
+    /// The assertion is simply that these return. Against the unpatched grammar
+    /// the test binary aborts rather than failing, which is the point: the fix
+    /// is in `vendor/tree-sitter-markdown-updated` (see its `PATCH.md`), and
+    /// the bound is now enforced as the state is built rather than as it is
+    /// written.
+    #[test]
+    fn pathological_markdown_does_not_abort_the_process() {
+        let mut parser = make_parser();
+
+        // Just past the old threshold, the document still parses cleanly: the
+        // budget now covers roughly twice the nesting it used to abort on, so
+        // the range of documents that parse correctly grew rather than shrank.
+        for depth in [57usize, 58, 60] {
+            let nested: String = (0..depth)
+                .map(|level| format!("{}- level {level}\n", "  ".repeat(level)))
+                .collect();
+            let tree = parser
+                .parse(&nested, None)
+                .expect("nested list produced no tree");
+            assert_eq!(
+                tree.root_node().kind(),
+                "document",
+                "{depth} levels of nesting should still parse cleanly"
+            );
+        }
+
+        // Far past it, the requirement is only that the parse finishes and
+        // hands back a tree. Structure that 1024 bytes of state cannot describe
+        // is dropped, so the root may well be an ERROR node — that is the
+        // intended degradation. What must not happen is an abort, or the
+        // non-terminating parse that truncating the state on the way out would
+        // produce instead.
+        let deep: String = (0..2000)
+            .map(|level| format!("{}- level {level}\n", "  ".repeat(level)))
+            .collect();
+        parser
+            .parse(&deep, None)
+            .expect("very deeply nested list produced no tree");
+
+        // Delimiter density: one link whose text runs over many lines. This
+        // grows the inline-delimiter list, which past 255 entries also wrapped
+        // the single byte that records its length — a silently wrong parse
+        // rather than a crash.
+        let body: Vec<String> = (0..500).map(|n| format!("line {n}")).collect();
+        let long_link = format!("# t\n\n[{}](x://y)\n", body.join("\n"));
+        let tree = parser
+            .parse(&long_link, None)
+            .expect("multi-line link produced no tree");
+
+        // Extraction has to stay well-defined on the degraded trees too.
+        let lang = MarkdownLanguage;
+        let _ = lang.extract(&long_link, &tree);
+    }
+
     #[test]
     fn test_no_imports() {
         let source = "# Hello\n\nWorld\n";

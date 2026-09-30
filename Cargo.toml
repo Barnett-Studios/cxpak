@@ -283,6 +283,22 @@ debug = "line-tables-only"
 #   - esaxx-rs 0.1.10:        `-std=c++11` (ungated for non-macOS; cl defaults
 #                             to c++14, a superset, so dropping it is safe)
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# tree-sitter-markdown-updated 0.1.0 is vendored for a different reason: its
+# external scanner writes the parse state into tree-sitter's 1024-byte
+# serialization buffer BEFORE testing that it fits, so a sufficiently nested or
+# delimiter-dense markdown file overruns that buffer.  The grammar is built with
+# TREE_SITTER_MARKDOWN_AVOID_CRASH, which turns the (too-late) bounds assert
+# into `throw 1` — and the scanner is `extern "C"`, so that exception cannot
+# cross back into Rust and the process dies in std::terminate.  One markdown
+# file therefore killed `cxpak serve` at startup with no message naming it.
+# The vendored copy makes "the state always fits" an invariant: the scanner
+# refuses to push state it could not serialize, so the bound is enforced before
+# anything is written.  See vendor/tree-sitter-markdown-updated/PATCH.md.
+# Upstream (github.com/c-gamble/tree-sitter-markdown) has issues disabled and
+# 0.1.0 is its only crates.io release.
+# ─────────────────────────────────────────────────────────────────────────────
 [patch.crates-io]
 tree-sitter-scss = { path = "vendor/tree-sitter-scss" }
 esaxx-rs = { path = "vendor/esaxx-rs" }
+tree-sitter-markdown-updated = { path = "vendor/tree-sitter-markdown-updated" }
