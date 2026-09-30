@@ -3,15 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
+    # Markdown is NOT ignored: tests/architecture_no_core_cycle.rs indexes the repo itself,
+    # markdown included, so a docs-only change can break the suite (a dense markdown file
+    # crashed the markdown grammar — see #136).
     paths-ignore:
-      - '*.md'
-      - 'docs/**'
       - 'LICENSE'
   pull_request:
     branches: [main]
+    # Markdown is NOT ignored: tests/architecture_no_core_cycle.rs indexes the repo itself,
+    # markdown included, so a docs-only change can break the suite (a dense markdown file
+    # crashed the markdown grammar — see #136).
     paths-ignore:
-      - '*.md'
-      - 'docs/**'
       - 'LICENSE'
 
 concurrency:
