@@ -320,6 +320,132 @@ fn resolve_ts_import(
     try_candidates(&candidates, all_paths)
 }
 
+/// The files a Lua / Luau module path can name: `base.luau`, `base.lua`, then the folder
+/// forms `base/init.luau`, `base/init.lua`.
+fn lua_candidates(base: &str) -> Vec<String> {
+    vec![
+        format!("{base}.luau"),
+        format!("{base}.lua"),
+        format!("{base}/init.luau"),
+        format!("{base}/init.lua"),
+    ]
+}
+
+/// A file's position in the Rojo instance tree, as path segments: `a/Foo.server.luau` is the
+/// instance `a/Foo` (`.server` / `.client` name the script kind, not the instance), and
+/// `a/init.luau` is the folder `a` itself.
+fn lua_instance_of(source_path: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = source_path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(file) = parts.pop() else {
+        return parts;
+    };
+    let stem = file
+        .strip_suffix(".luau")
+        .or_else(|| file.strip_suffix(".lua"))
+        .unwrap_or(file);
+    let stem = stem
+        .strip_suffix(".server")
+        .or_else(|| stem.strip_suffix(".client"))
+        .unwrap_or(stem);
+    if stem != "init" {
+        parts.push(stem);
+    }
+    parts
+}
+
+/// Walk a Roblox instance path (`.Parent`, `.Name`, `:WaitForChild("Name")`,
+/// `:FindFirstChild("Name")`) from the requiring file's instance, to a file.
+fn resolve_lua_instance_path(
+    source_path: &str,
+    mut rest: &str,
+    all_paths: &HashSet<&str>,
+) -> Option<String> {
+    let mut at = lua_instance_of(source_path);
+    while !rest.is_empty() {
+        let (step, tail) = if let Some(r) = rest.strip_prefix('.') {
+            let end = r.find(['.', ':']).unwrap_or(r.len());
+            (&r[..end], &r[end..])
+        } else if let Some(r) = rest.strip_prefix(':') {
+            let open = r.find("(\"")?;
+            if !matches!(&r[..open], "WaitForChild" | "FindFirstChild") {
+                return None;
+            }
+            let args = &r[open + 2..];
+            let close = args.find("\")")?;
+            (&args[..close], &args[close + 2..])
+        } else {
+            return None;
+        };
+        match step {
+            "" => return None,
+            "Parent" => {
+                at.pop()?;
+            }
+            name => at.push(name),
+        }
+        rest = tail;
+    }
+    try_candidates(&lua_candidates(&at.join("/")), all_paths)
+}
+
+/// Resolve a Lua / Luau `require` argument, as the parsers record it, to a file.
+///
+/// - `./x`, `../x`: a path relative to the requiring file's directory.
+/// - `script…`: a Roblox instance path walked from the requiring file's instance
+///   (`.Parent` climbs; `.Name`, `:WaitForChild("Name")`, `:FindFirstChild("Name")` descend).
+/// - `a.b` (plain Lua): a dotted module path from the root.
+///
+/// Aliases (`@lune/fs`) and paths anchored to anything but `script` (a local variable,
+/// `game.ReplicatedStorage`) return `None`: the file universe alone cannot place them, and
+/// `game.…` would need the Rojo project file.
+fn resolve_lua_import(
+    source_path: &str,
+    import_source: &str,
+    all_paths: &HashSet<&str>,
+) -> Option<String> {
+    if import_source.starts_with("./") || import_source.starts_with("../") {
+        let mut dir: Vec<&str> = parent_dir(source_path)
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        for seg in import_source.split('/') {
+            match seg {
+                "." | "" => {}
+                ".." => {
+                    dir.pop()?;
+                }
+                name => dir.push(name),
+            }
+        }
+        return try_candidates(&lua_candidates(&dir.join("/")), all_paths);
+    }
+
+    // The walk refuses anything after `script` but `.` or `:`, so `scripts.util` places no
+    // instance. In a `.lua` file a `script…` argument that places none falls through to the
+    // dotted-module reading, which `require("scripts.util")` or `require("script.util")` means.
+    let anchored = import_source
+        .strip_prefix("(script :: any)")
+        .or_else(|| import_source.strip_prefix("script"));
+    if let Some(rest) = anchored {
+        // A walk that lands on the requiring file itself (a bare `script`) names no dependency.
+        let hit = resolve_lua_instance_path(source_path, rest, all_paths)
+            .filter(|target| target != source_path);
+        if hit.is_some() || !source_path.ends_with(".lua") {
+            return hit;
+        }
+    }
+
+    // In Luau a dotted argument is an expression (`Shared.Typed`, a local), recorded verbatim;
+    // only plain Lua's `require("a.b")` string is a dotted module path.
+    if !source_path.ends_with(".lua")
+        || import_source.starts_with('@')
+        || import_source.contains(['/', '(', ':'])
+    {
+        return None;
+    }
+    try_candidates(&lua_candidates(&import_source.replace('.', "/")), all_paths)
+}
+
 /// Legacy best-effort resolver for languages without a dedicated resolver.
 ///
 /// Converts `::` and `.` separators to `/` and tries common extensions.
@@ -355,6 +481,7 @@ fn resolve_import(
         "ts" | "tsx" | "js" | "jsx" | "mjs" => {
             resolve_ts_import(source_path, import_source, all_paths)
         }
+        "lua" | "luau" => resolve_lua_import(source_path, import_source, all_paths),
         _ => resolve_legacy(import_source, all_paths),
     }
 }
@@ -1408,5 +1535,150 @@ mod tests {
             Some("app/models/__init__.py".to_string()),
             "relative Python import should fall back to __init__.py on type re-export"
         );
+    }
+
+    // ── Lua / Luau requires (#141) ─────────────────────────────────────────────
+
+    fn lua_paths(paths: &[&'static str]) -> HashSet<&'static str> {
+        paths.iter().copied().collect()
+    }
+
+    #[test]
+    fn test_resolve_lua_relative_string_to_luau_file() {
+        let all = lua_paths(&[".lune/faucet.luau", "src/shared/Config.luau"]);
+        assert_eq!(
+            resolve_import(".lune/faucet.luau", "../src/shared/Config", &all),
+            Some("src/shared/Config.luau".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_lua_dot_slash_falls_back_to_init() {
+        let all = lua_paths(&["src/a/main.luau", "src/a/Bar/init.luau"]);
+        assert_eq!(
+            resolve_import("src/a/main.luau", "./Bar", &all),
+            Some("src/a/Bar/init.luau".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_lua_dotted_module_from_plain_lua() {
+        let all = lua_paths(&["main.lua", "lib/json.lua"]);
+        assert_eq!(
+            resolve_import("main.lua", "lib.json", &all),
+            Some("lib/json.lua".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_lua_alias_is_external() {
+        let all = lua_paths(&["tools/run.luau", "fs.luau", "lune/fs.luau"]);
+        assert_eq!(resolve_import("tools/run.luau", "@lune/fs", &all), None);
+    }
+
+    #[test]
+    fn test_resolve_lua_instance_path_sibling() {
+        // A file is its own instance; its Parent is the folder that holds it.
+        let all = lua_paths(&["src/server/Boot.server.luau", "src/server/Registry.luau"]);
+        assert_eq!(
+            resolve_import(
+                "src/server/Boot.server.luau",
+                "script.Parent.Registry",
+                &all
+            ),
+            Some("src/server/Registry.luau".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_lua_instance_path_from_init_is_the_folder() {
+        // `init.luau` IS its folder, so its Parent is one level further up.
+        let all = lua_paths(&["src/shared/Net/init.luau", "src/shared/Logger.luau"]);
+        assert_eq!(
+            resolve_import(
+                "src/shared/Net/init.luau",
+                "(script :: any).Parent.Logger",
+                &all
+            ),
+            Some("src/shared/Logger.luau".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_lua_instance_path_child_of_init_and_wait_for_child() {
+        let all = lua_paths(&[
+            "src/shared/Net/init.luau",
+            "src/shared/Net/Codec.luau",
+            "src/shared/B/init.lua",
+            "src/shared/A.luau",
+        ]);
+        assert_eq!(
+            resolve_import("src/shared/Net/init.luau", "script.Codec", &all),
+            Some("src/shared/Net/Codec.luau".to_string())
+        );
+        assert_eq!(
+            resolve_import(
+                "src/shared/A.luau",
+                "script.Parent:WaitForChild(\"B\")",
+                &all
+            ),
+            Some("src/shared/B/init.lua".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_lua_unresolvable_instance_paths_are_none() {
+        let all = lua_paths(&[
+            "src/a/X.luau",
+            "Typed.luau",
+            "src/a/Typed.luau",
+            "Shared/Typed.luau",
+        ]);
+        // A local variable, not `script`: nothing to anchor it to, even where a file matches.
+        assert_eq!(resolve_import("src/a/X.luau", "Shared.Typed", &all), None);
+        // Climbing past the root names nothing.
+        assert_eq!(
+            resolve_import(
+                "src/a/X.luau",
+                "script.Parent.Parent.Parent.Parent.Typed",
+                &all
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_lua_script_is_a_whole_word_and_plain_lua_falls_back() {
+        let all = lua_paths(&[
+            "main.lua",
+            "scripts/util.lua",
+            "scriptFoo/Bar.lua",
+            "lib/main.lua",
+            "script/util.lua",
+        ]);
+        // `scripts` / `scriptFoo` are module names, not the `script` global.
+        assert_eq!(
+            resolve_import("main.lua", "scripts.util", &all),
+            Some("scripts/util.lua".to_string())
+        );
+        assert_eq!(
+            resolve_import("main.lua", "scriptFoo.Bar", &all),
+            Some("scriptFoo/Bar.lua".to_string())
+        );
+        // In plain Lua, a `script.x` that places no instance is read as the module `script/x`.
+        assert_eq!(
+            resolve_import("lib/main.lua", "script.util", &all),
+            Some("script/util.lua".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_lua_bare_script_is_not_a_self_edge() {
+        let all = lua_paths(&["main.lua", "script.lua", "src/X.luau"]);
+        assert_eq!(
+            resolve_import("main.lua", "script", &all),
+            Some("script.lua".to_string())
+        );
+        assert_eq!(resolve_import("src/X.luau", "script", &all), None);
     }
 }
