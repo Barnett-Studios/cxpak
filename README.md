@@ -11,7 +11,7 @@ See the [component map](https://github.com/Barnett-Studios) for how this fits th
 
 **Spends CPU cycles so you don't spend tokens.**
 
-cxpak indexes your codebase using tree-sitter across 43 languages, builds a typed dependency graph, and produces token-budgeted context bundles that give LLMs a briefing packet instead of a flashlight in a dark room. It understands your code's architecture, conventions, risk profile, and data layer -- then packs exactly what the LLM needs, nothing more.
+cxpak indexes your codebase using tree-sitter across 44 languages, builds a typed dependency graph, and produces token-budgeted context bundles that give LLMs a briefing packet instead of a flashlight in a dark room. It understands your code's architecture, conventions, risk profile, and data layer -- then packs exactly what the LLM needs, nothing more.
 
 ## What it looks like
 
@@ -272,10 +272,10 @@ cxpak onboard .
 
 Generates a dependency-ordered reading guide: files topologically sorted, grouped into phases by module, ordered by PageRank. Each file lists key symbols to focus on and an estimated reading time.
 
-## Language support (43)
+## Language support (44)
 
 **Full extraction** (functions, classes, methods, imports, exports):
-Rust, TypeScript, JavaScript, Python, Java, Go, C, C++, Ruby, C#, Swift, Kotlin, Bash, PHP, Dart, Scala, Lua, Elixir, Zig, Haskell, Groovy, Objective-C, R, Julia, OCaml, MATLAB, Clojure
+Rust, TypeScript, JavaScript, Python, Java, Go, C, C++, Ruby, C#, Swift, Kotlin, Bash, PHP, Dart, Scala, Lua, Luau, Elixir, Zig, Haskell, Groovy, Objective-C, R, Julia, OCaml, MATLAB, Clojure
 
 **Structural extraction** (selectors, keys, blocks):
 CSS, SCSS, Markdown, JSON, YAML, TOML, Dockerfile, HCL/Terraform, Protobuf, Svelte, Makefile, HTML, GraphQL, XML
@@ -372,7 +372,7 @@ an indexer and pulls no rmcp:
 cxpak = { version = "3.1", features = ["client"] }
 ```
 
-If you want the client without the 43 bundled grammars, `default-features = false, features =
+If you want the client without the 44 bundled grammars, `default-features = false, features =
 ["client", "daemon"]` builds the library — `daemon` is currently the floor, not `client` alone.
 
 `CxpakClient` is one method, and its return type is the contract:

@@ -37,6 +37,7 @@ pub fn is_code_language(lang: &str) -> bool {
             | "dart"
             | "scala"
             | "lua"
+            | "luau"
             | "clojure"
             | "elixir"
             | "zig"
@@ -122,6 +123,9 @@ impl LanguageRegistry {
 
         #[cfg(feature = "lang-lua")]
         self.register(Box::new(languages::lua::LuaLanguage));
+
+        #[cfg(feature = "lang-luau")]
+        self.register(Box::new(languages::luau::LuauLanguage));
 
         #[cfg(feature = "lang-clojure")]
         self.register(Box::new(languages::clojure::ClojureLanguage));
@@ -236,8 +240,8 @@ mod tests {
         // Unconditional floor: fires even under --no-default-features so a
         // miscounted feature flag cannot silently hollow out the registry.
         assert!(
-            langs.len() >= 43,
-            "expected at least 43 languages, got {}",
+            langs.len() >= 44,
+            "expected at least 44 languages, got {}",
             langs.len()
         );
         assert!(langs.contains(&"rust"));

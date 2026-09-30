@@ -64,6 +64,45 @@ fn format_date(unix_secs: i64) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
+/// Current git HEAD commit oid as a hex string, or `""` when `path` is not a
+/// git repository / has no commits. Part of the derived-cache fingerprint so a
+/// HEAD move invalidates history-derived data (conventions, co-changes).
+///
+/// Shared by the daemon and the post-commit rebuild (`commands::hook`), so both compute the SAME
+/// content fingerprint as `build_index`, keeping the shared derived cache it
+/// writes a valid warm hit for a later `overview` (ADR-0179).
+pub fn git_head_oid(path: &Path) -> String {
+    let Ok(repo) = git2::Repository::discover(path) else {
+        return String::new();
+    };
+    repo.head()
+        .ok()
+        .and_then(|head| head.target())
+        .map(|oid| oid.to_string())
+        .unwrap_or_default()
+}
+
+/// Whether the repo's working tree is CLEAN versus HEAD — i.e. no tracked-file
+/// modifications, staged changes, or deletions. Untracked and ignored files are
+/// deliberately excluded (a new scratch file does not make the committed tree
+/// stale). Any status error degrades to "dirty" (`false`), fail-closed.
+///
+/// This is the truth condition behind a `base_commit = Some(HEAD)` stamp: the
+/// stamp promises "graph == committed tree at this SHA", which only holds when
+/// the working tree the graph was built from equals HEAD's tree (ADR-0179).
+pub(crate) fn working_tree_clean(repo: &git2::Repository) -> bool {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    match repo.statuses(Some(&mut opts)) {
+        // With untracked + ignored excluded, any remaining entry is a tracked
+        // modification/staged/deleted change → the tree differs from HEAD.
+        Ok(statuses) => statuses.iter().all(|entry| entry.status().is_empty()),
+        Err(_) => false,
+    }
+}
+
 /// Extract git context from the repository at `repo_path`.
 ///
 /// Walks up to `max_commits` commits from HEAD (newest first), diffs each

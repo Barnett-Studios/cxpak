@@ -125,6 +125,21 @@ jobs:
       - name: Verify build on declared MSRV (1.91.0)
         run: cargo build --verbose
 
+  # `default-features = false` is a documented way to consume the crate (README), and it did not
+  # compile for weeks without any job noticing (#140). A check, not a build: it is the compile
+  # boundary that breaks, and `cargo check` finds it in a fraction of the time.
+  features:
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9  # branch 1.94.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      - name: No default features
+        run: cargo check --no-default-features
+      - name: The minimal library (one grammar)
+        run: cargo check --no-default-features --features lang-rust
+
   coverage:
     runs-on: ubuntu-latest
     needs: [test]
@@ -136,7 +151,7 @@ jobs:
         run: cargo install cargo-tarpaulin --version 0.35.2 --locked
       - name: Check coverage (90% minimum)
         run: |
-          OUTPUT=$(cargo tarpaulin --engine llvm --skip-clean --no-default-features --features "daemon,lang-rust,lang-typescript,lang-javascript,lang-java,lang-python,lang-go,lang-c,lang-cpp,lang-ruby,lang-csharp,lang-swift,lang-kotlin,lang-bash,lang-css,lang-scss,lang-php,lang-markdown,lang-json,lang-yaml,lang-toml,lang-dockerfile,lang-hcl,lang-dart,lang-scala,lang-lua,lang-clojure,lang-elixir,lang-zig,lang-haskell,lang-groovy,lang-objc,lang-r,lang-julia,lang-ocaml,lang-matlab,lang-proto,lang-svelte,lang-makefile,lang-html,lang-graphql,lang-xml,lang-sql,lang-prisma" --all-targets --timeout 600 --exclude-files 'vendor/*' 'references/*' 2>&1) || true
+          OUTPUT=$(cargo tarpaulin --engine llvm --skip-clean --no-default-features --features "daemon,lang-rust,lang-typescript,lang-javascript,lang-java,lang-python,lang-go,lang-c,lang-cpp,lang-ruby,lang-csharp,lang-swift,lang-kotlin,lang-bash,lang-css,lang-scss,lang-php,lang-markdown,lang-json,lang-yaml,lang-toml,lang-dockerfile,lang-hcl,lang-dart,lang-scala,lang-lua,lang-luau,lang-clojure,lang-elixir,lang-zig,lang-haskell,lang-groovy,lang-objc,lang-r,lang-julia,lang-ocaml,lang-matlab,lang-proto,lang-svelte,lang-makefile,lang-html,lang-graphql,lang-xml,lang-sql,lang-prisma" --all-targets --timeout 600 --exclude-files 'vendor/*' 'references/*' 2>&1) || true
           echo "$OUTPUT"
           COVERAGE=$(echo "$OUTPUT" | grep -oP '[\d.]+(?=% coverage)' | tail -1)
           echo "Coverage: ${COVERAGE}%"
