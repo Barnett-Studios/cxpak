@@ -741,3 +741,143 @@ fn a_nonexistent_path_inside_the_root_gets_no_answer() {
     child.kill().ok();
     child.wait().ok();
 }
+
+// ---------------------------------------------------------------------------
+// #114 — `exit` and stdin EOF must terminate the process.
+//
+// `shutdown` answering `result: null` is necessary but not sufficient: the
+// LSP spec defines `exit` as "a notification to ask the server to exit its
+// process", and every client falls back to closing the pipe when it dies
+// without a handshake. Pre-fix, neither path ended the process — `shutdown`
+// + `exit` + closing stdin left the process alive indefinitely, because (a)
+// tower-lsp's `exit` handling only stops it from accepting further
+// requests, it does not itself break the stdin read loop when the client
+// keeps the pipe open, and (b) even when the read loop does end via stdin
+// EOF, returning normally lets the `tokio::runtime::Runtime` drop, which
+// blocks forever shutting down the blocking-pool thread `tokio::io::stdin()`
+// parks on a `read()` that never un-blocks.
+// ---------------------------------------------------------------------------
+
+/// Poll `try_wait` until the child exits or `timeout` elapses. Returns the
+/// `ExitStatus` on success; panics (after killing the child, so the test
+/// process itself does not leak one) if the deadline passes first.
+fn wait_for_exit(
+    child: &mut process::Child,
+    timeout: Duration,
+    context: &str,
+) -> process::ExitStatus {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    child.kill().ok();
+                    child.wait().ok();
+                    panic!("process still running after {timeout:?} — {context}; had to kill it");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    }
+}
+
+/// A clean `shutdown` + `exit` must terminate the process with status 0,
+/// per the LSP spec's "0 if it was shut down normally" — even with stdin
+/// left open, since a client is not required to also close the pipe.
+#[test]
+fn lsp_exit_after_shutdown_terminates_process_with_status_0() {
+    let repo = make_test_repo();
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}).to_string(),
+    );
+    let resp = read_response_for_id(&mut reader, 2).expect("shutdown response");
+    assert_eq!(
+        resp["result"],
+        Value::Null,
+        "shutdown must answer result: null"
+    );
+
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "exit"}).to_string(),
+    );
+    // Deliberately leave stdin open — the process must exit on `exit` alone.
+
+    let status = wait_for_exit(
+        &mut child,
+        Duration::from_secs(10),
+        "`exit` after `shutdown` must terminate the process even with stdin left open",
+    );
+    assert!(
+        status.success(),
+        "exit after a prior shutdown must be status 0; got {status:?}"
+    );
+}
+
+/// `exit` received WITHOUT a prior `shutdown` is still a request to leave —
+/// the spec says the process should exit with a non-zero code in that case.
+#[test]
+fn lsp_exit_without_shutdown_terminates_process_with_status_1() {
+    let repo = make_test_repo();
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "exit"}).to_string(),
+    );
+    // No shutdown was sent, and stdin stays open.
+
+    let status = wait_for_exit(
+        &mut child,
+        Duration::from_secs(10),
+        "`exit` without a prior `shutdown` must still terminate the process",
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "exit without a prior shutdown must be status 1 per spec; got {status:?}"
+    );
+}
+
+/// The fallback every client relies on when it dies without a handshake:
+/// closing stdin, with no `shutdown`/`exit` sent at all, must also end the
+/// process rather than leaving it parked on a read that will never return.
+#[test]
+fn lsp_stdin_eof_without_exit_terminates_process() {
+    let repo = make_test_repo();
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    // Close stdin — the child's write end of the pipe, simulating a client
+    // that died without ever sending `shutdown`/`exit`.
+    drop(child.stdin.take());
+
+    let status = wait_for_exit(
+        &mut child,
+        Duration::from_secs(10),
+        "stdin EOF with no prior shutdown/exit must terminate the process",
+    );
+    assert!(
+        status.success(),
+        "stdin EOF alone should be a clean exit; got {status:?}"
+    );
+}
