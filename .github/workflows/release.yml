@@ -16,13 +16,20 @@ jobs:
   build:
     strategy:
       fail-fast: false   # one target failing shouldn't cancel/mask the others
+      # .github#20: `os: ubuntu-latest` on the two *-unknown-linux-gnu rows silently
+      # inherited whatever glibc ubuntu-latest promotes to — ubuntu-24.04 (2.39) ships
+      # pidfd_spawnp/pidfd_getpid, which std::process::Command links when present on the
+      # BUILD host, raising the runtime floor past Debian 12 (2.36), Ubuntu 22.04 LTS
+      # (2.35), RHEL 9 and Amazon Linux 2023 (2.34 each). Pinned to 22.04 so the floor
+      # stops tracking whatever GitHub last promoted; `ubuntu-20.04` would cover RHEL9/
+      # AL2023 too (2.31) but GitHub fully removed that runner image on 2025-04-01.
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
