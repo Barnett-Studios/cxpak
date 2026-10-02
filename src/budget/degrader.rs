@@ -37,6 +37,42 @@ pub fn truncate_to_budget_with_pointer(
     )
 }
 
+/// Computes the net change in brace/bracket/paren nesting depth for a single
+/// line of source, ignoring any such characters that appear inside
+/// double-quoted string literals.
+///
+/// This is a conservative, language-agnostic heuristic rather than a real
+/// parse: it does not understand per-language comment syntax, raw strings,
+/// or char-literal braces (e.g. Rust's `'{'`), so on pathological input it
+/// can misjudge a handful of lines. Deliberately single-quote-blind (Rust
+/// lifetimes like `&'a str` would otherwise wedge the scanner into a
+/// permanent "inside string" state). Any miscount only ever biases toward
+/// treating the content as *more* unbalanced than it is, which makes the
+/// caller back off to an earlier, definitely-safe boundary — never toward
+/// emitting a broken fragment.
+fn bracket_depth_delta(line: &str) -> i64 {
+    let mut delta: i64 = 0;
+    let mut in_string = false;
+    let mut prev = '\0';
+    for ch in line.chars() {
+        if in_string {
+            if ch == '"' && prev != '\\' {
+                in_string = false;
+            }
+            prev = ch;
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' | '(' => delta += 1,
+            '}' | ']' | ')' => delta -= 1,
+            _ => {}
+        }
+        prev = ch;
+    }
+    delta
+}
+
 fn truncate_to_budget_inner(
     content: &str,
     budget: usize,
@@ -51,6 +87,9 @@ fn truncate_to_budget_inner(
 
     let mut lines = Vec::new();
     let mut used = 0;
+    let mut depth: i64 = 0;
+    let mut last_safe_boundary: Option<(usize, usize)> = None;
+    let mut cut_short = false;
     for line in content.lines() {
         let line_tokens = counter.count(line) + 1;
         // Reserve 150 tokens for the omission marker.  The marker text can
@@ -58,10 +97,36 @@ fn truncate_to_budget_inner(
         // 50 was too small and could result in the final content exceeding the
         // caller's budget once the marker is appended.
         if used + line_tokens > budget.saturating_sub(150) {
+            cut_short = true;
             break;
         }
         lines.push(line);
         used += line_tokens;
+        depth += bracket_depth_delta(line);
+        if depth == 0 {
+            last_safe_boundary = Some((lines.len(), used));
+        }
+    }
+
+    // A raw line-count cut can land partway through a function/block,
+    // emitting an opening brace with no matching close — a structurally
+    // broken fragment (issue #41). When the cut happened mid-block, back
+    // off to the last point where nesting was balanced so the retained
+    // content never ends on a half-open symbol.
+    if cut_short && depth != 0 {
+        match last_safe_boundary {
+            Some((safe_len, safe_used)) => {
+                lines.truncate(safe_len);
+                used = safe_used;
+            }
+            None => {
+                // No balanced point was ever reached — the cut lands inside
+                // the very first symbol. Emit nothing rather than a
+                // half-open fragment.
+                lines.clear();
+                used = 0;
+            }
+        }
     }
 
     let omitted = total_tokens - used;
@@ -164,5 +229,49 @@ mod tests {
         assert!(pointer.contains(".cxpak/details.md"));
         // Small tokens should show "~42" not "~0.0k"
         assert!(!pointer.contains("~0.0k"));
+    }
+
+    #[test]
+    fn test_truncate_never_leaves_unbalanced_braces() {
+        // Issue #41 (defect D): the original implementation truncates on a
+        // raw line-count cut with no awareness of block structure, so a
+        // budget that lands partway through a function's body emits its
+        // opening brace with no matching close — an unbalanced, structurally
+        // broken fragment. Sweep a wide range of budgets (forcing the cut
+        // point to land inside every function in turn) and assert the
+        // retained code is always brace-balanced whenever truncation
+        // actually occurred.
+        let counter = crate::budget::counter::TokenCounter::new();
+        let content = (0..20)
+            .map(|i| {
+                let body_lines = 3 + (i % 5);
+                let body = (0..body_lines)
+                    .map(|j| format!("    let v{j} = {j} + {i};"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("fn function_number_{i}() {{\n{body}\n    v0\n}}\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let total = counter.count(&content);
+        assert!(total > 400, "fixture too small to exercise the sweep");
+
+        let mut saw_truncation = false;
+        for budget in (160..total).step_by(5) {
+            let (result, _used, omitted) =
+                truncate_to_budget(&content, budget, &counter, "source code");
+            if omitted == 0 {
+                continue;
+            }
+            saw_truncation = true;
+            let code_only = result.split("<!--").next().unwrap_or(&result);
+            let opens = code_only.matches('{').count();
+            let closes = code_only.matches('}').count();
+            assert_eq!(
+                opens, closes,
+                "budget {budget} produced unbalanced braces: {code_only:?}"
+            );
+        }
+        assert!(saw_truncation, "sweep never exercised truncation");
     }
 }
