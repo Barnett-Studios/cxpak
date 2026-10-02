@@ -161,7 +161,10 @@ fn mean_pool(
         .sum(1)
         .map_err(|e| format!("sum mask error: {e}"))?
         .unsqueeze(1)
-        .map_err(|e| format!("unsqueeze error: {e}"))?;
+        .map_err(|e| format!("unsqueeze error: {e}"))?
+        // Same clamp as sentence-transformers: an all-padding row pools to 0, not 0/0 = NaN.
+        .maximum(1e-9)
+        .map_err(|e| format!("clamp error: {e}"))?;
     let mean = summed
         .broadcast_div(&counts)
         .map_err(|e| format!("div error: {e}"))?;
@@ -246,6 +249,20 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An all-padding row has a zero token count; it must pool to zeros, never 0/0 = NaN,
+    // which l2_normalize would pass straight into the index.
+    #[test]
+    fn test_mean_pool_all_padding_row_is_finite() {
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        let output = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 1, 2), &dev).unwrap();
+        let mask = Tensor::from_vec(vec![1i64, 0], (2, 1), &dev).unwrap();
+
+        let rows: Vec<Vec<f32>> = mean_pool(&output, &mask).unwrap().to_vec2().unwrap();
+
+        assert_eq!(rows, vec![vec![1.0, 2.0], vec![0.0, 0.0]]);
+    }
 
     // #137: pooling must broadcast the (n, seq, 1) mask over the hidden dimension,
     // exclude padding positions, and divide each row by its own token count.
