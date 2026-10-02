@@ -111,22 +111,7 @@ impl LocalEmbeddingProvider {
             .forward(&input_ids, &token_type_ids, Some(&attention_mask))
             .map_err(|e| format!("model forward error: {e}"))?;
 
-        // Mean-pool over token dimension (dim 1), excluding padding tokens.
-        let mask_f32 = attention_mask
-            .to_dtype(candle_core::DType::F32)
-            .map_err(|e| format!("dtype error: {e}"))?;
-        // mask_f32: (n, seq_len), output: (n, seq_len, hidden)
-        let mask_expanded = mask_f32
-            .unsqueeze(2)
-            .map_err(|e| format!("unsqueeze error: {e}"))?;
-        let masked = (output * mask_expanded).map_err(|e| format!("mul error: {e}"))?;
-        let summed = masked.sum(1).map_err(|e| format!("sum error: {e}"))?;
-        let counts = mask_f32
-            .sum(1)
-            .map_err(|e| format!("sum mask error: {e}"))?
-            .unsqueeze(1)
-            .map_err(|e| format!("unsqueeze error: {e}"))?;
-        let mean = (summed / counts).map_err(|e| format!("div error: {e}"))?;
+        let mean = mean_pool(&output, &attention_mask)?;
 
         // L2-normalize each row.
         let mean_data: Vec<f32> = mean
@@ -153,6 +138,36 @@ impl LocalEmbeddingProvider {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Mean-pool `output` (n, seq_len, hidden) over the token dimension, excluding
+/// padding positions where `attention_mask` (n, seq_len) is 0. Returns (n, hidden).
+fn mean_pool(
+    output: &candle_core::Tensor,
+    attention_mask: &candle_core::Tensor,
+) -> Result<candle_core::Tensor, String> {
+    // Mean-pool over token dimension (dim 1), excluding padding tokens.
+    let mask_f32 = attention_mask
+        .to_dtype(candle_core::DType::F32)
+        .map_err(|e| format!("dtype error: {e}"))?;
+    // mask_f32: (n, seq_len), output: (n, seq_len, hidden)
+    let mask_expanded = mask_f32
+        .unsqueeze(2)
+        .map_err(|e| format!("unsqueeze error: {e}"))?;
+    let masked = output
+        .broadcast_mul(&mask_expanded)
+        .map_err(|e| format!("mul error: {e}"))?;
+    let summed = masked.sum(1).map_err(|e| format!("sum error: {e}"))?;
+    let counts = mask_f32
+        .sum(1)
+        .map_err(|e| format!("sum mask error: {e}"))?
+        .unsqueeze(1)
+        .map_err(|e| format!("unsqueeze error: {e}"))?;
+    let mean = summed
+        .broadcast_div(&counts)
+        .map_err(|e| format!("div error: {e}"))?;
+
+    Ok(mean)
+}
 
 /// Resolve the home directory from environment variables.
 ///
@@ -231,6 +246,31 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #137: pooling must broadcast the (n, seq, 1) mask over the hidden dimension,
+    // exclude padding positions, and divide each row by its own token count.
+    #[test]
+    fn test_mean_pool_excludes_padding_and_broadcasts_over_hidden() {
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        // n=2, seq_len=3, hidden=2. Row 0 has 3 real tokens; row 1 has 1 real + 2 padding.
+        let output = Tensor::from_vec(
+            vec![
+                1.0f32, 10.0, 2.0, 20.0, 3.0, 30.0, //
+                4.0, 40.0, 99.0, 990.0, 99.0, 990.0,
+            ],
+            (2, 3, 2),
+            &dev,
+        )
+        .unwrap();
+        let mask = Tensor::from_vec(vec![1i64, 1, 1, 1, 0, 0], (2, 3), &dev).unwrap();
+
+        let pooled = mean_pool(&output, &mask).expect("pooling must succeed");
+
+        assert_eq!(pooled.dims(), &[2, 2]);
+        let rows: Vec<Vec<f32>> = pooled.to_vec2().unwrap();
+        assert_eq!(rows, vec![vec![2.0, 20.0], vec![4.0, 40.0]]);
+    }
 
     #[test]
     #[ignore = "requires network to download model"]
