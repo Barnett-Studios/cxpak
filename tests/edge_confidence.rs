@@ -62,7 +62,7 @@ fn make_file_no_parse(path: &str, language: &str, content: &str) -> IndexedFile 
         token_count: 0,
         parse_result: None,
         content: content.to_string(),
-        mtime_secs: None,
+        mtime_ns: None,
     }
 }
 

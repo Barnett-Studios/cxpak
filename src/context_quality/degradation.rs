@@ -841,7 +841,7 @@ mod tests {
                 exports: vec![],
             }),
             content: "x ".repeat(tokens),
-            mtime_secs: None,
+            mtime_ns: None,
         }
     }
 

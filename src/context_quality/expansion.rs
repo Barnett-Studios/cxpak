@@ -652,7 +652,7 @@ mod tests {
             token_count: 0,
             parse_result: None,
             content: String::new(),
-            mtime_secs: None,
+            mtime_ns: None,
         })
     }
 

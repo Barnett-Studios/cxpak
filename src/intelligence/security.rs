@@ -891,7 +891,7 @@ pub fn process_input(data: String) {
                 exports: vec![],
             }),
             content: content.to_string(),
-            mtime_secs: None,
+            mtime_ns: None,
         })
     }
 

@@ -581,7 +581,7 @@ mod tests {
                 exports: vec![],
             }),
             content: String::new(),
-            mtime_secs: None,
+            mtime_ns: None,
         })
     }
 

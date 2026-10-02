@@ -150,11 +150,11 @@ impl CodebaseIndex {
                 compute_term_frequencies(&content),
             );
 
-            let mtime_secs = std::fs::metadata(&file.absolute_path)
+            let mtime_ns = std::fs::metadata(&file.absolute_path)
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
+                .map(|d| d.as_nanos() as u64);
 
             let parse_result = parse_results.get(&file.relative_path).cloned();
             indexed_files.push(Arc::new(IndexedFile {
@@ -164,7 +164,7 @@ impl CodebaseIndex {
                 token_count,
                 parse_result,
                 content,
-                mtime_secs,
+                mtime_ns,
             }));
         }
 
@@ -279,11 +279,11 @@ impl CodebaseIndex {
                 compute_term_frequencies(&file_content),
             );
 
-            let mtime_secs = std::fs::metadata(&file.absolute_path)
+            let mtime_ns = std::fs::metadata(&file.absolute_path)
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
+                .map(|d| d.as_nanos() as u64);
 
             let parse_result = parse_results.get(&file.relative_path).cloned();
             indexed_files.push(Arc::new(IndexedFile {
@@ -293,7 +293,7 @@ impl CodebaseIndex {
                 token_count,
                 parse_result,
                 content: file_content,
-                mtime_secs,
+                mtime_ns,
             }));
         }
 
@@ -437,8 +437,16 @@ impl CodebaseIndex {
 
     /// Rebuild the index incrementally: re-parse only files whose mtime/size differs.
     ///
+    /// The staleness check compares `(mtime_ns, size_bytes)` with `!=`, not a
+    /// strict "newer than" ordering on a whole-second mtime: a same-size edit
+    /// landing within the same wall-clock second as the prior index still
+    /// changes the nanosecond mtime, and a `!=` comparison also catches an
+    /// mtime that moves *backward* (e.g. a `git checkout`/rebase that resets
+    /// mtime to an earlier value) — both were silently skipped by the old
+    /// `new > old` check (cxpak#36).
+    ///
     /// Steps:
-    /// 1. Scan current files, compare mtime against stored IndexedFile.mtime_secs.
+    /// 1. Scan current files, compare mtime against stored IndexedFile.mtime_ns.
     /// 2. Call upsert_file() for changed/new files.
     /// 3. Call remove_file() for deleted files.
     /// 4. Call rebuild_graph() to recompute the dependency graph.
@@ -470,11 +478,11 @@ impl CodebaseIndex {
         // the graph can be rebuilt by edge-delta rather than from scratch.
         let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for file in current_files {
-            let mtime_secs = std::fs::metadata(&file.absolute_path)
+            let mtime_ns = std::fs::metadata(&file.absolute_path)
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
+                .map(|d| d.as_nanos() as u64);
 
             let needs_update = match self
                 .files
@@ -482,8 +490,8 @@ impl CodebaseIndex {
                 .find(|f| f.relative_path == file.relative_path)
             {
                 None => true, // new file
-                Some(existing) => match (existing.mtime_secs, mtime_secs) {
-                    (Some(old), Some(new)) => new > old || file.size_bytes != existing.size_bytes,
+                Some(existing) => match (existing.mtime_ns, mtime_ns) {
+                    (Some(old), Some(new)) => new != old || file.size_bytes != existing.size_bytes,
                     _ => true, // no mtime available: always re-parse
                 },
             };
@@ -501,7 +509,7 @@ impl CodebaseIndex {
                     &content,
                     parse_result,
                     counter,
-                    mtime_secs,
+                    mtime_ns,
                 );
                 changed.insert(file.relative_path.clone());
             }
@@ -547,7 +555,7 @@ impl CodebaseIndex {
         content: &str,
         parse_result: Option<ParseResult>,
         counter: &TokenCounter,
-        mtime_secs: Option<u64>,
+        mtime_ns: Option<u64>,
     ) {
         // Remove old entry if it exists (adjusts stats)
         self.remove_file(relative_path);
@@ -579,7 +587,7 @@ impl CodebaseIndex {
             token_count,
             parse_result,
             content: content.to_string(),
-            mtime_secs,
+            mtime_ns,
         }));
 
         self.total_files = self.files.len();
@@ -798,7 +806,7 @@ mod tests {
                         exports: vec![],
                     }),
                     content: String::new(),
-                    mtime_secs: None,
+                    mtime_ns: None,
                 })
             })
             .collect();
@@ -1585,8 +1593,8 @@ mod tests {
         }];
         let index = CodebaseIndex::build(files, HashMap::new(), &counter);
         assert!(
-            index.files[0].mtime_secs.is_some(),
-            "mtime_secs should be populated from disk"
+            index.files[0].mtime_ns.is_some(),
+            "mtime_ns should be populated from disk"
         );
     }
 
@@ -1645,10 +1653,10 @@ mod tests {
         }];
         let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
         assert!(
-            index.files[0].mtime_secs.is_some(),
+            index.files[0].mtime_ns.is_some(),
             "precondition: disk build populates mtime"
         );
-        Arc::make_mut(&mut index.files[0]).mtime_secs = None;
+        Arc::make_mut(&mut index.files[0]).mtime_ns = None;
 
         let current = vec![ScannedFile {
             relative_path: "a.rs".into(),
@@ -1658,8 +1666,8 @@ mod tests {
         }];
         index.incremental_rebuild(&current, &HashMap::new(), &counter);
         assert!(
-            index.files[0].mtime_secs.is_some(),
-            "the wildcard re-parse arm must have run upsert_file, repopulating mtime_secs from disk"
+            index.files[0].mtime_ns.is_some(),
+            "the wildcard re-parse arm must have run upsert_file, repopulating mtime_ns from disk"
         );
     }
 

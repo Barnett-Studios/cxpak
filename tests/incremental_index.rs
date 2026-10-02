@@ -65,3 +65,38 @@ fn test_incremental_rebuild_noop_when_nothing_changed() {
         "noop incremental rebuild must not change token count"
     );
 }
+
+#[test]
+fn test_incremental_rebuild_detects_same_size_same_second_edit() {
+    // cxpak#36: a same-size edit landing in the same wall-clock second as the
+    // prior index build must still trigger a reparse. The old `needs_update`
+    // check compared `mtime` truncated to whole seconds with a strict `>`, so
+    // a same-second, same-size edit was silently skipped and stale content
+    // kept being served.
+    let counter = TokenCounter::new();
+    let dir = tempfile::TempDir::new().unwrap();
+    let fp = dir.path().join("a.rs");
+    std::fs::write(&fp, "fn a() { 111 }").unwrap();
+    let file = ScannedFile {
+        relative_path: "a.rs".into(),
+        absolute_path: fp.clone(),
+        language: Some("rust".into()),
+        size_bytes: 14,
+    };
+
+    let mut index = CodebaseIndex::build(vec![file.clone()], HashMap::new(), &counter);
+    assert_eq!(index.files[0].content, "fn a() { 111 }");
+
+    // Same byte size as the original content, written immediately after
+    // (microseconds later — deterministically within the same wall-clock
+    // second on any filesystem with at least 1s mtime resolution).
+    std::fs::write(&fp, "fn a() { 222 }").unwrap();
+
+    index.incremental_rebuild(&[file], &HashMap::new(), &counter);
+
+    assert_eq!(
+        index.files[0].content, "fn a() { 222 }",
+        "a same-size edit within the same wall-clock second as the prior index \
+         must still trigger a reparse (cxpak#36)"
+    );
+}

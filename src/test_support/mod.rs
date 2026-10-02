@@ -119,7 +119,7 @@ impl IndexBuilder {
                     // No `#[cfg(test)]` marker → `has_inline_tests` is false →
                     // every synthetic file is untested (test_penalty = 1.0).
                     content: String::new(),
-                    mtime_secs: None,
+                    mtime_ns: None,
                 })
             })
             .collect();

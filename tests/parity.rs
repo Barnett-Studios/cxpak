@@ -86,7 +86,7 @@ fn rust_file(stem: &str, imports: &[&str]) -> std::sync::Arc<IndexedFile> {
             exports: vec![],
         }),
         content: String::new(),
-        mtime_secs: None,
+        mtime_ns: None,
     })
 }
 
@@ -388,7 +388,7 @@ fn delta_with_schema_falls_back_and_preserves_fk_edge() {
             token_count: 0,
             parse_result: None,
             content: String::new(),
-            mtime_secs: None,
+            mtime_ns: None,
         }),
         std::sync::Arc::new(IndexedFile {
             relative_path: "src/customers.sql".to_string(),
@@ -397,7 +397,7 @@ fn delta_with_schema_falls_back_and_preserves_fk_edge() {
             token_count: 0,
             parse_result: None,
             content: String::new(),
-            mtime_secs: None,
+            mtime_ns: None,
         }),
         rust_file("app", &[]),
     ];
