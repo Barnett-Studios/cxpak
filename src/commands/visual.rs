@@ -200,15 +200,24 @@ pub fn run(
         ),
     };
 
-    // Determine output path.
+    // Determine output path. With no explicit `--out`, the default artifact
+    // is written under `.cxpak/` — the same cache/output root `cxpak clean`
+    // removes and the scanner ignores — rather than the repo root, so it
+    // never lands in `git add -A` or gets indexed on the next run (#102).
+    // An explicit `--out` is a user-chosen path and is honored verbatim.
     let default_name = format!(
         "cxpak-{}.{}",
         type_slug(visual_type),
         ext_for_format(format)
     );
-    let out_path: std::path::PathBuf = out
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| path.join(&default_name));
+    let out_path: std::path::PathBuf = match out {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let dir = path.join(".cxpak");
+            std::fs::create_dir_all(&dir)?;
+            dir.join(&default_name)
+        }
+    };
 
     if is_binary {
         std::fs::write(&out_path, &content_bytes)?;
