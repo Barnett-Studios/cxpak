@@ -419,6 +419,46 @@ impl LanguageServer for CxpakLspBackend {
         ))
     }
 
+    /// `initialize` advertises `diagnosticProvider.workspaceDiagnostics:
+    /// true` (#115), so this must answer rather than fall through to
+    /// tower-lsp's default `Err(Error::method_not_found())`. It delegates
+    /// to the same `diagnostics_for_file` logic backing `textDocument/
+    /// diagnostic` (the `diagnostic` method above), run once per document
+    /// this server knows about — the open-document set tracked in
+    /// `self.documents` by `did_open`/`did_change`/`did_close`.
+    ///
+    /// Clone the URI list and release the lock before running diagnostics
+    /// (snapshot-then-release, matching `snapshot()` above): a workspace
+    /// pull over many documents must not hold `self.documents` for its
+    /// full duration and starve a concurrent `did_change`.
+    async fn workspace_diagnostic(
+        &self,
+        _params: WorkspaceDiagnosticParams,
+    ) -> LspResult<WorkspaceDiagnosticReportResult> {
+        let uris: Vec<Url> = {
+            let docs = self.documents.read().map_err(Self::lock_err)?;
+            docs.keys().cloned().collect()
+        };
+        let idx = self.snapshot()?;
+        let items = uris
+            .into_iter()
+            .map(|uri| {
+                let diags = super::methods::diagnostics_for_file(uri.as_str(), &idx, &self.path);
+                WorkspaceDocumentDiagnosticReport::Full(WorkspaceFullDocumentDiagnosticReport {
+                    uri,
+                    version: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: diags,
+                    },
+                })
+            })
+            .collect();
+        Ok(WorkspaceDiagnosticReportResult::Report(
+            WorkspaceDiagnosticReport { items },
+        ))
+    }
+
     #[allow(deprecated)]
     async fn symbol(
         &self,
