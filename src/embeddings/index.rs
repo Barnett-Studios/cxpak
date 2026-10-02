@@ -2,6 +2,31 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Identity of the model that produced an [`EmbeddingIndex`]'s vectors.
+///
+/// Two shipped providers (voyage-code-3, cohere embed-english-v3.0) both emit
+/// 1024-dim vectors, so `dims` alone cannot tell them apart. Comparing a
+/// query embedded by one against an index built by the other produces a
+/// numerically valid but semantically meaningless cosine score — no error,
+/// just confidently wrong retrieval. This fingerprint lets a loader refuse
+/// that silently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFingerprint {
+    pub provider: String,
+    pub model: String,
+    pub dims: usize,
+}
+
+impl ModelFingerprint {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>, dims: usize) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            dims,
+        }
+    }
+}
+
 /// Flat-matrix vector index. Vectors are stored contiguously:
 /// `vectors[i * dims .. (i + 1) * dims]` is the embedding for `paths[i]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,17 +35,43 @@ pub struct EmbeddingIndex {
     path_index: HashMap<String, usize>,
     vectors: Vec<f32>,
     dims: usize,
+    /// `None` for an index built before this field existed, or built via
+    /// [`EmbeddingIndex::new`] without an explicit model identity.
+    /// [`EmbeddingIndex::load_verified`] treats a missing fingerprint as a
+    /// rejection, the same as a mismatched one — identity cannot be confirmed
+    /// either way, so the caller must rebuild rather than trust it.
+    fingerprint: Option<ModelFingerprint>,
 }
 
 impl EmbeddingIndex {
-    /// Create a new empty index with the given dimensionality.
+    /// Create a new empty index with the given dimensionality and no model
+    /// identity. Prefer [`EmbeddingIndex::with_fingerprint`] wherever the
+    /// producing provider/model is known, so a later load can be validated.
     pub fn new(dims: usize) -> Self {
         Self {
             paths: Vec::new(),
             path_index: HashMap::new(),
             vectors: Vec::new(),
             dims,
+            fingerprint: None,
         }
+    }
+
+    /// Create a new empty index carrying the identity of the model that will
+    /// produce its vectors.
+    pub fn with_fingerprint(dims: usize, fingerprint: ModelFingerprint) -> Self {
+        Self {
+            paths: Vec::new(),
+            path_index: HashMap::new(),
+            vectors: Vec::new(),
+            dims,
+            fingerprint: Some(fingerprint),
+        }
+    }
+
+    /// The model identity this index was built with, if any.
+    pub fn fingerprint(&self) -> Option<&ModelFingerprint> {
+        self.fingerprint.as_ref()
     }
 
     /// Add or update the vector for a file path.
@@ -109,10 +160,37 @@ impl EmbeddingIndex {
         std::fs::rename(&tmp, path).map_err(|e| format!("rename error: {e}"))
     }
 
-    /// Deserialize from `path` using bincode 1.x.
+    /// Deserialize from `path` using bincode 1.x, with no model-identity
+    /// check. Prefer [`EmbeddingIndex::load_verified`] in any path that will
+    /// compare the loaded vectors against a live query embedding.
     pub fn load(path: &Path) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("read error: {e}"))?;
         bincode::deserialize(&bytes).map_err(|e| format!("bincode deserialize error: {e}"))
+    }
+
+    /// Deserialize from `path` and reject the result unless its stored
+    /// [`ModelFingerprint`] matches `expected` exactly.
+    ///
+    /// An index with no fingerprint (built before this field existed, or via
+    /// [`EmbeddingIndex::new`]) is also rejected: identity cannot be
+    /// confirmed, so it must be rebuilt rather than silently trusted. This is
+    /// the acceptance criterion for cxpak#38 — swapping providers at the same
+    /// dimensionality must not silently load stale vectors.
+    pub fn load_verified(path: &Path, expected: &ModelFingerprint) -> Result<Self, String> {
+        let idx = Self::load(path)?;
+        match &idx.fingerprint {
+            Some(fp) if fp == expected => Ok(idx),
+            Some(fp) => Err(format!(
+                "embedding index model mismatch: index was built with provider={} model={} dims={}, \
+                 but current config is provider={} model={} dims={} — rebuild the index",
+                fp.provider, fp.model, fp.dims, expected.provider, expected.model, expected.dims
+            )),
+            None => Err(
+                "embedding index has no model fingerprint (built by an older cxpak version) \
+                 — rebuild the index"
+                    .to_string(),
+            ),
+        }
     }
 
     /// Cosine similarity of the stored vector for `path` against `query`.
@@ -304,6 +382,96 @@ mod tests {
             result,
             Some(0.0),
             "dim mismatch should return Some(0.0), got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // cxpak#38: model fingerprint — reject a cross-model load, don't
+    // silently compare vectors from different providers at the same dims.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn load_verified_rejects_different_provider_same_dims() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.bin");
+
+        // Built under voyageai, 1024 dims (use 3 here for test speed; the
+        // bug is dims-equality masking a provider mismatch, not the exact
+        // number).
+        let built_as = ModelFingerprint::new("voyageai", "voyage-code-3", 3);
+        let mut idx = EmbeddingIndex::with_fingerprint(3, built_as.clone());
+        idx.add("a.rs", vec![1.0, 0.0, 0.0]);
+        idx.save(&path).expect("save should succeed");
+
+        // Now configured for cohere — same dims, different provider/model.
+        let configured_as = ModelFingerprint::new("cohere", "embed-english-v3.0", 3);
+        let result = EmbeddingIndex::load_verified(&path, &configured_as);
+
+        assert!(
+            result.is_err(),
+            "loading an index built by a different model must be rejected, not silently used"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("voyageai"),
+            "error should name the stored provider: {err}"
+        );
+        assert!(
+            err.contains("cohere"),
+            "error should name the configured provider: {err}"
+        );
+    }
+
+    #[test]
+    fn load_verified_accepts_matching_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.bin");
+
+        let fp = ModelFingerprint::new("local", "all-MiniLM-L6-v2", 3);
+        let mut idx = EmbeddingIndex::with_fingerprint(3, fp.clone());
+        idx.add("a.rs", vec![1.0, 0.0, 0.0]);
+        idx.save(&path).expect("save should succeed");
+
+        let loaded = EmbeddingIndex::load_verified(&path, &fp)
+            .expect("matching fingerprint should load successfully");
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn load_verified_rejects_legacy_index_with_no_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.bin");
+
+        // Built via `new()` — no fingerprint, as every pre-#38 index was.
+        let mut idx = EmbeddingIndex::new(3);
+        idx.add("a.rs", vec![1.0, 0.0, 0.0]);
+        idx.save(&path).expect("save should succeed");
+
+        let expected = ModelFingerprint::new("local", "all-MiniLM-L6-v2", 3);
+        let result = EmbeddingIndex::load_verified(&path, &expected);
+
+        assert!(
+            result.is_err(),
+            "a legacy index with no fingerprint must be rejected, not trusted"
+        );
+    }
+
+    #[test]
+    fn load_verified_rejects_same_provider_different_revision() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.bin");
+
+        let built_as = ModelFingerprint::new("local", "all-MiniLM-L6-v2-rev1", 3);
+        let mut idx = EmbeddingIndex::with_fingerprint(3, built_as);
+        idx.add("a.rs", vec![1.0, 0.0, 0.0]);
+        idx.save(&path).expect("save should succeed");
+
+        let configured_as = ModelFingerprint::new("local", "all-MiniLM-L6-v2-rev2", 3);
+        let result = EmbeddingIndex::load_verified(&path, &configured_as);
+
+        assert!(
+            result.is_err(),
+            "a revision change under the same provider must also be rejected"
         );
     }
 }

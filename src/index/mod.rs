@@ -707,13 +707,22 @@ pub fn build_embedding_index(
     repo_path: &std::path::Path,
     mode: crate::relevance::RelevanceMode,
 ) -> Option<crate::embeddings::EmbeddingIndex> {
-    use crate::embeddings::{create_provider, EmbeddingConfig, EmbeddingIndex};
+    use crate::embeddings::{create_provider, EmbeddingConfig, EmbeddingIndex, ModelFingerprint};
 
     let config = EmbeddingConfig::from_repo_root(repo_path);
     let provider = match create_provider(config.clone()) {
         Ok(p) => p,
         Err(_) => return None,
     };
+    // cxpak#38: tag this index with the model that is about to produce its
+    // vectors, so a later load against a different provider/model (even at
+    // the same dims — voyage-code-3 and cohere v3.0 both emit 1024) is
+    // rejected rather than silently compared.
+    let fingerprint = ModelFingerprint::new(
+        config.provider.clone(),
+        config.model.clone(),
+        provider.dimensions(),
+    );
 
     let contextual = mode.contextual();
     let symbols: Vec<(String, String)> = index
@@ -743,7 +752,7 @@ pub fn build_embedding_index(
         return None;
     }
 
-    let mut emb_index = EmbeddingIndex::new(provider.dimensions());
+    let mut emb_index = EmbeddingIndex::with_fingerprint(provider.dimensions(), fingerprint);
 
     // Embed in batches.
     let batch_size = config.batch_size;
