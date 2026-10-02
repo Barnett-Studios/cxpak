@@ -122,6 +122,79 @@ SH
     [[ "$output" == *"Unsupported"* ]]
 }
 
+@test "accepts a newer patch version within the same major" {
+    mkdir -p "${TEST_TMP}/bin"
+    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
+#!/bin/sh
+echo "cxpak 3.2.2"
+SH
+    chmod +x "${TEST_TMP}/bin/cxpak"
+
+    # No brew on PATH: isolates the PATH-resolution comparison from the
+    # auto-install fallback, per the #119 repro.
+    PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"${TEST_TMP}/bin/cxpak"* ]]
+}
+
+@test "accepts a newer minor version within the same major" {
+    mkdir -p "${TEST_TMP}/bin"
+    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
+#!/bin/sh
+echo "cxpak 3.3.0"
+SH
+    chmod +x "${TEST_TMP}/bin/cxpak"
+
+    PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"${TEST_TMP}/bin/cxpak"* ]]
+}
+
+@test "rejects an older patch version within the same major" {
+    mkdir -p "${TEST_TMP}/bin"
+    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
+#!/bin/sh
+echo "cxpak 3.2.0"
+SH
+    chmod +x "${TEST_TMP}/bin/cxpak"
+
+    PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not found"* ]]
+}
+
+@test "rejects a newer major version" {
+    mkdir -p "${TEST_TMP}/bin"
+    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
+#!/bin/sh
+echo "cxpak 4.0.0"
+SH
+    chmod +x "${TEST_TMP}/bin/cxpak"
+
+    PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not found"* ]]
+}
+
+@test "rejects an older major version" {
+    mkdir -p "${TEST_TMP}/bin"
+    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
+#!/bin/sh
+echo "cxpak 2.9.9"
+SH
+    chmod +x "${TEST_TMP}/bin/cxpak"
+
+    PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not found"* ]]
+}
+
+@test "rejects a missing binary exactly as before" {
+    PATH="/usr/bin:/bin" run "${ENSURE_CXPAK}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not found"* ]]
+}
+
 @test "prefers PATH binary over cached" {
     mkdir -p "${TEST_TMP}/bin"
     cat > "${TEST_TMP}/bin/cxpak" << 'SH'

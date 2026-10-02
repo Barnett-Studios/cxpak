@@ -3,10 +3,34 @@ set -euo pipefail
 
 REQUIRED_VERSION="3.2.1"
 
+# Accepts an installed version that is >= required within the same major
+# component (Cargo's ^REQUIRED_VERSION semantics) and rejects everything else:
+# a missing binary, an older installed version, or a different major (older
+# or newer — a major bump is not assumed compatible). This distinguishes a
+# genuinely-missing/incompatible binary from a merely newer-and-compatible one
+# (#119): exact equality rejected both identically.
+version_gte_same_major() {
+    awk -v a="$1" -v b="$2" '
+    BEGIN {
+        split(a, va, ".")
+        split(b, vb, ".")
+        for (i = 1; i <= 3; i++) {
+            va[i] = va[i] + 0
+            vb[i] = vb[i] + 0
+        }
+        if (va[1] != vb[1]) exit 1
+        if (va[2] > vb[2]) exit 0
+        if (va[2] < vb[2]) exit 1
+        if (va[3] >= vb[3]) exit 0
+        exit 1
+    }'
+}
+
 version_matches() {
     local installed
     installed="$("$1" --version 2>/dev/null | awk '{print $2}')" || return 1
-    [ "$installed" = "$REQUIRED_VERSION" ]
+    [ -n "$installed" ] || return 1
+    version_gte_same_major "$installed" "$REQUIRED_VERSION"
 }
 
 # 1. Check PATH
