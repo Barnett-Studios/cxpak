@@ -195,6 +195,49 @@ SH
     [[ "$output" == *"not found"* ]]
 }
 
+@test "rejects a pre-release that is not an exact match" {
+    mkdir -p "${TEST_TMP}/bin"
+    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
+#!/bin/sh
+echo "cxpak 3.2.1-rc.1"
+SH
+    chmod +x "${TEST_TMP}/bin/cxpak"
+
+    # REQUIRED_VERSION is a plain 3.2.1 release, not the "3.2.1-rc.1"
+    # pre-release string, so caret-range matching must not apply here —
+    # only an exact string match would qualify, per Cargo's own
+    # pre-release rule.
+    PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not found"* ]]
+}
+
+@test "rejects a pre-release of a different minor, caret range notwithstanding" {
+    mkdir -p "${TEST_TMP}/bin"
+    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
+#!/bin/sh
+echo "cxpak 3.3.0-rc.1"
+SH
+    chmod +x "${TEST_TMP}/bin/cxpak"
+
+    PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not found"* ]]
+}
+
+@test "rejects a version string missing its patch component" {
+    mkdir -p "${TEST_TMP}/bin"
+    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
+#!/bin/sh
+echo "cxpak 3.3"
+SH
+    chmod +x "${TEST_TMP}/bin/cxpak"
+
+    PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not found"* ]]
+}
+
 @test "prefers PATH binary over cached" {
     mkdir -p "${TEST_TMP}/bin"
     cat > "${TEST_TMP}/bin/cxpak" << 'SH'

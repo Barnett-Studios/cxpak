@@ -3,21 +3,33 @@ set -euo pipefail
 
 REQUIRED_VERSION="3.2.1"
 
-# Accepts an installed version that is >= required within the same major
-# component (Cargo's ^REQUIRED_VERSION semantics) and rejects everything else:
-# a missing binary, an older installed version, or a different major (older
-# or newer — a major bump is not assumed compatible). This distinguishes a
-# genuinely-missing/incompatible binary from a merely newer-and-compatible one
-# (#119): exact equality rejected both identically.
+# Accepts an installed version against REQUIRED_VERSION using Cargo's
+# ^REQUIRED_VERSION semantics and rejects everything else:
+#   - a missing or unparseable version string (fail closed on anything that
+#     is not a clean major.minor.patch[-prerelease])
+#   - a different major version, older or newer (a major bump is not assumed
+#     compatible)
+#   - an older installed version within the same major
+#   - a pre-release (e.g. "3.2.1-rc.1") that isn't an EXACT string match —
+#     pre-releases are never accepted by caret-range comparison alone, per
+#     Cargo's own pre-release rule, even when their numeric major.minor.patch
+#     would otherwise satisfy the range
+# This distinguishes a genuinely-missing/incompatible binary from a merely
+# newer-and-compatible one (#119): exact equality rejected both identically.
 version_gte_same_major() {
     awk -v a="$1" -v b="$2" '
+    function well_formed(v) {
+        return (v ~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$/)
+    }
     BEGIN {
+        if (!well_formed(a) || !well_formed(b)) exit 1
+        if (a == b) exit 0
+        # A pre-release on either side only matches via the exact-equality
+        # check above; caret-range numeric comparison below does not apply.
+        if (a ~ /-/ || b ~ /-/) exit 1
+
         split(a, va, ".")
         split(b, vb, ".")
-        for (i = 1; i <= 3; i++) {
-            va[i] = va[i] + 0
-            vb[i] = vb[i] + 0
-        }
         if (va[1] != vb[1]) exit 1
         if (va[2] > vb[2]) exit 0
         if (va[2] < vb[2]) exit 1

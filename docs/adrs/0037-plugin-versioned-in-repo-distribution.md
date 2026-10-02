@@ -56,5 +56,34 @@ the test:
   its own denominator can only confirm that the files it happened to find agree with each other.
   So a fourth declaration means editing that list — here and in the test.
 
+### Lockstep is enforced at release time, not resolution time (added after #119)
+
+The enforcement above is about the four declarations agreeing with each other **at the tag** —
+`Cargo.toml`, `plugin.json`, `marketplace.json`, and `ensure-cxpak`'s own `REQUIRED_VERSION` all
+naming the same release. It says nothing about what a *running* `ensure-cxpak` should do when the
+binary it finds on a user's machine isn't exactly that release.
+
+Until #119, resolution-time comparison read lockstep as exact string equality, so a cxpak binary
+one patch release newer than `REQUIRED_VERSION` — the ordinary, correct outcome of `brew upgrade`
+run for any reason, cxpak-shaped or not — was rejected identically to a missing binary. That is a
+different failure from #91's: nothing was inconsistent at the tag, the resolver's comparison was
+simply stricter than the guarantee it was checking for.
+
+Resolution time now accepts `^REQUIRED_VERSION` (Cargo's caret semantics: same major,
+`installed >= required`), with pre-releases excluded from caret matching per Cargo's own rule —
+a pre-release is only accepted via exact string equality to `REQUIRED_VERSION`, never by numeric
+range alone. This closes the `brew upgrade` / marketplace-refresh window without weakening
+release-time lockstep: the test asserting the four declarations agree is unchanged, and a release
+still has to get `REQUIRED_VERSION` right.
+
+**Consequence this creates, worth stating explicitly:** because the resolver now accepts a range
+rather than a point, **removing or renaming a CLI flag or MCP tool the plugin depends on is a
+MAJOR-version change**, not a patch or minor one. A caret-compatible plugin bundled with an older
+`REQUIRED_VERSION` pin will happily resolve against a newer-but-still-^-compatible binary and then
+call a flag or tool that release genuinely removed, if that removal shipped under a non-major
+bump. The resolver's job is only to pick a binary within the declared-compatible range; it cannot
+know the plugin's actual flag/tool usage, so that constraint has to be honored at release-planning
+time, not rediscovered at resolution time.
+
 ## Revisit if
 - An independent plugin release cadence becomes necessary (e.g., plugin-only fixes that should not wait on a CLI release).
