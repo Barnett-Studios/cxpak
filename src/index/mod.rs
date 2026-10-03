@@ -180,12 +180,32 @@ fn read_indexable_settled_with(
 /// describe exactly the content just read. See [`settled_read_with`] for
 /// why this is needed; this is the production entry point ([`read_indexable`]
 /// as the read step, no injection).
+///
+/// Retries the settle check once before giving up (review follow-up on
+/// cxpak#36): a single mid-read edit is ordinarily a narrow, transient
+/// window, and for a one-shot build (a CLI command with no later
+/// `incremental_rebuild` on the same `CodebaseIndex`) silently dropping the
+/// file on the first collision would mean this run never indexes it at all
+/// — there is no "next pass" coming to pick it up. If the retry also fails
+/// to settle, the file is being edited continuously (or faster than this
+/// process can keep up with); that case is logged — visible, not silent —
+/// and still skipped rather than caching a potentially-mismatched pair.
 fn read_indexable_settled(
     path: &std::path::Path,
     size_bytes: u64,
     cap_bytes: u64,
 ) -> Option<(String, Option<u64>)> {
-    read_indexable_settled_with(path, size_bytes, cap_bytes, read_indexable)
+    if let Some(result) = read_indexable_settled_with(path, size_bytes, cap_bytes, read_indexable) {
+        return Some(result);
+    }
+    if let Some(result) = read_indexable_settled_with(path, size_bytes, cap_bytes, read_indexable) {
+        return Some(result);
+    }
+    eprintln!(
+        "cxpak: warning: skipping {}: changed while being read, twice in a row (not settling)",
+        path.display()
+    );
+    None
 }
 
 /// Content read from disk together with an mtime proven to describe exactly
@@ -367,6 +387,25 @@ impl CodebaseIndex {
     /// `content` maps `relative_path` -> file contents.  When an entry is present the
     /// provided string is used directly; missing entries fall back to a disk read so
     /// that callers are not required to pre-read every file.
+    ///
+    /// **Explicit TOCTOU exception (review follow-up on cxpak#36):** when an
+    /// entry IS present, this stamps `IndexedFile.mtime_ns` with a stat taken
+    /// *after* receiving the caller's already-read `content` — there is no
+    /// read happening in this function to bracket with a pre/post stat, so
+    /// unlike the disk-read fallback below it is **not** proven to describe
+    /// the same instant as `content`. This is a deliberate, scoped
+    /// exception, not an oversight: every current caller of this branch
+    /// (`commands::onboard`, `commands::graph`, both via
+    /// `cache::parse::parse_with_cache`) builds a one-shot `CodebaseIndex`
+    /// for a single CLI invocation that exits immediately after — nothing
+    /// ever calls `incremental_rebuild` on that instance, and
+    /// `IndexedFile.mtime_ns` has no other reader in the codebase, so the
+    /// unverified stamp is inert for them. A caller that keeps the index
+    /// alive across edits (`commands::serve`'s long-lived watch process) has
+    /// a real TOCTOU exposure here and MUST use
+    /// [`CodebaseIndex::build_with_settled_content`] instead, which proves
+    /// content and mtime came from the same read via the [`SettledRead`]
+    /// type rather than trusting this best-effort stamp.
     pub fn build_with_content(
         files: Vec<ScannedFile>,
         parse_results: HashMap<String, ParseResult>,

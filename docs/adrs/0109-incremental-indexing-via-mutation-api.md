@@ -21,7 +21,7 @@ Introduced in v1.2.0. Re-indexing must avoid re-parsing unchanged files — tree
 
 ## Decision
 
-Use a hybrid incremental strategy: track mtime/size per file, re-parse only changed files through the existing mutation API (`upsert_file` / `remove_file`), call `rebuild_graph` once, then fully recompute graph-derived scores (PageRank, co-changes, health). Implemented on the existing mutation API rather than a new `build()` parameter, which eliminates second-generation memory overlap and stale-content risk. Requires adding mtime to `IndexedFile` (shipped as the `mtime_secs` field).
+Use a hybrid incremental strategy: track mtime/size per file, re-parse only changed files through the existing mutation API (`upsert_file` / `remove_file`), call `rebuild_graph` once, then fully recompute graph-derived scores (PageRank, co-changes, health). Implemented on the existing mutation API rather than a new `build()` parameter, which eliminates second-generation memory overlap and stale-content risk. Requires adding mtime to `IndexedFile` (shipped as the `mtime_secs` field, renamed to `mtime_ns` — nanosecond precision — by cxpak#36).
 
 ## Consequences
 
@@ -31,7 +31,7 @@ Use a hybrid incremental strategy: track mtime/size per file, re-parse only chan
 - Reuses the existing mutation API; no stale content.
 
 ### Negative
-- mtime must be stored per file on `IndexedFile` (as `mtime_secs`), with current mtime read from disk at rebuild time.
+- mtime must be stored per file on `IndexedFile` (as `mtime_ns`), with current mtime read from disk at rebuild time.
 - Graph scores are recomputed in full even for a single-file change.
 
 ### Neutral
