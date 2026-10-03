@@ -31,7 +31,12 @@ const DEBOUNCE_MAX_MS: u64 = 2_000;
 /// bounded channel.  Every component here is also in BUILTIN_IGNORES (or the
 /// `.git` check), so the pre-filter can only ever be a subset of what
 /// classify_changes rejects — enforced by
-/// `test_noise_components_are_rejected_by_classify_changes` below.
+/// `test_noise_components_are_rejected_by_classify_changes` below. Credential
+/// material (CREDENTIAL_IGNORES — `credentials.json`, `id_rsa`, `.env`, …) is
+/// deliberately NOT here: those are filename patterns, not directory
+/// components, and classify_changes checks them by basename, not by path
+/// component — a coarse directory-name pre-filter has nothing to contribute
+/// there. See classify_changes' own doc for that check.
 const NOISE_COMPONENTS: &[&str] = &[
     ".git",
     "target",
@@ -362,8 +367,11 @@ mod tests {
     /// pre-filter MUST also be rejected by the authoritative classify_changes for
     /// a path relative to the repo root. Guards against the pre-filter silently
     /// dropping events classify_changes would keep. No git repo is needed — with
-    /// `Repository::discover` returning None, classify_changes falls back to the
-    /// BUILTIN_IGNORES matcher, which is exactly what we assert parity against.
+    /// `Repository::discover` returning None, classify_changes falls back to its
+    /// BUILTIN_IGNORES matcher (NOISE_COMPONENTS are directory names, so the
+    /// CREDENTIAL_IGNORES matcher classify_changes also consults never enters
+    /// into this particular parity claim), which is exactly what we assert
+    /// parity against.
     #[test]
     fn test_noise_components_are_rejected_by_classify_changes() {
         use crate::commands::watch::classify_changes;

@@ -94,19 +94,26 @@ pub(crate) fn classify_changes(
 
     // The recursive FileWatcher fires on every path under the root, including
     // build/noise trees (target/, .cxpak/, node_modules/, dist/, …), binary
-    // assets, lockfiles, and .git internals. The index is built by Scanner::scan,
-    // which excludes all of these — git's ignore rules PLUS BUILTIN_IGNORES and
-    // an optional .cxpakignore. The watcher must apply the *same* exclusion set,
-    // or committed-but-noise files (Cargo.lock, *.png, dist/, *.min.js,
-    // .DS_Store — none of which git ignores) leak into the live index, drift it
-    // away from a fresh scan, and re-trigger a full rebuild on every build.
+    // assets, lockfiles, credential material, and .git internals. The index is
+    // built by Scanner::scan, which excludes all of these — git's ignore rules
+    // PLUS BUILTIN_IGNORES, CREDENTIAL_IGNORES, and an optional .cxpakignore.
+    // The watcher must apply the *same* exclusion set, or committed-but-noise
+    // files (Cargo.lock, *.png, dist/, *.min.js, .DS_Store — none of which git
+    // ignores) leak into the live index and drift it away from a fresh scan —
+    // and a live credentials.json/.env/id_rsa created or modified while
+    // `cxpak watch` is running gets incrementally indexed exactly as it would
+    // ordinarily be scanned out (cxpak#78 round 3: this file kept its own
+    // BUILTIN_IGNORES-only copy and never consulted CREDENTIAL_IGNORES at all).
     //
     // git2 covers .gitignore / core.excludesFile / .git/info/exclude (incl.
     // nested dirs); the ignore-crate matcher covers BUILTIN_IGNORES +
-    // .cxpakignore, built exactly as Scanner::scan builds them. base_path is
-    // always a repo root (Scanner::new requires <root>/.git before any watcher
-    // starts), so `discover` resolves it — and `discover`, not `open`, so a
-    // non-root root can't silently fail-open to no filtering.
+    // .cxpakignore, built exactly as Scanner::scan builds them.
+    // `scanner::build_credential_matcher` + `is_credential_match` are the same
+    // functions Scanner::scan itself calls, so this file cannot drift from the
+    // scanner's own decision on what counts as credential material. base_path
+    // is always a repo root (Scanner::new requires <root>/.git before any
+    // watcher starts), so `discover` resolves it — and `discover`, not `open`,
+    // so a non-root root can't silently fail-open to no filtering.
     let repo = git2::Repository::discover(base_path).ok();
     let noise = {
         let mut builder = ignore::gitignore::GitignoreBuilder::new(base_path);
@@ -119,6 +126,7 @@ pub(crate) fn classify_changes(
         }
         builder.build().ok()
     };
+    let credential_matcher = crate::scanner::build_credential_matcher(base_path).ok();
     let is_ignored = |abs: &Path| -> bool {
         let Ok(rel) = abs.strip_prefix(base_path) else {
             return false;
@@ -130,6 +138,12 @@ pub(crate) fn classify_changes(
         // BUILTIN_IGNORES / .cxpakignore — Scanner's non-git exclusions.
         if let Some(gi) = &noise {
             if gi.matched_path_or_any_parents(rel, false).is_ignore() {
+                return true;
+            }
+        }
+        // CREDENTIAL_IGNORES, basename-only, identical to Scanner::scan's own check.
+        if let Some(cm) = &credential_matcher {
+            if crate::scanner::is_credential_match(cm, abs) {
                 return true;
             }
         }
@@ -635,6 +649,48 @@ mod case_preservation_tests {
             .collect();
         v.sort();
         v
+    }
+
+    // cxpak#78 round 3: classify_changes built its ignore matcher from BUILTIN_IGNORES
+    // only, never consulting CREDENTIAL_IGNORES — so with `cxpak watch`/the daemon
+    // running, a live credentials.json/id_rsa/.env/*.pem/terraform.tfstate created or
+    // modified got incrementally indexed, exactly what a fresh `Scanner::scan` excludes.
+    // No files need exist on disk: is_ignored's git2/gitignore checks operate on the path
+    // string alone.
+    #[test]
+    fn classify_changes_ignores_credential_files() {
+        let base = PathBuf::from("/repo");
+        for name in [
+            "credentials.json",
+            "id_rsa",
+            ".env",
+            "server.pem",
+            "terraform.tfstate",
+        ] {
+            let (modified, _removed) =
+                classify_changes(&[FileChange::Modified(base.join(name))], &base);
+            assert!(
+                modified.is_empty(),
+                "{name} must be ignored by classify_changes (CREDENTIAL_IGNORES), not \
+                 incrementally indexed: {modified:?}"
+            );
+        }
+    }
+
+    // The control, same shape as the scanner's own directory-pruning and glob-collision
+    // fixes: real source under a credential-named directory, and a source file sharing the
+    // id_rsa_* prefix, must both still be picked up by the watcher.
+    #[test]
+    fn classify_changes_does_not_ignore_real_source_colliding_with_a_credential_pattern() {
+        let base = PathBuf::from("/repo");
+        for path in ["src/credentials/mod.rs", "src/id_rsa_helper.rs"] {
+            let (modified, _removed) =
+                classify_changes(&[FileChange::Modified(base.join(path))], &base);
+            assert!(
+                modified.contains(path),
+                "{path} must still be indexed by classify_changes: {modified:?}"
+            );
+        }
     }
 
     #[test]

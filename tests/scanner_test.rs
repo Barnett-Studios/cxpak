@@ -267,6 +267,29 @@ fn credential_files_are_never_scanned() {
         // anyone defeats by putting the key in `config/`.
         "config/deploy.key",
         "deploy/credentials.json",
+        // cxpak#78: the completeness gaps against this list's own stated rule, measured
+        // independently against post-#67 main (and `deploy_key` the reviewer flagged on
+        // the same ticket). `*.asc`/`*.der` deliberately excluded — the issue itself
+        // flags both as more often public (detached signatures, public certs) than
+        // secret, so the coverage win is not worth the false-exclusion cost.
+        "credentials",
+        "id_rsa_work",
+        "id_ed25519_github",
+        "deploy_key",
+        "AuthKey_ABC123.p8",
+        "deploy.ppk",
+        "secring.gpg",
+        "kubeconfig",
+        "service-account.json",
+        "terraform.tfstate",
+        "terraform.tfstate.backup",
+        ".git-credentials",
+        ".pgpass",
+        ".my.cnf",
+        ".htpasswd",
+        ".dockercfg",
+        ".s3cfg",
+        ".boto",
     ];
     let tmp = repo_with(&secrets);
     let scanned = scanned_paths(tmp.path());
@@ -306,3 +329,64 @@ fn ordinary_source_that_merely_mentions_secrets_is_still_scanned() {
         "real source was excluded by the credential denylist: {missing:?}"
     );
 }
+
+// cxpak#78 round 2: a bare credential name also matches a DIRECTORY of the same name under
+// `ignore::overrides::Override`'s gitignore-style semantics, pruning the whole subtree — the
+// same silent-exclusion defect the exact-name design was chosen to avoid, reached through a
+// different door. `id_rsa_*`'s trailing wildcard has the sibling problem one level down: gitignore
+// glob has no "stop before a dot" token, so it also matches a real source file sharing the prefix.
+#[test]
+fn a_directory_named_credentials_does_not_prune_its_contents() {
+    let tmp = repo_with(&["src/credentials/mod.rs"]);
+    let scanned = scanned_paths(tmp.path());
+    assert!(
+        scanned.iter().any(|p| p == "src/credentials/mod.rs"),
+        "a directory named 'credentials' must not prune real source beneath it: {scanned:?}"
+    );
+}
+
+#[test]
+fn a_directory_named_kubeconfig_does_not_prune_its_contents() {
+    let tmp = repo_with(&["pkg/kubeconfig/loader.go"]);
+    let scanned = scanned_paths(tmp.path());
+    assert!(
+        scanned.iter().any(|p| p == "pkg/kubeconfig/loader.go"),
+        "a directory named 'kubeconfig' must not prune real source beneath it: {scanned:?}"
+    );
+}
+
+#[test]
+fn id_rsa_suffix_glob_does_not_exclude_a_same_prefixed_source_file() {
+    let tmp = repo_with(&["src/id_rsa_helper.rs"]);
+    let scanned = scanned_paths(tmp.path());
+    assert!(
+        scanned.iter().any(|p| p == "src/id_rsa_helper.rs"),
+        "id_rsa_* must not swallow a real source file sharing its prefix: {scanned:?}"
+    );
+}
+
+// The control for the glob-collision fix: the extensionless key file id_rsa_* exists to
+// catch must still be excluded — the fix is a language exemption, not a removed pattern.
+#[test]
+fn id_rsa_suffix_glob_still_excludes_the_extensionless_key_file() {
+    let tmp = repo_with(&["id_rsa_work", "src/id_rsa_helper.rs"]);
+    let scanned = scanned_paths(tmp.path());
+    assert!(
+        !scanned.iter().any(|p| p == "id_rsa_work"),
+        "the extensionless suffixed key must still be excluded: {scanned:?}"
+    );
+    assert!(
+        scanned.iter().any(|p| p == "src/id_rsa_helper.rs"),
+        "and the real source file must still be kept: {scanned:?}"
+    );
+}
+
+// Watcher parity (cxpak#78 round 3): classify_changes (src/commands/watch.rs) must apply
+// the identical credential-exclusion rule the initial scan does. That test lives next to
+// classify_changes itself (`classify_changes_ignores_credential_files` /
+// `classify_changes_does_not_ignore_real_source_colliding_with_a_credential_pattern` in
+// src/commands/watch.rs's own test module) — classify_changes is `pub(crate)`, not
+// reachable from this external integration test, and a same-crate unit test is also where
+// the earlier version of this test's bug lived: it scanned the same tree twice and called
+// that "parity", which is true of any two calls to the same function and would stay green
+// even if the watcher's ignore rule were deleted outright.
