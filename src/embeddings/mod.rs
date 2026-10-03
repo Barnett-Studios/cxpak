@@ -4,7 +4,7 @@ pub mod local;
 pub mod remote;
 
 pub use config::EmbeddingConfig;
-pub use index::{EmbeddingIndex, ModelFingerprint};
+pub use index::EmbeddingIndex;
 
 /// Core trait that every embedding backend must satisfy.
 pub trait EmbeddingProvider: Send + Sync {

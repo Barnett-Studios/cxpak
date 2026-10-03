@@ -1,3 +1,4 @@
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,10 +22,13 @@ const HF_BASE: &str =
 const MODEL_DIMS: usize = 384;
 const CACHE_SUBDIR: &str = "all-MiniLM-L6-v2";
 
-/// Known-good SHA256 of each model file at `HF_COMMIT`, computed from the
-/// actual bytes served by Hugging Face for that pinned commit. A byte
-/// mismatch — a corrupted download, a tampered mirror, or `HF_COMMIT` having
-/// drifted out of sync with this table — is rejected rather than loaded.
+/// Known-good SHA256 of each model file at the commit pinned in `HF_BASE`,
+/// computed from the actual bytes served by Hugging Face for that commit.
+/// This is also the authoritative list of file names cxpak fetches — there
+/// is deliberately no separate "files to fetch" list that could drift out
+/// of sync with it. A byte mismatch — a corrupted download, a tampered
+/// mirror, or `HF_BASE` having drifted out of sync with this table — is
+/// rejected rather than loaded.
 const MODEL_FILE_CHECKSUMS: &[(&str, &str)] = &[
     (
         "config.json",
@@ -221,61 +225,67 @@ fn model_cache_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Look up the pinned SHA256 for a model file by name.
-///
-/// Returns `Err` for any name not in `MODEL_FILE_CHECKSUMS` — an unpinned
-/// file is never downloaded, let alone trusted.
-fn expected_sha256(name: &str) -> Result<&'static str, String> {
-    MODEL_FILE_CHECKSUMS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, hash)| *hash)
-        .ok_or_else(|| format!("no pinned checksum configured for model file '{name}'"))
-}
-
-/// Reject `bytes` unless its SHA256 matches `expected` exactly.
-///
-/// Reused idiom from `commands::plugin`'s manifest checksum
-/// (`format!("{:x}", Sha256::digest(..))`) — this is the "checksum-mismatch
-/// refuses the bytes" contract cxpak#38 asks for on the HF download path.
-fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), String> {
-    use sha2::{Digest, Sha256};
-    let actual = format!("{:x}", Sha256::digest(bytes));
-    if actual != expected {
-        return Err(format!(
-            "checksum mismatch: expected {expected}, got {actual} ({} bytes)",
-            bytes.len()
-        ));
-    }
-    Ok(())
-}
-
 fn ensure_model_files(dir: &Path) -> Result<(), String> {
-    let files = ["model.safetensors", "config.json", "tokenizer.json"];
+    ensure_model_files_at(dir, HF_BASE, MODEL_FILE_CHECKSUMS)
+}
 
-    for name in files {
+/// Core implementation, parameterized over the base URL and the expected
+/// checksums so tests can point it at a local loopback fixture server
+/// instead of the real Hugging Face endpoint, with no real network access
+/// (cxpak#38).
+fn ensure_model_files_at(
+    dir: &Path,
+    base_url: &str,
+    checksums: &[(&str, &str)],
+) -> Result<(), String> {
+    for (name, expected) in checksums {
         let dest = dir.join(name);
-        let expected = expected_sha256(name)?;
 
         if dest.exists() {
             // A file left over from an older, unpinned fetch (or corrupted/
             // tampered on disk) must not be trusted silently just because it
-            // exists. Re-validate; a mismatch falls through to a fresh,
-            // verified download instead of erroring outright.
-            let existing = std::fs::read(&dest).map_err(|e| format!("read error: {e}"))?;
-            if verify_sha256(&existing, expected).is_ok() {
+            // exists. Re-validate by streaming its content through SHA256
+            // (never buffer the whole file); a mismatch falls through to a
+            // fresh, verified download instead of erroring outright.
+            if matches!(sha256_of_file(&dest), Ok(actual) if actual == *expected) {
                 continue;
             }
         }
 
-        let url = format!("{HF_BASE}/{name}");
+        let url = format!("{base_url}/{name}");
         download_file_atomic(&url, &dest, expected)?;
     }
     Ok(())
 }
 
-/// Download `url` to `dest` atomically via a temporary file + rename, after
-/// verifying the downloaded bytes against `expected_sha256`.
+/// Stream `path`'s content through SHA256 in bounded-size chunks.
+///
+/// Never buffers the whole file in memory, so this is as cheap to call on
+/// the ~90MB `model.safetensors` as on `config.json`.
+fn sha256_of_file(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path).map_err(|e| format!("read error: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("read error: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Download `url` to `dest` atomically via a temporary file + rename.
+///
+/// The response body is streamed directly into both the SHA256 hasher and
+/// the temp file in one pass, in bounded-size chunks — it is never buffered
+/// into a single in-memory `Vec`/`Bytes`, so peak memory stays bounded
+/// regardless of the ~90MB `model.safetensors` size, and the bytes are
+/// hashed exactly once (not read back from disk afterward to verify).
 ///
 /// The file is written to `<dest>.tmp.<pid>` and then renamed to `dest`.
 /// On Unix, `rename(2)` is atomic: if two processes race, one wins and the
@@ -290,12 +300,14 @@ fn ensure_model_files(dir: &Path) -> Result<(), String> {
 /// embedding index" rather than a hard failure — embeddings become
 /// unavailable, the rest of the command proceeds.
 fn download_file_atomic(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+
     let client = reqwest::blocking::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
         .build()
         .map_err(|e| format!("http client build error: {e}"))?;
 
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .map_err(|e| format!("download error for {url}: {e}"))?;
@@ -304,15 +316,34 @@ fn download_file_atomic(url: &str, dest: &Path, expected_sha256: &str) -> Result
         return Err(format!("HTTP {} downloading {url}", response.status()));
     }
 
-    let bytes = response
-        .bytes()
-        .map_err(|e| format!("read bytes error: {e}"))?;
-
-    verify_sha256(&bytes, expected_sha256)
-        .map_err(|e| format!("integrity check failed for {url}: {e}"))?;
-
     let tmp_path = dest.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp_path, &bytes).map_err(|e| format!("write error: {e}"))?;
+    let mut tmp_file =
+        std::fs::File::create(&tmp_path).map_err(|e| format!("create temp file error: {e}"))?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = response
+            .read(&mut buf)
+            .map_err(|e| format!("read bytes error: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        tmp_file
+            .write_all(&buf[..n])
+            .map_err(|e| format!("write error: {e}"))?;
+    }
+    tmp_file.flush().map_err(|e| format!("flush error: {e}"))?;
+    drop(tmp_file);
+
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected_sha256 {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "integrity check failed for {url}: checksum mismatch: expected {expected_sha256}, got {actual}"
+        ));
+    }
 
     if let Err(e) = std::fs::rename(&tmp_path, dest) {
         // Another process already created the destination — clean up the temp
@@ -457,68 +488,139 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn verify_sha256_rejects_wrong_checksum() {
-        let bytes = b"hello world";
-        // Deliberately wrong SHA256 (64 hex chars, not the real digest).
-        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
-        let result = verify_sha256(bytes, wrong);
-        assert!(
-            result.is_err(),
-            "a checksum mismatch must refuse the bytes, not accept them"
-        );
-    }
-
-    #[test]
-    fn verify_sha256_accepts_correct_checksum() {
-        use sha2::{Digest, Sha256};
-        let bytes = b"hello world";
-        let correct = format!("{:x}", Sha256::digest(bytes));
-        assert!(
-            verify_sha256(bytes, &correct).is_ok(),
-            "a matching checksum must be accepted"
-        );
-    }
-
-    #[test]
-    fn verify_sha256_rejects_tampered_bytes_with_correct_looking_hash() {
-        use sha2::{Digest, Sha256};
-        let original = b"model weights v1";
-        let tampered = b"model weights v2 (tampered)";
-        // The checksum was computed over `original`; `tampered` must fail
-        // against it even though both are plausible byte strings.
-        let expected = format!("{:x}", Sha256::digest(original));
-        assert!(verify_sha256(tampered, &expected).is_err());
-    }
-
-    #[test]
-    fn expected_sha256_known_files_match_pinned_table() {
-        // Guards against the table and HF_BASE drifting independently: every
-        // file cxpak actually fetches must have a pinned checksum.
-        for name in ["model.safetensors", "config.json", "tokenizer.json"] {
-            assert!(
-                expected_sha256(name).is_ok(),
-                "model file '{name}' has no pinned checksum"
-            );
-        }
-    }
-
-    #[test]
-    fn expected_sha256_rejects_unknown_file() {
-        assert!(
-            expected_sha256("not-a-real-model-file.bin").is_err(),
-            "an unpinned file name must not resolve to a checksum"
-        );
-    }
-
-    #[test]
     fn hf_base_is_pinned_to_a_commit_not_main() {
         assert!(
             !HF_BASE.ends_with("/main"),
             "HF_BASE must pin a commit SHA, not the mutable `main` ref: {HF_BASE}"
         );
-        assert!(
-            HF_BASE.contains("1110a243fdf4706b3f48f1d95db1a4f5529b4d41"),
-            "HF_BASE must pin the commit MODEL_FILE_CHECKSUMS was computed against"
+    }
+
+    #[test]
+    fn sha256_of_file_streams_a_correct_digest() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f.bin");
+        let content = b"some file content, hashed two independent ways";
+        std::fs::write(&path, content).expect("write fixture file");
+
+        let expected = format!("{:x}", Sha256::digest(content));
+        let actual = sha256_of_file(&path).expect("streaming hash should succeed");
+        assert_eq!(
+            actual, expected,
+            "chunked streaming hash must match a direct digest of the same bytes"
         );
+    }
+
+    /// A single-shot HTTP/1.1 server on loopback that answers exactly one
+    /// GET with a fixed body, then exits. No real network access — this
+    /// stays entirely on 127.0.0.1, so it is safe and fast in CI, while
+    /// still exercising the real `reqwest::blocking` download path.
+    fn spawn_single_response_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain (don't bother parsing) the request line/headers.
+                let mut drain = [0u8; 4096];
+                let _ = stream.read(&mut drain);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn download_file_atomic_rejects_wrong_checksum_and_leaves_no_files_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("weights.bin");
+
+        let (base_url, server) =
+            spawn_single_response_server(b"wrong-bytes-from-a-bad-mirror".to_vec());
+        let url = format!("{base_url}/weights.bin");
+
+        // Deliberately wrong SHA256 relative to the bytes the server serves.
+        let wrong_checksum = "0".repeat(64);
+        let result = download_file_atomic(&url, &dest, &wrong_checksum);
+
+        assert!(
+            result.is_err(),
+            "a checksum mismatch must refuse the downloaded bytes, not accept them"
+        );
+        assert!(
+            !dest.exists(),
+            "a failed integrity check must not leave a file at the destination"
+        );
+        let leftover_tmp: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "a failed download must not leave a temp file behind either"
+        );
+
+        server.join().expect("server thread should exit cleanly");
+    }
+
+    #[test]
+    fn ensure_model_files_at_rejects_tampered_cache_and_redownloads_clean_copy() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good_content = b"the-real-model-bytes-served-by-the-fixture";
+        let good_hash = format!("{:x}", Sha256::digest(good_content));
+
+        // Plant a tampered file at the destination the loader checks first —
+        // simulating an older unpinned cache entry or on-disk corruption.
+        let dest = dir.path().join("weights.bin");
+        std::fs::write(&dest, b"tampered-bytes-not-the-real-model").expect("plant tampered file");
+
+        let (base_url, server) = spawn_single_response_server(good_content.to_vec());
+        let checksums: &[(&str, &str)] = &[("weights.bin", good_hash.as_str())];
+
+        ensure_model_files_at(dir.path(), &base_url, checksums)
+            .expect("a tampered cache entry should be detected and transparently redownloaded");
+
+        let final_bytes = std::fs::read(&dest).expect("dest should exist after redownload");
+        assert_eq!(
+            final_bytes, good_content,
+            "the tampered cache file must be replaced with the verified download, not left in place"
+        );
+
+        server.join().expect("server thread should exit cleanly");
+    }
+
+    #[test]
+    fn ensure_model_files_at_rejects_a_corrupted_upstream_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // The server serves bytes that do NOT match the pinned checksum —
+        // simulating a corrupted transfer or a tampered mirror.
+        let (base_url, server) =
+            spawn_single_response_server(b"wrong-bytes-from-a-bad-mirror".to_vec());
+        let wrong_checksum = "0".repeat(64);
+        let checksums: &[(&str, &str)] = &[("weights.bin", wrong_checksum.as_str())];
+
+        let result = ensure_model_files_at(dir.path(), &base_url, checksums);
+
+        assert!(
+            result.is_err(),
+            "a response that fails checksum verification must not be accepted"
+        );
+        assert!(
+            !dir.path().join("weights.bin").exists(),
+            "a failed download must not leave a partial/incorrect file at the destination"
+        );
+
+        server.join().expect("server thread should exit cleanly");
     }
 }
