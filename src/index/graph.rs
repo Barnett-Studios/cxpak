@@ -74,18 +74,31 @@ fn is_module_root_file(path: &str) -> bool {
 ///     not `src/`).  Each additional `super::` walks up one more level.
 ///   * Progressive prefix shortening is applied to the remaining path after
 ///     the `super::` segments are resolved, same as for `crate::`.
+/// - the crate's own name (`crate_name`, e.g. `use cxpak::commands::serve::X`
+///   from an integration test under `tests/`, which cannot use `crate::` —
+///   only the crate's own name is accepted there) resolves identically to
+///   `crate::X`.
 /// - anything else is treated as an external crate (returns `None`)
 fn resolve_rust_import(
     source_path: &str,
     import_source: &str,
     all_paths: &HashSet<&str>,
+    crate_name: Option<&str>,
 ) -> Option<String> {
     let source_dir = parent_dir(source_path);
+
+    // The crate's own name used as an import prefix (only form Rust accepts
+    // from an integration test in `tests/`) resolves exactly like `crate::`.
+    let own_crate_rest = crate_name.and_then(|name| {
+        import_source
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix("::"))
+    });
 
     // `crate::X::Y::Z` — try longest path first, strip segments on failure.
     // This allows `crate::intelligence::CallGraph` to fall back to
     // `src/intelligence/mod.rs` when `CallGraph` is a re-exported type.
-    if let Some(rest) = import_source.strip_prefix("crate::") {
+    if let Some(rest) = import_source.strip_prefix("crate::").or(own_crate_rest) {
         let parts: Vec<&str> = rest.split("::").collect();
         for take in (1..=parts.len()).rev() {
             let base = parts[..take].join("/");
@@ -466,17 +479,22 @@ fn resolve_legacy(import_source: &str, all_paths: &HashSet<&str>) -> Option<Stri
 }
 
 /// Dispatch to the appropriate per-language resolver based on the source file's extension.
+///
+/// `crate_name` is the analysed project's own crate name (from its
+/// `Cargo.toml`, see [`detect_crate_name`]) — only consulted by the Rust
+/// resolver, so it can be `None` for non-Rust sources without effect.
 fn resolve_import(
     source_path: &str,
     import_source: &str,
     all_paths: &HashSet<&str>,
+    crate_name: Option<&str>,
 ) -> Option<String> {
     if import_source.is_empty() {
         return None;
     }
     let ext = source_path.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
     match ext {
-        "rs" => resolve_rust_import(source_path, import_source, all_paths),
+        "rs" => resolve_rust_import(source_path, import_source, all_paths, crate_name),
         "py" | "pyi" => resolve_python_import(source_path, import_source, all_paths),
         "ts" | "tsx" | "js" | "jsx" | "mjs" => {
             resolve_ts_import(source_path, import_source, all_paths)
@@ -518,11 +536,14 @@ fn resolve_import(
 pub(crate) fn edges_for_file(
     file: &Arc<IndexedFile>,
     all_paths: &HashSet<&str>,
+    crate_name: Option<&str>,
 ) -> Vec<(String, EdgeType)> {
     let mut out = Vec::new();
     if let Some(pr) = &file.parse_result {
         for import in &pr.imports {
-            if let Some(target) = resolve_import(&file.relative_path, &import.source, all_paths) {
+            if let Some(target) =
+                resolve_import(&file.relative_path, &import.source, all_paths, crate_name)
+            {
                 out.push((target, EdgeType::Import));
             }
         }
@@ -530,16 +551,51 @@ pub(crate) fn edges_for_file(
     out
 }
 
+/// Read the analysed project's own crate name out of its root `Cargo.toml`
+/// (the `name` key under `[package]`), if one is present among `files`.
+///
+/// Used so a Rust integration test's `use <crate_name>::...` — the only
+/// form Rust accepts from a `tests/` integration test, which cannot use
+/// `crate::` — resolves to the same file `crate::...` would (cxpak#84).
+/// A hand-rolled line scan rather than a full TOML parse: the `toml` crate
+/// is gated behind the `bench` feature, not available on this path, and a
+/// `[package] name = "..."` line is simple enough not to need one.
+pub(crate) fn detect_crate_name(files: &[Arc<IndexedFile>]) -> Option<String> {
+    let cargo_toml = files.iter().find(|f| f.relative_path == "Cargo.toml")?;
+    let mut in_package_section = false;
+    for line in cargo_toml.content.lines() {
+        let trimmed = line.trim();
+        if let Some(stripped) = trimmed.strip_prefix('[') {
+            in_package_section = stripped.trim_end_matches(']') == "package";
+            continue;
+        }
+        if !in_package_section {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("name") {
+            let rest = rest.trim_start();
+            if let Some(value) = rest.strip_prefix('=') {
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn build_dependency_graph(
     files: &[Arc<IndexedFile>],
     schema: Option<&crate::schema::SchemaIndex>,
 ) -> DependencyGraph {
     let all_paths: HashSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+    let crate_name = detect_crate_name(files);
 
     let mut graph = DependencyGraph::new();
 
     for file in files {
-        for (target, edge_type) in edges_for_file(file, &all_paths) {
+        for (target, edge_type) in edges_for_file(file, &all_paths, crate_name.as_deref()) {
             graph.add_edge(&file.relative_path, &target, edge_type);
         }
     }
@@ -616,11 +672,11 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(
-            resolve_rust_import("src/main.rs", "crate::foo", &all),
+            resolve_rust_import("src/main.rs", "crate::foo", &all, None),
             Some("src/foo.rs".to_string())
         );
         assert_eq!(
-            resolve_rust_import("src/main.rs", "crate::bar::baz", &all),
+            resolve_rust_import("src/main.rs", "crate::bar::baz", &all, None),
             Some("src/bar/baz.rs".to_string())
         );
     }
@@ -629,7 +685,7 @@ mod tests {
     fn test_resolve_rust_crate_mod_rs_fallback() {
         let all: HashSet<&str> = ["src/foo/mod.rs"].iter().copied().collect();
         assert_eq!(
-            resolve_rust_import("src/main.rs", "crate::foo", &all),
+            resolve_rust_import("src/main.rs", "crate::foo", &all, None),
             Some("src/foo/mod.rs".to_string())
         );
     }
@@ -646,8 +702,13 @@ mod tests {
         .copied()
         .collect();
         assert!(
-            resolve_rust_import("src/intelligence/data_flow.rs", "self::call_graph", &all)
-                .is_none(),
+            resolve_rust_import(
+                "src/intelligence/data_flow.rs",
+                "self::call_graph",
+                &all,
+                None
+            )
+            .is_none(),
             "self:: must return None regardless of what files exist"
         );
     }
@@ -661,7 +722,7 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(
-            resolve_rust_import("src/visual/render.rs", "super::layout", &all),
+            resolve_rust_import("src/visual/render.rs", "super::layout", &all, None),
             Some("src/visual/layout.rs".to_string())
         );
     }
@@ -674,7 +735,7 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(
-            resolve_rust_import("src/visual/mod.rs", "super::foo", &all),
+            resolve_rust_import("src/visual/mod.rs", "super::foo", &all, None),
             Some("src/foo.rs".to_string())
         );
     }
@@ -684,7 +745,7 @@ mod tests {
         // lib.rs is a module root — super:: walks up.
         let all: HashSet<&str> = ["foo.rs", "src/lib.rs"].iter().copied().collect();
         assert_eq!(
-            resolve_rust_import("src/lib.rs", "super::foo", &all),
+            resolve_rust_import("src/lib.rs", "super::foo", &all, None),
             Some("foo.rs".to_string())
         );
     }
@@ -700,7 +761,7 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(
-            resolve_rust_import("src/a/b/file.rs", "super::super::target", &all),
+            resolve_rust_import("src/a/b/file.rs", "super::super::target", &all, None),
             Some("src/a/target.rs".to_string())
         );
     }
@@ -714,7 +775,12 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(
-            resolve_rust_import("src/intelligence/a/b/mod.rs", "super::super::target", &all),
+            resolve_rust_import(
+                "src/intelligence/a/b/mod.rs",
+                "super::super::target",
+                &all,
+                None
+            ),
             Some("src/intelligence/target.rs".to_string())
         );
     }
@@ -727,7 +793,7 @@ mod tests {
         // fallback) — must fall through to the final `None`.
         let all: HashSet<&str> = ["src/other.rs"].iter().copied().collect();
         assert_eq!(
-            resolve_rust_import("src/sub/mod.rs", "super::totally_missing", &all),
+            resolve_rust_import("src/sub/mod.rs", "super::totally_missing", &all, None),
             None
         );
     }
@@ -736,17 +802,112 @@ mod tests {
     fn test_resolve_rust_external_returns_none() {
         let all: HashSet<&str> = ["src/main.rs"].iter().copied().collect();
         assert_eq!(
-            resolve_rust_import("src/main.rs", "std::collections", &all),
+            resolve_rust_import("src/main.rs", "std::collections", &all, None),
             None
         );
         assert_eq!(
-            resolve_rust_import("src/main.rs", "serde::Serialize", &all),
+            resolve_rust_import("src/main.rs", "serde::Serialize", &all, None),
             None
         );
         assert_eq!(
-            resolve_rust_import("src/main.rs", "tokio::sync::mpsc", &all),
+            resolve_rust_import("src/main.rs", "tokio::sync::mpsc", &all, None),
             None
         );
+    }
+
+    // ── own-crate-name resolution (cxpak#84 cause 2) ────────────────────────
+    //
+    // From a `tests/` integration test, `use crate::...` is a compile error —
+    // the only form Rust accepts is the crate's own name
+    // (`use cxpak::commands::serve::build_index;`). `resolve_rust_import`
+    // must treat that prefix exactly like `crate::` when the caller supplies
+    // the detected crate name, and must NOT treat it as a known Rust prefix
+    // (hence no accidental resolution) when no crate name is available.
+
+    #[test]
+    fn test_resolve_rust_own_crate_name_prefix_resolves_like_crate() {
+        let all: HashSet<&str> = ["src/commands/serve.rs"].iter().copied().collect();
+        assert_eq!(
+            resolve_rust_import(
+                "tests/serve_test.rs",
+                "cxpak::commands::serve",
+                &all,
+                Some("cxpak")
+            ),
+            Some("src/commands/serve.rs".to_string()),
+            "the crate's own name must resolve identically to `crate::`"
+        );
+    }
+
+    #[test]
+    fn test_resolve_rust_own_crate_name_without_detected_name_is_external() {
+        // Without a detected crate name, `cxpak::...` falls through to the
+        // legacy heuristic exactly as any other unknown prefix would — this
+        // is the pre-fix behaviour and documents why cause 2 existed.
+        let all: HashSet<&str> = ["src/commands/serve.rs"].iter().copied().collect();
+        assert_eq!(
+            resolve_rust_import("tests/serve_test.rs", "cxpak::commands::serve", &all, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_rust_own_crate_name_does_not_shadow_real_external_crate() {
+        // A genuinely external crate whose name happens to equal the local
+        // crate's own name cannot occur in practice (cargo forbids a crate
+        // depending on a dependency with its own package name), but the
+        // resolver must still require an exact match before treating the
+        // prefix as `crate::` — a different crate name must not match.
+        let all: HashSet<&str> = ["src/commands/serve.rs"].iter().copied().collect();
+        assert_eq!(
+            resolve_rust_import(
+                "tests/serve_test.rs",
+                "serde::Serialize",
+                &all,
+                Some("cxpak")
+            ),
+            None
+        );
+    }
+
+    // ── detect_crate_name (cxpak#84 cause 2) ────────────────────────────────
+
+    #[test]
+    fn test_detect_crate_name_from_cargo_toml() {
+        let cargo_toml = Arc::new(IndexedFile {
+            relative_path: "Cargo.toml".to_string(),
+            language: Some("toml".to_string()),
+            size_bytes: 0,
+            token_count: 0,
+            parse_result: None,
+            content: "[package]\nname = \"cxpak\"\nversion = \"3.3.1\"\nedition = \"2021\"\n"
+                .to_string(),
+            mtime_ns: None,
+        });
+        assert_eq!(detect_crate_name(&[cargo_toml]), Some("cxpak".to_string()));
+    }
+
+    #[test]
+    fn test_detect_crate_name_ignores_name_outside_package_section() {
+        // A `name = "..."` line in a different table (e.g. `[[bin]]`) must
+        // not be mistaken for the package name.
+        let cargo_toml = Arc::new(IndexedFile {
+            relative_path: "Cargo.toml".to_string(),
+            language: Some("toml".to_string()),
+            size_bytes: 0,
+            token_count: 0,
+            parse_result: None,
+            content: "[[bin]]\nname = \"not-the-crate\"\n\n[package]\nname = \"cxpak\"\n"
+                .to_string(),
+            mtime_ns: None,
+        });
+        assert_eq!(detect_crate_name(&[cargo_toml]), Some("cxpak".to_string()));
+    }
+
+    #[test]
+    fn test_detect_crate_name_missing_cargo_toml_returns_none() {
+        let files: Vec<Arc<IndexedFile>> = vec![];
+        assert_eq!(detect_crate_name(&files), None);
     }
 
     // ─── Python resolver ──────────────────────────────────────────────────────
@@ -956,7 +1117,7 @@ mod tests {
     fn test_resolve_import_dispatches_rust() {
         let all: HashSet<&str> = ["src/scanner.rs"].iter().copied().collect();
         assert_eq!(
-            resolve_import("src/main.rs", "crate::scanner", &all),
+            resolve_import("src/main.rs", "crate::scanner", &all, None),
             Some("src/scanner.rs".to_string())
         );
     }
@@ -965,7 +1126,7 @@ mod tests {
     fn test_resolve_import_dispatches_ts() {
         let all: HashSet<&str> = ["src/utils.ts"].iter().copied().collect();
         assert_eq!(
-            resolve_import("src/index.ts", "./utils", &all),
+            resolve_import("src/index.ts", "./utils", &all, None),
             Some("src/utils.ts".to_string())
         );
     }
@@ -974,7 +1135,7 @@ mod tests {
     fn test_resolve_import_dispatches_python() {
         let all: HashSet<&str> = ["app/models.py"].iter().copied().collect();
         assert_eq!(
-            resolve_import("app/views.py", ".models", &all),
+            resolve_import("app/views.py", ".models", &all, None),
             Some("app/models.py".to_string())
         );
     }
@@ -985,7 +1146,7 @@ mod tests {
         // through to the catch-all legacy resolver.
         let all: HashSet<&str> = ["foo.go"].iter().copied().collect();
         assert_eq!(
-            resolve_import("main.go", "foo", &all),
+            resolve_import("main.go", "foo", &all, None),
             Some("foo.go".to_string())
         );
     }
@@ -993,7 +1154,7 @@ mod tests {
     #[test]
     fn test_resolve_import_empty_source_returns_none() {
         let all: HashSet<&str> = ["src/foo.rs"].iter().copied().collect();
-        assert_eq!(resolve_import("src/main.rs", "", &all), None);
+        assert_eq!(resolve_import("src/main.rs", "", &all, None), None);
     }
 
     // ─── build_dependency_graph integration ───────────────────────────────────
@@ -1090,6 +1251,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_build_dependency_graph_rust_integration_test_resolves_via_own_crate_name() {
+        // End-to-end: a Cargo.toml in the file universe lets `detect_crate_name`
+        // find the crate's own name, which lets a `tests/` integration test's
+        // `use <crate_name>::...` resolve to the module it imports — the only
+        // import form Rust accepts there (cxpak#84 cause 2).
+        let cargo_toml = Arc::new(IndexedFile {
+            relative_path: "Cargo.toml".to_string(),
+            language: Some("toml".to_string()),
+            size_bytes: 0,
+            token_count: 0,
+            parse_result: None,
+            content: "[package]\nname = \"cxpak\"\n".to_string(),
+            mtime_ns: None,
+        });
+        let files = vec![
+            cargo_toml,
+            make_indexed_file("src/commands/serve.rs", "rust", vec![]),
+            make_indexed_file(
+                "tests/serve_test.rs",
+                "rust",
+                vec!["cxpak::commands::serve"],
+            ),
+        ];
+        let graph = build_dependency_graph(&files, None);
+        assert!(
+            graph
+                .dependents("src/commands/serve.rs")
+                .iter()
+                .any(|e| e.target == "tests/serve_test.rs"),
+            "tests/serve_test.rs should be a dependent of src/commands/serve.rs \
+             via the own-crate-name import"
+        );
+    }
+
     // ─── existing graph tests ─────────────────────────────────────────────────
 
     #[test]
@@ -1127,12 +1323,12 @@ mod tests {
             make_indexed_file("src/b.rs", "rust", vec![]),
         ];
         let all_paths: HashSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
-        let edges = edges_for_file(&files[0], &all_paths);
+        let edges = edges_for_file(&files[0], &all_paths, None);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].0, "src/b.rs");
         assert_eq!(edges[0].1, EdgeType::Import);
         // A file with no parse result / no imports yields no edges.
-        assert!(edges_for_file(&files[1], &all_paths).is_empty());
+        assert!(edges_for_file(&files[1], &all_paths, None).is_empty());
     }
 
     #[test]
@@ -1469,7 +1665,7 @@ mod tests {
         // `crate::intelligence::CallGraph` — CallGraph is a type re-exported
         // from mod.rs; there is no src/intelligence/CallGraph.rs.
         assert_eq!(
-            resolve_rust_import("src/other.rs", "crate::intelligence::CallGraph", &all),
+            resolve_rust_import("src/other.rs", "crate::intelligence::CallGraph", &all, None),
             Some("src/intelligence/mod.rs".to_string()),
             "should fall back to mod.rs when the type has no own file"
         );
@@ -1484,7 +1680,12 @@ mod tests {
         // When call_graph.rs exists, prefer it over mod.rs for
         // crate::intelligence::call_graph (exact module path).
         assert_eq!(
-            resolve_rust_import("src/other.rs", "crate::intelligence::call_graph", &all),
+            resolve_rust_import(
+                "src/other.rs",
+                "crate::intelligence::call_graph",
+                &all,
+                None
+            ),
             Some("src/intelligence/call_graph.rs".to_string()),
             "exact module path should resolve to the dedicated file"
         );
@@ -1496,7 +1697,12 @@ mod tests {
         // `crate::visual::layout::LayoutNode` — strip the type name segment,
         // resolve to src/visual/layout.rs.
         assert_eq!(
-            resolve_rust_import("src/main.rs", "crate::visual::layout::LayoutNode", &all),
+            resolve_rust_import(
+                "src/main.rs",
+                "crate::visual::layout::LayoutNode",
+                &all,
+                None
+            ),
             Some("src/visual/layout.rs".to_string()),
             "three-segment path should resolve to the containing module file"
         );
@@ -1508,7 +1714,12 @@ mod tests {
         // From src/intelligence/blast_radius.rs, `super::CallGraph` should fall
         // back to src/intelligence/mod.rs via progressive shortening.
         assert_eq!(
-            resolve_rust_import("src/intelligence/blast_radius.rs", "super::CallGraph", &all),
+            resolve_rust_import(
+                "src/intelligence/blast_radius.rs",
+                "super::CallGraph",
+                &all,
+                None
+            ),
             Some("src/intelligence/mod.rs".to_string()),
             "super:: type re-export should fall back to mod.rs"
         );
@@ -1547,7 +1758,7 @@ mod tests {
     fn test_resolve_lua_relative_string_to_luau_file() {
         let all = lua_paths(&[".lune/faucet.luau", "src/shared/Config.luau"]);
         assert_eq!(
-            resolve_import(".lune/faucet.luau", "../src/shared/Config", &all),
+            resolve_import(".lune/faucet.luau", "../src/shared/Config", &all, None),
             Some("src/shared/Config.luau".to_string())
         );
     }
@@ -1556,7 +1767,7 @@ mod tests {
     fn test_resolve_lua_dot_slash_falls_back_to_init() {
         let all = lua_paths(&["src/a/main.luau", "src/a/Bar/init.luau"]);
         assert_eq!(
-            resolve_import("src/a/main.luau", "./Bar", &all),
+            resolve_import("src/a/main.luau", "./Bar", &all, None),
             Some("src/a/Bar/init.luau".to_string())
         );
     }
@@ -1565,7 +1776,7 @@ mod tests {
     fn test_resolve_lua_dotted_module_from_plain_lua() {
         let all = lua_paths(&["main.lua", "lib/json.lua"]);
         assert_eq!(
-            resolve_import("main.lua", "lib.json", &all),
+            resolve_import("main.lua", "lib.json", &all, None),
             Some("lib/json.lua".to_string())
         );
     }
@@ -1573,7 +1784,10 @@ mod tests {
     #[test]
     fn test_resolve_lua_alias_is_external() {
         let all = lua_paths(&["tools/run.luau", "fs.luau", "lune/fs.luau"]);
-        assert_eq!(resolve_import("tools/run.luau", "@lune/fs", &all), None);
+        assert_eq!(
+            resolve_import("tools/run.luau", "@lune/fs", &all, None),
+            None
+        );
     }
 
     #[test]
@@ -1584,7 +1798,8 @@ mod tests {
             resolve_import(
                 "src/server/Boot.server.luau",
                 "script.Parent.Registry",
-                &all
+                &all,
+                None
             ),
             Some("src/server/Registry.luau".to_string())
         );
@@ -1598,7 +1813,8 @@ mod tests {
             resolve_import(
                 "src/shared/Net/init.luau",
                 "(script :: any).Parent.Logger",
-                &all
+                &all,
+                None
             ),
             Some("src/shared/Logger.luau".to_string())
         );
@@ -1613,14 +1829,15 @@ mod tests {
             "src/shared/A.luau",
         ]);
         assert_eq!(
-            resolve_import("src/shared/Net/init.luau", "script.Codec", &all),
+            resolve_import("src/shared/Net/init.luau", "script.Codec", &all, None),
             Some("src/shared/Net/Codec.luau".to_string())
         );
         assert_eq!(
             resolve_import(
                 "src/shared/A.luau",
                 "script.Parent:WaitForChild(\"B\")",
-                &all
+                &all,
+                None
             ),
             Some("src/shared/B/init.lua".to_string())
         );
@@ -1635,13 +1852,17 @@ mod tests {
             "Shared/Typed.luau",
         ]);
         // A local variable, not `script`: nothing to anchor it to, even where a file matches.
-        assert_eq!(resolve_import("src/a/X.luau", "Shared.Typed", &all), None);
+        assert_eq!(
+            resolve_import("src/a/X.luau", "Shared.Typed", &all, None),
+            None
+        );
         // Climbing past the root names nothing.
         assert_eq!(
             resolve_import(
                 "src/a/X.luau",
                 "script.Parent.Parent.Parent.Parent.Typed",
-                &all
+                &all,
+                None
             ),
             None
         );
@@ -1658,16 +1879,16 @@ mod tests {
         ]);
         // `scripts` / `scriptFoo` are module names, not the `script` global.
         assert_eq!(
-            resolve_import("main.lua", "scripts.util", &all),
+            resolve_import("main.lua", "scripts.util", &all, None),
             Some("scripts/util.lua".to_string())
         );
         assert_eq!(
-            resolve_import("main.lua", "scriptFoo.Bar", &all),
+            resolve_import("main.lua", "scriptFoo.Bar", &all, None),
             Some("scriptFoo/Bar.lua".to_string())
         );
         // In plain Lua, a `script.x` that places no instance is read as the module `script/x`.
         assert_eq!(
-            resolve_import("lib/main.lua", "script.util", &all),
+            resolve_import("lib/main.lua", "script.util", &all, None),
             Some("script/util.lua".to_string())
         );
     }
@@ -1676,9 +1897,9 @@ mod tests {
     fn test_resolve_lua_bare_script_is_not_a_self_edge() {
         let all = lua_paths(&["main.lua", "script.lua", "src/X.luau"]);
         assert_eq!(
-            resolve_import("main.lua", "script", &all),
+            resolve_import("main.lua", "script", &all, None),
             Some("script.lua".to_string())
         );
-        assert_eq!(resolve_import("src/X.luau", "script", &all), None);
+        assert_eq!(resolve_import("src/X.luau", "script", &all, None), None);
     }
 }

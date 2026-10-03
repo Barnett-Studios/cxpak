@@ -263,11 +263,12 @@ pub fn compute_blast_radius(
         }
 
         let file_pagerank = pagerank.get(&path).copied().unwrap_or(0.0);
-        let has_test = covered_test_files.contains(&path)
-            || test_map
-                .values()
-                .any(|refs| refs.iter().any(|r| r.path == path));
-        let risk = compute_blast_impact(hops, &edge_type, file_pagerank, has_test);
+        // `has_test_coverage` asks "does `path` HAVE test coverage" — a lookup
+        // over the test map's keys (source paths), not its values (test file
+        // paths). A test file itself has no tests of its own, so it correctly
+        // scores as untested here (cxpak#85).
+        let has_test_coverage = test_map.contains_key(&path);
+        let risk = compute_blast_impact(hops, &edge_type, file_pagerank, has_test_coverage);
 
         // Update best entry: keep highest risk. If equal risk, prefer fewer hops.
         let update = match best.get(&path) {
@@ -300,6 +301,32 @@ pub fn compute_blast_radius(
                     queue.push_back((next_path.clone(), hops + 1, next_edge.edge_type.clone()));
                 }
             }
+        }
+    }
+
+    // Surface test files that are linked to a changed file only by NAME match
+    // (no import edge). The BFS above seeds and expands exclusively along
+    // `graph.dependents` edges, so a test file with no such edge is never
+    // enqueued and therefore never classified — regardless of what
+    // `covered_test_files` (built from the whole `test_map`) says about it.
+    // Union those candidates in directly, at hops=1 relative to the changed
+    // file they test, same as any other direct dependent (cxpak#84 cause 1).
+    if depth >= 1 {
+        for test_path in &covered_test_files {
+            if changed_set.contains(test_path.as_str()) || best.contains_key(test_path) {
+                continue;
+            }
+            let file_pagerank = pagerank.get(test_path).copied().unwrap_or(0.0);
+            let has_test_coverage = test_map.contains_key(test_path);
+            let risk = compute_blast_impact(1, &EdgeType::Import, file_pagerank, has_test_coverage);
+            best.insert(
+                test_path.clone(),
+                BestEntry {
+                    hops: 1,
+                    risk,
+                    edge_type: EdgeType::Import,
+                },
+            );
         }
     }
 
@@ -854,6 +881,116 @@ mod tests {
         assert!(
             !direct_paths.contains("tests/auth_test.rs"),
             "auth_test.rs must NOT be in direct_dependents"
+        );
+    }
+
+    // ── name-matched test file surfacing (cxpak#84 cause 1) ─────────────────
+    //
+    // A test file linked to a changed file only by NAME match (no import
+    // edge) must still appear in `test_files`. Before the fix, `test_files`
+    // is built by filtering the BFS traversal's results, and the traversal
+    // never enqueues a file it has no edge to reach — so a name-only match
+    // is dropped regardless of what `covered_test_files` says about it.
+
+    #[test]
+    fn test_blast_radius_name_matched_test_file_surfaces_with_no_import_edge() {
+        // src/calc.rs and tests/calc_test.rs are linked ONLY via the test_map
+        // (as find_test_files_by_name would produce) — no graph edge at all.
+        let graph = DependencyGraph::new();
+        let pagerank = make_pagerank(&[("tests/calc_test.rs", 0.4)]);
+        let test_map = make_test_map_from(&[("src/calc.rs", "tests/calc_test.rs")]);
+
+        let result = compute_blast_radius(&["src/calc.rs"], &graph, &pagerank, &test_map, 3, None);
+
+        let test_file_paths: HashSet<&str> = result
+            .categories
+            .test_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(
+            test_file_paths.contains("tests/calc_test.rs"),
+            "a name-matched test file with no import edge must still be \
+             reported in test_files"
+        );
+    }
+
+    #[test]
+    fn test_blast_radius_name_matched_test_file_absent_at_depth_zero() {
+        // depth=0 excludes every hops=1 result, including the BFS's own
+        // direct dependents — the name-match union must respect that too.
+        let graph = DependencyGraph::new();
+        let pagerank = make_pagerank(&[("tests/calc_test.rs", 0.4)]);
+        let test_map = make_test_map_from(&[("src/calc.rs", "tests/calc_test.rs")]);
+
+        let result = compute_blast_radius(&["src/calc.rs"], &graph, &pagerank, &test_map, 0, None);
+        assert_eq!(result.total_affected, 0);
+    }
+
+    // ── has_test_coverage direction (cxpak#85) ───────────────────────────────
+
+    #[test]
+    fn test_blast_radius_tested_source_scores_lower_than_untested() {
+        // Two direct dependents, bit-identical hops/pagerank/edge_type; only
+        // src/tested.rs HAS a test-map entry (it is a key in test_map). Per
+        // compute_blast_impact's doc, a tested file scores LOWER (no 1.2x
+        // untested boost) than an identical file with no coverage.
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("src/tested.rs", "src/core.rs", EdgeType::Import);
+        graph.add_edge("src/untested.rs", "src/core.rs", EdgeType::Import);
+
+        let pagerank = make_pagerank(&[("src/tested.rs", 0.5), ("src/untested.rs", 0.5)]);
+        let test_map = make_test_map_from(&[("src/tested.rs", "tests/tested_test.rs")]);
+
+        let result = compute_blast_radius(&["src/core.rs"], &graph, &pagerank, &test_map, 3, None);
+
+        let risk_of = |path: &str| -> f64 {
+            result
+                .categories
+                .direct_dependents
+                .iter()
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("{path} must appear in direct_dependents"))
+                .risk
+        };
+        assert!(
+            risk_of("src/tested.rs") < risk_of("src/untested.rs"),
+            "a source file with test coverage must score LOWER risk than an \
+             identical untested one"
+        );
+    }
+
+    #[test]
+    fn test_blast_radius_test_file_itself_scores_as_untested() {
+        // A test file is not a key in test_map (it has no tests of its own),
+        // so it must score as untested — even though it IS somebody's test
+        // (a value in test_map). This is the inverted-lookup bug: `has_test`
+        // searched the map's values ("is this path a test") instead of its
+        // keys ("does this path have test coverage").
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("tests/core_test.rs", "src/core.rs", EdgeType::Import);
+        graph.add_edge("src/plain.rs", "src/core.rs", EdgeType::Import);
+
+        let pagerank = make_pagerank(&[("tests/core_test.rs", 0.5), ("src/plain.rs", 0.5)]);
+        // tests/core_test.rs is a VALUE (it tests src/core.rs) but not a KEY.
+        let test_map = make_test_map_from(&[("src/core.rs", "tests/core_test.rs")]);
+
+        let result = compute_blast_radius(&["src/core.rs"], &graph, &pagerank, &test_map, 3, None);
+
+        let risk_of = |path: &str| -> f64 {
+            result
+                .categories
+                .test_files
+                .iter()
+                .chain(result.categories.direct_dependents.iter())
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("{path} must appear"))
+                .risk
+        };
+        assert!(
+            (risk_of("tests/core_test.rs") - risk_of("src/plain.rs")).abs() < 1e-9,
+            "a test file (no tests of its own) must score identically to an \
+             equally-untested plain source file, not as 'covered'"
         );
     }
 

@@ -66,8 +66,12 @@ pub fn run(
                     .iter()
                     .map(|f| f.relative_path.clone())
                     .collect();
-                index.test_map =
-                    crate::intelligence::test_map::build_test_map(&index.files, &paths);
+                let crate_name = crate::index::graph::detect_crate_name(&index.files);
+                index.test_map = crate::intelligence::test_map::build_test_map(
+                    &index.files,
+                    &paths,
+                    crate_name.as_deref(),
+                );
                 eprintln!(
                     "cxpak: updated {} file(s), {} files / {} tokens total",
                     update_count, index.total_files, index.total_tokens
