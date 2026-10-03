@@ -82,31 +82,50 @@ pub fn parse_time_expression(expr: &str) -> Result<std::time::Duration, String> 
 }
 
 /// Convert a `--since` expression into a git ref string.
-/// Uses `git log --since` to find the oldest commit within the time window,
-/// then returns its parent as the diff base.
+///
+/// Walks every reachable commit (via `git2`'s revwalk over all refs, matching
+/// `git log --all`) to find the oldest commit within the time window, then returns
+/// its parent as the diff base. No `git` binary is spawned — the published image
+/// ships none (cxpak#108), and the rest of this tool reads history through
+/// libgit2 exclusively.
 pub fn resolve_since(repo_path: &std::path::Path, since_expr: &str) -> Result<String, String> {
     let duration = parse_time_expression(since_expr)?;
-    let secs = duration.as_secs();
-    let output = std::process::Command::new("git")
-        .args([
-            "-C",
-            &repo_path.to_string_lossy(),
-            "log",
-            "--all",
-            "--format=%H",
-            &format!("--since={secs} seconds ago"),
-        ])
-        .output()
+    let secs = duration.as_secs() as i64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system clock error: {e}"))?
+        .as_secs() as i64;
+    let threshold = now - secs;
+
+    let repo = git2::Repository::discover(repo_path).map_err(|e| format!("git log failed: {e}"))?;
+    let mut revwalk = repo.revwalk().map_err(|e| format!("git log failed: {e}"))?;
+    // `push_glob("*")` expands to `refs/*`, walking every ref — the `git2` equivalent
+    // of `git log --all` rather than just `HEAD`.
+    revwalk
+        .push_glob("*")
         .map_err(|e| format!("git log failed: {e}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let hashes: Vec<&str> = stdout.lines().collect();
-    if hashes.is_empty() {
-        return Err(format!("no commits found in the last {since_expr}"));
+
+    // Find the oldest commit still inside the window: the minimum commit time
+    // at or above `threshold`. Matches `git log --since` taking the last (oldest)
+    // hash from its newest-first output.
+    let mut oldest: Option<(i64, git2::Oid)> = None;
+    for oid in revwalk.flatten() {
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
+        let commit_time = commit.time().seconds();
+        if commit_time < threshold {
+            continue;
+        }
+        match oldest {
+            Some((t, _)) if commit_time >= t => {}
+            _ => oldest = Some((commit_time, oid)),
+        }
     }
-    // The last hash in the list is the oldest commit in the time window.
-    // We want its parent as the diff base.
-    let oldest = hashes.last().unwrap();
-    Ok(format!("{oldest}~1"))
+
+    let (_, oldest_oid) =
+        oldest.ok_or_else(|| format!("no commits found in the last {since_expr}"))?;
+    Ok(format!("{oldest_oid}~1"))
 }
 
 /// A single file's changes from a git diff.

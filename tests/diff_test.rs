@@ -210,6 +210,84 @@ fn test_diff_out_flag() {
 }
 
 #[test]
+fn test_diff_since_without_git_binary_on_path() {
+    // Built by hand rather than via `make_diff_repo`: the oldest commit *inside* the
+    // `--since` window needs a parent to diff against, so the first commit here is
+    // backdated well outside the window and the second (the one the window actually
+    // captures) sits on top of it.
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn compute(x: i32) -> i32 {\n    x * 2\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"diff_test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let old_time = git2::Time::new(now_secs - 30 * 24 * 3600, 0);
+    let old_sig = git2::Signature::new("Test", "test@test.com", &old_time).unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &old_sig,
+            &old_sig,
+            "initial commit",
+            &tree,
+            &[],
+        )
+        .unwrap();
+    }
+
+    // Second commit, now — inside the `--since 1d` window — carrying the change to report.
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn compute(x: i32) -> i32 {\n    x * 11\n}\n",
+    )
+    .unwrap();
+    let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "second commit", &tree, &[&parent])
+        .unwrap();
+
+    // Mirrors the published image (cxpak#108): no `git` binary anywhere on PATH.
+    // `--since` must resolve the time window through git2 alone, with no subprocess spawn.
+    let empty_bin = TempDir::new().unwrap();
+
+    Command::new(assert_cmd::cargo_bin!("cxpak"))
+        .args(["diff", "--tokens", "50k", "--since", "1d"])
+        .current_dir(dir.path())
+        .env("PATH", empty_bin.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("src/lib.rs"));
+}
+
+#[test]
 fn test_diff_not_git_repo() {
     let dir = TempDir::new().unwrap();
 
