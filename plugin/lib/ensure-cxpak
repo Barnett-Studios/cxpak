@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REQUIRED_VERSION="3.3.1"
+REQUIRED_VERSION="3.4.0"
 
 # Accepts an installed version against REQUIRED_VERSION using Cargo's
 # ^REQUIRED_VERSION semantics and rejects everything else:
