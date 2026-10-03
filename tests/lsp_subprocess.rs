@@ -1152,3 +1152,164 @@ fn lsp_exit_with_no_in_flight_request_is_near_instant() {
          must be skipped when there is nothing to drain"
     );
 }
+
+/// A pipelined `shutdown` immediately followed by `exit` — sent back-to-
+/// back, with `exit` dispatched before `shutdown`'s own response has
+/// necessarily finished resolving — must still land on the exit(0) path.
+/// Guards the ordering between `ExitWatch`'s `in_flight` decrement and its
+/// `shutdown_received` store: a decrement-before-store order lets the
+/// `exit` handler observe `in_flight == 0` (nothing left to drain) and
+/// `shutdown_received == false` (not stored yet) at the same instant,
+/// wrongly taking the "no prior shutdown" exit(1) path for a shutdown that
+/// actually succeeded.
+#[test]
+fn lsp_pipelined_shutdown_then_exit_terminates_process_with_status_0() {
+    let repo = make_test_repo();
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    // Deliberately do NOT read shutdown's response before sending exit —
+    // that is the pipelining the race depends on.
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}).to_string(),
+    );
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "exit"}).to_string(),
+    );
+
+    let resp = read_response_for_id(&mut reader, 2)
+        .expect("shutdown response must still arrive even when pipelined with exit");
+    assert_eq!(
+        resp["result"],
+        Value::Null,
+        "shutdown must answer result: null"
+    );
+
+    let status = wait_for_exit(
+        &mut child,
+        Duration::from_secs(10),
+        "pipelined shutdown+exit must terminate the process",
+    );
+    assert!(
+        status.success(),
+        "a pipelined shutdown immediately followed by exit must be status 0 — \
+         the shutdown succeeded, so exit must not take the no-prior-shutdown path; \
+         got {status:?}"
+    );
+}
+
+/// `exit` arriving while a request is genuinely in flight must still
+/// deliver that request's response rather than cutting it to EOF.
+/// Companion to `lsp_exit_with_no_in_flight_request_is_near_instant`, at
+/// the subprocess/real-binary level; the precise bookkeeping this depends
+/// on (`in_flight` actually reflecting "still running", and for however
+/// long that takes) is pinned down deterministically by the
+/// `lsp::tests::exit_watch` unit tests instead of by timing a real
+/// method's real — and, for `cxpak/dataFlow` specifically, depth-bounded
+/// and thus not reliably sleep-equivalent — computation.
+#[test]
+fn lsp_exit_with_in_flight_request_delivers_response() {
+    let repo = make_test_repo();
+    // Same rationale as `lsp_sigterm_drains_in_flight_response`: the
+    // default single-file fixture makes `cxpak/dataFlow` near-instant.
+    std::fs::write(
+        repo.path().join("src/util.rs"),
+        "pub fn helper() -> i32 { crate::main_helper() }\npub fn main_helper() -> i32 { 7 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub mod util;\npub fn entry() { util::helper(); }\n",
+    )
+    .unwrap();
+
+    let mut child = spawn_lsp(&repo);
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    write_lsp_message(
+        stdin,
+        r#"{"jsonrpc":"2.0","id":42,"method":"cxpak/dataFlow","params":{"symbol":"main"}}"#,
+    );
+    // Send `exit` immediately after, without waiting for dataFlow's
+    // response — the overlap the in-flight tracking exists to catch.
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "exit"}).to_string(),
+    );
+
+    // tower-lsp's own `exit` handling cancels every pending request
+    // synchronously as part of dispatching `exit` (`Pending::cancel_all`),
+    // independent of anything this crate's code does — so a well-formed
+    // `-32800 "Canceled"` response is an EXPECTED outcome here, not a
+    // failure. What this test guards is that the response (whichever
+    // shape) actually finishes being written rather than being cut to
+    // raw EOF by the process exiting mid-write — the same "don't drop
+    // in-flight responses" contract `lsp_sigterm_drains_in_flight_response`
+    // guards for the signal path.
+    let resp = read_response_for_id(&mut reader, 42)
+        .expect("in-flight response must arrive — must not be cut to EOF by exit");
+    assert!(
+        resp["result"].is_object() || resp["result"].is_array() || resp["error"].is_object(),
+        "in-flight cxpak/dataFlow must resolve to a well-formed response (real result or a \
+         well-formed cancellation), not be cut to EOF; got: {resp}"
+    );
+
+    let status = wait_for_exit(
+        &mut child,
+        Duration::from_secs(10),
+        "exit with an in-flight request must still terminate the process",
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "no shutdown was sent in this test, so exit must take the no-prior-shutdown \
+         path regardless; got {status:?}"
+    );
+}
+
+/// Stress-test companion to `lsp_stdin_eof_without_exit_terminates_process`:
+/// runs the same scenario (initialize, then close stdin with no
+/// shutdown/exit ever sent) 50 times in a row. Guards a real race in
+/// `run_stdio`'s `select!`: on plain stdin EOF, `Server::serve` dropping
+/// `service` also drops `ExitWatch`'s `exit_tx`, resolving `exit_rx` to
+/// `Err` at essentially the same instant `serve_handle` resolves. A bare
+/// `_ = exit_rx` arm matches that `Err` too and can race the `res =
+/// serve_handle` arm, intermittently producing exit(1) instead of EOF's
+/// correct exit(0). One run passing proves little against a race this
+/// narrow; 50 in a row is the actual evidence the match-pattern fix
+/// (`Ok(()) = exit_rx`, which an `Err` cannot satisfy) closes it rather
+/// than just narrowing the window.
+#[test]
+fn lsp_stdin_eof_without_exit_terminates_process_stress() {
+    for i in 0..50 {
+        let repo = make_test_repo();
+        let mut child = spawn_lsp(&repo);
+
+        let stdin = child.stdin.as_mut().expect("stdin pipe");
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let mut reader = BufReader::new(stdout);
+        handshake(stdin, &mut reader, repo.path());
+
+        drop(child.stdin.take());
+
+        let status = wait_for_exit(
+            &mut child,
+            Duration::from_secs(10),
+            "stdin EOF with no prior shutdown/exit must terminate the process",
+        );
+        assert!(
+            status.success(),
+            "iteration {i}: stdin EOF alone should be a clean exit; got {status:?} — \
+             the exit_rx/serve_handle race is back"
+        );
+    }
+}

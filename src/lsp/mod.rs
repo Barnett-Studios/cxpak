@@ -49,19 +49,54 @@ pub fn workspace_root(path: &std::path::Path) -> std::io::Result<std::path::Path
 /// `exit` itself is excluded from this count — its own resolution is
 /// near-instant and irrelevant to "is there something to drain".
 struct ExitWatch<S> {
-    inner: S,
+    // `Option` so `exit`'s handling (see `call`) can `take()` it: tower-lsp's
+    // own `ExitService::call` — reached by delegating to `inner` at all,
+    // for the `exit` method — synchronously cancels every pending request
+    // (`Pending::cancel_all`) the instant it runs. A `shutdown` pipelined
+    // immediately before `exit` (sent without waiting for its response,
+    // which the LSP spec does not require a conforming client to do before
+    // sending `exit`... though it recommends it) can still be QUEUED,
+    // not yet resolved, at that instant — and cancellation would turn its
+    // well-formed `result: null` into a `-32800 "Canceled"` error, which
+    // then fails the "did shutdown actually succeed" check below. Taking
+    // `inner` out and delegating inside a future that first waits (bounded)
+    // for `in_flight` to settle defers that cancellation until any
+    // just-dispatched request has had a real chance to finish.
+    inner: Option<S>,
     shutdown_received: std::sync::Arc<std::sync::atomic::AtomicBool>,
     exit_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// RAII decrement for `ExitWatch::in_flight`, held across the wrapped
+/// request's `.await`.
+///
+/// A plain `fetch_sub` placed AFTER `fut.await` only runs on the happy
+/// path: if the future is dropped before completing (the client closes
+/// stdin mid-request, `$/cancelRequest` fires, or a handler panics and
+/// the panic unwinds through the `.await` point), that statement is
+/// simply never reached and the counter leaks upward forever — every
+/// later `exit` would then wrongly believe something is still in flight
+/// and pay the full drain grace for the rest of the process's life.
+/// `Drop` runs on every exit path (normal return, panic unwind, AND the
+/// future being dropped while suspended), so holding the decrement here
+/// instead closes all three.
+struct InFlightGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl<S> tower::Service<tower_lsp::jsonrpc::Request> for ExitWatch<S>
 where
     S: tower::Service<
-        tower_lsp::jsonrpc::Request,
-        Response = Option<tower_lsp::jsonrpc::Response>,
-        Error = tower_lsp::ExitedError,
-    >,
+            tower_lsp::jsonrpc::Request,
+            Response = Option<tower_lsp::jsonrpc::Response>,
+            Error = tower_lsp::ExitedError,
+        > + Send
+        + 'static,
     S::Future: Send + 'static,
 {
     type Response = S::Response;
@@ -73,23 +108,56 @@ where
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
+        match &mut self.inner {
+            Some(inner) => inner.poll_ready(cx),
+            // `inner` was taken for `exit`'s deferred dispatch (see `call`).
+            // Any further message is a client protocol violation (nothing
+            // should follow `exit`) — stay `Pending` rather than panic;
+            // `run_stdio`'s own `exit_rx`/grace path exits the process
+            // shortly regardless, bounding how long this can matter.
+            None => std::task::Poll::Pending,
+        }
     }
 
     fn call(&mut self, req: tower_lsp::jsonrpc::Request) -> Self::Future {
         if req.method() == "exit" {
-            // `take()` makes this a one-shot signal even if a
-            // (spec-violating) client sends `exit` twice — the second
-            // send simply has nowhere to go rather than panicking on a
-            // closed channel. Not counted in `in_flight`: `exit`'s own
-            // resolution is near-instant and tells us nothing about
-            // whether there is a response to drain.
-            if let Ok(mut slot) = self.exit_tx.lock() {
-                if let Some(tx) = slot.take() {
-                    let _ = tx.send(());
+            let in_flight = std::sync::Arc::clone(&self.in_flight);
+            let exit_tx = std::sync::Arc::clone(&self.exit_tx);
+            let Some(mut inner) = self.inner.take() else {
+                // Unreachable in practice: `poll_ready` returns `Pending`
+                // once `inner` is gone, and the transport always awaits
+                // `poll_ready` before calling. No `S::Error` value is
+                // constructible from here (tower-lsp's `ExitedError` has no
+                // public constructor) — never resolving is the honest
+                // signal for a state that should not occur.
+                return Box::pin(std::future::pending());
+            };
+            return Box::pin(async move {
+                // Bounded wait for any request dispatched just before
+                // `exit` (most notably a pipelined `shutdown`) to actually
+                // finish before delegating — which is what triggers
+                // tower-lsp's own `Pending::cancel_all()` — so it is not
+                // cancelled out from under us. 500ms is generous for any
+                // ordinary handler and short against the ~1.5s default
+                // drain grace; it only ever costs real time when something
+                // was genuinely still in flight.
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+                while in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
-            }
-            return Box::pin(self.inner.call(req));
+                // `take()` makes this a one-shot signal even if a
+                // (spec-violating) client sends `exit` twice — the second
+                // send simply has nowhere to go rather than panicking on a
+                // closed channel.
+                if let Ok(mut slot) = exit_tx.lock() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                inner.call(req).await
+            });
         }
 
         // `shutdown` only counts toward `shutdown_received` if tower-lsp's
@@ -100,13 +168,33 @@ where
         let shutdown_received =
             (req.method() == "shutdown").then(|| std::sync::Arc::clone(&self.shutdown_received));
 
+        // `inner` is only ever taken by the `exit` branch above, and
+        // `exit` is one-shot — this should be unreachable in practice.
+        // `poll_ready` already returns `Pending` once `inner` is gone, so
+        // a well-behaved transport cannot reach `call` in that state; if
+        // it somehow does, the honest answer (no `S::Error` is
+        // constructible from here — see `poll_ready`) is a future that
+        // never resolves, not a panic.
+        let Some(inner) = self.inner.as_mut() else {
+            return Box::pin(std::future::pending());
+        };
+
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let in_flight = std::sync::Arc::clone(&self.in_flight);
-        let fut = self.inner.call(req);
+        let guard = InFlightGuard(std::sync::Arc::clone(&self.in_flight));
+        let fut = inner.call(req);
         Box::pin(async move {
             let result = fut.await;
-            in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            // Set the flag BEFORE `guard` drops (and so before `in_flight`
+            // is decremented) — `guard`, declared after `shutdown_received`
+            // was captured but before this point, drops at the end of this
+            // block, strictly after the store below runs. That ordering is
+            // what closes the race a pipelined `shutdown` immediately
+            // followed by `exit` could otherwise hit: the `exit` handler
+            // reads `in_flight == 0` as "nothing to drain" and
+            // `shutdown_received` to pick the exit code, and SeqCst's total
+            // order guarantees it can never observe the decrement without
+            // also observing this store.
             if let Some(flag) = shutdown_received {
                 if let Ok(response) = &result {
                     if response.as_ref().and_then(|r| r.error()).is_none() {
@@ -114,6 +202,7 @@ where
                     }
                 }
             }
+            drop(guard);
             result
         })
     }
@@ -168,7 +257,7 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<()>();
     let service = ExitWatch {
-        inner: service,
+        inner: Some(service),
         shutdown_received: std::sync::Arc::clone(&shutdown_received),
         exit_tx: std::sync::Arc::new(std::sync::Mutex::new(Some(exit_tx))),
         in_flight: std::sync::Arc::clone(&in_flight),
@@ -253,7 +342,19 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
                 let _ = res;
                 std::process::exit(0);
             }
-            _ = exit_rx => {
+            // Matching `Ok(())` specifically (not a bare `_`) matters: on
+            // plain stdin EOF with no `exit` ever sent, `Server::serve`
+            // drops `service` (and so `ExitWatch`'s `exit_tx`) as part of
+            // returning — which resolves `exit_rx` to `Err(RecvError)` at
+            // essentially the same instant `serve_handle` above resolves.
+            // A bare `_ = exit_rx` would match THAT too and could win the
+            // race against the `res = serve_handle` arm, wrongly taking
+            // this branch's exit(1)-on-no-shutdown path for a plain EOF
+            // that should be exit(0). Only a genuine `exit` notification
+            // sends `Ok(())`; a dropped sender's `Err` fails to match this
+            // pattern, so `select!` falls through to the branches that are
+            // still live instead of firing this one.
+            Ok(()) = exit_rx => {
                 // #114: the client sent the `exit` notification. tower-lsp's
                 // own `exit` handling only stops it from accepting further
                 // requests — it does not break `Server::serve`'s stdin read
@@ -279,6 +380,18 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(1500);
                     tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+                } else {
+                    // `in_flight` can read zero because a request's future
+                    // (most notably a pipelined `shutdown`, dispatched
+                    // immediately before this `exit`) resolved microseconds
+                    // ago — the VALUE is ready, but it still has to travel
+                    // through tower-lsp's own response-forwarding stream to
+                    // the actual stdout write, which needs its own poll. A
+                    // short, fixed flush cushion — far below the drain grace
+                    // and well under what any caller would notice — gives
+                    // that one write a realistic chance to land before
+                    // `process::exit` pulls the rug.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 // Spec: 0 if `exit` followed a `shutdown` request, 1 (a
                 // "non-zero code", left unspecified beyond that) otherwise.
@@ -334,6 +447,140 @@ mod tests {
         // Verify the module and re-export compile under the lsp feature.
         fn _check() -> fn(&std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             super::run_stdio
+        }
+    }
+
+    // `ExitWatch`'s `in_flight`/`shutdown_received` bookkeeping, exercised
+    // directly against a fake inner `Service` with a controllable delay —
+    // deterministic and fast, unlike driving the same logic through a real
+    // subprocess and a real (inherently depth-bounded, hard to reliably
+    // slow down) LSP method. `tests/lsp_subprocess.rs` covers the
+    // end-to-end, real-binary behaviour these unit tests can't see
+    // (the actual process exit code and timing); this covers the
+    // bookkeeping these unit tests are better suited to pin down exactly.
+    mod exit_watch {
+        use super::super::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tower::Service;
+        use tower_lsp::jsonrpc::{Request, Response};
+
+        /// A fake inner service that resolves successfully after a fixed
+        /// delay — standing in for a real LSP method handler without
+        /// depending on anything's actual runtime to create one.
+        #[derive(Clone)]
+        struct DelayedOk {
+            delay_ms: u64,
+        }
+
+        impl Service<Request> for DelayedOk {
+            type Response = Option<Response>;
+            type Error = tower_lsp::ExitedError;
+            type Future = std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+            >;
+
+            fn poll_ready(
+                &mut self,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: Request) -> Self::Future {
+                let delay_ms = self.delay_ms;
+                let id = req.id().cloned();
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    Ok(id.map(|id| Response::from_ok(id, serde_json::Value::Null)))
+                })
+            }
+        }
+
+        fn watch(inner: DelayedOk, in_flight: &Arc<AtomicUsize>) -> ExitWatch<DelayedOk> {
+            ExitWatch {
+                inner: Some(inner),
+                shutdown_received: Arc::new(AtomicBool::new(false)),
+                exit_tx: Arc::new(Mutex::new(None)),
+                in_flight: Arc::clone(in_flight),
+            }
+        }
+
+        /// The bug #114's follow-up review flagged: a plain `fetch_sub`
+        /// placed after `fut.await` never runs if the future is dropped
+        /// before completing — e.g. the client closes stdin mid-request,
+        /// or `$/cancelRequest` fires. `InFlightGuard`'s `Drop` must run
+        /// regardless.
+        #[tokio::test]
+        async fn in_flight_does_not_leak_when_the_future_is_dropped_before_completing() {
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let mut w = watch(DelayedOk { delay_ms: 5_000 }, &in_flight);
+
+            let fut = w.call(Request::build("textDocument/hover").id(1).finish());
+            assert_eq!(
+                in_flight.load(Ordering::SeqCst),
+                1,
+                "in_flight must be incremented as soon as the request is dispatched"
+            );
+
+            drop(fut); // simulate cancellation/drop before completion — never awaited.
+            assert_eq!(
+                in_flight.load(Ordering::SeqCst),
+                0,
+                "in_flight must still be decremented when the future is dropped \
+                 before completing — a leak here means every later `exit` pays \
+                 the drain grace forever"
+            );
+        }
+
+        /// `in_flight` must also clear on the ordinary happy path — the
+        /// companion case to the leak test above, proving the counter is a
+        /// true reflection of "still running", not just "never leaks up".
+        #[tokio::test]
+        async fn in_flight_tracks_a_request_for_its_actual_duration() {
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let mut w = watch(DelayedOk { delay_ms: 50 }, &in_flight);
+
+            let fut = w.call(Request::build("textDocument/hover").id(1).finish());
+            assert_eq!(in_flight.load(Ordering::SeqCst), 1);
+
+            fut.await.ok();
+            assert_eq!(
+                in_flight.load(Ordering::SeqCst),
+                0,
+                "in_flight must be back to zero once the request has actually resolved"
+            );
+        }
+
+        /// The ordering #114's follow-up review flagged: a pipelined
+        /// `shutdown` immediately followed by `exit` must never let `exit`
+        /// observe `in_flight == 0` without `shutdown_received` already
+        /// being `true` for a shutdown that actually succeeded.
+        #[tokio::test]
+        async fn shutdown_received_is_set_before_in_flight_clears() {
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let shutdown_received = Arc::new(AtomicBool::new(false));
+            let mut w = ExitWatch {
+                inner: Some(DelayedOk { delay_ms: 20 }),
+                shutdown_received: Arc::clone(&shutdown_received),
+                exit_tx: Arc::new(Mutex::new(None)),
+                in_flight: Arc::clone(&in_flight),
+            };
+
+            let fut = w.call(Request::build("shutdown").id(1).finish());
+            let resp = fut.await.expect("DelayedOk never errors");
+            assert!(resp.is_some(), "shutdown must get a response");
+            assert_eq!(
+                in_flight.load(Ordering::SeqCst),
+                0,
+                "in_flight must have cleared by the time the future resolves"
+            );
+            assert!(
+                shutdown_received.load(Ordering::SeqCst),
+                "shutdown_received must be set — and per the ordering inside \
+                 `call`, it is set strictly before `in_flight`'s decrement runs, \
+                 so any reader that observes the decrement also observes this"
+            );
         }
     }
 }
