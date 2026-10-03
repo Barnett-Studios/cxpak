@@ -11,7 +11,9 @@ setup() {
     IFS=. read -r MAJ MIN PAT <<< "${REQ}"
     NEWER_PATCH="${MAJ}.${MIN}.$((PAT + 1))"
     NEWER_MINOR="${MAJ}.$((MIN + 1)).0"
-    if [ "${PAT}" -gt 0 ]; then OLDER="${MAJ}.${MIN}.$((PAT - 1))"; else OLDER="${MAJ}.$((MIN - 1)).0"; fi
+    if [ "${PAT}" -gt 0 ]; then OLDER="${MAJ}.${MIN}.$((PAT - 1))"
+    elif [ "${MIN}" -gt 0 ]; then OLDER="${MAJ}.$((MIN - 1)).0"
+    else OLDER="$((MAJ - 1)).0.0"; fi
 }
 
 # Write a fake cxpak at $1 that reports version $2.
