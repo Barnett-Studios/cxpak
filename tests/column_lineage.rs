@@ -66,7 +66,7 @@ fn indexed_file(
             exports: vec![],
         }),
         content: content.to_string(),
-        mtime_secs: None,
+        mtime_ns: None,
     })
 }
 

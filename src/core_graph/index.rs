@@ -82,7 +82,14 @@ pub struct IndexedFile {
     pub token_count: usize,
     pub parse_result: Option<ParseResult>,
     pub content: String,
-    pub mtime_secs: Option<u64>, // Unix epoch seconds, None if unavailable
+    /// Mtime in nanoseconds since the Unix epoch, `None` if unavailable.
+    ///
+    /// Nanosecond (not whole-second) precision: the incremental reparse
+    /// decision in `index/mod.rs::incremental_rebuild` compares this against
+    /// a freshly-read mtime with `!=`, and a whole-second value would miss a
+    /// same-size edit landing within the same wall-clock second as the prior
+    /// index (cxpak#36).
+    pub mtime_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

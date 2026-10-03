@@ -674,7 +674,7 @@ mod tests {
                 token_count: 50,
                 parse_result: None,
                 content: "fn f() {}".to_string(),
-                mtime_secs: None,
+                mtime_ns: None,
             }));
         }
 
@@ -716,7 +716,7 @@ mod tests {
                 token_count: 25,
                 parse_result: None,
                 content: "fn f() {}".to_string(),
-                mtime_secs: None,
+                mtime_ns: None,
             }));
         }
 
@@ -750,7 +750,7 @@ mod tests {
                 token_count: 50,
                 parse_result: None,
                 content: "fn f() {}".to_string(),
-                mtime_secs: None,
+                mtime_ns: None,
             }));
         }
 
@@ -803,7 +803,7 @@ mod tests {
                 token_count: 50,
                 parse_result: None,
                 content: "fn f() {}".to_string(),
-                mtime_secs: None,
+                mtime_ns: None,
             }));
         }
 
@@ -859,7 +859,7 @@ mod tests {
                 token_count: 50,
                 parse_result: None,
                 content: "fn f() {}".to_string(),
-                mtime_secs: None,
+                mtime_ns: None,
             }));
         }
 
@@ -935,7 +935,7 @@ mod tests {
                 token_count: 50,
                 parse_result: None,
                 content: "fn f() {}".to_string(),
-                mtime_secs: None,
+                mtime_ns: None,
             }));
         }
         // Module B: 2 files → does NOT qualify
@@ -947,7 +947,7 @@ mod tests {
                 token_count: 25,
                 parse_result: None,
                 content: "fn g() {}".to_string(),
-                mtime_secs: None,
+                mtime_ns: None,
             }));
         }
 

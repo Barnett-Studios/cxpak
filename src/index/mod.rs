@@ -112,6 +112,144 @@ pub(crate) fn read_indexable(
     }
 }
 
+/// `(mtime_ns, size_bytes)` for `path`, or `None` if `path` cannot be stat'd.
+/// The settle-check building block below compares two of these taken around
+/// a read; `None` only compares equal to `None`, so a stat that starts
+/// failing or starts succeeding between the two calls is itself treated as
+/// "not settled".
+fn stat_fingerprint(path: &std::path::Path) -> Option<(Option<u64>, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime_ns = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64);
+    Some((mtime_ns, m.len()))
+}
+
+/// Core settle check (cxpak#36 follow-up): run `read` and require the stat
+/// it ran under (`pre`, taken by the caller before invoking this) to still
+/// hold after `read` returns.
+///
+/// Reading content and then stat'ing the mtime afterward has a TOCTOU
+/// window: an edit landing between the read and the stat caches content from
+/// *before* the edit under an mtime recorded *after* it, so a later
+/// incremental pass sees a `(mtime, size)` pair that matches the file's
+/// current disk state even though the cached content predates it — the same
+/// staleness class #36 fixes in the comparison, just moved to the read
+/// boundary instead.
+///
+/// A disagreement between `pre` and the post-read stat means the file was
+/// still being edited during this pass: rather than cache a `(content,
+/// mtime)` pair that may not match either the before- or after-edit disk
+/// state, this returns `None` — the caller skips the file exactly as it
+/// already does for an unreadable file, and the next incremental/full
+/// rebuild picks it up once it has settled.
+///
+/// `read` is a parameter (not a hardcoded `read_indexable` call) so a test
+/// can inject a closure that mutates the file *during* the read, landing
+/// deterministically inside the pre/post stat window — proving the settle
+/// check actually catches a race rather than relying on a timing-dependent
+/// background thread that may or may not land inside that window in CI.
+fn settled_read_with(
+    path: &std::path::Path,
+    pre: Option<(Option<u64>, u64)>,
+    read: impl FnOnce() -> Option<String>,
+) -> Option<(String, Option<u64>)> {
+    let content = read()?;
+    let post = stat_fingerprint(path);
+    if pre != post {
+        return None;
+    }
+    Some((content, post.and_then(|(mtime_ns, _)| mtime_ns)))
+}
+
+/// [`read_indexable`] wrapped in the [`settled_read_with`] stat-read-stat
+/// check, with the read step injectable for deterministic race testing.
+fn read_indexable_settled_with(
+    path: &std::path::Path,
+    size_bytes: u64,
+    cap_bytes: u64,
+    read: impl FnOnce(&std::path::Path, u64, u64) -> Option<String>,
+) -> Option<(String, Option<u64>)> {
+    let pre = stat_fingerprint(path);
+    settled_read_with(path, pre, || read(path, size_bytes, cap_bytes))
+}
+
+/// Read `path`'s content together with an mtime that is guaranteed to
+/// describe exactly the content just read. See [`settled_read_with`] for
+/// why this is needed; this is the production entry point ([`read_indexable`]
+/// as the read step, no injection).
+///
+/// Retries the settle check once before giving up (review follow-up on
+/// cxpak#36): a single mid-read edit is ordinarily a narrow, transient
+/// window, and for a one-shot build (a CLI command with no later
+/// `incremental_rebuild` on the same `CodebaseIndex`) silently dropping the
+/// file on the first collision would mean this run never indexes it at all
+/// — there is no "next pass" coming to pick it up. If the retry also fails
+/// to settle, the file is being edited continuously (or faster than this
+/// process can keep up with); that case is logged — visible, not silent —
+/// and still skipped rather than caching a potentially-mismatched pair.
+fn read_indexable_settled(
+    path: &std::path::Path,
+    size_bytes: u64,
+    cap_bytes: u64,
+) -> Option<(String, Option<u64>)> {
+    if let Some(result) = read_indexable_settled_with(path, size_bytes, cap_bytes, read_indexable) {
+        return Some(result);
+    }
+    if let Some(result) = read_indexable_settled_with(path, size_bytes, cap_bytes, read_indexable) {
+        return Some(result);
+    }
+    eprintln!(
+        "cxpak: warning: skipping {}: changed while being read, twice in a row (not settling)",
+        path.display()
+    );
+    None
+}
+
+/// Content read from disk together with an mtime proven to describe exactly
+/// that content (cxpak#36 follow-up).
+///
+/// Fields are private and the only public constructor is
+/// [`SettledRead::from_disk`], which runs the [`settled_read_with`]
+/// stat-read-stat check. A caller cannot construct a `SettledRead` from an
+/// arbitrary `(content, mtime)` pair it assembled itself — "this content and
+/// this mtime came from the same settled read" is therefore a property the
+/// type system enforces, not a contract a doc comment merely asks a future
+/// caller to honor (see [`CodebaseIndex::build_with_settled_content`]).
+#[derive(Debug, Clone)]
+pub struct SettledRead {
+    content: String,
+    mtime_ns: Option<u64>,
+}
+
+impl SettledRead {
+    /// Read `path` from disk with the settled stat-read-stat check. `None`
+    /// means either an unreadable file (see [`read_indexable`]'s contract)
+    /// or a mid-read edit that left this pass's read unverifiable.
+    pub fn from_disk(path: &std::path::Path, size_bytes: u64, cap_bytes: u64) -> Option<Self> {
+        let (content, mtime_ns) = read_indexable_settled(path, size_bytes, cap_bytes)?;
+        Some(Self { content, mtime_ns })
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub fn mtime_ns(&self) -> Option<u64> {
+        self.mtime_ns
+    }
+
+    /// Consume `self` into its parts, for callers (e.g.
+    /// [`CodebaseIndex::build_with_settled_content`]) that are about to move
+    /// the content into an `IndexedFile` anyway and would otherwise pay an
+    /// extra clone.
+    fn into_parts(self) -> (String, Option<u64>) {
+        (self.content, self.mtime_ns)
+    }
+}
+
 impl CodebaseIndex {
     pub fn build(
         files: Vec<ScannedFile>,
@@ -126,7 +264,8 @@ impl CodebaseIndex {
 
         let cap_bytes = max_file_bytes();
         for file in &files {
-            let Some(content) = read_indexable(&file.absolute_path, file.size_bytes, cap_bytes)
+            let Some((content, mtime_ns)) =
+                read_indexable_settled(&file.absolute_path, file.size_bytes, cap_bytes)
             else {
                 continue;
             };
@@ -150,12 +289,6 @@ impl CodebaseIndex {
                 compute_term_frequencies(&content),
             );
 
-            let mtime_secs = std::fs::metadata(&file.absolute_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
-
             let parse_result = parse_results.get(&file.relative_path).cloned();
             indexed_files.push(Arc::new(IndexedFile {
                 relative_path: file.relative_path.clone(),
@@ -164,10 +297,36 @@ impl CodebaseIndex {
                 token_count,
                 parse_result,
                 content,
-                mtime_secs,
+                mtime_ns,
             }));
         }
 
+        Self::finish_build(
+            indexed_files,
+            language_stats,
+            total_tokens,
+            total_bytes,
+            term_frequencies,
+        )
+    }
+
+    // `all_public_symbols`, `all_imports`, `find_symbol`, `find_content_matches`
+    // are pure queries over the data model and now live in `core_graph::index`
+    // (cxpak 3.0.0 Phase 0 de-cycle). The orchestration constructors below stay
+    // here.
+
+    /// Construction tail shared by `build`, `build_with_content`, and
+    /// `build_with_settled_content`: wraps the already-populated per-file
+    /// data into a `CodebaseIndex` and runs the schema/graph/pagerank/
+    /// test_map/call_graph/cross-language passes, which are identical
+    /// regardless of how each file's content was obtained.
+    fn finish_build(
+        indexed_files: Vec<Arc<IndexedFile>>,
+        language_stats: HashMap<String, LanguageStats>,
+        total_tokens: usize,
+        total_bytes: u64,
+        term_frequencies: HashMap<String, HashMap<String, u32>>,
+    ) -> Self {
         let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
 
         let mut index = Self {
@@ -223,16 +382,30 @@ impl CodebaseIndex {
         index
     }
 
-    // `all_public_symbols`, `all_imports`, `find_symbol`, `find_content_matches`
-    // are pure queries over the data model and now live in `core_graph::index`
-    // (cxpak 3.0.0 Phase 0 de-cycle). The orchestration constructors below stay
-    // here.
-
     /// Build a `CodebaseIndex` using pre-read file content instead of reading from disk.
     ///
     /// `content` maps `relative_path` -> file contents.  When an entry is present the
     /// provided string is used directly; missing entries fall back to a disk read so
     /// that callers are not required to pre-read every file.
+    ///
+    /// **Explicit TOCTOU exception (review follow-up on cxpak#36):** when an
+    /// entry IS present, this stamps `IndexedFile.mtime_ns` with a stat taken
+    /// *after* receiving the caller's already-read `content` — there is no
+    /// read happening in this function to bracket with a pre/post stat, so
+    /// unlike the disk-read fallback below it is **not** proven to describe
+    /// the same instant as `content`. This is a deliberate, scoped
+    /// exception, not an oversight: every current caller of this branch
+    /// (`commands::onboard`, `commands::graph`, both via
+    /// `cache::parse::parse_with_cache`) builds a one-shot `CodebaseIndex`
+    /// for a single CLI invocation that exits immediately after — nothing
+    /// ever calls `incremental_rebuild` on that instance, and
+    /// `IndexedFile.mtime_ns` has no other reader in the codebase, so the
+    /// unverified stamp is inert for them. A caller that keeps the index
+    /// alive across edits (`commands::serve`'s long-lived watch process) has
+    /// a real TOCTOU exposure here and MUST use
+    /// [`CodebaseIndex::build_with_settled_content`] instead, which proves
+    /// content and mtime came from the same read via the [`SettledRead`]
+    /// type rather than trusting this best-effort stamp.
     pub fn build_with_content(
         files: Vec<ScannedFile>,
         parse_results: HashMap<String, ParseResult>,
@@ -249,14 +422,25 @@ impl CodebaseIndex {
         for file in &files {
             // The content map is the caller's already-successful read. Only the
             // miss falls through to disk, and only that path can fail.
-            let file_content = match content.get(&file.relative_path).cloned() {
-                Some(c) => c,
+            //
+            // The caller-provided branch has no read to bracket with a
+            // before/after stat: freshness of `c` relative to the stat taken
+            // here is the caller's contract, not something verifiable from
+            // inside this function. The disk-read branch uses the settled
+            // read/stat pair (cxpak#36 follow-up) so a mid-read edit is never
+            // cached under a mismatched mtime.
+            let (file_content, mtime_ns) = match content.get(&file.relative_path).cloned() {
+                Some(c) => {
+                    let mtime_ns = stat_fingerprint(&file.absolute_path).and_then(|(ns, _)| ns);
+                    (c, mtime_ns)
+                }
                 None => {
-                    let Some(c) = read_indexable(&file.absolute_path, file.size_bytes, cap_bytes)
+                    let Some((c, mtime_ns)) =
+                        read_indexable_settled(&file.absolute_path, file.size_bytes, cap_bytes)
                     else {
                         continue;
                     };
-                    c
+                    (c, mtime_ns)
                 }
             };
             let token_count = counter.count_or_zero(&file_content);
@@ -279,11 +463,84 @@ impl CodebaseIndex {
                 compute_term_frequencies(&file_content),
             );
 
-            let mtime_secs = std::fs::metadata(&file.absolute_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
+            let parse_result = parse_results.get(&file.relative_path).cloned();
+            indexed_files.push(Arc::new(IndexedFile {
+                relative_path: file.relative_path.clone(),
+                language: file.language.clone(),
+                size_bytes: file.size_bytes,
+                token_count,
+                parse_result,
+                content: file_content,
+                mtime_ns,
+            }));
+        }
+
+        Self::finish_build(
+            indexed_files,
+            language_stats,
+            total_tokens,
+            total_bytes,
+            term_frequencies,
+        )
+    }
+
+    /// Build a `CodebaseIndex` from content that is already proven to have
+    /// settled against disk (cxpak#36 follow-up on the `build_with_content`
+    /// TOCTOU: a caller handing in raw `(String, mtime)` pairs there has no
+    /// way to prove they came from the same read, and nothing stopped a
+    /// future call site from skipping the settle check).
+    ///
+    /// `settled` maps `relative_path` -> [`SettledRead`], whose only public
+    /// constructor is [`SettledRead::from_disk`] — the stat-read-stat check
+    /// cxpak#36 introduced. A caller cannot fabricate a `SettledRead` with a
+    /// content/mtime pair that was never actually verified together; "is
+    /// this settled?" is therefore a property the type system enforces, not
+    /// a contract a doc comment merely asks callers to honor. A path missing
+    /// from `settled` falls through to the same enforced disk read.
+    pub fn build_with_settled_content(
+        files: Vec<ScannedFile>,
+        parse_results: HashMap<String, ParseResult>,
+        counter: &TokenCounter,
+        mut settled: HashMap<String, SettledRead>,
+    ) -> Self {
+        let mut language_stats: HashMap<String, LanguageStats> = HashMap::new();
+        let mut indexed_files = Vec::new();
+        let mut total_tokens = 0usize;
+        let mut total_bytes = 0u64;
+        let mut term_frequencies = HashMap::new();
+
+        let cap_bytes = max_file_bytes();
+        for file in &files {
+            let (file_content, mtime_ns) = match settled.remove(&file.relative_path) {
+                Some(s) => s.into_parts(),
+                None => {
+                    let Some(s) =
+                        SettledRead::from_disk(&file.absolute_path, file.size_bytes, cap_bytes)
+                    else {
+                        continue;
+                    };
+                    s.into_parts()
+                }
+            };
+            let token_count = counter.count_or_zero(&file_content);
+            total_tokens += token_count;
+            total_bytes += file.size_bytes;
+
+            if let Some(lang) = &file.language {
+                let stats = language_stats.entry(lang.clone()).or_insert(LanguageStats {
+                    file_count: 0,
+                    total_bytes: 0,
+                    total_tokens: 0,
+                });
+                stats.file_count += 1;
+                stats.total_bytes += file.size_bytes;
+                stats.total_tokens += token_count;
+            }
+
+            term_frequencies.insert(
+                file.relative_path.clone(),
+                compute_term_frequencies(&file_content),
+            );
 
             let parse_result = parse_results.get(&file.relative_path).cloned();
             indexed_files.push(Arc::new(IndexedFile {
@@ -293,62 +550,17 @@ impl CodebaseIndex {
                 token_count,
                 parse_result,
                 content: file_content,
-                mtime_secs,
+                mtime_ns,
             }));
         }
 
-        let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
-
-        let mut index = Self {
-            total_files: indexed_files.len(),
-            total_bytes,
-            total_tokens,
-            files: indexed_files,
+        Self::finish_build(
+            indexed_files,
             language_stats,
+            total_tokens,
+            total_bytes,
             term_frequencies,
-            domains,
-            schema: None,
-            graph: DependencyGraph::new(),
-            pagerank: HashMap::new(),
-            test_map: HashMap::new(),
-            call_graph: CallGraph::default(),
-            conventions: ConventionProfile::default(),
-            co_changes: Vec::new(),
-            cross_lang_edges: Vec::new(),
-            #[cfg(feature = "embeddings")]
-            embedding_index: None,
-            dead_code_cache: Arc::new(OnceLock::new()),
-            health_cache: Arc::new(OnceLock::new()),
-        };
-        index.schema = crate::schema::detect::build_schema_index(&index);
-        index.graph =
-            crate::index::graph::build_dependency_graph(&index.files, index.schema.as_ref());
-        index.pagerank = crate::intelligence::pagerank::compute_pagerank(&index.graph, 0.85, 100);
-        let all_paths: std::collections::HashSet<String> = index
-            .files
-            .iter()
-            .map(|f| f.relative_path.clone())
-            .collect();
-        index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
-        index.call_graph = crate::intelligence::call_graph::build_call_graph(&index);
-
-        // v1.5.0: detect cross-language boundaries and inject as CrossLanguage
-        // edges — see `build()` for the same logic.
-        let cross_edges = crate::intelligence::cross_lang::detect_cross_lang_edges(&index);
-        for e in &cross_edges {
-            index.graph.add_edge(
-                &e.source_file,
-                &e.target_file,
-                crate::index::graph::EdgeType::CrossLanguage(e.bridge_type.clone()),
-            );
-        }
-        index.cross_lang_edges = cross_edges;
-
-        // NOTE: embedding_index is NOT built here. It's built at server startup
-        // via build_embedding_index() — model download should not block CLI commands.
-        // NOTE: conventions is NOT built here. It's built after index construction
-        // via build_convention_profile() — needs repo_path for git2 access.
-        index
+        )
     }
 
     /// Rebuild the cached dependency graph from current files and schema.
@@ -437,8 +649,16 @@ impl CodebaseIndex {
 
     /// Rebuild the index incrementally: re-parse only files whose mtime/size differs.
     ///
+    /// The staleness check compares `(mtime_ns, size_bytes)` with `!=`, not a
+    /// strict "newer than" ordering on a whole-second mtime: a same-size edit
+    /// landing within the same wall-clock second as the prior index still
+    /// changes the nanosecond mtime, and a `!=` comparison also catches an
+    /// mtime that moves *backward* (e.g. a `git checkout`/rebase that resets
+    /// mtime to an earlier value) — both were silently skipped by the old
+    /// `new > old` check (cxpak#36).
+    ///
     /// Steps:
-    /// 1. Scan current files, compare mtime against stored IndexedFile.mtime_secs.
+    /// 1. Scan current files, compare mtime against stored IndexedFile.mtime_ns.
     /// 2. Call upsert_file() for changed/new files.
     /// 3. Call remove_file() for deleted files.
     /// 4. Call rebuild_graph() to recompute the dependency graph.
@@ -448,6 +668,21 @@ impl CodebaseIndex {
         current_files: &[crate::scanner::ScannedFile],
         parse_results: &std::collections::HashMap<String, crate::parser::language::ParseResult>,
         counter: &TokenCounter,
+    ) {
+        self.incremental_rebuild_with_reader(current_files, parse_results, counter, read_indexable)
+    }
+
+    /// [`incremental_rebuild`](Self::incremental_rebuild) with the read step
+    /// injectable, for deterministic race testing of the settle check
+    /// (cxpak#36 follow-up) without a timing-dependent background thread. The
+    /// public `incremental_rebuild` always calls this with [`read_indexable`]
+    /// itself — the injection seam exists for `#[cfg(test)]` callers only.
+    fn incremental_rebuild_with_reader(
+        &mut self,
+        current_files: &[crate::scanner::ScannedFile],
+        parse_results: &std::collections::HashMap<String, crate::parser::language::ParseResult>,
+        counter: &TokenCounter,
+        read: impl Fn(&std::path::Path, u64, u64) -> Option<String>,
     ) {
         let current_paths: std::collections::HashSet<String> = current_files
             .iter()
@@ -470,11 +705,8 @@ impl CodebaseIndex {
         // the graph can be rebuilt by edge-delta rather than from scratch.
         let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for file in current_files {
-            let mtime_secs = std::fs::metadata(&file.absolute_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
+            let pre_stat = stat_fingerprint(&file.absolute_path);
+            let mtime_ns = pre_stat.and_then(|(ns, _)| ns);
 
             let needs_update = match self
                 .files
@@ -482,15 +714,25 @@ impl CodebaseIndex {
                 .find(|f| f.relative_path == file.relative_path)
             {
                 None => true, // new file
-                Some(existing) => match (existing.mtime_secs, mtime_secs) {
-                    (Some(old), Some(new)) => new > old || file.size_bytes != existing.size_bytes,
+                Some(existing) => match (existing.mtime_ns, mtime_ns) {
+                    (Some(old), Some(new)) => new != old || file.size_bytes != existing.size_bytes,
                     _ => true, // no mtime available: always re-parse
                 },
             };
 
             if needs_update {
-                let Some(content) =
-                    read_indexable(&file.absolute_path, file.size_bytes, max_file_bytes())
+                // Settle-check (cxpak#36 follow-up): `pre_stat` was taken
+                // above, before this read; `settled_read_with` re-stats after
+                // the read and returns `None` if the file changed again in
+                // between. Caching `content` under `mtime_ns` in that case
+                // would record a pair that matches neither the before- nor
+                // after-edit disk state — skip and let the next
+                // incremental_rebuild pass, which will see a fresh mismatch
+                // against `existing.mtime_ns`, pick it up.
+                let Some((content, mtime_ns)) =
+                    settled_read_with(&file.absolute_path, pre_stat, || {
+                        read(&file.absolute_path, file.size_bytes, max_file_bytes())
+                    })
                 else {
                     continue;
                 };
@@ -501,7 +743,7 @@ impl CodebaseIndex {
                     &content,
                     parse_result,
                     counter,
-                    mtime_secs,
+                    mtime_ns,
                 );
                 changed.insert(file.relative_path.clone());
             }
@@ -547,7 +789,7 @@ impl CodebaseIndex {
         content: &str,
         parse_result: Option<ParseResult>,
         counter: &TokenCounter,
-        mtime_secs: Option<u64>,
+        mtime_ns: Option<u64>,
     ) {
         // Remove old entry if it exists (adjusts stats)
         self.remove_file(relative_path);
@@ -579,7 +821,7 @@ impl CodebaseIndex {
             token_count,
             parse_result,
             content: content.to_string(),
-            mtime_secs,
+            mtime_ns,
         }));
 
         self.total_files = self.files.len();
@@ -798,7 +1040,7 @@ mod tests {
                         exports: vec![],
                     }),
                     content: String::new(),
-                    mtime_secs: None,
+                    mtime_ns: None,
                 })
             })
             .collect();
@@ -1585,8 +1827,149 @@ mod tests {
         }];
         let index = CodebaseIndex::build(files, HashMap::new(), &counter);
         assert!(
-            index.files[0].mtime_secs.is_some(),
-            "mtime_secs should be populated from disk"
+            index.files[0].mtime_ns.is_some(),
+            "mtime_ns should be populated from disk"
+        );
+    }
+
+    #[test]
+    fn test_stat_fingerprint_detects_mtime_and_size_changes() {
+        // Deterministic test for the settle-check's building block (cxpak#36
+        // TOCTOU follow-up): two stats of the same, unmodified file must
+        // compare equal, and a stat taken after either the mtime or the size
+        // changes must compare unequal to one taken before.
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+
+        let before = stat_fingerprint(&fp);
+        assert!(before.is_some(), "a freshly-written file must be stat'able");
+        let before_again = stat_fingerprint(&fp);
+        assert_eq!(
+            before, before_again,
+            "two stats of an unmodified file must agree"
+        );
+
+        // Re-write with the same byte size so only the mtime, not the size,
+        // changes -- the exact dimension #36 itself is about. Sleep past a
+        // whole second so the bump is visible even on filesystems with only
+        // whole-second mtime resolution (this test must not depend on the
+        // nanosecond precision it is itself validating).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&fp, "fn b() {}").unwrap();
+        let after_same_size_edit = stat_fingerprint(&fp);
+        assert_ne!(
+            before, after_same_size_edit,
+            "a changed mtime with unchanged size must not compare equal"
+        );
+
+        std::fs::write(&fp, "fn a() { 1 }").unwrap();
+        let after_size_change = stat_fingerprint(&fp);
+        assert_ne!(
+            after_same_size_edit, after_size_change,
+            "a changed size must not compare equal"
+        );
+
+        let missing = dir.path().join("does-not-exist.rs");
+        assert_eq!(
+            stat_fingerprint(&missing),
+            None,
+            "a nonexistent path must stat to None"
+        );
+    }
+
+    #[test]
+    fn test_read_indexable_settled_returns_content_and_mtime_when_unchanged() {
+        // Happy-path regression for the settled read/stat pair introduced to
+        // close the cxpak#36 TOCTOU: when nothing changes around the read,
+        // behavior must be identical to the unguarded read it replaced.
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+
+        let result = read_indexable_settled(&fp, 9, max_file_bytes());
+        let (content, mtime_ns) = result.expect("settled read must succeed when nothing races it");
+        assert_eq!(content, "fn a() {}");
+        assert!(mtime_ns.is_some());
+    }
+
+    #[test]
+    fn test_read_indexable_settled_returns_none_on_mid_read_edit() {
+        // Deterministic race test (review follow-up on cxpak#36): rather than
+        // hope a background thread wins a timing race, the read step is
+        // injected as a closure that mutates the file -- same byte size,
+        // different content -- WHILE it runs. The pre-stat was taken before
+        // this closure; the post-stat happens after it returns, so the
+        // mutation deterministically lands inside the settle-check window on
+        // every run, not just the lucky ones.
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+
+        let result = read_indexable_settled_with(&fp, 9, max_file_bytes(), |path, size, cap| {
+            let content = read_indexable(path, size, cap);
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            std::fs::write(path, "fn b() {}").unwrap();
+            content
+        });
+
+        assert_eq!(
+            result, None,
+            "a file that changes between the pre- and post-read stat must not be cached"
+        );
+    }
+
+    #[test]
+    fn test_incremental_rebuild_skips_file_that_changes_mid_read() {
+        // Deterministic race test for `incremental_rebuild` itself (review
+        // follow-up on cxpak#36): injects the same kind of mid-read mutation
+        // via `incremental_rebuild_with_reader`'s test-only seam, and asserts
+        // the public behavior a caller actually observes -- the file's
+        // cached content and mtime are left exactly as they were before this
+        // pass, so a later pass (seeing a fresh mismatch) tries again, rather
+        // than silently adopting content that raced the read.
+        let counter = TokenCounter::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+        let file = ScannedFile {
+            relative_path: "a.rs".into(),
+            absolute_path: fp.clone(),
+            language: Some("rust".into()),
+            size_bytes: 9,
+        };
+
+        let mut index = CodebaseIndex::build(vec![file.clone()], HashMap::new(), &counter);
+        let original_content = index.files[0].content.clone();
+        let original_mtime_ns = index.files[0].mtime_ns;
+
+        // Bump the mtime forward (same byte size) so `needs_update` is true
+        // and `incremental_rebuild` actually attempts a read this pass.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&fp, "fn b() {}").unwrap();
+
+        index.incremental_rebuild_with_reader(
+            &[file],
+            &HashMap::new(),
+            &counter,
+            |path, size, cap| {
+                let content = read_indexable(path, size, cap);
+                // Mutate again (same size) while "reading" -- lands between
+                // the pre-stat `incremental_rebuild` already took and the
+                // post-stat the settle check takes after this closure
+                // returns.
+                std::fs::write(path, "fn c() {}").unwrap();
+                content
+            },
+        );
+
+        assert_eq!(
+            index.files[0].content, original_content,
+            "a mid-read edit must not be cached as this pass's content"
+        );
+        assert_eq!(
+            index.files[0].mtime_ns, original_mtime_ns,
+            "nor must its mtime advance, so a later pass still sees a mismatch and retries"
         );
     }
 
@@ -1645,10 +2028,10 @@ mod tests {
         }];
         let mut index = CodebaseIndex::build(files, HashMap::new(), &counter);
         assert!(
-            index.files[0].mtime_secs.is_some(),
+            index.files[0].mtime_ns.is_some(),
             "precondition: disk build populates mtime"
         );
-        Arc::make_mut(&mut index.files[0]).mtime_secs = None;
+        Arc::make_mut(&mut index.files[0]).mtime_ns = None;
 
         let current = vec![ScannedFile {
             relative_path: "a.rs".into(),
@@ -1658,8 +2041,8 @@ mod tests {
         }];
         index.incremental_rebuild(&current, &HashMap::new(), &counter);
         assert!(
-            index.files[0].mtime_secs.is_some(),
-            "the wildcard re-parse arm must have run upsert_file, repopulating mtime_secs from disk"
+            index.files[0].mtime_ns.is_some(),
+            "the wildcard re-parse arm must have run upsert_file, repopulating mtime_ns from disk"
         );
     }
 
