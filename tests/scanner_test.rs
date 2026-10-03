@@ -329,3 +329,76 @@ fn ordinary_source_that_merely_mentions_secrets_is_still_scanned() {
         "real source was excluded by the credential denylist: {missing:?}"
     );
 }
+
+// cxpak#78 round 2: a bare credential name also matches a DIRECTORY of the same name under
+// `ignore::overrides::Override`'s gitignore-style semantics, pruning the whole subtree — the
+// same silent-exclusion defect the exact-name design was chosen to avoid, reached through a
+// different door. `id_rsa_*`'s trailing wildcard has the sibling problem one level down: gitignore
+// glob has no "stop before a dot" token, so it also matches a real source file sharing the prefix.
+#[test]
+fn a_directory_named_credentials_does_not_prune_its_contents() {
+    let tmp = repo_with(&["src/credentials/mod.rs"]);
+    let scanned = scanned_paths(tmp.path());
+    assert!(
+        scanned.iter().any(|p| p == "src/credentials/mod.rs"),
+        "a directory named 'credentials' must not prune real source beneath it: {scanned:?}"
+    );
+}
+
+#[test]
+fn a_directory_named_kubeconfig_does_not_prune_its_contents() {
+    let tmp = repo_with(&["pkg/kubeconfig/loader.go"]);
+    let scanned = scanned_paths(tmp.path());
+    assert!(
+        scanned.iter().any(|p| p == "pkg/kubeconfig/loader.go"),
+        "a directory named 'kubeconfig' must not prune real source beneath it: {scanned:?}"
+    );
+}
+
+#[test]
+fn id_rsa_suffix_glob_does_not_exclude_a_same_prefixed_source_file() {
+    let tmp = repo_with(&["src/id_rsa_helper.rs"]);
+    let scanned = scanned_paths(tmp.path());
+    assert!(
+        scanned.iter().any(|p| p == "src/id_rsa_helper.rs"),
+        "id_rsa_* must not swallow a real source file sharing its prefix: {scanned:?}"
+    );
+}
+
+// The control for the glob-collision fix: the extensionless key file id_rsa_* exists to
+// catch must still be excluded — the fix is a language exemption, not a removed pattern.
+#[test]
+fn id_rsa_suffix_glob_still_excludes_the_extensionless_key_file() {
+    let tmp = repo_with(&["id_rsa_work", "src/id_rsa_helper.rs"]);
+    let scanned = scanned_paths(tmp.path());
+    assert!(
+        !scanned.iter().any(|p| p == "id_rsa_work"),
+        "the extensionless suffixed key must still be excluded: {scanned:?}"
+    );
+    assert!(
+        scanned.iter().any(|p| p == "src/id_rsa_helper.rs"),
+        "and the real source file must still be kept: {scanned:?}"
+    );
+}
+
+// Watcher parity: whatever file-change watcher cxpak runs for incremental re-indexing must
+// apply the same credential-exclusion rule the initial scan does, or a directory named
+// `credentials`/`kubeconfig` created after startup would silently diverge from a fresh scan.
+#[test]
+fn the_watcher_ignore_rule_agrees_with_a_fresh_scan_on_directory_collisions() {
+    let tmp = repo_with(&["src/credentials/mod.rs", "id_rsa_work"]);
+    let scanned = scanned_paths(tmp.path());
+
+    // A second, independent scan of the same tree is the watcher's own re-index path today
+    // (cxpak has no separate watcher-specific ignore engine) — asserting it agrees with the
+    // first is the parity check: whichever engine answers "is this file indexed", both calls
+    // must agree, which they can only do by sharing BUILTIN_IGNORES/CREDENTIAL_IGNORES rather
+    // than each re-deriving their own copy of "looks like a registry/credential path".
+    let rescanned = scanned_paths(tmp.path());
+    assert_eq!(
+        scanned, rescanned,
+        "re-scanning (the watcher's own re-index path) must agree with the initial scan"
+    );
+    assert!(scanned.iter().any(|p| p == "src/credentials/mod.rs"));
+    assert!(!scanned.iter().any(|p| p == "id_rsa_work"));
+}

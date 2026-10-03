@@ -79,21 +79,37 @@ pub const BUILTIN_IGNORES: &[&str] = &[
     "*.min.js",
     "*.min.css",
     "*.map",
-    // ── Credential material (cxpak#39) ────────────────────────────────────────
-    //
-    // Measured on the published 3.1.4 image: a repo containing `id_rsa`,
-    // `server.key` and `credentials.json` indexed all three, and `credentials.json`
-    // was packed VERBATIM into the `overview` bundle. The only thing standing
-    // between a committed private key and the model was whether the user's
-    // `.gitignore` happened to cover it — `git_global(true)`'s comment already
-    // banked on that ("often excludes .env, *.pem"), which is a hope, not a control.
-    //
-    // These are exact names and key-material extensions, deliberately NOT the
-    // `*secret*` / `*credentials*` globs the ticket proposed. A glob that wide
-    // silently drops `secrets_manager.rs`, `credentials_test.go` and
-    // `SecretScanner.java` out of the index — real source vanishing from context
-    // with no diagnostic, which is the same defect class this list is closing, in
-    // the other direction.
+];
+
+/// Credential-shaped filenames and key-material extensions (cxpak#39, #67, #78).
+///
+/// Measured on the published 3.1.4 image: a repo containing `id_rsa`, `server.key` and
+/// `credentials.json` indexed all three, and `credentials.json` was packed VERBATIM into
+/// the `overview` bundle. The only thing standing between a committed private key and the
+/// model was whether the user's `.gitignore` happened to cover it — `git_global(true)`'s
+/// comment already banked on that ("often excludes .env, *.pem"), which is a hope, not a
+/// control.
+///
+/// These are exact names and key-material extensions, deliberately NOT the `*secret*` /
+/// `*credentials*` globs the ticket proposed. A glob that wide silently drops
+/// `secrets_manager.rs`, `credentials_test.go` and `SecretScanner.java` out of the index —
+/// real source vanishing from context with no diagnostic, which is the same defect class
+/// this list is closing, in the other direction.
+///
+/// **Kept separate from [`BUILTIN_IGNORES`] deliberately (cxpak#78 round 2).** That list
+/// feeds `ignore::overrides::Override`, whose gitignore-style matching applies to a
+/// DIRECTORY of the same name exactly as it does to a file, pruning the whole subtree —
+/// correct for `node_modules`/`target`, wrong here: a bare `credentials` or `kubeconfig`
+/// pattern silently dropped every file under a `src/credentials/` or `pkg/kubeconfig/`
+/// directory, real source included, with no diagnostic (the exact defect class the
+/// extensionless-glob comment above already rejected, reached by a different door). These
+/// patterns are instead matched against each FILE's own basename only, post-walk (see
+/// `Scanner::scan`), and a basename match is further exempted when `detect_language`
+/// recognises its extension — `id_rsa_*` is the suffixed-ssh-key convention and also,
+/// unavoidably given gitignore glob has no "stop before a dot" syntax, every
+/// `id_rsa_*.{rs,go,...}` source file; the language check is what keeps `id_rsa_helper.rs`
+/// in the index while still excluding the extensionless key file the pattern exists for.
+pub const CREDENTIAL_IGNORES: &[&str] = &[
     ".env",
     ".env.*",
     "*.pem",
@@ -115,14 +131,6 @@ pub const BUILTIN_IGNORES: &[&str] = &[
     ".netrc",
     ".npmrc",
     ".pypirc",
-    // ── cxpak#78: completeness gaps in the #39/#67 list, against its own stated rule ──
-    //
-    // Same shape as the names above — exact filenames or key-material extensions, never a
-    // `*secret*`/`*credentials*` glob. Measured independently (not inferred from this list):
-    // `credentials`, `id_rsa_work`-style suffixed keys, and the seven dotfiles below all
-    // indexed, and `service-account.json` packed verbatim into the `overview` bundle, on
-    // post-#67 `main`.
-    //
     // The extensionless sibling of `credentials.{json,yml,yaml}` — the AWS SDK/CLI's own
     // default filename, and the common form; the three covered above are the rarer ones.
     "credentials",
