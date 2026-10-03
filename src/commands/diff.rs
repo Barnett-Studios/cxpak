@@ -981,6 +981,7 @@ mod tests {
                     medium: 0,
                     low: 0,
                 },
+                not_found: vec![],
             },
             predicted_tests: vec![],
             violations: vec![],
@@ -1053,6 +1054,7 @@ mod tests {
                     medium: 0,
                     low: 0,
                 },
+                not_found: vec![],
             },
             predicted_tests: vec![],
             violations: vec![],
@@ -1167,6 +1169,7 @@ mod tests {
                     medium: 0,
                     low: 1,
                 },
+                not_found: vec![],
             },
             predicted_tests: vec![
                 TestPrediction {
@@ -1270,6 +1273,7 @@ mod tests {
                     medium: 0,
                     low: 0,
                 },
+                not_found: vec![],
             },
             predicted_tests: vec![],
             violations: vec![],

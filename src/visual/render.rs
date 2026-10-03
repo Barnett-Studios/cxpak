@@ -3829,6 +3829,7 @@ mod tests {
             paths: vec![path],
             truncated,
             limitations: vec![],
+            found: true,
         }
     }
 
@@ -4479,6 +4480,7 @@ mod tests {
             paths: vec![path],
             truncated: false,
             limitations: vec![],
+            found: true,
         };
         let index = make_minimal_index();
         let config = crate::visual::layout::LayoutConfig::default();

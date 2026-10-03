@@ -39,6 +39,13 @@ pub struct PredictionResult {
     pub call_impact: Vec<ImpactEntry>,
     pub test_impact: Vec<TestPrediction>,
     pub confidence_summary: String,
+    /// Seeds in `changed_files` that are not edge-participating nodes in the
+    /// dependency graph at all — sorted, `[]` when every seed resolved. Same
+    /// shape as `blast_radius`'s `not_found` (cxpak#79): an unresolved seed
+    /// must not be indistinguishable from one that genuinely predicts
+    /// nothing.
+    #[serde(default)]
+    pub not_found: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +358,16 @@ pub fn predict_with_call_graph(
     let historical = historical_impact(changed_files, co_changes);
     let call_impact = call_graph_impact(changed_files, call_graph);
 
+    // Seeds that are not edge-participating nodes at all (cxpak#79): report
+    // them honestly rather than a confident-looking all-zero prediction.
+    let mut not_found: Vec<String> = changed_files
+        .iter()
+        .filter(|&&seed| !graph.contains_node(seed))
+        .map(|s| s.to_string())
+        .collect();
+    not_found.sort();
+    not_found.dedup();
+
     let test_impact = merge_test_predictions(
         changed_files,
         &structural,
@@ -387,6 +404,7 @@ pub fn predict_with_call_graph(
         call_impact,
         test_impact,
         confidence_summary,
+        not_found,
     }
 }
 
@@ -822,6 +840,47 @@ mod tests {
         assert!(
             total_reported <= naive_sum || naive_sum == 0,
             "distinct count {total_reported} must be ≤ naive sum {naive_sum}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // not_found: unknown seed vs. a genuinely isolated real seed (cxpak#79)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_predict_isolated_real_seed_is_not_in_not_found() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("leaf.rs", "b.rs", EdgeType::Import);
+        let pagerank = HashMap::new();
+        let co_changes = vec![];
+        let test_map = HashMap::new();
+
+        let result = predict(&["leaf.rs"], &graph, &pagerank, &co_changes, &test_map, 3);
+        assert!(
+            result.not_found.is_empty(),
+            "leaf.rs is a real (edge-participating) node"
+        );
+    }
+
+    #[test]
+    fn test_predict_unknown_seed_reported_distinctly_from_isolated() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs", EdgeType::Import);
+        let pagerank = HashMap::new();
+        let co_changes = vec![];
+        let test_map = HashMap::new();
+
+        let unknown = predict(&["nosuch.rs"], &graph, &pagerank, &co_changes, &test_map, 3);
+        let isolated = predict(&["b.rs"], &graph, &pagerank, &co_changes, &test_map, 3);
+
+        assert_eq!(
+            unknown.not_found,
+            vec!["nosuch.rs".to_string()],
+            "nosuch.rs is not a node in the graph at all"
+        );
+        assert!(
+            isolated.not_found.is_empty(),
+            "b.rs is a real node — must not be reported as not_found"
         );
     }
 }

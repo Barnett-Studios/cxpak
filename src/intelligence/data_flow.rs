@@ -117,6 +117,15 @@ fn path_confidence(hops: &[CallConfidence], unresolved: bool) -> FlowConfidence 
     if unresolved {
         return FlowConfidence::Speculative;
     }
+    // A zero-hop path (a dead end at the very first node: no callees were
+    // ever traversed) has no evidence at all. `any()` over an empty slice is
+    // vacuously false, so without this guard the fallthrough below reports
+    // `Exact` — the verdict reserved for a fully-verified chain — for a path
+    // that verified nothing (cxpak#80). `Approximate` is the honest label:
+    // plausible (the source itself is real) but not proven by any hop.
+    if hops.is_empty() {
+        return FlowConfidence::Approximate;
+    }
     if hops
         .iter()
         .any(|h| matches!(h, CallConfidence::Approximate))
@@ -170,7 +179,10 @@ pub fn trace_data_flow(
 
     // 1. Locate the source symbol. We accept any file that defines a public or
     //    private symbol with this name; if multiple exist, we pick the first.
-    let (source_file, source_language, source_param) = locate_source(symbol, index);
+    let located = locate_source(symbol, index);
+    let found = located.is_some();
+    let (source_file, source_language, source_param) =
+        located.unwrap_or_else(|| ("<unknown>".into(), "unknown".into(), None));
 
     let source_node = FlowNode {
         file: source_file.clone(),
@@ -180,6 +192,20 @@ pub fn trace_data_flow(
         node_type: FlowNodeType::Source,
     };
 
+    // 2. Guard: the source symbol does not exist anywhere in the index. There
+    // is no evidence to trace from, so report that honestly (cxpak#80)
+    // instead of fabricating a path through the `<unknown>` placeholder.
+    if !found {
+        return DataFlowResult {
+            source: source_node,
+            sink: None,
+            paths: Vec::new(),
+            truncated: false,
+            limitations: standard_limitations(),
+            found: false,
+        };
+    }
+
     // Compute the set of "security-sensitive" files once per trace. A file is
     // security-sensitive when it appears in the v1.4.0 SecuritySurface as an
     // unprotected endpoint, an input-validation gap, a secret-pattern match,
@@ -187,7 +213,7 @@ pub fn trace_data_flow(
     // flagged via `touches_security_boundary` on the resulting FlowPath.
     let security_files = compute_security_file_set(index);
 
-    // 2. Guard: empty call graph or unknown source → empty paths.
+    // 3. Guard: empty call graph → empty paths (graceful degradation).
     if index.call_graph.edges.is_empty() {
         return DataFlowResult {
             source: source_node,
@@ -195,6 +221,7 @@ pub fn trace_data_flow(
             paths: Vec::new(),
             truncated: false,
             limitations: standard_limitations(),
+            found: true,
         };
     }
 
@@ -214,6 +241,7 @@ pub fn trace_data_flow(
             paths: vec![single],
             truncated: false,
             limitations: standard_limitations(),
+            found: true,
         };
     }
 
@@ -338,27 +366,29 @@ pub fn trace_data_flow(
         paths: completed,
         truncated,
         limitations: standard_limitations(),
+        found: true,
     }
 }
 
 /// Heuristically locate the source symbol's file/language/parameter name.
+///
+/// Returns `None` when `symbol` is not defined anywhere in the index — the
+/// caller must not treat an unresolved source as a located one (cxpak#80):
+/// `<unknown>`/`"unknown"` must never stand in for a real file/language.
 fn locate_source(
     symbol: &str,
     index: &crate::core_graph::CodebaseIndex,
-) -> (String, String, Option<String>) {
+) -> Option<(String, String, Option<String>)> {
     let matches = index.find_symbol(symbol);
-    if let Some((path, sym)) = matches.first() {
-        let lang = index
-            .files
-            .iter()
-            .find(|f| f.relative_path == *path)
-            .and_then(|f| f.language.clone())
-            .unwrap_or_else(|| "unknown".into());
-        let param = first_parameter_name(&sym.signature);
-        return ((*path).to_string(), lang, param);
-    }
-    // Symbol not found in any indexed file — record what we know.
-    ("<unknown>".into(), "unknown".into(), None)
+    let (path, sym) = matches.first()?;
+    let lang = index
+        .files
+        .iter()
+        .find(|f| f.relative_path == *path)
+        .and_then(|f| f.language.clone())
+        .unwrap_or_else(|| "unknown".into());
+    let param = first_parameter_name(&sym.signature);
+    Some(((*path).to_string(), lang, param))
 }
 
 /// Forward the named parameter from `prev` into the callee.
@@ -514,6 +544,11 @@ pub struct DataFlowResult {
     /// Documented limitations — included on every result so the LLM always
     /// sees them. See module docs for the full list.
     pub limitations: Vec<String>,
+    /// Whether the requested source `symbol` was located anywhere in the
+    /// index, mirroring the sibling `trace` op's `found` field (cxpak#80).
+    /// `false` means `source` is a placeholder (`file: "<unknown>"`) and
+    /// `paths` is always empty — there is no evidence to report a flow on.
+    pub found: bool,
 }
 
 #[cfg(test)]
@@ -1288,6 +1323,66 @@ mod tests {
         assert!(
             !surface.sql_injection_surface.is_empty(),
             "expected a sql-injection finding"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // cxpak#80: unresolved source must not fabricate an Exact path through
+    // `<unknown>`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trace_unknown_symbol_reports_not_found() {
+        let mut index =
+            build_index_with_symbols(&[("src/api.rs", "rust", "fn handle_request(req: Request)")]);
+        // A non-empty call graph, so the "empty call graph" guard does not
+        // mask this case — the defect is specifically about an unresolved
+        // *symbol*, not an unresolved *call graph*.
+        index.call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "src/api.rs".into(),
+                caller_symbol: "handle_request".into(),
+                callee_file: "src/api.rs".into(),
+                callee_symbol: "handle_request".into(),
+                confidence: CallConfidence::Exact,
+                resolution_note: None,
+            }],
+            unresolved: Vec::new(),
+        };
+
+        let result = trace_data_flow("NoSuchSymbol", None, 10, &index);
+        assert!(
+            !result.found,
+            "NoSuchSymbol does not exist anywhere in the index"
+        );
+        assert!(
+            result.paths.is_empty(),
+            "an unresolved source must not fabricate a path; limitations already \
+             promise empty paths when there is no evidence"
+        );
+        assert!(result.sink.is_none());
+    }
+
+    #[test]
+    fn test_trace_known_symbol_reports_found() {
+        let index =
+            build_index_with_symbols(&[("src/api.rs", "rust", "fn handle_request(req: Request)")]);
+        let result = trace_data_flow("handle_request", None, 10, &index);
+        assert!(result.found, "handle_request is a real indexed symbol");
+    }
+
+    #[test]
+    fn test_path_confidence_zero_hops_is_never_exact() {
+        // A zero-hop path carries no evidence at all — `any()` over an empty
+        // slice is vacuously false, so the naive fallthrough reported Exact,
+        // the strongest verdict the field expresses, for a path that proves
+        // nothing.
+        let conf = path_confidence(&[], false);
+        assert_ne!(
+            conf,
+            FlowConfidence::Exact,
+            "zero hops must never be reported as Exact — no evidence is not \
+             the same as all-hops-verified"
         );
     }
 }

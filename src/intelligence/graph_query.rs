@@ -117,6 +117,12 @@ pub struct NeighborEdge {
 pub struct Neighbors {
     pub id: String,
     pub direction: String,
+    /// Whether `id` is a known (edge-participating) node, mirroring
+    /// `NodeInfo::exists`. An empty `neighbors` list with `exists: false`
+    /// means the id is not in the graph; with `exists: true` it means a
+    /// real, genuinely isolated node (ADR-0202 family: unknown is never
+    /// silently identical to empty).
+    pub exists: bool,
     pub neighbors: Vec<NeighborEdge>,
 }
 
@@ -137,6 +143,13 @@ pub struct PathResult {
     pub to: String,
     /// Whether a directed (out-edge) path exists.
     pub found: bool,
+    /// Whether `from` is a known (edge-participating) node, mirroring
+    /// `NodeInfo::exists`. Distinguishes "two real nodes, genuinely no
+    /// route" (both `_exists` true, `found: false`) from "named an id not
+    /// in the graph" (ADR-0202 family).
+    pub from_exists: bool,
+    /// Whether `to` is a known (edge-participating) node. See `from_exists`.
+    pub to_exists: bool,
     /// The canonical shortest-path node sequence (inclusive of both endpoints),
     /// or empty when no path exists.
     pub nodes: Vec<String>,
@@ -259,6 +272,7 @@ pub fn neighbors(graph: &DependencyGraph, id: &str, direction: Direction) -> Nei
     Neighbors {
         id: id.to_string(),
         direction: direction.label().to_string(),
+        exists: graph.contains_node(id),
         neighbors: out,
     }
 }
@@ -273,6 +287,8 @@ pub fn path(graph: &DependencyGraph, from: &str, to: &str) -> PathResult {
             from: from.to_string(),
             to: to.to_string(),
             found: exists,
+            from_exists: exists,
+            to_exists: exists,
             nodes: if exists {
                 vec![from.to_string()]
             } else {
@@ -281,6 +297,9 @@ pub fn path(graph: &DependencyGraph, from: &str, to: &str) -> PathResult {
             edges: vec![],
         };
     }
+
+    let from_exists = graph.contains_node(from);
+    let to_exists = graph.contains_node(to);
 
     // `dist[n]` = shortest number of out-edges from `n` to `to`. Computed by a
     // reverse BFS from `to` over incoming edges (deterministic: `dependents`
@@ -304,6 +323,8 @@ pub fn path(graph: &DependencyGraph, from: &str, to: &str) -> PathResult {
             from: from.to_string(),
             to: to.to_string(),
             found: false,
+            from_exists,
+            to_exists,
             nodes: vec![],
             edges: vec![],
         };
@@ -340,6 +361,8 @@ pub fn path(graph: &DependencyGraph, from: &str, to: &str) -> PathResult {
         from: from.to_string(),
         to: to.to_string(),
         found: true,
+        from_exists,
+        to_exists,
         nodes,
         edges,
     }
@@ -847,6 +870,62 @@ mod tests {
             execute(&g, "frobnicate", &json!({})),
             Err(GraphQueryError::UnknownOp("frobnicate".into()))
         );
+    }
+
+    #[test]
+    fn neighbors_unknown_id_distinguishable_from_isolated_real_node() {
+        let g = linear(); // a -> b -> c
+                          // Add an isolated real node with no edges at all so it never appears
+                          // via `add_edge`; use `subgraph`'s existing isolated-id convention: a
+                          // node is "real" only if it participates in an edge. So instead we
+                          // compare: unknown id vs. a real id queried in a direction that has
+                          // no neighbours on that side.
+        let unknown = neighbors(&g, "nope", Direction::Both);
+        assert!(!unknown.exists, "id never added to the graph");
+        assert!(unknown.neighbors.is_empty());
+
+        // `c` is real (has an in-edge from b) but has no *outgoing* edges —
+        // genuinely isolated in the `Out` direction, not unknown.
+        let isolated_out = neighbors(&g, "c", Direction::Out);
+        assert!(isolated_out.exists, "c is a real node");
+        assert!(isolated_out.neighbors.is_empty());
+
+        // The two empty-neighbour responses must differ in `exists`.
+        assert_ne!(unknown.exists, isolated_out.exists);
+    }
+
+    #[test]
+    fn path_unknown_endpoint_distinguishable_from_real_no_route() {
+        let g = linear(); // a -> b -> c, so c has no out-edge back to a.
+        let no_route = path(&g, "c", "a");
+        assert!(!no_route.found);
+        assert!(no_route.from_exists, "c is a real node");
+        assert!(no_route.to_exists, "a is a real node");
+
+        let unknown_from = path(&g, "nope", "a");
+        assert!(!unknown_from.found);
+        assert!(!unknown_from.from_exists);
+        assert!(unknown_from.to_exists);
+
+        let unknown_to = path(&g, "a", "nope");
+        assert!(!unknown_to.found);
+        assert!(unknown_to.from_exists);
+        assert!(!unknown_to.to_exists);
+
+        let both_unknown = path(&g, "nope", "alsonope");
+        assert!(!both_unknown.found);
+        assert!(!both_unknown.from_exists);
+        assert!(!both_unknown.to_exists);
+    }
+
+    #[test]
+    fn execute_neighbors_and_path_surface_exists_flags() {
+        let g = linear();
+        let n = execute(&g, "neighbors", &json!({"id": "nope"})).unwrap();
+        assert_eq!(n["exists"], json!(false));
+        let p = execute(&g, "path", &json!({"from": "nope", "to": "a"})).unwrap();
+        assert_eq!(p["from_exists"], json!(false));
+        assert_eq!(p["to_exists"], json!(true));
     }
 
     #[test]
