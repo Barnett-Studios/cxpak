@@ -2853,6 +2853,10 @@ pub fn mcp_stdio_loop_readiness(
                 }),
             ),
             "notifications/initialized" => continue, // no response for notifications
+            // Base protocol utility (MCP 2024-11-05): "the receiver MUST
+            // respond promptly with an empty response" — not capability-
+            // gated, unlike tools/resources/prompts. cxpak#110 / cxpak#116.
+            "ping" => mcp_response(id, json!({})),
             "tools/list" => mcp_response(
                 id,
                 json!({
@@ -6664,6 +6668,56 @@ mod tests {
         let line = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    /// MCP base protocol (2024-11-05): "the receiver MUST respond promptly
+    /// with an empty response" to `ping`, independent of declared
+    /// capabilities. cxpak#110 / cxpak#116: this fell into the catch-all
+    /// and answered -32601 Method not found instead.
+    #[test]
+    fn test_mcp_stdio_loop_ping() {
+        let index = make_test_index();
+        let input = r#"{"jsonrpc":"2.0","id":31,"method":"ping"}"#;
+        let input = format!("{input}\n");
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
+        let line = String::from_utf8(output).unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 31);
+        assert_eq!(resp["result"], json!({}));
+        assert!(resp.get("error").is_none(), "ping must not error: {resp}");
+    }
+
+    /// Same as above, with an explicit empty `params` member — issue #110
+    /// measured both shapes return the identical error, so both are covered.
+    #[test]
+    fn test_mcp_stdio_loop_ping_with_empty_params() {
+        let index = make_test_index();
+        let input = r#"{"jsonrpc":"2.0","id":32,"method":"ping","params":{}}"#;
+        let input = format!("{input}\n");
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut output = Vec::new();
+        mcp_stdio_loop_with_io(
+            Path::new("/tmp"),
+            &index,
+            &make_shared_snapshot(),
+            cursor,
+            &mut output,
+        )
+        .unwrap();
+        let line = String::from_utf8(output).unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["result"], json!({}));
+        assert!(resp.get("error").is_none(), "ping must not error: {resp}");
     }
 
     #[test]
