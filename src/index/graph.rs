@@ -551,6 +551,22 @@ pub(crate) fn edges_for_file(
     out
 }
 
+/// Strip a trailing TOML comment (`# ...` to end of line) from `line`,
+/// respecting basic-string quoting so a `#` inside `"..."` is not mistaken
+/// for a comment marker. Crate names never legitimately contain `"`, so no
+/// escape handling is needed beyond toggling on each `"`.
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_string = false;
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            '"' => in_string = !in_string,
+            '#' if !in_string => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
 /// Read the analysed project's own crate name out of its root `Cargo.toml`
 /// (the `name` key under `[package]`), if one is present among `files`.
 ///
@@ -558,12 +574,27 @@ pub(crate) fn edges_for_file(
 /// form Rust accepts from a `tests/` integration test, which cannot use
 /// `crate::` — resolves to the same file `crate::...` would (cxpak#84).
 /// A hand-rolled line scan rather than a full TOML parse: the `toml` crate
-/// is gated behind the `bench` feature, not available on this path, and a
-/// `[package] name = "..."` line is simple enough not to need one.
+/// is gated behind the `bench` feature (not a default/unconditional
+/// dependency), so it is not available on this path without widening that
+/// feature's scope — out of bounds for this fix. The `[package] name =
+/// "..."` + trailing-comment grammar handled here is simple enough not to
+/// need a full parser.
+///
+/// Cargo allows a hyphenated package name (`my-crate`); Rust's `use` syntax
+/// only accepts identifiers, so `my-crate` is imported as `my_crate` — the
+/// returned name is normalised (`-` → `_`) to match, since import-prefix
+/// matching is this function's only consumer.
+///
+/// **Workspace manifests are not supported**: a virtual-root `Cargo.toml`
+/// (`[workspace]` with `members = [...]`, no `[package]` table at the root)
+/// has no `name` key to find, so this returns `None` for one rather than
+/// resolving any member crate's name. Tracked as a known limitation, not
+/// fixed in this pass — see cxpak#168.
 pub(crate) fn detect_crate_name(files: &[Arc<IndexedFile>]) -> Option<String> {
     let cargo_toml = files.iter().find(|f| f.relative_path == "Cargo.toml")?;
     let mut in_package_section = false;
-    for line in cargo_toml.content.lines() {
+    for raw_line in cargo_toml.content.lines() {
+        let line = strip_toml_comment(raw_line);
         let trimmed = line.trim();
         if let Some(stripped) = trimmed.strip_prefix('[') {
             in_package_section = stripped.trim_end_matches(']') == "package";
@@ -577,7 +608,7 @@ pub(crate) fn detect_crate_name(files: &[Arc<IndexedFile>]) -> Option<String> {
             if let Some(value) = rest.strip_prefix('=') {
                 let value = value.trim().trim_matches('"').trim_matches('\'');
                 if !value.is_empty() {
-                    return Some(value.to_string());
+                    return Some(value.replace('-', "_"));
                 }
             }
         }
@@ -908,6 +939,77 @@ mod tests {
     fn test_detect_crate_name_missing_cargo_toml_returns_none() {
         let files: Vec<Arc<IndexedFile>> = vec![];
         assert_eq!(detect_crate_name(&files), None);
+    }
+
+    #[test]
+    fn test_detect_crate_name_maps_hyphen_to_underscore() {
+        // Cargo accepts hyphens in a package name, but Rust's `use` syntax
+        // only accepts identifiers — a package named `my-crate` is imported
+        // as `use my_crate::...;`. `detect_crate_name` must return the
+        // import-form (underscored) name, since import-prefix matching is
+        // its only consumer.
+        let cargo_toml = Arc::new(IndexedFile {
+            relative_path: "Cargo.toml".to_string(),
+            language: Some("toml".to_string()),
+            size_bytes: 0,
+            token_count: 0,
+            parse_result: None,
+            content: "[package]\nname = \"my-crate\"\n".to_string(),
+            mtime_ns: None,
+        });
+        assert_eq!(
+            detect_crate_name(&[cargo_toml]),
+            Some("my_crate".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_rust_hyphenated_crate_name_import_resolves() {
+        // End-to-end: a hyphenated package name's detected (underscored)
+        // crate_name must still resolve a `use my_crate::...` import, same
+        // as the plain-name case.
+        let all: HashSet<&str> = ["src/commands/serve.rs"].iter().copied().collect();
+        assert_eq!(
+            resolve_rust_import(
+                "tests/serve_test.rs",
+                "my_crate::commands::serve",
+                &all,
+                Some("my_crate")
+            ),
+            Some("src/commands/serve.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_crate_name_strips_trailing_comment_on_name_line() {
+        // TOML permits a trailing `# comment` after the value; the hand
+        // -rolled line scan must not capture it as part of the name.
+        let cargo_toml = Arc::new(IndexedFile {
+            relative_path: "Cargo.toml".to_string(),
+            language: Some("toml".to_string()),
+            size_bytes: 0,
+            token_count: 0,
+            parse_result: None,
+            content: "[package]\nname = \"cxpak\" # the crate name\n".to_string(),
+            mtime_ns: None,
+        });
+        assert_eq!(detect_crate_name(&[cargo_toml]), Some("cxpak".to_string()));
+    }
+
+    #[test]
+    fn test_detect_crate_name_strips_trailing_comment_on_section_header() {
+        // A trailing comment on the `[package]` header itself must not break
+        // section-header recognition.
+        let cargo_toml = Arc::new(IndexedFile {
+            relative_path: "Cargo.toml".to_string(),
+            language: Some("toml".to_string()),
+            size_bytes: 0,
+            token_count: 0,
+            parse_result: None,
+            content: "[package] # c\nname = \"cxpak\"\n".to_string(),
+            mtime_ns: None,
+        });
+        assert_eq!(detect_crate_name(&[cargo_toml]), Some("cxpak".to_string()));
     }
 
     // ─── Python resolver ──────────────────────────────────────────────────────
