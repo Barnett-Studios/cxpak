@@ -71,7 +71,10 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: matrix.glibc != ''
-        run: cargo install cargo-zigbuild --locked
+        run: |
+          cargo install cargo-zigbuild --locked --version 0.23.4
+          zig version
+          cargo zigbuild --version
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
@@ -83,29 +86,23 @@ jobs:
           if [ -n "${{ matrix.glibc }}" ]; then
             cargo zigbuild --release --features daemon --locked --target "${{ matrix.target }}.${{ matrix.glibc }}"
           else
-            cargo build --release --features daemon --target "${{ matrix.target }}"
+            cargo build --release --features daemon --locked --target "${{ matrix.target }}"
           fi
 
       # The regression test for the floor declared above: a future std/dependency
       # bump that starts referencing a newer symbol (or a zig/libc-headers bump)
       # fails HERE instead of shipping unnoticed — the same way this whole class of
-      # bug reached GA the first time (.github#20).
+      # bug reached GA the first time (.github#20). ci/glibc-floor.sh (self-tested
+      # in ci.yml against a fixture, so this gate has actually been shown to fail)
+      # uses `readelf`, not `objdump`: the release runner's native objdump cannot
+      # read the aarch64 row's binary at all ("file format not recognized" —
+      # objdump dispatches to a per-architecture BFD backend; readelf parses the
+      # ELF structures directly and has no such restriction) and that row would
+      # fail every release without ever reaching this check.
       - name: GLIBC floor gate
         if: matrix.glibc != ''
         shell: bash
-        run: |
-          bin="target/${{ matrix.target }}/release/cxpak"
-          max=$(objdump -T "$bin" | grep -oE 'GLIBC_2\.[0-9]+' | sed 's/GLIBC_2\.//' | sort -n | tail -1)
-          floor="${{ matrix.glibc }}"; floor="${floor#2.}"
-          if [ -z "$max" ]; then
-            echo "::error::objdump found no GLIBC_2.x symbol at all in $bin — investigate before trusting this gate"
-            exit 1
-          fi
-          if [ "$max" -gt "$floor" ]; then
-            echo "::error::$bin requires GLIBC_2.$max, above the declared floor 2.$floor — a dependency or std now needs a newer symbol; raise the pin deliberately (and this comment + the README) or avoid the dependency"
-            exit 1
-          fi
-          echo "GLIBC floor ok: $bin requires at most GLIBC_2.$max (floor 2.$floor)"
+        run: ci/glibc-floor.sh "target/${{ matrix.target }}/release/cxpak" "${{ matrix.glibc }}"
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
