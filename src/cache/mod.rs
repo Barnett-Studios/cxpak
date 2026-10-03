@@ -632,6 +632,66 @@ mod tests {
     }
 
     #[test]
+    fn test_old_shaped_cache_entry_missing_newer_fields_degrades_gracefully() {
+        // Review follow-up on cxpak#36: `core_graph::index::IndexedFile`'s
+        // `mtime_secs` field was renamed to `mtime_ns`, but `IndexedFile`
+        // has never derived `Serialize`/`Deserialize` (only `Debug, Clone`)
+        // and is always recomputed fresh from disk metadata inside
+        // `CodebaseIndex::build`/`build_with_content`/`incremental_rebuild`/
+        // `upsert_file` -- there is no on-disk artifact keyed by its field
+        // names, so that rename has no on-disk migration surface at all.
+        //
+        // The struct that genuinely IS persisted here is `CacheEntry`, which
+        // already carried its own, differently-named `mtime_ns` field (added
+        // at CACHE_VERSION 4, independent of and long before this PR) behind
+        // `#[serde(default)]`. This locks in that an entry written before
+        // `mtime_ns`/`content_sha256` existed still deserializes -- not
+        // panics or errors -- with those fields defaulting to `None`, inside
+        // a `FileCache` whose outer `version`/`grammar_hash` match current
+        // (so it is the per-field `#[serde(default)]` path under test here,
+        // not the whole-cache version-mismatch fail-closed path already
+        // covered by `test_cache_version_mismatch_returns_empty` above).
+        let old_shaped = serde_json::json!({
+            "version": CACHE_VERSION,
+            "grammar_hash": CURRENT_GRAMMAR_HASH,
+            "entries": [
+                {
+                    "relative_path": "src/old.rs",
+                    "mtime": 1_700_000_000_i64,
+                    "size_bytes": 128,
+                    "language": "rust",
+                    "token_count": 7,
+                    "parse_result": null
+                    // No `mtime_ns`, no `content_sha256` -- the pre-v4 shape.
+                }
+            ]
+        });
+        let json = old_shaped.to_string();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("cache.json"), &json).expect("write");
+
+        let cache = FileCache::load(dir.path());
+        assert_eq!(
+            cache.version, CACHE_VERSION,
+            "current version/grammar_hash must load, not fall back to an empty cache"
+        );
+        assert_eq!(
+            cache.entries.len(),
+            1,
+            "an old-shaped entry missing newer fields must still deserialize"
+        );
+        assert_eq!(
+            cache.entries[0].mtime_ns, None,
+            "a missing mtime_ns must default to None, not panic or error"
+        );
+        assert_eq!(
+            cache.entries[0].content_sha256, None,
+            "a missing content_sha256 must default to None, not panic or error"
+        );
+    }
+
+    #[test]
     fn test_save_and_load_cache() {
         let dir = tempfile::tempdir().expect("tempdir");
 

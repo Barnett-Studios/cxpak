@@ -112,6 +112,52 @@ pub(crate) fn read_indexable(
     }
 }
 
+/// `(mtime_ns, size_bytes)` for `path`, or `None` if `path` cannot be stat'd.
+/// The settle-check building block below compares two of these taken around
+/// a read; `None` only compares equal to `None`, so a stat that starts
+/// failing or starts succeeding between the two calls is itself treated as
+/// "not settled".
+fn stat_fingerprint(path: &std::path::Path) -> Option<(Option<u64>, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime_ns = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64);
+    Some((mtime_ns, m.len()))
+}
+
+/// Read `path`'s content together with an mtime that is guaranteed to
+/// describe exactly the content just read (cxpak#36 follow-up).
+///
+/// Reading content and then stat'ing the mtime afterward has a TOCTOU
+/// window: an edit landing between the read and the stat caches content from
+/// *before* the edit under an mtime recorded *after* it, so a later
+/// incremental pass sees a `(mtime, size)` pair that matches the file's
+/// current disk state even though the cached content predates it — the same
+/// staleness class #36 fixes in the comparison, just moved to the read
+/// boundary instead.
+///
+/// Stats before AND after the read and only returns a result when the two
+/// agree. A disagreement means the file was still being edited during this
+/// pass: rather than cache a `(content, mtime)` pair that may not match
+/// either the before- or after-edit disk state, this returns `None` — the
+/// caller skips the file exactly as it already does for an unreadable file,
+/// and the next incremental/full rebuild picks it up once it has settled.
+fn read_indexable_settled(
+    path: &std::path::Path,
+    size_bytes: u64,
+    cap_bytes: u64,
+) -> Option<(String, Option<u64>)> {
+    let pre = stat_fingerprint(path);
+    let content = read_indexable(path, size_bytes, cap_bytes)?;
+    let post = stat_fingerprint(path);
+    if pre != post {
+        return None;
+    }
+    Some((content, post.and_then(|(mtime_ns, _)| mtime_ns)))
+}
+
 impl CodebaseIndex {
     pub fn build(
         files: Vec<ScannedFile>,
@@ -126,7 +172,8 @@ impl CodebaseIndex {
 
         let cap_bytes = max_file_bytes();
         for file in &files {
-            let Some(content) = read_indexable(&file.absolute_path, file.size_bytes, cap_bytes)
+            let Some((content, mtime_ns)) =
+                read_indexable_settled(&file.absolute_path, file.size_bytes, cap_bytes)
             else {
                 continue;
             };
@@ -149,12 +196,6 @@ impl CodebaseIndex {
                 file.relative_path.clone(),
                 compute_term_frequencies(&content),
             );
-
-            let mtime_ns = std::fs::metadata(&file.absolute_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64);
 
             let parse_result = parse_results.get(&file.relative_path).cloned();
             indexed_files.push(Arc::new(IndexedFile {
@@ -249,14 +290,25 @@ impl CodebaseIndex {
         for file in &files {
             // The content map is the caller's already-successful read. Only the
             // miss falls through to disk, and only that path can fail.
-            let file_content = match content.get(&file.relative_path).cloned() {
-                Some(c) => c,
+            //
+            // The caller-provided branch has no read to bracket with a
+            // before/after stat: freshness of `c` relative to the stat taken
+            // here is the caller's contract, not something verifiable from
+            // inside this function. The disk-read branch uses the settled
+            // read/stat pair (cxpak#36 follow-up) so a mid-read edit is never
+            // cached under a mismatched mtime.
+            let (file_content, mtime_ns) = match content.get(&file.relative_path).cloned() {
+                Some(c) => {
+                    let mtime_ns = stat_fingerprint(&file.absolute_path).and_then(|(ns, _)| ns);
+                    (c, mtime_ns)
+                }
                 None => {
-                    let Some(c) = read_indexable(&file.absolute_path, file.size_bytes, cap_bytes)
+                    let Some((c, mtime_ns)) =
+                        read_indexable_settled(&file.absolute_path, file.size_bytes, cap_bytes)
                     else {
                         continue;
                     };
-                    c
+                    (c, mtime_ns)
                 }
             };
             let token_count = counter.count_or_zero(&file_content);
@@ -278,12 +330,6 @@ impl CodebaseIndex {
                 file.relative_path.clone(),
                 compute_term_frequencies(&file_content),
             );
-
-            let mtime_ns = std::fs::metadata(&file.absolute_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64);
 
             let parse_result = parse_results.get(&file.relative_path).cloned();
             indexed_files.push(Arc::new(IndexedFile {
@@ -478,11 +524,8 @@ impl CodebaseIndex {
         // the graph can be rebuilt by edge-delta rather than from scratch.
         let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for file in current_files {
-            let mtime_ns = std::fs::metadata(&file.absolute_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64);
+            let pre_stat = stat_fingerprint(&file.absolute_path);
+            let mtime_ns = pre_stat.and_then(|(ns, _)| ns);
 
             let needs_update = match self
                 .files
@@ -502,6 +545,15 @@ impl CodebaseIndex {
                 else {
                     continue;
                 };
+                // Settle-check (cxpak#36 follow-up): the file may have changed
+                // again between the stat above and this read. Caching `content`
+                // under `mtime_ns` in that case would record a pair that
+                // matches neither the before- nor after-edit disk state —
+                // skip and let the next incremental_rebuild pass, which will
+                // see a fresh mismatch against `existing.mtime_ns`, pick it up.
+                if stat_fingerprint(&file.absolute_path) != pre_stat {
+                    continue;
+                }
                 let parse_result = parse_results.get(&file.relative_path).cloned();
                 self.upsert_file(
                     &file.relative_path,
@@ -1596,6 +1648,67 @@ mod tests {
             index.files[0].mtime_ns.is_some(),
             "mtime_ns should be populated from disk"
         );
+    }
+
+    #[test]
+    fn test_stat_fingerprint_detects_mtime_and_size_changes() {
+        // Deterministic test for the settle-check's building block (cxpak#36
+        // TOCTOU follow-up): two stats of the same, unmodified file must
+        // compare equal, and a stat taken after either the mtime or the size
+        // changes must compare unequal to one taken before.
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+
+        let before = stat_fingerprint(&fp);
+        assert!(before.is_some(), "a freshly-written file must be stat'able");
+        let before_again = stat_fingerprint(&fp);
+        assert_eq!(
+            before, before_again,
+            "two stats of an unmodified file must agree"
+        );
+
+        // Re-write with the same byte size so only the mtime, not the size,
+        // changes -- the exact dimension #36 itself is about. Sleep past a
+        // whole second so the bump is visible even on filesystems with only
+        // whole-second mtime resolution (this test must not depend on the
+        // nanosecond precision it is itself validating).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&fp, "fn b() {}").unwrap();
+        let after_same_size_edit = stat_fingerprint(&fp);
+        assert_ne!(
+            before, after_same_size_edit,
+            "a changed mtime with unchanged size must not compare equal"
+        );
+
+        std::fs::write(&fp, "fn a() { 1 }").unwrap();
+        let after_size_change = stat_fingerprint(&fp);
+        assert_ne!(
+            after_same_size_edit, after_size_change,
+            "a changed size must not compare equal"
+        );
+
+        let missing = dir.path().join("does-not-exist.rs");
+        assert_eq!(
+            stat_fingerprint(&missing),
+            None,
+            "a nonexistent path must stat to None"
+        );
+    }
+
+    #[test]
+    fn test_read_indexable_settled_returns_content_and_mtime_when_unchanged() {
+        // Happy-path regression for the settled read/stat pair introduced to
+        // close the cxpak#36 TOCTOU: when nothing changes around the read,
+        // behavior must be identical to the unguarded read it replaced.
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        std::fs::write(&fp, "fn a() {}").unwrap();
+
+        let result = read_indexable_settled(&fp, 9, max_file_bytes());
+        let (content, mtime_ns) = result.expect("settled read must succeed when nothing races it");
+        assert_eq!(content, "fn a() {}");
+        assert!(mtime_ns.is_some());
     }
 
     #[test]
