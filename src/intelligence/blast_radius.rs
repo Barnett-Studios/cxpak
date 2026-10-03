@@ -899,8 +899,18 @@ mod tests {
         let graph = DependencyGraph::new();
         let pagerank = make_pagerank(&[("tests/calc_test.rs", 0.4)]);
         let test_map = make_test_map_from(&[("src/calc.rs", "tests/calc_test.rs")]);
+        let known_files: HashSet<&str> =
+            ["src/calc.rs", "tests/calc_test.rs"].into_iter().collect();
 
-        let result = compute_blast_radius(&["src/calc.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["src/calc.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &known_files,
+        );
 
         let test_file_paths: HashSet<&str> = result
             .categories
@@ -922,8 +932,18 @@ mod tests {
         let graph = DependencyGraph::new();
         let pagerank = make_pagerank(&[("tests/calc_test.rs", 0.4)]);
         let test_map = make_test_map_from(&[("src/calc.rs", "tests/calc_test.rs")]);
+        let known_files: HashSet<&str> =
+            ["src/calc.rs", "tests/calc_test.rs"].into_iter().collect();
 
-        let result = compute_blast_radius(&["src/calc.rs"], &graph, &pagerank, &test_map, 0, None);
+        let result = compute_blast_radius(
+            &["src/calc.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            0,
+            None,
+            &known_files,
+        );
         assert_eq!(result.total_affected, 0);
     }
 
@@ -942,7 +962,15 @@ mod tests {
         let pagerank = make_pagerank(&[("src/tested.rs", 0.5), ("src/untested.rs", 0.5)]);
         let test_map = make_test_map_from(&[("src/tested.rs", "tests/tested_test.rs")]);
 
-        let result = compute_blast_radius(&["src/core.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["src/core.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         let risk_of = |path: &str| -> f64 {
             result
@@ -975,7 +1003,15 @@ mod tests {
         // tests/core_test.rs is a VALUE (it tests src/core.rs) but not a KEY.
         let test_map = make_test_map_from(&[("src/core.rs", "tests/core_test.rs")]);
 
-        let result = compute_blast_radius(&["src/core.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["src/core.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         let risk_of = |path: &str| -> f64 {
             result
