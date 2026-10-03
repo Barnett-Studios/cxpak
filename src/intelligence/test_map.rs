@@ -165,7 +165,18 @@ fn general_test_candidates(filename_no_ext: &str, dir_prefix: &str, ext: &str) -
 /// For each test file (identified by path containing `test`, `spec`, or `__tests__`),
 /// examine imports and resolve them back to source file paths. Returns a map of
 /// source_path -> Vec<TestFileRef>.
-pub fn find_test_files_by_imports(files: &[Arc<IndexedFile>]) -> HashMap<String, Vec<TestFileRef>> {
+///
+/// `crate_name` is the analysed Rust project's own crate name (from its
+/// `Cargo.toml`, see [`crate::index::graph::detect_crate_name`]). A Rust
+/// integration test under `tests/` can only import the crate's own name
+/// (`use cxpak::commands::serve::build_index;` — `use crate::...` is a
+/// compile error from that directory), so that prefix is stripped before
+/// candidate generation, same as `crate::` would be. `None` for non-Rust
+/// projects, or when no root `Cargo.toml` was found (cxpak#84 cause 2).
+pub fn find_test_files_by_imports(
+    files: &[Arc<IndexedFile>],
+    crate_name: Option<&str>,
+) -> HashMap<String, Vec<TestFileRef>> {
     // Build a lookup set of all file paths for fast resolution
     let all_paths: HashSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
 
@@ -182,33 +193,57 @@ pub fn find_test_files_by_imports(files: &[Arc<IndexedFile>]) -> HashMap<String,
         };
 
         for import in &pr.imports {
-            // Attempt to resolve the import to a source file path using the same
-            // strategy as build_dependency_graph.
-            let candidate_base = import.source.replace("::", "/").replace('.', "/");
-            let candidates = [
-                format!("{candidate_base}.rs"),
-                format!("{candidate_base}/mod.rs"),
-                format!("src/{candidate_base}.rs"),
-                format!("src/{candidate_base}/mod.rs"),
-                format!("{candidate_base}.ts"),
-                format!("{candidate_base}.js"),
-                format!("{candidate_base}.py"),
-                format!("{candidate_base}.go"),
-                format!("{candidate_base}.java"),
-                format!("{candidate_base}.rb"),
-            ];
+            // Strip the crate's own name as an import prefix — the only form
+            // Rust accepts from an integration test — before resolving, same
+            // as `resolve_rust_import` treats `<crate_name>::X` as `crate::X`.
+            let source = crate_name
+                .and_then(|name| import.source.strip_prefix(name))
+                .and_then(|rest| rest.strip_prefix("::"))
+                .unwrap_or(&import.source);
 
-            for candidate in &candidates {
-                if all_paths.contains(candidate.as_str()) {
-                    result
-                        .entry(candidate.clone())
-                        .or_default()
-                        .push(TestFileRef {
-                            path: file.relative_path.clone(),
-                            confidence: TestConfidence::ImportMatch,
-                        });
-                    break;
+            let candidate_base = source.replace("::", "/").replace('.', "/");
+            let base_parts: Vec<&str> = candidate_base
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+            if base_parts.is_empty() {
+                continue;
+            }
+
+            // Progressive right-stripping: try the full path first, then
+            // shorter prefixes, so e.g. `cxpak::commands::serve::build_index`
+            // falls back to `src/commands/serve.rs` when `build_index` is a
+            // function (not a file) in that module — same pattern
+            // `resolve_rust_import`'s `crate::` handling already uses for
+            // re-exported types.
+            let mut resolved: Option<String> = None;
+            'shorten: for take in (1..=base_parts.len()).rev() {
+                let base = base_parts[..take].join("/");
+                let candidates = [
+                    format!("{base}.rs"),
+                    format!("{base}/mod.rs"),
+                    format!("src/{base}.rs"),
+                    format!("src/{base}/mod.rs"),
+                    format!("{base}.ts"),
+                    format!("{base}.js"),
+                    format!("{base}.py"),
+                    format!("{base}.go"),
+                    format!("{base}.java"),
+                    format!("{base}.rb"),
+                ];
+                for candidate in &candidates {
+                    if all_paths.contains(candidate.as_str()) {
+                        resolved = Some(candidate.clone());
+                        break 'shorten;
+                    }
                 }
+            }
+
+            if let Some(candidate) = resolved {
+                result.entry(candidate).or_default().push(TestFileRef {
+                    path: file.relative_path.clone(),
+                    confidence: TestConfidence::ImportMatch,
+                });
             }
         }
     }
@@ -220,9 +255,14 @@ pub fn find_test_files_by_imports(files: &[Arc<IndexedFile>]) -> HashMap<String,
 ///
 /// Combines naming-convention matching and import-based matching. When the same
 /// test file is found by both methods, its confidence is upgraded to `Both`.
+///
+/// `crate_name` is forwarded to [`find_test_files_by_imports`] — see its doc
+/// comment. Callers typically pass
+/// `crate::index::graph::detect_crate_name(files)`.
 pub fn build_test_map(
     files: &[Arc<IndexedFile>],
     all_paths: &HashSet<String>,
+    crate_name: Option<&str>,
 ) -> HashMap<String, Vec<TestFileRef>> {
     let mut map: HashMap<String, Vec<TestFileRef>> = HashMap::new();
 
@@ -239,7 +279,7 @@ pub fn build_test_map(
     }
 
     // Step 2: import-based matching
-    let import_map = find_test_files_by_imports(files);
+    let import_map = find_test_files_by_imports(files, crate_name);
 
     // Step 3: merge — upgrade confidence to Both where both methods agree
     for (source_path, import_refs) in import_map {
@@ -460,7 +500,7 @@ mod tests {
                 vec![make_import("src::db"), make_import("src/db")],
             ),
         ];
-        let import_map = find_test_files_by_imports(&files);
+        let import_map = find_test_files_by_imports(&files, None);
         // "src/db.rs" should map to "tests/db_test.rs"
         let refs = import_map
             .get("src/db.rs")
@@ -480,7 +520,7 @@ mod tests {
             make_file("src/util.rs", vec![]),
             make_file("tests/util_test.rs", vec![make_import("src::util")]),
         ];
-        let map = build_test_map(&files, &all_paths);
+        let map = build_test_map(&files, &all_paths, None);
         let refs = map
             .get("src/util.rs")
             .expect("src/util.rs should be in map");
@@ -511,7 +551,7 @@ mod tests {
                 ],
             ),
         ];
-        let import_map = find_test_files_by_imports(&files);
+        let import_map = find_test_files_by_imports(&files, None);
 
         for src in &["src/auth.rs", "src/db.rs", "src/handler.rs"] {
             let refs = import_map
@@ -540,7 +580,7 @@ mod tests {
                 vec![make_import("src::router")],
             ),
         ];
-        let map = build_test_map(&files, &all_paths);
+        let map = build_test_map(&files, &all_paths, None);
         let refs = map
             .get("src/router.rs")
             .expect("src/router.rs should be in map");
@@ -563,10 +603,58 @@ mod tests {
             make_file("src/main.rs", vec![]),
             make_file("src/lib.rs", vec![]),
         ];
-        let map = build_test_map(&files, &all_paths);
+        let map = build_test_map(&files, &all_paths, None);
         assert!(
             map.is_empty(),
             "should produce empty map when no test files exist"
+        );
+    }
+
+    // ── own-crate-name + progressive right-stripping (cxpak#84 cause 2) ────
+    //
+    // From `tests/`, `use crate::...` is a compile error — the only form
+    // Rust accepts is the crate's own name. And `build_index` here is a
+    // function, not a file, so the full dotted path never matches; the
+    // resolver must fall back to the containing module file, the same
+    // progressive-shortening pattern `resolve_rust_import`'s `crate::`
+    // handling already uses for re-exported types.
+
+    #[test]
+    fn test_find_test_files_by_imports_own_crate_name_with_progressive_stripping() {
+        let files = vec![
+            make_file("src/commands/serve.rs", vec![]),
+            make_file(
+                "tests/serve_test.rs",
+                vec![make_import("cxpak::commands::serve::build_index")],
+            ),
+        ];
+        let import_map = find_test_files_by_imports(&files, Some("cxpak"));
+        let refs = import_map
+            .get("src/commands/serve.rs")
+            .expect("src/commands/serve.rs should be in the import map");
+        assert!(
+            refs.iter().any(|r| r.path == "tests/serve_test.rs"),
+            "tests/serve_test.rs should resolve to src/commands/serve.rs via \
+             the own-crate-name prefix with progressive right-stripping"
+        );
+    }
+
+    #[test]
+    fn test_find_test_files_by_imports_without_crate_name_does_not_resolve() {
+        // Regression guard: without a detected crate name, the own-crate
+        // prefix is left on the candidate path (`cxpak/commands/serve/...`)
+        // and never matches — this is the pre-fix behaviour.
+        let files = vec![
+            make_file("src/commands/serve.rs", vec![]),
+            make_file(
+                "tests/serve_test.rs",
+                vec![make_import("cxpak::commands::serve::build_index")],
+            ),
+        ];
+        let import_map = find_test_files_by_imports(&files, None);
+        assert!(
+            !import_map.contains_key("src/commands/serve.rs"),
+            "without crate_name the own-crate-prefixed import must not resolve"
         );
     }
 }

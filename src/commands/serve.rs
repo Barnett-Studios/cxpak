@@ -4722,7 +4722,9 @@ pub fn process_watcher_changes(
     );
     let paths: std::collections::HashSet<String> =
         next.files.iter().map(|f| f.relative_path.clone()).collect();
-    next.test_map = crate::intelligence::test_map::build_test_map(&next.files, &paths);
+    let crate_name = crate::index::graph::detect_crate_name(&next.files);
+    next.test_map =
+        crate::intelligence::test_map::build_test_map(&next.files, &paths, crate_name.as_deref());
     {
         let mod_vec: Vec<String> = modified_paths.iter().cloned().collect();
         let rem_vec: Vec<String> = removed_paths.iter().cloned().collect();

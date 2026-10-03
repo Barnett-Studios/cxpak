@@ -599,7 +599,12 @@ pub(crate) fn build_review_bundle(
         .iter()
         .map(|f| f.relative_path.clone())
         .collect();
-    let test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
+    let crate_name = crate::index::graph::detect_crate_name(&index.files);
+    let test_map = crate::intelligence::test_map::build_test_map(
+        &index.files,
+        &all_paths,
+        crate_name.as_deref(),
+    );
     let known_files: std::collections::HashSet<&str> =
         all_paths.iter().map(|s| s.as_str()).collect();
 

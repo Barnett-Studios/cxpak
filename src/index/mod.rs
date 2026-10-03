@@ -359,7 +359,12 @@ impl CodebaseIndex {
             .iter()
             .map(|f| f.relative_path.clone())
             .collect();
-        index.test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
+        let crate_name = crate::index::graph::detect_crate_name(&index.files);
+        index.test_map = crate::intelligence::test_map::build_test_map(
+            &index.files,
+            &all_paths,
+            crate_name.as_deref(),
+        );
         index.call_graph = crate::intelligence::call_graph::build_call_graph(&index);
 
         // v1.5.0: detect cross-language boundaries (HTTP, FFI, gRPC, GraphQL,
@@ -622,9 +627,12 @@ impl CodebaseIndex {
             .iter()
             .map(|f| f.relative_path.as_str())
             .collect();
+        let crate_name = crate::index::graph::detect_crate_name(&self.files);
         for p in changed {
             if let Some(file) = self.files.iter().find(|f| &f.relative_path == p) {
-                for (target, edge_type) in crate::index::graph::edges_for_file(file, &all_paths) {
+                for (target, edge_type) in
+                    crate::index::graph::edges_for_file(file, &all_paths, crate_name.as_deref())
+                {
                     self.graph.add_edge(p, &target, edge_type);
                 }
             }
@@ -762,7 +770,12 @@ impl CodebaseIndex {
         );
         let all_paths: std::collections::HashSet<String> =
             self.files.iter().map(|f| f.relative_path.clone()).collect();
-        self.test_map = crate::intelligence::test_map::build_test_map(&self.files, &all_paths);
+        let crate_name = crate::index::graph::detect_crate_name(&self.files);
+        self.test_map = crate::intelligence::test_map::build_test_map(
+            &self.files,
+            &all_paths,
+            crate_name.as_deref(),
+        );
         self.total_files = self.files.len();
     }
 
