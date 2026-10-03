@@ -3,11 +3,53 @@ pub mod defaults;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use ignore::gitignore::GitignoreBuilder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use ignore::{Match, WalkBuilder};
 
 use defaults::{BUILTIN_IGNORES, CREDENTIAL_IGNORES};
+
+/// Build the credential-pattern matcher once, as a plain [`Gitignore`] rather than an
+/// [`ignore::overrides::Override`] — `.matched()` is then askable about a bare FILENAME
+/// directly, so no directory ever reaches this matcher and no directory is ever pruned by
+/// it (cxpak#78 round 2).
+///
+/// Exported so every path that decides "is this file credential material" — the initial
+/// scan (`Scanner::scan`) and the watcher's incremental classification
+/// (`commands::watch::classify_changes`) — builds it the same way and cannot diverge on
+/// what the denylist contains (cxpak#78 round 3: the watcher kept its own
+/// `BUILTIN_IGNORES`-only copy and never consulted `CREDENTIAL_IGNORES` at all, so a live
+/// `credentials.json`/`.env`/`id_rsa` created or modified while `cxpak watch` was running
+/// got incrementally indexed — exactly what a fresh scan excludes).
+pub fn build_credential_matcher(root: &Path) -> Result<Gitignore, ignore::Error> {
+    let mut builder = GitignoreBuilder::new(root);
+    for pattern in CREDENTIAL_IGNORES {
+        builder.add_line(None, pattern)?;
+    }
+    builder.build()
+}
+
+/// Is `path` excluded as credential material, per `matcher` (built by
+/// [`build_credential_matcher`])? Checked by basename only — see that function's doc for
+/// why a directory must never reach this check.
+///
+/// A recognised source extension (`detect_language(path).is_some()`) exempts ONLY a
+/// suffix-glob match (the `id_*_*` family — gitignore glob has no "stop before a dot"
+/// token, so `id_rsa_*` also matches every `id_rsa_*.{rs,go,...}` real source file). An
+/// EXACT filename match (`credentials.json`, `kubeconfig`, …) is never exempted this way:
+/// the whole name is deliberate, not a coincidental prefix collision.
+pub fn is_credential_match(matcher: &Gitignore, path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    match matcher.matched(name, false) {
+        Match::Ignore(glob) => {
+            let suffix_glob = glob.original().ends_with("_*");
+            !(suffix_glob && detect_language(path).is_some())
+        }
+        _ => false,
+    }
+}
 
 /// A single file discovered by the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,18 +137,8 @@ impl Scanner {
             .build()
             .map_err(|e| ScanError::Override(e.to_string()))?;
 
-        // Same patterns, built as a plain `Gitignore` matcher rather than an `Override`, so
-        // `.matched()` can be asked about a bare FILENAME directly — no directory ever
-        // reaches this matcher, so no directory is ever pruned by it.
-        let mut credential_builder = GitignoreBuilder::new(&self.root);
-        for pattern in CREDENTIAL_IGNORES {
-            credential_builder
-                .add_line(None, pattern)
-                .map_err(|e| ScanError::Override(e.to_string()))?;
-        }
-        let credential_matcher = credential_builder
-            .build()
-            .map_err(|e| ScanError::Override(e.to_string()))?;
+        let credential_matcher =
+            build_credential_matcher(&self.root).map_err(|e| ScanError::Override(e.to_string()))?;
 
         // Build the walker.
         let mut builder = WalkBuilder::new(&self.root);
@@ -144,26 +176,16 @@ impl Scanner {
 
             let absolute_path = entry.path().to_path_buf();
 
-            let language = detect_language(&absolute_path);
-
-            // Credential check, by basename only (cxpak#78 round 2) — matching the FULL
-            // path here would reintroduce the directory-pruning bug one level down: a
-            // path like `src/credentials/mod.rs` must be judged on `mod.rs`, not on
-            // `credentials` appearing as a path component.
-            if let Some(name) = entry.file_name().to_str() {
-                if let Match::Ignore(glob) = credential_matcher.matched(name, false) {
-                    // A recognised source extension exempts ONLY a suffix-glob pattern
-                    // (the `id_*_*` family — `_*` with no trailing dot token in gitignore
-                    // glob syntax, so it also matches every `id_rsa_*.{rs,go,...}` source
-                    // file). An EXACT filename like `credentials.json` must exclude
-                    // unconditionally: that is the whole, deliberate name, not a prefix
-                    // that happens to collide with one.
-                    let suffix_glob = glob.original().ends_with("_*");
-                    if !(suffix_glob && language.is_some()) {
-                        continue;
-                    }
-                }
+            // Basename-only credential check (cxpak#78 round 2) — matching the FULL path
+            // here would reintroduce the directory-pruning bug one level down: a path like
+            // `src/credentials/mod.rs` must be judged on `mod.rs`, not on `credentials`
+            // appearing as a path component. Shared with the watcher's incremental path
+            // (round 3) via `is_credential_match`, so the two cannot diverge.
+            if is_credential_match(&credential_matcher, &absolute_path) {
+                continue;
             }
+
+            let language = detect_language(&absolute_path);
 
             // Compute relative path from root, normalised to forward slashes.
             let relative_path = absolute_path

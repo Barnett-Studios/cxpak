@@ -381,24 +381,12 @@ fn id_rsa_suffix_glob_still_excludes_the_extensionless_key_file() {
     );
 }
 
-// Watcher parity: whatever file-change watcher cxpak runs for incremental re-indexing must
-// apply the same credential-exclusion rule the initial scan does, or a directory named
-// `credentials`/`kubeconfig` created after startup would silently diverge from a fresh scan.
-#[test]
-fn the_watcher_ignore_rule_agrees_with_a_fresh_scan_on_directory_collisions() {
-    let tmp = repo_with(&["src/credentials/mod.rs", "id_rsa_work"]);
-    let scanned = scanned_paths(tmp.path());
-
-    // A second, independent scan of the same tree is the watcher's own re-index path today
-    // (cxpak has no separate watcher-specific ignore engine) — asserting it agrees with the
-    // first is the parity check: whichever engine answers "is this file indexed", both calls
-    // must agree, which they can only do by sharing BUILTIN_IGNORES/CREDENTIAL_IGNORES rather
-    // than each re-deriving their own copy of "looks like a registry/credential path".
-    let rescanned = scanned_paths(tmp.path());
-    assert_eq!(
-        scanned, rescanned,
-        "re-scanning (the watcher's own re-index path) must agree with the initial scan"
-    );
-    assert!(scanned.iter().any(|p| p == "src/credentials/mod.rs"));
-    assert!(!scanned.iter().any(|p| p == "id_rsa_work"));
-}
+// Watcher parity (cxpak#78 round 3): classify_changes (src/commands/watch.rs) must apply
+// the identical credential-exclusion rule the initial scan does. That test lives next to
+// classify_changes itself (`classify_changes_ignores_credential_files` /
+// `classify_changes_does_not_ignore_real_source_colliding_with_a_credential_pattern` in
+// src/commands/watch.rs's own test module) — classify_changes is `pub(crate)`, not
+// reachable from this external integration test, and a same-crate unit test is also where
+// the earlier version of this test's bug lived: it scanned the same tree twice and called
+// that "parity", which is true of any two calls to the same function and would stay green
+// even if the watcher's ignore rule were deleted outright.
