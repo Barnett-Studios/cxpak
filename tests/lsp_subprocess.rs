@@ -881,3 +881,182 @@ fn lsp_stdin_eof_without_exit_terminates_process() {
         "stdin EOF alone should be a clean exit; got {status:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #115 — `initialize` advertises `diagnosticProvider.workspaceDiagnostics:
+// true`, so a client is entitled to call `workspace/diagnostic` and expect an
+// answer rather than `-32601 Method not found`.
+// ---------------------------------------------------------------------------
+
+/// Every capability `initialize` advertises as available must answer its
+/// corresponding request without `-32601`. This is a loop over the
+/// advertised capability set rather than a single pinned method, so it
+/// generalises past `workspace/diagnostic` to any future capability/
+/// implementation mismatch.
+#[test]
+fn every_advertised_capability_answers_without_method_not_found() {
+    let repo = make_test_repo();
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    let file_uri = format!(
+        "file://{}",
+        repo.path().join("src/main.rs").to_str().unwrap()
+    );
+
+    // `textDocument/diagnostic` and `workspace/diagnostic` both read the
+    // open-document set, so open one first.
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": {"textDocument": {
+                "uri": file_uri, "languageId": "rust", "version": 1,
+                "text": "fn main() { println!(\"hi\"); }\n"
+            }}
+        })
+        .to_string(),
+    );
+
+    let requests: &[(u64, &str, serde_json::Value)] = &[
+        (
+            10,
+            "textDocument/hover",
+            serde_json::json!({"textDocument": {"uri": file_uri}, "position": {"line": 0, "character": 3}}),
+        ),
+        (11, "workspace/symbol", serde_json::json!({"query": "main"})),
+        (
+            12,
+            "textDocument/codeLens",
+            serde_json::json!({"textDocument": {"uri": file_uri}}),
+        ),
+        (
+            13,
+            "textDocument/diagnostic",
+            serde_json::json!({"textDocument": {"uri": file_uri}}),
+        ),
+        (
+            14,
+            "workspace/diagnostic",
+            serde_json::json!({"identifier": null, "previousResultIds": []}),
+        ),
+    ];
+
+    for (id, method, params) in requests {
+        write_lsp_message(
+            stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": method, "params": params
+            })
+            .to_string(),
+        );
+        let resp = read_response_for_id(&mut reader, *id)
+            .unwrap_or_else(|| panic!("no response for advertised capability {method}"));
+        assert_ne!(
+            resp["error"]["code"].as_i64(),
+            Some(-32601),
+            "{method} is advertised in `initialize` capabilities but answered \
+             Method not found: {resp}"
+        );
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// `workspace/diagnostic` must report REAL diagnostics for every open
+/// document, not merely answer without erroring. A server that returned an
+/// empty-but-non-error report for every document would pass a weaker check
+/// vacuously, so this opens a file containing an actual dead-code symbol
+/// (the same detector that backs `textDocument/diagnostic` and
+/// `cxpak/deadCode`) and asserts that specific warning comes through.
+///
+/// Scope note: `workspace/diagnostic` here reports OPEN documents only
+/// (the `self.documents` set populated by `didOpen`/`didChange`/`didClose`)
+/// — not a full workspace scan of every indexed file. A file that is
+/// indexed but never opened does not appear, which is why this test opens
+/// the dead-code file explicitly rather than relying on it being on disk.
+#[test]
+fn workspace_diagnostic_reports_a_real_dead_code_warning() {
+    let repo = make_test_repo();
+    // A private function with zero callers, no #[test], no qualified
+    // reference, in a non-root file — the exact shape the dead-code
+    // detector's zero-false-positive heuristics flag (see
+    // `diagnostics_include_dead_code_warnings` in `src/lsp/methods.rs`).
+    let dead_code_src = "fn unused_helper() {\n    let _ = 1 + 1;\n}\n";
+    std::fs::write(repo.path().join("src/dead_code_target.rs"), dead_code_src).unwrap();
+
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    let dead_file_uri = format!(
+        "file://{}",
+        repo.path()
+            .join("src/dead_code_target.rs")
+            .to_str()
+            .unwrap()
+    );
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": {"textDocument": {
+                "uri": dead_file_uri, "languageId": "rust", "version": 1,
+                "text": dead_code_src
+            }}
+        })
+        .to_string(),
+    );
+
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 20, "method": "workspace/diagnostic",
+            "params": {"identifier": null, "previousResultIds": []}
+        })
+        .to_string(),
+    );
+    let resp = read_response_for_id(&mut reader, 20).expect("workspace/diagnostic response");
+    assert!(
+        resp["error"].is_null(),
+        "workspace/diagnostic must not error on a server with an open document: {resp}"
+    );
+    let items = resp["result"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let report_for_dead_file = items
+        .iter()
+        .find(|it| it["uri"].as_str() == Some(dead_file_uri.as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "workspace/diagnostic must report the open document {dead_file_uri}, got: {resp}"
+            )
+        });
+    let diags = report_for_dead_file["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        diags.iter().any(|d| {
+            d["source"].as_str() == Some("cxpak")
+                && d["severity"].as_i64() == Some(2) // Warning
+                && d["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("dead code") && m.contains("unused_helper"))
+        }),
+        "workspace/diagnostic must surface the real dead-code warning for unused_helper, \
+         not just a non-error empty report; got items: {diags:?}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
