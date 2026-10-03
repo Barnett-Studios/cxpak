@@ -21,7 +21,7 @@ use cxpak::schema::{
     column_node_id, ColumnSchema, EdgeConfidence, EdgeType, OrmFieldSchema, OrmFramework,
     OrmModelSchema, SchemaIndex, TableSchema,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -469,7 +469,15 @@ fn table_file_blast_excludes_synthetic_column_nodes() {
     let pagerank = empty_pagerank(&graph);
     let test_map: HashMap<String, Vec<_>> = HashMap::new();
 
-    let result = compute_blast_radius(&["schema/users.sql"], &graph, &pagerank, &test_map, 5, None);
+    let result = compute_blast_radius(
+        &["schema/users.sql"],
+        &graph,
+        &pagerank,
+        &test_map,
+        5,
+        None,
+        &HashSet::new(),
+    );
 
     let all: Vec<&str> = result
         .categories

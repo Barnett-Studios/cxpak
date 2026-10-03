@@ -68,6 +68,11 @@ fn main() {
     println!("  reverse_edges count: {}", count);
 
     println!("\n=== BLAST RADIUS src/parser/language.rs ===");
+    let known_files: std::collections::HashSet<&str> = index
+        .files
+        .iter()
+        .map(|f| f.relative_path.as_str())
+        .collect();
     let b = cxpak::intelligence::blast_radius::compute_blast_radius(
         &["src/parser/language.rs"],
         &index.graph,
@@ -75,6 +80,7 @@ fn main() {
         &index.test_map,
         3,
         None,
+        &known_files,
     );
     println!(
         "direct: {}  transitive: {}  tests: {}",

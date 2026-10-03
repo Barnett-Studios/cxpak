@@ -3131,6 +3131,11 @@ pub fn build_diff_view_data(
 
     // ── 2. Blast radius ───────────────────────────────────────────────────────
     let changed_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+    let known_files: std::collections::HashSet<&str> = index
+        .files
+        .iter()
+        .map(|f| f.relative_path.as_str())
+        .collect();
     let blast = crate::intelligence::blast_radius::compute_blast_radius(
         &changed_refs,
         &index.graph,
@@ -3138,6 +3143,7 @@ pub fn build_diff_view_data(
         &index.test_map,
         3,
         None,
+        &known_files,
     );
 
     // ── 3. Collect blast-radius file paths ────────────────────────────────────
@@ -3829,6 +3835,7 @@ mod tests {
             paths: vec![path],
             truncated,
             limitations: vec![],
+            found: true,
         }
     }
 
@@ -4479,6 +4486,7 @@ mod tests {
             paths: vec![path],
             truncated: false,
             limitations: vec![],
+            found: true,
         };
         let index = make_minimal_index();
         let config = crate::visual::layout::LayoutConfig::default();
