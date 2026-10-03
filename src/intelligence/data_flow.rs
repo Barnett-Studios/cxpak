@@ -516,6 +516,20 @@ pub struct DataFlowResult {
     pub limitations: Vec<String>,
 }
 
+impl DataFlowResult {
+    /// Keep only paths whose source OR sink file lives under `focus`. Shared
+    /// by every surface that honours `focus` (HTTP's `data_flow_handler` and
+    /// the MCP `data_flow` arm) so neither can drift from the other's
+    /// filtering rule (cxpak#81). An empty result is meaningful — the caller
+    /// asked for a specific area and got nothing.
+    pub fn apply_focus(&mut self, focus: Option<&str>) {
+        if let Some(prefix) = focus {
+            self.paths
+                .retain(|p| p.nodes.iter().any(|n| n.file.starts_with(prefix)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +624,43 @@ mod tests {
         assert_eq!(path.length, 2);
         assert_eq!(path.confidence, FlowConfidence::Exact);
         assert_eq!(path.nodes.last().unwrap().node_type, FlowNodeType::Sink);
+    }
+
+    /// cxpak#81: `data_flow`'s MCP arm declared `focus` but never called
+    /// this filter; HTTP's `data_flow_handler` already did.
+    #[test]
+    fn test_apply_focus_keeps_only_paths_under_prefix() {
+        let mut index = build_index_with_symbols(&[
+            ("src/api.rs", "rust", "fn handle_request(req: Request)"),
+            ("src/db.rs", "rust", "fn save_user(req: Request)"),
+        ]);
+        index.call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "src/api.rs".into(),
+                caller_symbol: "handle_request".into(),
+                callee_file: "src/db.rs".into(),
+                callee_symbol: "save_user".into(),
+                confidence: CallConfidence::Exact,
+                resolution_note: None,
+            }],
+            unresolved: Vec::new(),
+        };
+        let mut result = trace_data_flow("handle_request", None, 10, &index);
+        assert_eq!(result.paths.len(), 1, "fixture must produce one path");
+
+        result.apply_focus(Some("nosuchdir/"));
+        assert!(
+            result.paths.is_empty(),
+            "focus matching neither node must empty paths"
+        );
+
+        let mut result2 = trace_data_flow("handle_request", None, 10, &index);
+        result2.apply_focus(Some("src/api"));
+        assert_eq!(
+            result2.paths.len(),
+            1,
+            "focus matching the source node must keep the path"
+        );
     }
 
     #[test]
