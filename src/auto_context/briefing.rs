@@ -342,24 +342,43 @@ fn truncate_to_budget(content: &str, budget: usize, counter: &TokenCounter) -> S
 
     let available = budget - marker_tokens;
     let lines: Vec<&str> = content.lines().collect();
-    let mut accumulated = String::new();
+    let mut accumulated_lines: Vec<&str> = Vec::new();
     let mut accumulated_tokens = 0usize;
+    // Same mid-symbol defect, and same fix, as `budget::degrader`'s
+    // truncate_to_budget_inner (issue #41): a raw line-count cut can land
+    // partway through a function/block and emit an opening brace with no
+    // matching close. Track nesting depth and back off to the last
+    // genuinely-safe (depth <= 0) boundary when the cut lands while still
+    // inside an open block (depth > 0) — see `bracket_depth_delta`'s doc
+    // comment for why `<= 0`, not `== 0`, is the safe threshold.
+    let mut depth: i64 = 0;
+    let mut last_safe_len: Option<usize> = None;
+    let mut cut_short = false;
 
     for line in &lines {
         let line_with_newline = format!("{}\n", line);
         let line_tokens = counter.count(&line_with_newline);
         if accumulated_tokens + line_tokens > available {
+            cut_short = true;
             break;
         }
-        accumulated.push_str(&line_with_newline);
+        accumulated_lines.push(line);
         accumulated_tokens += line_tokens;
+        depth += crate::budget::degrader::bracket_depth_delta(line);
+        if depth <= 0 {
+            last_safe_len = Some(accumulated_lines.len());
+        }
     }
 
-    if accumulated.is_empty() {
+    if cut_short && depth > 0 {
+        accumulated_lines.truncate(last_safe_len.unwrap_or(0));
+    }
+
+    if accumulated_lines.is_empty() {
         return String::new();
     }
 
-    format!("{}{}", accumulated.trim_end_matches('\n'), marker)
+    format!("{}{}", accumulated_lines.join("\n"), marker)
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +623,46 @@ mod tests {
             result.len() < content.len(),
             "truncated output should be shorter than original"
         );
+    }
+
+    #[test]
+    fn test_truncate_to_budget_never_leaves_unbalanced_braces() {
+        // Same sibling defect as budget::degrader::truncate_to_budget_inner
+        // (issue #41): a raw line-count cut here can land partway through a
+        // function body and emit its opening brace with no matching close.
+        let counter = TokenCounter::new();
+        let content = (0..20)
+            .map(|i| {
+                let body_lines = 3 + (i % 5);
+                let body = (0..body_lines)
+                    .map(|j| format!("    let v{j} = {j} + {i};"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("fn function_number_{i}() {{\n{body}\n    v0\n}}\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let total = tok(&content);
+        assert!(total > 400, "fixture too small to exercise the sweep");
+
+        let mut saw_truncation = false;
+        for budget in (40..total).step_by(5) {
+            let result = truncate_to_budget(&content, budget, &counter);
+            if result.is_empty() || !result.contains("truncated") {
+                continue;
+            }
+            saw_truncation = true;
+            let code_only = result
+                .strip_suffix("\n// ... (truncated)")
+                .unwrap_or(&result);
+            let opens = code_only.matches('{').count();
+            let closes = code_only.matches('}').count();
+            assert_eq!(
+                opens, closes,
+                "budget {budget} produced unbalanced braces: {code_only:?}"
+            );
+        }
+        assert!(saw_truncation, "sweep never exercised truncation");
     }
 
     // -----------------------------------------------------------------------
