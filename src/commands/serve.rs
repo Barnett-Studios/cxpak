@@ -1106,6 +1106,8 @@ async fn v1_predict_handler(
         )
     })?;
     let refs: Vec<&str> = normalized.iter().map(|s| s.as_str()).collect();
+    let known_files: std::collections::HashSet<&str> =
+        idx.files.iter().map(|f| f.relative_path.as_str()).collect();
     let result = crate::intelligence::predict::predict(
         &refs,
         &idx.graph,
@@ -1113,6 +1115,7 @@ async fn v1_predict_handler(
         &idx.co_changes,
         &idx.test_map,
         depth,
+        &known_files,
     );
     Ok(axum::Json(serde_json::to_value(result).map_err(|_| {
         v1_error(
@@ -1791,6 +1794,8 @@ async fn blast_radius_handler(
     let files: Vec<&str> = params.files.iter().map(|s| s.as_str()).collect();
     let depth = params.depth.unwrap_or(3);
     let focus = params.focus.as_deref();
+    let known_files: std::collections::HashSet<&str> =
+        idx.files.iter().map(|f| f.relative_path.as_str()).collect();
 
     let result = crate::intelligence::blast_radius::compute_blast_radius(
         &files,
@@ -1799,6 +1804,7 @@ async fn blast_radius_handler(
         &idx.test_map,
         depth,
         focus,
+        &known_files,
     );
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_else(
@@ -2145,6 +2151,8 @@ async fn predict_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
     let depth = params.depth.unwrap_or(3);
+    let known_files: std::collections::HashSet<&str> =
+        idx.files.iter().map(|f| f.relative_path.as_str()).collect();
 
     let mut result = crate::intelligence::predict::predict(
         &file_refs,
@@ -2153,6 +2161,7 @@ async fn predict_handler(
         &idx.co_changes,
         &idx.test_map,
         depth,
+        &known_files,
     );
     if let Some(prefix) = params.focus.as_deref() {
         result
@@ -3860,6 +3869,11 @@ fn dispatch_capability_op(
             }
             let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
             let focus = args.get("focus").and_then(|v| v.as_str());
+            let known_files: std::collections::HashSet<&str> = index
+                .files
+                .iter()
+                .map(|f| f.relative_path.as_str())
+                .collect();
             let result = crate::intelligence::blast_radius::compute_blast_radius(
                 &files,
                 &index.graph,
@@ -3867,6 +3881,7 @@ fn dispatch_capability_op(
                 &index.test_map,
                 depth,
                 focus,
+                &known_files,
             );
             mcp_tool_result(
                 id,
@@ -4209,6 +4224,11 @@ fn dispatch_capability_op(
             let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
             let depth = args.get("depth").and_then(|d| d.as_u64()).unwrap_or(3) as usize;
             let focus = args.get("focus").and_then(|f| f.as_str());
+            let known_files: std::collections::HashSet<&str> = index
+                .files
+                .iter()
+                .map(|f| f.relative_path.as_str())
+                .collect();
             let mut result = crate::intelligence::predict::predict(
                 &file_refs,
                 &index.graph,
@@ -4216,6 +4236,7 @@ fn dispatch_capability_op(
                 &index.co_changes,
                 &index.test_map,
                 depth,
+                &known_files,
             );
             // Apply focus filter: keep only impact entries whose path starts with prefix
             if let Some(focus_prefix) = focus {

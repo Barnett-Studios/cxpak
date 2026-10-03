@@ -53,11 +53,15 @@ pub struct PredictionResult {
 // ---------------------------------------------------------------------------
 
 /// Compute structural impact via BFS on the reverse dependency graph.
+///
+/// `known_files` — every real path the index holds, independent of edge
+/// participation; see [`crate::intelligence::blast_radius::compute_blast_radius`].
 pub fn structural_impact(
     changed_files: &[&str],
     graph: &DependencyGraph,
     pagerank: &HashMap<String, f64>,
     depth: usize,
+    known_files: &HashSet<&str>,
 ) -> Vec<ImpactEntry> {
     let result = crate::intelligence::blast_radius::compute_blast_radius(
         changed_files,
@@ -66,6 +70,7 @@ pub fn structural_impact(
         &HashMap::new(),
         depth,
         None,
+        known_files,
     );
     let mut entries: Vec<ImpactEntry> = result
         .categories
@@ -325,6 +330,11 @@ pub fn call_graph_impact(
 // ---------------------------------------------------------------------------
 
 /// Compute full prediction result for a set of changed files.
+///
+/// `known_files` — every real path the index holds, independent of edge
+/// participation; see [`crate::intelligence::blast_radius::compute_blast_radius`]
+/// for why this is required to tell an unresolvable seed apart from a real,
+/// genuinely isolated one (cxpak#79).
 pub fn predict(
     changed_files: &[&str],
     graph: &DependencyGraph,
@@ -332,6 +342,7 @@ pub fn predict(
     co_changes: &[CoChangeEdge],
     test_map: &HashMap<String, Vec<TestFileRef>>,
     depth: usize,
+    known_files: &HashSet<&str>,
 ) -> PredictionResult {
     predict_with_call_graph(
         changed_files,
@@ -341,10 +352,12 @@ pub fn predict(
         test_map,
         depth,
         &crate::intelligence::call_graph::CallGraph::new(),
+        known_files,
     )
 }
 
 /// Like [`predict`] but also incorporates call-graph signals.
+#[allow(clippy::too_many_arguments)]
 pub fn predict_with_call_graph(
     changed_files: &[&str],
     graph: &DependencyGraph,
@@ -353,16 +366,20 @@ pub fn predict_with_call_graph(
     test_map: &HashMap<String, Vec<TestFileRef>>,
     depth: usize,
     call_graph: &crate::intelligence::call_graph::CallGraph,
+    known_files: &HashSet<&str>,
 ) -> PredictionResult {
-    let structural = structural_impact(changed_files, graph, pagerank, depth);
+    let structural = structural_impact(changed_files, graph, pagerank, depth, known_files);
     let historical = historical_impact(changed_files, co_changes);
     let call_impact = call_graph_impact(changed_files, call_graph);
 
-    // Seeds that are not edge-participating nodes at all (cxpak#79): report
-    // them honestly rather than a confident-looking all-zero prediction.
+    // Seeds that are neither edge-participating nodes NOR a real file known
+    // to the index at all (cxpak#79): report them honestly rather than a
+    // confident-looking all-zero prediction. A real, indexed, zero-edge file
+    // (in `known_files` but not `graph.contains_node`) is the honest-empty
+    // case this distinction exists to protect.
     let mut not_found: Vec<String> = changed_files
         .iter()
-        .filter(|&&seed| !graph.contains_node(seed))
+        .filter(|&&seed| !graph.contains_node(seed) && !known_files.contains(seed))
         .map(|s| s.to_string())
         .collect();
     not_found.sort();
@@ -426,7 +443,7 @@ mod tests {
         let graph = make_graph_chain();
         let pagerank: HashMap<String, f64> =
             [("src/a.rs".to_string(), 0.8), ("src/c.rs".to_string(), 0.6)].into();
-        let entries = structural_impact(&["src/b.rs"], &graph, &pagerank, 3);
+        let entries = structural_impact(&["src/b.rs"], &graph, &pagerank, 3, &HashSet::new());
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         assert!(
             paths.contains(&"src/a.rs"),
@@ -491,7 +508,7 @@ mod tests {
         let mut graph = DependencyGraph::new();
         graph.add_edge("tests/b_test.rs", "src/b.rs", EdgeType::Import);
         let pagerank = HashMap::new();
-        let structural = structural_impact(&["src/b.rs"], &graph, &pagerank, 3);
+        let structural = structural_impact(&["src/b.rs"], &graph, &pagerank, 3, &HashSet::new());
         let historical = historical_impact(&["src/b.rs"], &co_changes);
         let result =
             merge_test_predictions(&["src/b.rs"], &structural, &historical, &[], &test_map);
@@ -566,7 +583,7 @@ mod tests {
     fn test_predict_changed_files_excluded_from_impact() {
         let graph = DependencyGraph::new();
         let pagerank = HashMap::new();
-        let entries = structural_impact(&["src/b.rs"], &graph, &pagerank, 3);
+        let entries = structural_impact(&["src/b.rs"], &graph, &pagerank, 3, &HashSet::new());
         assert!(entries.iter().all(|e| e.path != "src/b.rs"));
     }
 
@@ -630,7 +647,7 @@ mod tests {
         graph.add_edge("low.rs", "src.rs", EdgeType::Import);
         let pagerank: HashMap<String, f64> =
             [("high.rs".to_string(), 0.9), ("low.rs".to_string(), 0.1)].into();
-        let entries = structural_impact(&["src.rs"], &graph, &pagerank, 3);
+        let entries = structural_impact(&["src.rs"], &graph, &pagerank, 3, &HashSet::new());
         for i in 1..entries.len() {
             assert!(
                 entries[i - 1].score >= entries[i].score,
@@ -745,6 +762,7 @@ mod tests {
             &test_map,
             3,
             &call_graph,
+            &HashSet::new(),
         );
 
         assert!(
@@ -822,6 +840,7 @@ mod tests {
             &test_map,
             3,
             &crate::intelligence::call_graph::CallGraph::new(),
+            &HashSet::new(),
         );
 
         // The summary must reflect distinct files, not structural.len() + historical.len().
@@ -855,7 +874,15 @@ mod tests {
         let co_changes = vec![];
         let test_map = HashMap::new();
 
-        let result = predict(&["leaf.rs"], &graph, &pagerank, &co_changes, &test_map, 3);
+        let result = predict(
+            &["leaf.rs"],
+            &graph,
+            &pagerank,
+            &co_changes,
+            &test_map,
+            3,
+            &HashSet::new(),
+        );
         assert!(
             result.not_found.is_empty(),
             "leaf.rs is a real (edge-participating) node"
@@ -870,8 +897,24 @@ mod tests {
         let co_changes = vec![];
         let test_map = HashMap::new();
 
-        let unknown = predict(&["nosuch.rs"], &graph, &pagerank, &co_changes, &test_map, 3);
-        let isolated = predict(&["b.rs"], &graph, &pagerank, &co_changes, &test_map, 3);
+        let unknown = predict(
+            &["nosuch.rs"],
+            &graph,
+            &pagerank,
+            &co_changes,
+            &test_map,
+            3,
+            &HashSet::new(),
+        );
+        let isolated = predict(
+            &["b.rs"],
+            &graph,
+            &pagerank,
+            &co_changes,
+            &test_map,
+            3,
+            &HashSet::new(),
+        );
 
         assert_eq!(
             unknown.not_found,
@@ -882,5 +925,45 @@ mod tests {
             isolated.not_found.is_empty(),
             "b.rs is a real node — must not be reported as not_found"
         );
+    }
+
+    #[test]
+    fn test_predict_indexed_but_edgeless_seed_is_not_not_found() {
+        // "untouched.rs" is a real, indexed file with zero edges in either
+        // direction — `graph.contains_node` is false for it even though it
+        // genuinely exists. `not_found` must distinguish this honest-empty
+        // case from a truly unresolvable seed via the broader `known_files`
+        // set, not via graph node participation alone.
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs", EdgeType::Import);
+        let pagerank = HashMap::new();
+        let co_changes = vec![];
+        let test_map = HashMap::new();
+        let known_files: HashSet<&str> = ["a.rs", "b.rs", "untouched.rs"].into_iter().collect();
+
+        let result = predict(
+            &["untouched.rs"],
+            &graph,
+            &pagerank,
+            &co_changes,
+            &test_map,
+            3,
+            &known_files,
+        );
+        assert!(
+            result.not_found.is_empty(),
+            "untouched.rs is in known_files — a real, zero-edge file"
+        );
+
+        let truly_unknown = predict(
+            &["nosuch.rs"],
+            &graph,
+            &pagerank,
+            &co_changes,
+            &test_map,
+            3,
+            &known_files,
+        );
+        assert_eq!(truly_unknown.not_found, vec!["nosuch.rs".to_string()]);
     }
 }

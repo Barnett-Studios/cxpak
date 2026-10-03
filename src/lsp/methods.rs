@@ -542,6 +542,7 @@ pub fn handle_custom_method(
                 &index.test_map,
                 depth,
                 focus,
+                &indexed,
             );
             Ok(Some(serde_json::to_value(result).map_err(|e| {
                 LspMethodError::Internal(format!("serialization failed: {e}"))
@@ -724,6 +725,11 @@ pub fn handle_custom_method(
                 ));
             }
             let refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+            let known_files: std::collections::HashSet<&str> = index
+                .files
+                .iter()
+                .map(|f| f.relative_path.as_str())
+                .collect();
             let result = crate::intelligence::predict::predict(
                 &refs,
                 &index.graph,
@@ -731,6 +737,7 @@ pub fn handle_custom_method(
                 &index.co_changes,
                 &index.test_map,
                 3,
+                &known_files,
             );
             Ok(Some(serde_json::to_value(result).map_err(|e| {
                 LspMethodError::Internal(format!("serialization failed: {e}"))

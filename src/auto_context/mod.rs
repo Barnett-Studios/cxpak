@@ -204,6 +204,11 @@ pub fn auto_context_with_mode(
     // Step 8: Optional blast radius (top 5 target files).
     let blast_json = if opts.include_blast_radius && !kept.is_empty() {
         let top_paths: Vec<&str> = kept.iter().take(5).map(|f| f.path.as_str()).collect();
+        let known_files: std::collections::HashSet<&str> = index
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
         let result = crate::intelligence::blast_radius::compute_blast_radius(
             &top_paths,
             &index.graph,
@@ -211,6 +216,7 @@ pub fn auto_context_with_mode(
             &index.test_map,
             3,
             opts.focus.as_deref(),
+            &known_files,
         );
         serde_json::to_value(&result).ok()
     } else {
@@ -293,6 +299,11 @@ pub fn auto_context_with_mode(
         mentions.retain(|p| index.files.iter().any(|f| f.relative_path == *p));
 
         if !mentions.is_empty() {
+            let known_files: std::collections::HashSet<&str> = index
+                .files
+                .iter()
+                .map(|f| f.relative_path.as_str())
+                .collect();
             Some(crate::intelligence::predict::predict(
                 &mentions,
                 &index.graph,
@@ -300,6 +311,7 @@ pub fn auto_context_with_mode(
                 &index.co_changes,
                 &index.test_map,
                 3,
+                &known_files,
             ))
         } else {
             None

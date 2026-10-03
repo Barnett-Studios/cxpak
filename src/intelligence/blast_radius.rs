@@ -180,6 +180,13 @@ struct BestEntry {
 /// - `test_map` — source → test file refs mapping (for test categorisation)
 /// - `depth` — maximum BFS hops to follow
 /// - `focus` — optional path prefix; only paths matching this prefix appear in results
+/// - `known_files` — every real path the index holds, independent of edge
+///   participation (e.g. `index.files`). `graph.contains_node` alone cannot
+///   distinguish "not a real file" from "a real file with zero edges in
+///   either direction" — this graph's node universe is edge-implied (the
+///   union of `edges`/`reverse_edges` keys), so a genuinely isolated real
+///   file is indistinguishable from an unknown one without this. A seed
+///   counts as `not_found` only when it is in neither set.
 pub fn compute_blast_radius(
     changed_files: &[&str],
     graph: &DependencyGraph,
@@ -187,14 +194,18 @@ pub fn compute_blast_radius(
     test_map: &HashMap<String, Vec<TestFileRef>>,
     depth: usize,
     focus: Option<&str>,
+    known_files: &HashSet<&str>,
 ) -> BlastRadiusResult {
     let changed_set: HashSet<&str> = changed_files.iter().copied().collect();
 
-    // Seeds that are not edge-participating nodes at all — reported honestly
-    // rather than silently answered as "affects nothing" (cxpak#79).
+    // Seeds that are neither edge-participating nodes NOR a real file known
+    // to the index at all — reported honestly rather than silently answered
+    // as "affects nothing" (cxpak#79). A real, indexed, zero-edge file (in
+    // `known_files` but not `graph.contains_node`) is the honest-empty case
+    // this distinction exists to protect, not an unresolved seed.
     let mut not_found: Vec<String> = changed_files
         .iter()
-        .filter(|&&seed| !graph.contains_node(seed))
+        .filter(|&&seed| !graph.contains_node(seed) && !known_files.contains(seed))
         .map(|s| s.to_string())
         .collect();
     not_found.sort();
@@ -422,8 +433,18 @@ pub fn compute_column_blast_radius(
     focus: Option<&str>,
 ) -> BlastRadiusResult {
     let node = crate::schema::column_node_id(table, column);
-    let mut result =
-        compute_blast_radius(&[node.as_str()], graph, pagerank, test_map, depth, focus);
+    // The seed here is always the synthetic `col:` node, never a real file
+    // path, so there is no file-list membership to check beyond
+    // `contains_node` — pass an empty `known_files`.
+    let mut result = compute_blast_radius(
+        &[node.as_str()],
+        graph,
+        pagerank,
+        test_map,
+        depth,
+        focus,
+        &HashSet::new(),
+    );
     // Report the human-readable `table.column` seed rather than the synthetic
     // `col:` node id, so callers see what they asked about — in both the
     // echoed seed list and any not_found entry.
@@ -614,7 +635,8 @@ mod tests {
         let graph = DependencyGraph::new();
         let pagerank = HashMap::new();
         let test_map = HashMap::new();
-        let result = compute_blast_radius(&[], &graph, &pagerank, &test_map, 3, None);
+        let result =
+            compute_blast_radius(&[], &graph, &pagerank, &test_map, 3, None, &HashSet::new());
         assert_eq!(result.total_affected, 0);
         assert!(result.categories.direct_dependents.is_empty());
         assert!(result.categories.transitive_dependents.is_empty());
@@ -631,7 +653,15 @@ mod tests {
         let pagerank = make_pagerank(&[("src/a.rs", 0.8), ("src/b.rs", 0.5)]);
         let test_map = HashMap::new();
 
-        let result = compute_blast_radius(&["src/b.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["src/b.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         assert_eq!(result.total_affected, 1);
         assert_eq!(result.categories.direct_dependents.len(), 1);
@@ -653,7 +683,15 @@ mod tests {
         let pagerank = make_pagerank(&[("a.rs", 0.9), ("b.rs", 0.6), ("c.rs", 0.3)]);
         let test_map = HashMap::new();
 
-        let result = compute_blast_radius(&["c.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["c.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         assert_eq!(result.total_affected, 2);
         let direct: HashSet<&str> = result
@@ -693,7 +731,15 @@ mod tests {
         ]);
         let test_map = HashMap::new();
 
-        let result = compute_blast_radius(&["e.rs"], &graph, &pagerank, &test_map, 2, None);
+        let result = compute_blast_radius(
+            &["e.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            2,
+            None,
+            &HashSet::new(),
+        );
 
         // depth=2: d (hops=1), c (hops=2); a and b should not appear
         let all_paths: HashSet<&str> = result
@@ -729,8 +775,15 @@ mod tests {
         let pagerank = make_pagerank(&[("src/a.rs", 0.5), ("src/b.rs", 0.5), ("vendor/c.rs", 0.5)]);
         let test_map = HashMap::new();
 
-        let result =
-            compute_blast_radius(&["core.rs"], &graph, &pagerank, &test_map, 3, Some("src/"));
+        let result = compute_blast_radius(
+            &["core.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            Some("src/"),
+            &HashSet::new(),
+        );
 
         let all_paths: HashSet<&str> = result
             .categories
@@ -767,7 +820,15 @@ mod tests {
         // Only auth_test.rs is in the test_map for src/auth.rs
         let test_map = make_test_map_from(&[("src/auth.rs", "tests/auth_test.rs")]);
 
-        let result = compute_blast_radius(&["src/auth.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["src/auth.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         let test_file_paths: HashSet<&str> = result
             .categories
@@ -808,7 +869,15 @@ mod tests {
         let test_map = HashMap::new();
 
         // Must not panic or infinite-loop
-        let result = compute_blast_radius(&["a.rs"], &graph, &pagerank, &test_map, 10, None);
+        let result = compute_blast_radius(
+            &["a.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            10,
+            None,
+            &HashSet::new(),
+        );
 
         // b and c are affected; a is the seed (excluded from results)
         let all_paths: HashSet<&str> = result
@@ -837,7 +906,15 @@ mod tests {
         let pagerank = make_pagerank(&[("x.rs", 0.8), ("y.rs", 0.6)]);
         let test_map = HashMap::new();
 
-        let result = compute_blast_radius(&["a.rs", "b.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["a.rs", "b.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         let all_paths: HashSet<&str> = result
             .categories
@@ -871,7 +948,15 @@ mod tests {
         let pagerank = make_pagerank(&[("api.rs", 0.7), ("report.rs", 0.5)]);
         let test_map = HashMap::new();
 
-        let result = compute_blast_radius(&["models.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["models.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         let schema_paths: HashSet<&str> = result
             .categories
@@ -899,7 +984,15 @@ mod tests {
         let pagerank = make_pagerank(&[("dep1.rs", 1.0), ("dep2.rs", 0.1)]);
         let test_map = HashMap::new();
 
-        let result = compute_blast_radius(&["src.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["src.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         let summary = &result.risk_summary;
         let counted = summary.high + summary.medium + summary.low;
@@ -925,7 +1018,15 @@ mod tests {
         let pagerank = make_pagerank(&[("a.rs", 0.5), ("d.rs", 0.8)]);
         let test_map = HashMap::new();
 
-        let result = compute_blast_radius(&["c.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["c.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         // d.rs is reachable via hops=1 (Import/ForeignKey from c.rs) AND hops=2 (via a.rs).
         // Best hop for d.rs is 1.  The highest-risk edge at hops=1 is ForeignKey (weight 1.0)
@@ -950,7 +1051,15 @@ mod tests {
         let pagerank = make_pagerank(&[("a.rs", 1.0)]);
         let test_map = HashMap::new();
 
-        let result = compute_blast_radius(&["a.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["a.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         let all_paths: HashSet<&str> = result
             .categories
@@ -983,7 +1092,15 @@ mod tests {
         let pagerank = make_pagerank(&[("a.rs", 0.5), ("b.rs", 0.5)]);
         let test_map = HashMap::new();
 
-        let result = compute_blast_radius(&["leaf.rs"], &graph, &pagerank, &test_map, 3, None);
+        let result = compute_blast_radius(
+            &["leaf.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
         assert_eq!(
             result.total_affected, 0,
             "leaf.rs genuinely affects nothing"
@@ -1001,8 +1118,24 @@ mod tests {
         let pagerank = make_pagerank(&[("a.rs", 0.5)]);
         let test_map = HashMap::new();
 
-        let unknown = compute_blast_radius(&["nosuch.rs"], &graph, &pagerank, &test_map, 3, None);
-        let isolated = compute_blast_radius(&["b.rs"], &graph, &pagerank, &test_map, 3, None);
+        let unknown = compute_blast_radius(
+            &["nosuch.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
+        let isolated = compute_blast_radius(
+            &["b.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &HashSet::new(),
+        );
 
         // Both produce total_affected: 0 — that part is byte-identical...
         assert_eq!(unknown.total_affected, 0);
@@ -1032,9 +1165,57 @@ mod tests {
             &test_map,
             3,
             None,
+            &HashSet::new(),
         );
         assert_eq!(result.not_found, vec!["nosuch.rs".to_string()]);
         // The real seed's own answer is unaffected by the unresolved one.
         assert_eq!(result.total_affected, 1);
+    }
+
+    #[test]
+    fn test_blast_radius_indexed_but_edgeless_seed_is_not_not_found() {
+        // "untouched.rs" is a real, indexed file (present in `known_files`)
+        // that imports nothing and is imported by nothing — zero edges in
+        // either direction, so `graph.contains_node` is false for it even
+        // though it genuinely exists. This is the exact case `not_found`
+        // must NOT report: a real file with an honest-empty blast radius,
+        // not an unresolvable one. `graph.contains_node` alone cannot tell
+        // these apart because this graph's node universe is edge-implied
+        // (the union of `edges`/`reverse_edges` keys) — only the index's
+        // actual file list can.
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a.rs", "b.rs", EdgeType::Import);
+        let pagerank = make_pagerank(&[("a.rs", 0.5), ("b.rs", 0.5)]);
+        let test_map = HashMap::new();
+        let known_files: HashSet<&str> = ["a.rs", "b.rs", "untouched.rs"].into_iter().collect();
+
+        let result = compute_blast_radius(
+            &["untouched.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &known_files,
+        );
+        assert_eq!(result.total_affected, 0, "untouched.rs affects nothing");
+        assert!(
+            result.not_found.is_empty(),
+            "untouched.rs is in known_files — a real, zero-edge file, not an \
+             unresolvable seed"
+        );
+
+        // Contrast: a seed absent from known_files entirely IS not_found,
+        // even though it is just as edgeless in the graph.
+        let truly_unknown = compute_blast_radius(
+            &["nosuch.rs"],
+            &graph,
+            &pagerank,
+            &test_map,
+            3,
+            None,
+            &known_files,
+        );
+        assert_eq!(truly_unknown.not_found, vec!["nosuch.rs".to_string()]);
     }
 }

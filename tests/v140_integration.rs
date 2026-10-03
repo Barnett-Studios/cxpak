@@ -1,6 +1,6 @@
 use cxpak::intelligence::co_change::CoChangeEdge;
 use cxpak::intelligence::predict::{confidence_for_signals, predict, ImpactSignal};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[test]
 fn test_predict_empty_graph_returns_summary() {
@@ -16,6 +16,7 @@ fn test_predict_empty_graph_returns_summary() {
         &co_changes,
         &test_map,
         3,
+        &HashSet::new(),
     );
     assert_eq!(result.changed_files, vec!["src/lib.rs"]);
     assert!(result.confidence_summary.contains("predicted"));
@@ -92,7 +93,15 @@ fn test_predict_with_co_changes_produces_historical() {
     }];
     let test_map = HashMap::new();
 
-    let result = predict(&["src/a.rs"], &graph, &pagerank, &co_changes, &test_map, 3);
+    let result = predict(
+        &["src/a.rs"],
+        &graph,
+        &pagerank,
+        &co_changes,
+        &test_map,
+        3,
+        &HashSet::new(),
+    );
     assert!(
         !result.historical_impact.is_empty(),
         "co-changes should produce historical impact"

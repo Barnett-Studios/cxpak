@@ -600,6 +600,8 @@ pub(crate) fn build_review_bundle(
         .map(|f| f.relative_path.clone())
         .collect();
     let test_map = crate::intelligence::test_map::build_test_map(&index.files, &all_paths);
+    let known_files: std::collections::HashSet<&str> =
+        all_paths.iter().map(|s| s.as_str()).collect();
 
     let blast = crate::intelligence::blast_radius::compute_blast_radius(
         &refs,
@@ -608,6 +610,7 @@ pub(crate) fn build_review_bundle(
         &test_map,
         2,
         None,
+        &known_files,
     );
     let prediction = crate::intelligence::predict::predict(
         &refs,
@@ -616,6 +619,7 @@ pub(crate) fn build_review_bundle(
         &index.co_changes,
         &test_map,
         2,
+        &known_files,
     );
     let verify = crate::conventions::verify::verify_changes(&changed, index, repo_path);
     // Same default auth-pattern slice the serve `cxpak_security_surface` handler passes.
