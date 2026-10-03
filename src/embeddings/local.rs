@@ -44,10 +44,15 @@ const MODEL_FILE_CHECKSUMS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Network timeout for a single model-file download. `model.safetensors` is
-/// ~90MB; a stalled or throttled connection must fail the embedding provider
-/// rather than hang the caller indefinitely.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long to wait for the TCP connection to establish. Short — a dead or
+/// unreachable host should fail fast.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait for the NEXT chunk of data once the transfer has
+/// started. `model.safetensors` is ~90MB; a slow-but-progressing link must
+/// be allowed to finish, so this bounds idle time between reads, not the
+/// whole transfer — only a connection that stalls mid-stream times out.
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl LocalEmbeddingProvider {
     /// Build the provider, downloading the model weights if necessary.
@@ -294,20 +299,26 @@ fn sha256_of_file(path: &Path) -> Result<String, String> {
 /// another process already placed the final file, we remove the temp file and
 /// accept the already-existing copy.
 ///
-/// Bounded by `DOWNLOAD_TIMEOUT`; a checksum mismatch or timeout returns
-/// `Err` here, which every caller up the chain (`LocalEmbeddingProvider::new`
-/// → `create_provider` → `build_embedding_index`) already turns into "no
+/// `<dest>.tmp.<pid>` is removed on EVERY error exit — connect/read/write
+/// failure, idle-timeout, or checksum mismatch — never just the checksum
+/// case, so a failed attempt never leaves a stray partial file behind.
+///
+/// `CONNECT_TIMEOUT` bounds only establishing the connection;
+/// `IDLE_READ_TIMEOUT` bounds the gap between successive chunks once data
+/// is flowing, so a slow-but-progressing ~90MB transfer can still finish —
+/// only a connection that never connects, or a read that stalls mid-stream,
+/// times out. A checksum mismatch or either timeout returns `Err` here,
+/// which every caller up the chain (`LocalEmbeddingProvider::new` →
+/// `create_provider` → `build_embedding_index`) already turns into "no
 /// embedding index" rather than a hard failure — embeddings become
 /// unavailable, the rest of the command proceeds.
 fn download_file_atomic(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), String> {
-    use sha2::{Digest, Sha256};
-
     let client = reqwest::blocking::Client::builder()
-        .timeout(DOWNLOAD_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|e| format!("http client build error: {e}"))?;
 
-    let mut response = client
+    let response = client
         .get(url)
         .send()
         .map_err(|e| format!("download error for {url}: {e}"))?;
@@ -317,43 +328,96 @@ fn download_file_atomic(url: &str, dest: &Path, expected_sha256: &str) -> Result
     }
 
     let tmp_path = dest.with_extension(format!("tmp.{}", std::process::id()));
-    let mut tmp_file =
-        std::fs::File::create(&tmp_path).map_err(|e| format!("create temp file error: {e}"))?;
 
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = response
-            .read(&mut buf)
-            .map_err(|e| format!("read bytes error: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        tmp_file
-            .write_all(&buf[..n])
-            .map_err(|e| format!("write error: {e}"))?;
-    }
-    tmp_file.flush().map_err(|e| format!("flush error: {e}"))?;
-    drop(tmp_file);
-
-    let actual = format!("{:x}", hasher.finalize());
-    if actual != expected_sha256 {
+    // Every error path below goes through this `result` before returning, so
+    // the temp file is cleaned up uniformly regardless of which step failed.
+    let result = write_verified_body(response, &tmp_path, expected_sha256, url);
+    if let Err(e) = result {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
-            "integrity check failed for {url}: checksum mismatch: expected {expected_sha256}, got {actual}"
-        ));
+        return Err(e);
     }
 
     if let Err(e) = std::fs::rename(&tmp_path, dest) {
         // Another process already created the destination — clean up the temp
-        // file and verify the existing file is readable.
+        // file and accept the already-existing copy.
         let _ = std::fs::remove_file(&tmp_path);
         if !dest.exists() {
             return Err(format!("rename failed and destination missing: {e}"));
         }
     }
     Ok(())
+}
+
+/// Stream `response`'s body into `tmp_path` in bounded 64KB chunks, hashing
+/// as it goes, and verify the final digest against `expected_sha256`.
+///
+/// The actual socket read happens on a background thread that ships each
+/// chunk through a channel; the caller enforces `IDLE_READ_TIMEOUT` on
+/// `recv_timeout` for each chunk. `reqwest::blocking`'s client only exposes
+/// a connect timeout and a whole-request timeout — neither lets a transfer
+/// run arbitrarily long while still catching a stream that stalls partway
+/// through, which this does.
+fn write_verified_body(
+    mut response: reqwest::blocking::Response,
+    tmp_path: &Path,
+    expected_sha256: &str,
+    url: &str,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::sync::mpsc;
+
+    let mut tmp_file =
+        std::fs::File::create(tmp_path).map_err(|e| format!("create temp file error: {e}"))?;
+
+    let (tx, rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+    std::thread::scope(|scope| -> Result<(), String> {
+        scope.spawn(move || {
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                match response.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                            break; // receiver gave up (idle-timeout fired) — stop reading
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut hasher = Sha256::new();
+        loop {
+            match rx.recv_timeout(IDLE_READ_TIMEOUT) {
+                Ok(Ok(chunk)) => {
+                    hasher.update(&chunk);
+                    tmp_file
+                        .write_all(&chunk)
+                        .map_err(|e| format!("write error: {e}"))?;
+                }
+                Ok(Err(e)) => return Err(format!("read bytes error: {e}")),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "download stalled: no data received for {IDLE_READ_TIMEOUT:?} from {url}"
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break, // reader thread finished
+            }
+        }
+
+        tmp_file.flush().map_err(|e| format!("flush error: {e}"))?;
+
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != expected_sha256 {
+            return Err(format!(
+                "integrity check failed for {url}: checksum mismatch: expected {expected_sha256}, got {actual}"
+            ));
+        }
+        Ok(())
+    })
 }
 
 fn l2_normalize(v: &[f32]) -> Vec<f32> {
@@ -536,6 +600,92 @@ mod tests {
             }
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// A loopback server that advertises `advertised_len` via
+    /// `Content-Length` but sends only `actual_body` (shorter) before
+    /// closing the connection — a truncated transfer, which the client must
+    /// surface as a read error rather than a clean EOF.
+    fn spawn_truncated_response_server(
+        advertised_len: usize,
+        actual_body: Vec<u8>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut drain = [0u8; 4096];
+                let _ = stream.read(&mut drain);
+                let header =
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {advertised_len}\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&actual_body);
+                let _ = stream.flush();
+                // Drop the connection here — fewer bytes than advertised.
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn download_file_atomic_cleans_up_after_truncated_response_read_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("weights.bin");
+
+        // Advertise far more bytes than are actually sent, then close the
+        // connection — reqwest/hyper must treat this as a read error, not a
+        // clean end-of-stream.
+        let (base_url, server) =
+            spawn_truncated_response_server(10_000, b"only-a-few-bytes".to_vec());
+        let url = format!("{base_url}/weights.bin");
+        let wrong_checksum = "0".repeat(64);
+
+        let result = download_file_atomic(&url, &dest, &wrong_checksum);
+
+        assert!(
+            result.is_err(),
+            "a connection that closes before delivering the advertised body must surface as an error"
+        );
+        assert!(
+            !dest.exists(),
+            "a read error must not leave a file at the destination"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "a read error must not leave a temp file behind either"
+        );
+
+        server.join().expect("server thread should exit cleanly");
+    }
+
+    #[test]
+    fn download_file_atomic_cleans_up_when_temp_file_cannot_be_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `dest`'s parent directory doesn't exist, so the temp file write
+        // step fails before any bytes are written.
+        let dest = dir.path().join("missing-subdir").join("weights.bin");
+
+        let (base_url, server) = spawn_single_response_server(b"irrelevant-body".to_vec());
+        let url = format!("{base_url}/weights.bin");
+
+        let result = download_file_atomic(&url, &dest, &"0".repeat(64));
+
+        assert!(
+            result.is_err(),
+            "a temp-file-creation failure must surface as an error, not succeed silently"
+        );
+        assert!(
+            !dest.exists(),
+            "nothing should be written to a missing directory"
+        );
+
+        server.join().expect("server thread should exit cleanly");
     }
 
     #[test]
