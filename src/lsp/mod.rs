@@ -34,14 +34,25 @@ pub fn workspace_root(path: &std::path::Path) -> std::io::Result<std::path::Path
 /// forever waiting for bytes that never arrive.
 ///
 /// This layer watches every incoming request's method name as it passes
-/// through: `shutdown` flips `shutdown_received` (read by the `exit`
-/// handler in `run_stdio` to pick the spec-mandated exit code), and `exit`
-/// fires `exit_tx` the moment the notification is seen — independent of
-/// whatever the transport does with stdin afterward.
+/// through: a `shutdown` that tower-lsp actually ACCEPTS (not one rejected
+/// pre-`initialize`/post-`shutdown` with the `-32002` "not initialized"
+/// error) flips `shutdown_received` once its response resolves (read by
+/// the `exit` handler in `run_stdio` to pick the spec-mandated exit code);
+/// `exit` fires `exit_tx` the moment the notification is seen —
+/// independent of whatever the transport does with stdin afterward.
+///
+/// Every OTHER request's future is wrapped to hold `in_flight` above zero
+/// for its duration, so `run_stdio`'s `exit` handler can tell whether
+/// there is a response still being written and skip the drain grace
+/// entirely when there is not (#114 follow-up: `exit` with nothing
+/// outstanding was waiting out the full grace window regardless).
+/// `exit` itself is excluded from this count — its own resolution is
+/// near-instant and irrelevant to "is there something to drain".
 struct ExitWatch<S> {
     inner: S,
     shutdown_received: std::sync::Arc<std::sync::atomic::AtomicBool>,
     exit_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<S> tower::Service<tower_lsp::jsonrpc::Request> for ExitWatch<S>
@@ -51,10 +62,12 @@ where
         Response = Option<tower_lsp::jsonrpc::Response>,
         Error = tower_lsp::ExitedError,
     >,
+    S::Future: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = S::Future;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
 
     fn poll_ready(
         &mut self,
@@ -64,25 +77,45 @@ where
     }
 
     fn call(&mut self, req: tower_lsp::jsonrpc::Request) -> Self::Future {
-        match req.method() {
-            "shutdown" => {
-                self.shutdown_received
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+        if req.method() == "exit" {
+            // `take()` makes this a one-shot signal even if a
+            // (spec-violating) client sends `exit` twice — the second
+            // send simply has nowhere to go rather than panicking on a
+            // closed channel. Not counted in `in_flight`: `exit`'s own
+            // resolution is near-instant and tells us nothing about
+            // whether there is a response to drain.
+            if let Ok(mut slot) = self.exit_tx.lock() {
+                if let Some(tx) = slot.take() {
+                    let _ = tx.send(());
+                }
             }
-            "exit" => {
-                // `take()` makes this a one-shot signal even if a
-                // (spec-violating) client sends `exit` twice — the second
-                // send simply has nowhere to go rather than panicking on a
-                // closed channel.
-                if let Ok(mut slot) = self.exit_tx.lock() {
-                    if let Some(tx) = slot.take() {
-                        let _ = tx.send(());
+            return Box::pin(self.inner.call(req));
+        }
+
+        // `shutdown` only counts toward `shutdown_received` if tower-lsp's
+        // own state machine actually accepted it — a `shutdown` arriving
+        // before `initialize` (or after a prior `shutdown`) is answered
+        // with a `-32002` error, not `result: null`, and must not make a
+        // following `exit` take the "clean" exit-code-0 path.
+        let shutdown_received =
+            (req.method() == "shutdown").then(|| std::sync::Arc::clone(&self.shutdown_received));
+
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let in_flight = std::sync::Arc::clone(&self.in_flight);
+        let fut = self.inner.call(req);
+        Box::pin(async move {
+            let result = fut.await;
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(flag) = shutdown_received {
+                if let Ok(response) = &result {
+                    if response.as_ref().and_then(|r| r.error()).is_none() {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
             }
-            _ => {}
-        }
-        self.inner.call(req)
+            result
+        })
     }
 }
 
@@ -132,11 +165,13 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     // stdin-driven loop — see `ExitWatch` for why that loop alone cannot
     // be trusted to end the process on `exit`.
     let shutdown_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<()>();
     let service = ExitWatch {
         inner: service,
         shutdown_received: std::sync::Arc::clone(&shutdown_received),
         exit_tx: std::sync::Arc::new(std::sync::Mutex::new(Some(exit_tx))),
+        in_flight: std::sync::Arc::clone(&in_flight),
     };
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -231,13 +266,20 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
                 // Same drain rationale as the SIGTERM branch below: a
                 // request sent just before `exit` may still be in flight on
                 // the runtime, so give it the same grace window to finish
-                // writing its response before cutting the process.
+                // writing its response before cutting the process — but
+                // ONLY if there is actually something in flight. The common
+                // case (`shutdown` answered, then `exit`, nothing else
+                // outstanding) has nothing to drain, and a client waiting
+                // on this process to go away shouldn't eat a fixed ~1.5s
+                // for no reason (#114 follow-up).
                 eprintln!("cxpak lsp: exit notification received, shutting down...");
-                let grace_ms: u64 = std::env::var("CXPAK_LSP_SHUTDOWN_GRACE_MS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1500);
-                tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+                if in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    let grace_ms: u64 = std::env::var("CXPAK_LSP_SHUTDOWN_GRACE_MS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1500);
+                    tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+                }
                 // Spec: 0 if `exit` followed a `shutdown` request, 1 (a
                 // "non-zero code", left unspecified beyond that) otherwise.
                 if shutdown_received.load(std::sync::atomic::Ordering::SeqCst) {

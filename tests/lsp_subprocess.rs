@@ -1060,3 +1060,95 @@ fn workspace_diagnostic_reports_a_real_dead_code_warning() {
     child.kill().ok();
     child.wait().ok();
 }
+
+/// A `shutdown` request REJECTED because it arrived before `initialize`
+/// (tower-lsp answers it with the `-32002 "server not initialized"` error,
+/// not `result: null`) must NOT count as a successful shutdown. The spec
+/// ties `exit`'s exit code to whether `shutdown` actually ran — a rejected
+/// `shutdown` followed by `exit` must still take the "no prior shutdown"
+/// path (status 1), not the "clean" path (status 0).
+#[test]
+fn lsp_exit_after_shutdown_rejected_pre_initialize_exits_with_status_1() {
+    let repo = make_test_repo();
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+
+    // Deliberately skip `initialize`/`initialized` — `shutdown` sent here
+    // must be rejected by tower-lsp's own state machine.
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "shutdown"}).to_string(),
+    );
+    let resp = read_response_for_id(&mut reader, 1).expect("shutdown response");
+    assert!(
+        resp["error"].is_object(),
+        "shutdown before initialize must be rejected with a JSON-RPC error; got: {resp}"
+    );
+
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "exit"}).to_string(),
+    );
+
+    let status = wait_for_exit(
+        &mut child,
+        Duration::from_secs(10),
+        "`exit` after a REJECTED `shutdown` must still terminate the process",
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a rejected shutdown must not count as a prior shutdown — exit must be status 1; got {status:?}"
+    );
+}
+
+/// `exit` with no request in flight must return near-instantly — the grace
+/// window exists to let an in-flight response finish writing, and has
+/// nothing to wait for in the common case (shutdown, then exit, with
+/// nothing else outstanding). Bounded well under the ~1.5s default grace.
+#[test]
+fn lsp_exit_with_no_in_flight_request_is_near_instant() {
+    let repo = make_test_repo();
+    let mut child = spawn_lsp(&repo);
+
+    let stdin = child.stdin.as_mut().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+    handshake(stdin, &mut reader, repo.path());
+
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}).to_string(),
+    );
+    let resp = read_response_for_id(&mut reader, 2).expect("shutdown response");
+    assert_eq!(
+        resp["result"],
+        Value::Null,
+        "shutdown must answer result: null"
+    );
+
+    let start = std::time::Instant::now();
+    write_lsp_message(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "exit"}).to_string(),
+    );
+
+    let status = wait_for_exit(
+        &mut child,
+        Duration::from_secs(10),
+        "exit with nothing in flight must still terminate the process",
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        status.success(),
+        "exit after shutdown must be status 0; got {status:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(750),
+        "exit with no in-flight request took {elapsed:?} — the drain grace (~1.5s default) \
+         must be skipped when there is nothing to drain"
+    );
+}
