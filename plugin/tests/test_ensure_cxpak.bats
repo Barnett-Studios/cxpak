@@ -5,6 +5,20 @@ setup() {
     ENSURE_CXPAK="${SCRIPT_DIR}/../lib/ensure-cxpak"
     TEST_TMP="$(mktemp -d)"
     export CXPAK_INSTALL_DIR="${TEST_TMP}/install"
+    # Fixtures are derived from the script's own REQUIRED_VERSION so a release bump
+    # can't silently turn "newer"/"older" fixtures into the wrong side of the pin.
+    REQ="$(sed -n 's/^REQUIRED_VERSION="\(.*\)"$/\1/p' "${ENSURE_CXPAK}")"
+    IFS=. read -r MAJ MIN PAT <<< "${REQ}"
+    NEWER_PATCH="${MAJ}.${MIN}.$((PAT + 1))"
+    NEWER_MINOR="${MAJ}.$((MIN + 1)).0"
+    if [ "${PAT}" -gt 0 ]; then OLDER="${MAJ}.${MIN}.$((PAT - 1))"; else OLDER="${MAJ}.$((MIN - 1)).0"; fi
+}
+
+# Write a fake cxpak at $1 that reports version $2.
+fake_cxpak() {
+    mkdir -p "$(dirname "$1")"
+    printf '#!/bin/sh\necho "cxpak %s"\n' "$2" > "$1"
+    chmod +x "$1"
 }
 
 teardown() {
@@ -12,12 +26,7 @@ teardown() {
 }
 
 @test "returns path when cxpak is on PATH" {
-    mkdir -p "${TEST_TMP}/bin"
-    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
-#!/bin/sh
-echo "cxpak 0.4.0"
-SH
-    chmod +x "${TEST_TMP}/bin/cxpak"
+    fake_cxpak "${TEST_TMP}/bin/cxpak" "${REQ}"
 
     PATH="${TEST_TMP}/bin:${PATH}" run "${ENSURE_CXPAK}"
     [ "$status" -eq 0 ]
@@ -25,12 +34,7 @@ SH
 }
 
 @test "returns cached binary if already downloaded" {
-    mkdir -p "${CXPAK_INSTALL_DIR}"
-    cat > "${CXPAK_INSTALL_DIR}/cxpak" << 'SH'
-#!/bin/sh
-echo "cxpak 0.4.0"
-SH
-    chmod +x "${CXPAK_INSTALL_DIR}/cxpak"
+    fake_cxpak "${CXPAK_INSTALL_DIR}/cxpak" "${REQ}"
 
     PATH="/usr/bin:/bin" run "${ENSURE_CXPAK}"
     [ "$status" -eq 0 ]
@@ -123,12 +127,7 @@ SH
 }
 
 @test "accepts a newer patch version within the same major" {
-    mkdir -p "${TEST_TMP}/bin"
-    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
-#!/bin/sh
-echo "cxpak 3.2.2"
-SH
-    chmod +x "${TEST_TMP}/bin/cxpak"
+    fake_cxpak "${TEST_TMP}/bin/cxpak" "${NEWER_PATCH}"
 
     # No brew on PATH: isolates the PATH-resolution comparison from the
     # auto-install fallback, per the #119 repro.
@@ -138,12 +137,7 @@ SH
 }
 
 @test "accepts a newer minor version within the same major" {
-    mkdir -p "${TEST_TMP}/bin"
-    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
-#!/bin/sh
-echo "cxpak 3.3.0"
-SH
-    chmod +x "${TEST_TMP}/bin/cxpak"
+    fake_cxpak "${TEST_TMP}/bin/cxpak" "${NEWER_MINOR}"
 
     PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
     [ "$status" -eq 0 ]
@@ -151,12 +145,7 @@ SH
 }
 
 @test "rejects an older patch version within the same major" {
-    mkdir -p "${TEST_TMP}/bin"
-    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
-#!/bin/sh
-echo "cxpak 3.2.0"
-SH
-    chmod +x "${TEST_TMP}/bin/cxpak"
+    fake_cxpak "${TEST_TMP}/bin/cxpak" "${OLDER}"
 
     PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
     [ "$status" -ne 0 ]
@@ -196,14 +185,9 @@ SH
 }
 
 @test "rejects a pre-release that is not an exact match" {
-    mkdir -p "${TEST_TMP}/bin"
-    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
-#!/bin/sh
-echo "cxpak 3.2.1-rc.1"
-SH
-    chmod +x "${TEST_TMP}/bin/cxpak"
+    fake_cxpak "${TEST_TMP}/bin/cxpak" "${REQ}-rc.1"
 
-    # REQUIRED_VERSION is a plain 3.2.1 release, not the "3.2.1-rc.1"
+    # REQUIRED_VERSION is a plain release, not its "-rc.1" pre-release
     # pre-release string, so caret-range matching must not apply here —
     # only an exact string match would qualify, per Cargo's own
     # pre-release rule.
@@ -213,12 +197,7 @@ SH
 }
 
 @test "rejects a pre-release of a different minor, caret range notwithstanding" {
-    mkdir -p "${TEST_TMP}/bin"
-    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
-#!/bin/sh
-echo "cxpak 3.3.0-rc.1"
-SH
-    chmod +x "${TEST_TMP}/bin/cxpak"
+    fake_cxpak "${TEST_TMP}/bin/cxpak" "${NEWER_MINOR}-rc.1"
 
     PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
     [ "$status" -ne 0 ]
@@ -226,12 +205,7 @@ SH
 }
 
 @test "rejects a version string missing its patch component" {
-    mkdir -p "${TEST_TMP}/bin"
-    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
-#!/bin/sh
-echo "cxpak 3.3"
-SH
-    chmod +x "${TEST_TMP}/bin/cxpak"
+    fake_cxpak "${TEST_TMP}/bin/cxpak" "${MAJ}.$((MIN + 1))"
 
     PATH="${TEST_TMP}/bin:/usr/bin:/bin" run "${ENSURE_CXPAK}"
     [ "$status" -ne 0 ]
@@ -239,12 +213,7 @@ SH
 }
 
 @test "prefers PATH binary over cached" {
-    mkdir -p "${TEST_TMP}/bin"
-    cat > "${TEST_TMP}/bin/cxpak" << 'SH'
-#!/bin/sh
-echo "cxpak 0.4.0"
-SH
-    chmod +x "${TEST_TMP}/bin/cxpak"
+    fake_cxpak "${TEST_TMP}/bin/cxpak" "${REQ}"
 
     mkdir -p "${CXPAK_INSTALL_DIR}"
     cat > "${CXPAK_INSTALL_DIR}/cxpak" << 'SH'
