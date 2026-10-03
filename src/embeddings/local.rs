@@ -284,7 +284,20 @@ fn sha256_of_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Download `url` to `dest` atomically via a temporary file + rename.
+/// Download `url` to `dest` atomically via a temporary file + rename, using
+/// the production `CONNECT_TIMEOUT`/`IDLE_READ_TIMEOUT` values.
+fn download_file_atomic(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), String> {
+    download_file_atomic_with_timeouts(
+        url,
+        dest,
+        expected_sha256,
+        CONNECT_TIMEOUT,
+        IDLE_READ_TIMEOUT,
+    )
+}
+
+/// Core implementation, parameterized over both timeouts so tests can use
+/// small values instead of the real production ones.
 ///
 /// The response body is streamed directly into both the SHA256 hasher and
 /// the temp file in one pass, in bounded-size chunks — it is never buffered
@@ -303,18 +316,29 @@ fn sha256_of_file(path: &Path) -> Result<String, String> {
 /// failure, idle-timeout, or checksum mismatch — never just the checksum
 /// case, so a failed attempt never leaves a stray partial file behind.
 ///
-/// `CONNECT_TIMEOUT` bounds only establishing the connection;
-/// `IDLE_READ_TIMEOUT` bounds the gap between successive chunks once data
-/// is flowing, so a slow-but-progressing ~90MB transfer can still finish —
-/// only a connection that never connects, or a read that stalls mid-stream,
-/// times out. A checksum mismatch or either timeout returns `Err` here,
-/// which every caller up the chain (`LocalEmbeddingProvider::new` →
-/// `create_provider` → `build_embedding_index`) already turns into "no
+/// `connect_timeout` bounds only establishing the connection. `idle_timeout`
+/// is passed to `reqwest::blocking::ClientBuilder::timeout`, which — despite
+/// the generic name — bounds each individual connect/read/write *operation*,
+/// not the request's total wall-clock time (confirmed empirically: a
+/// deliberately slow drip that never goes idle for longer than the timeout
+/// completes even though the overall transfer exceeds it). So a
+/// slow-but-progressing ~90MB transfer can still finish; only a connection
+/// that never connects, or a read that goes idle mid-stream for longer than
+/// `idle_timeout`, times out. A checksum mismatch or either timeout returns
+/// `Err` here, which every caller up the chain (`LocalEmbeddingProvider::new`
+/// → `create_provider` → `build_embedding_index`) already turns into "no
 /// embedding index" rather than a hard failure — embeddings become
 /// unavailable, the rest of the command proceeds.
-fn download_file_atomic(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), String> {
+fn download_file_atomic_with_timeouts(
+    url: &str,
+    dest: &Path,
+    expected_sha256: &str,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(connect_timeout)
+        .timeout(idle_timeout)
         .build()
         .map_err(|e| format!("http client build error: {e}"))?;
 
@@ -351,12 +375,10 @@ fn download_file_atomic(url: &str, dest: &Path, expected_sha256: &str) -> Result
 /// Stream `response`'s body into `tmp_path` in bounded 64KB chunks, hashing
 /// as it goes, and verify the final digest against `expected_sha256`.
 ///
-/// The actual socket read happens on a background thread that ships each
-/// chunk through a channel; the caller enforces `IDLE_READ_TIMEOUT` on
-/// `recv_timeout` for each chunk. `reqwest::blocking`'s client only exposes
-/// a connect timeout and a whole-request timeout — neither lets a transfer
-/// run arbitrarily long while still catching a stream that stalls partway
-/// through, which this does.
+/// Each `response.read()` call is itself bounded by the client's configured
+/// idle timeout (see `download_file_atomic_with_timeouts`), so a stalled
+/// read surfaces here as an `io::Error` without any extra thread/channel
+/// plumbing.
 fn write_verified_body(
     mut response: reqwest::blocking::Response,
     tmp_path: &Path,
@@ -364,60 +386,33 @@ fn write_verified_body(
     url: &str,
 ) -> Result<(), String> {
     use sha2::{Digest, Sha256};
-    use std::sync::mpsc;
 
     let mut tmp_file =
         std::fs::File::create(tmp_path).map_err(|e| format!("create temp file error: {e}"))?;
 
-    let (tx, rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
-    std::thread::scope(|scope| -> Result<(), String> {
-        scope.spawn(move || {
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                match response.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
-                            break; // receiver gave up (idle-timeout fired) — stop reading
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        break;
-                    }
-                }
-            }
-        });
-
-        let mut hasher = Sha256::new();
-        loop {
-            match rx.recv_timeout(IDLE_READ_TIMEOUT) {
-                Ok(Ok(chunk)) => {
-                    hasher.update(&chunk);
-                    tmp_file
-                        .write_all(&chunk)
-                        .map_err(|e| format!("write error: {e}"))?;
-                }
-                Ok(Err(e)) => return Err(format!("read bytes error: {e}")),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(format!(
-                        "download stalled: no data received for {IDLE_READ_TIMEOUT:?} from {url}"
-                    ));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break, // reader thread finished
-            }
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = response
+            .read(&mut buf)
+            .map_err(|e| format!("read bytes error: {e}"))?;
+        if n == 0 {
+            break;
         }
+        hasher.update(&buf[..n]);
+        tmp_file
+            .write_all(&buf[..n])
+            .map_err(|e| format!("write error: {e}"))?;
+    }
+    tmp_file.flush().map_err(|e| format!("flush error: {e}"))?;
 
-        tmp_file.flush().map_err(|e| format!("flush error: {e}"))?;
-
-        let actual = format!("{:x}", hasher.finalize());
-        if actual != expected_sha256 {
-            return Err(format!(
-                "integrity check failed for {url}: checksum mismatch: expected {expected_sha256}, got {actual}"
-            ));
-        }
-        Ok(())
-    })
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected_sha256 {
+        return Err(format!(
+            "integrity check failed for {url}: checksum mismatch: expected {expected_sha256}, got {actual}"
+        ));
+    }
+    Ok(())
 }
 
 fn l2_normalize(v: &[f32]) -> Vec<f32> {
@@ -684,6 +679,149 @@ mod tests {
             !dest.exists(),
             "nothing should be written to a missing directory"
         );
+        // Strengthened per review: the whole tempdir root, not just `dest`,
+        // must end up empty — no stray `.tmp.<pid>` file anywhere.
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "a temp-file-creation failure must not leave anything behind in the tempdir: {leftover:?}"
+        );
+
+        server.join().expect("server thread should exit cleanly");
+    }
+
+    /// A loopback server that sends `initial_chunk` and then goes silent
+    /// (without closing the connection) for `stall_for` before finally
+    /// closing — simulates a connection that stalls mid-body rather than
+    /// one that closes early.
+    fn spawn_stall_mid_body_server(
+        advertised_len: usize,
+        initial_chunk: Vec<u8>,
+        stall_for: Duration,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut drain = [0u8; 4096];
+                let _ = stream.read(&mut drain);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {advertised_len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&initial_chunk);
+                let _ = stream.flush();
+                // Go idle without sending more data or closing. Bounded so
+                // this thread still exits; the client must time out well
+                // before this elapses.
+                std::thread::sleep(stall_for);
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn download_file_atomic_times_out_on_a_mid_body_stall_near_the_idle_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("weights.bin");
+
+        let idle_timeout = Duration::from_millis(500);
+        // Stall for far longer than the idle timeout, but still bounded so
+        // the server thread itself exits once joined.
+        let (base_url, server) = spawn_stall_mid_body_server(
+            10_000,
+            b"first-bytes-then-silence".to_vec(),
+            Duration::from_secs(2),
+        );
+        let url = format!("{base_url}/weights.bin");
+
+        let start = std::time::Instant::now();
+        let result = download_file_atomic_with_timeouts(
+            &url,
+            &dest,
+            &"0".repeat(64),
+            Duration::from_secs(2),
+            idle_timeout,
+        );
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "a mid-body stall must surface as an error");
+        assert!(
+            elapsed < idle_timeout * 4,
+            "must time out near the configured idle timeout ({idle_timeout:?}), not reqwest's \
+             30s default or the server's full stall duration; took {elapsed:?}"
+        );
+        assert!(!dest.exists());
+
+        server.join().expect("server thread should exit cleanly");
+    }
+
+    /// A loopback server that sends `chunks` one at a time, sleeping
+    /// `delay_between_chunks` before each — a slow-but-progressing transfer.
+    fn spawn_drip_server(
+        chunks: Vec<Vec<u8>>,
+        delay_between_chunks: Duration,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+
+        let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut drain = [0u8; 4096];
+                let _ = stream.read(&mut drain);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {total_len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.flush();
+                for chunk in chunks {
+                    std::thread::sleep(delay_between_chunks);
+                    let _ = stream.write_all(&chunk);
+                    let _ = stream.flush();
+                }
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn download_file_atomic_succeeds_on_a_slow_drip_whose_total_time_exceeds_the_idle_timeout() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("weights.bin");
+
+        let chunks: Vec<Vec<u8>> = (0..4).map(|i| format!("chunk-{i}-").into_bytes()).collect();
+        let full_body: Vec<u8> = chunks.concat();
+        let expected = format!("{:x}", Sha256::digest(&full_body));
+
+        let idle_timeout = Duration::from_millis(600);
+        // 4 gaps of 300ms each: no single gap exceeds idle_timeout, but the
+        // total (~1.2s) does — proving this is a per-read/idle bound, not a
+        // cap on the whole transfer's wall-clock time.
+        let (base_url, server) = spawn_drip_server(chunks, Duration::from_millis(300));
+        let url = format!("{base_url}/weights.bin");
+
+        let result = download_file_atomic_with_timeouts(
+            &url,
+            &dest,
+            &expected,
+            Duration::from_secs(2),
+            idle_timeout,
+        );
+
+        assert!(
+            result.is_ok(),
+            "a slow-but-progressing transfer must not be killed by the idle timeout: {result:?}"
+        );
+        assert_eq!(std::fs::read(&dest).expect("dest should exist"), full_body);
 
         server.join().expect("server thread should exit cleanly");
     }
