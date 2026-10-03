@@ -18,12 +18,32 @@ jobs:
       fail-fast: false   # one target failing shouldn't cancel/mask the others
       matrix:
         include:
+          # .github#20: a *-unknown-linux-gnu binary links whatever newer glibc symbols
+          # std/its deps reference IF the build host's glibc has them — e.g.
+          # pidfd_spawnp/pidfd_getpid (GLIBC_2.39), which std::process::Command links
+          # when present, silently raising the shipped binary's floor past Debian 12
+          # (2.36), Ubuntu 22.04 LTS (2.35), RHEL 9, and Amazon Linux 2023 (2.34 each)
+          # every time `os: ubuntu-latest` promotes to a newer glibc. `cargo-zigbuild`
+          # (zig as the C compiler/linker, bundling its own libc headers per glibc
+          # version) decouples the floor from the build host entirely: `--target
+          # <triple>.2.28` always produces a binary needing at most GLIBC_2.28,
+          # regardless of what `ubuntu-latest` resolves to this month — verified
+          # locally via readelf before this PR (objdump cannot read the aarch64
+          # binary on an x86_64 host at all — see the GLIBC floor gate step
+          # below; including this repo's `git2`/libgit2/jemallocator native
+          # deps, all cross-compile fine via zig cc): max required symbol
+          # GLIBC_2.28 on both linux targets, zero GLIBC_2.39
+          # references. 2.28 is chosen, not forced by a dependency: it is the floor
+          # that still covers all four named distros with room (RHEL 9/AL2023 are
+          # the tightest at 2.34).
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            glibc: "2.28"
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            glibc: "2.28"
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -42,19 +62,49 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      # zig provides its own cross-linker + per-glibc-version libc headers, so
+      # neither linux-gnu row needs a system cross-compiler (gcc-aarch64-linux-gnu)
+      # any more — zigbuild replaces that step for both rows, not just aarch64.
+      - name: Install zig
+        if: matrix.glibc != ''
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.16.0"
+
+      - name: Install cargo-zigbuild
+        if: matrix.glibc != ''
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          cargo install cargo-zigbuild --locked --version 0.23.4
+          zig version
+          cargo-zigbuild --version
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --features daemon --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.glibc }}" ]; then
+            cargo zigbuild --release --features daemon --locked --target "${{ matrix.target }}.${{ matrix.glibc }}"
+          else
+            cargo build --release --features daemon --locked --target "${{ matrix.target }}"
+          fi
+
+      # The regression test for the floor declared above: a future std/dependency
+      # bump that starts referencing a newer symbol (or a zig/libc-headers bump)
+      # fails HERE instead of shipping unnoticed — the same way this whole class of
+      # bug reached GA the first time (.github#20). ci/glibc-floor.sh (self-tested
+      # in ci.yml against a fixture, so this gate has actually been shown to fail)
+      # uses `readelf`, not `objdump`: the release runner's native objdump cannot
+      # read the aarch64 row's binary at all ("file format not recognized" —
+      # objdump dispatches to a per-architecture BFD backend; readelf parses the
+      # ELF structures directly and has no such restriction) and that row would
+      # fail every release without ever reaching this check.
+      - name: GLIBC floor gate
+        if: matrix.glibc != ''
+        shell: bash
+        run: ci/glibc-floor.sh "target/${{ matrix.target }}/release/cxpak" "${{ matrix.glibc }}"
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'

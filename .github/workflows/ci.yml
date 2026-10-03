@@ -166,3 +166,23 @@ jobs:
             exit 1
           fi
           echo "✅ Coverage ${COVERAGE}% meets 90% threshold"
+
+  glibc-floor-gate-selftest:
+    # .github#20 review: the release workflow's GLIBC-floor gate had never
+    # actually been shown to fail. Self-tests ci/glibc-floor.sh against two
+    # canned readelf dumps — no binary, no real readelf invocation (the script
+    # falls back to reading the fixture as already-captured text) — so a
+    # regression in the gate itself is caught here, not discovered the day a
+    # release silently ships over the floor. No Rust toolchain needed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: self-test the GLIBC floor gate
+        run: |
+          set -e
+          ci/glibc-floor.sh ci/fixtures/readelf-2.28.txt 2.28
+          if ci/glibc-floor.sh ci/fixtures/readelf-2.39-pidfd.txt 2.28; then
+            echo "::error::glibc-floor.sh should have failed on the 2.39 fixture but exited 0"
+            exit 1
+          fi
+          echo "glibc-floor.sh correctly failed on the 2.39 fixture"
