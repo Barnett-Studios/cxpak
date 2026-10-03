@@ -11,14 +11,25 @@ use std::path::Path;
 /// usage (e.g. large generated files that slipped through the blocklist).
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
 
-/// Get the mtime of a file as seconds since UNIX epoch, or 0 on failure.
+/// Get the mtime of a file in nanoseconds since UNIX epoch, or 0 on failure.
+///
+/// Delegates to [`crate::cache::file_mtime_ns`] rather than stat'ing
+/// independently. This used to truncate to whole seconds (`.as_secs()`): a
+/// same-size edit landing within the same wall-clock second as the cached
+/// entry then had an identical `(mtime, size)` pair and the cache-hit check
+/// below (`entry.mtime == mtime`) silently served the stale parse — the
+/// cxpak#36 bug, here in the parse cache rather than the index's
+/// `incremental_rebuild`. Nanosecond precision closes that window.
+///
+/// `CacheEntry.mtime`'s historical type (`i64`) is unchanged: a cache
+/// written before this fix holds a whole-second value, many orders of
+/// magnitude smaller than a freshly stat'd nanosecond value, so it simply
+/// never equals a fresh stat post-upgrade — a one-time, safe cache miss
+/// (always re-parsed) rather than a silent corrupt match. No `CACHE_VERSION`
+/// bump is needed: the field still deserializes fine, and every mismatch
+/// path here already falls back to a full re-parse, never a stale read.
 fn file_mtime(path: &Path) -> i64 {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::cache::file_mtime_ns(path) as i64
 }
 
 /// Parse all `files` using tree-sitter, with a persistent disk cache stored

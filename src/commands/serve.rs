@@ -199,20 +199,30 @@ pub fn build_index_with_workspace(
     let files = scanner.scan_workspace(workspace)?;
 
     let mut parse_results = HashMap::new();
-    let mut content_map = HashMap::new();
+    let mut settled_map: HashMap<String, crate::index::SettledRead> = HashMap::new();
     // Capture mtime_ns + size_bytes per file before `files` is consumed by
-    // build_with_content.  These feed the stat-index to skip re-hashing
-    // files whose (mtime_ns, size_bytes) are unchanged (Task 0.2).
+    // build_with_settled_content.  These feed the stat-index to skip
+    // re-hashing files whose (mtime_ns, size_bytes) are unchanged (Task 0.2).
     let mut file_stats: HashMap<String, (u64, u64)> = HashMap::new();
     let cap_bytes = crate::index::max_file_bytes();
     for file in &files {
-        // An unreadable file leaves no trace here: no parse, no content-map
+        // An unreadable file leaves no trace here: no parse, no settled-map
         // entry, and no stat-index row. `fp_files` below is built from
-        // `index.files`, so dropping it in `build_with_content` keeps it out of
-        // the fingerprint too — which is what stops `sha256("")` being stored
-        // under the file's real (mtime, size) key and served back later (#40).
-        let Some(source) =
-            crate::index::read_indexable(&file.absolute_path, file.size_bytes, cap_bytes)
+        // `index.files`, so dropping it in `build_with_settled_content` keeps
+        // it out of the fingerprint too — which is what stops `sha256("")`
+        // being stored under the file's real (mtime, size) key and served
+        // back later (#40).
+        //
+        // `SettledRead::from_disk` (cxpak#36 TOCTOU follow-up) replaces the
+        // old `read_indexable` + a later, separate `file_mtime_ns` call: that
+        // ordering let an edit land between the content read and the mtime
+        // stat, caching pre-edit content under a post-edit mtime. One settled
+        // read now produces both `source` and `mtime_ns` together, and that
+        // same pair feeds BOTH the stat-index below AND `IndexedFile.mtime_ns`
+        // via `build_with_settled_content` — previously these were two
+        // independently-stat'd values that could disagree with each other.
+        let Some(settled) =
+            crate::index::SettledRead::from_disk(&file.absolute_path, file.size_bytes, cap_bytes)
         else {
             continue;
         };
@@ -221,18 +231,21 @@ pub fn build_index_with_workspace(
                 let ts_lang = lang.ts_language();
                 let mut parser = tree_sitter::Parser::new();
                 parser.set_language(&ts_lang).ok();
-                if let Some(tree) = parser.parse(&source, None) {
-                    let result = lang.extract(&source, &tree);
+                if let Some(tree) = parser.parse(settled.content(), None) {
+                    let result = lang.extract(settled.content(), &tree);
                     parse_results.insert(file.relative_path.clone(), result);
                 }
             }
         }
-        let mtime_ns = crate::cache::file_mtime_ns(&file.absolute_path);
-        file_stats.insert(file.relative_path.clone(), (mtime_ns, file.size_bytes));
-        content_map.insert(file.relative_path.clone(), source);
+        file_stats.insert(
+            file.relative_path.clone(),
+            (settled.mtime_ns().unwrap_or(0), file.size_bytes),
+        );
+        settled_map.insert(file.relative_path.clone(), settled);
     }
 
-    let mut index = CodebaseIndex::build_with_content(files, parse_results, &counter, content_map);
+    let mut index =
+        CodebaseIndex::build_with_settled_content(files, parse_results, &counter, settled_map);
 
     // Derived-index cache (ADR-0167): on a content+HEAD fingerprint hit, restore
     // the derived analysis — crucially skipping the expensive git-mined
