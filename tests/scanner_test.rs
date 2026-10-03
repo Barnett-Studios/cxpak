@@ -267,6 +267,29 @@ fn credential_files_are_never_scanned() {
         // anyone defeats by putting the key in `config/`.
         "config/deploy.key",
         "deploy/credentials.json",
+        // cxpak#78: the completeness gaps against this list's own stated rule, measured
+        // independently against post-#67 main (and `deploy_key` the reviewer flagged on
+        // the same ticket). `*.asc`/`*.der` deliberately excluded — the issue itself
+        // flags both as more often public (detached signatures, public certs) than
+        // secret, so the coverage win is not worth the false-exclusion cost.
+        "credentials",
+        "id_rsa_work",
+        "id_ed25519_github",
+        "deploy_key",
+        "AuthKey_ABC123.p8",
+        "deploy.ppk",
+        "secring.gpg",
+        "kubeconfig",
+        "service-account.json",
+        "terraform.tfstate",
+        "terraform.tfstate.backup",
+        ".git-credentials",
+        ".pgpass",
+        ".my.cnf",
+        ".htpasswd",
+        ".dockercfg",
+        ".s3cfg",
+        ".boto",
     ];
     let tmp = repo_with(&secrets);
     let scanned = scanned_paths(tmp.path());

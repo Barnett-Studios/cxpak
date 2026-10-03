@@ -115,4 +115,45 @@ pub const BUILTIN_IGNORES: &[&str] = &[
     ".netrc",
     ".npmrc",
     ".pypirc",
+    // ── cxpak#78: completeness gaps in the #39/#67 list, against its own stated rule ──
+    //
+    // Same shape as the names above — exact filenames or key-material extensions, never a
+    // `*secret*`/`*credentials*` glob. Measured independently (not inferred from this list):
+    // `credentials`, `id_rsa_work`-style suffixed keys, and the seven dotfiles below all
+    // indexed, and `service-account.json` packed verbatim into the `overview` bundle, on
+    // post-#67 `main`.
+    //
+    // The extensionless sibling of `credentials.{json,yml,yaml}` — the AWS SDK/CLI's own
+    // default filename, and the common form; the three covered above are the rarer ones.
+    "credentials",
+    // `ssh-keygen -f id_rsa_work` / `-f id_ed25519_github` — the standard multi-key
+    // convention. The four exact names above only catch someone with exactly one key.
+    // Suffix, not a bare `id_rsa*` glob: that would also swallow `id_rsa_work.pub`, a
+    // PUBLIC key. Over-excluding a public key from the index is a usability regression,
+    // not a security hole, so the asymmetry is accepted deliberately — but kept narrow
+    // (underscore-separated, the convention `ssh-keygen` itself documents) rather than
+    // widened to every possible rename, which no finite list closes anyway.
+    "id_rsa_*",
+    "id_dsa_*",
+    "id_ecdsa_*",
+    "id_ed25519_*",
+    // OpenSSH private key under a conventional name with no `id_` prefix and no extension.
+    "deploy_key",
+    "*.p8",                 // Apple auth key (e.g. `AuthKey_ABC123.p8`)
+    "*.ppk",                // PuTTY private key
+    "*.gpg", // PGP secret (or public — same over-exclusion trade-off as id_rsa_*, see above) keyring
+    "kubeconfig", // cluster certs + auth tokens
+    "service-account.json", // GCP service-account key
+    "terraform.tfstate",
+    "terraform.tfstate.backup", // plaintext secrets in Terraform state
+    // Dotfile credential stores in the identical position as .env/.netrc/.npmrc/.pypirc
+    // above: protected ONLY by `hidden(true)` today, which #39's remaining half will lift.
+    // Landing these before that change is the same reasoning PR #67 gave for .env.
+    ".git-credentials", // plaintext https tokens
+    ".pgpass",
+    ".my.cnf",
+    ".htpasswd",
+    ".dockercfg",
+    ".s3cfg",
+    ".boto",
 ];
