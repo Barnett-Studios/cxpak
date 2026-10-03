@@ -555,10 +555,15 @@ pub fn handle_custom_method(
         "cxpak/trace" => {
             // `target` is the name `capability/mod.rs` declares for `trace`
             // and the name MCP's `cxpak_graph {op: "trace"}` requires
-            // (cxpak#82) — accept the catalog's name, not an LSP-only one.
+            // (cxpak#82) — accept the catalog's name first. `symbol` is the
+            // old LSP-only name this arm required before the rename; kept
+            // as a deprecated fallback for one release so existing clients
+            // do not break on upgrade. Remove the fallback in the next
+            // minor release.
             let sym = params
                 .get("target")
                 .and_then(|v| v.as_str())
+                .or_else(|| params.get("symbol").and_then(|v| v.as_str()))
                 .ok_or_else(|| {
                     LspMethodError::Internal("cxpak/trace requires 'target' (string) param".into())
                 })?;
@@ -631,11 +636,15 @@ pub fn handle_custom_method(
         }
         "cxpak/search" => {
             // `pattern` is the name `capability/mod.rs` declares for `search`
-            // (cxpak#82) — align to the catalog's name rather than the
-            // LSP-only `query` this arm used to require.
+            // (cxpak#82) — align to the catalog's name first. `query` is the
+            // old LSP-only name this arm used to require; kept as a
+            // deprecated fallback for one release so existing clients do
+            // not break on upgrade. Remove the fallback in the next minor
+            // release.
             let query = params
                 .get("pattern")
                 .and_then(|v| v.as_str())
+                .or_else(|| params.get("query").and_then(|v| v.as_str()))
                 .ok_or_else(|| {
                     LspMethodError::Internal(
                         "cxpak/search requires 'pattern' (string) param".into(),
@@ -1328,7 +1337,10 @@ mod tests {
     }
 
     // --- cxpak#82: cxpak/trace and cxpak/search must accept the catalog's
-    // param names (`target`/`pattern`), not LSP-only ones (`symbol`/`query`).
+    // param names (`target`/`pattern`). The old LSP-only names
+    // (`symbol`/`query`) are kept as deprecated fallbacks for one release
+    // so existing clients do not break on upgrade; remove the fallback
+    // (and these two tests) in the next minor release.
 
     #[test]
     fn trace_accepts_target_the_catalog_declared_name() {
@@ -1349,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_rejects_the_old_lsp_only_symbol_name() {
+    fn trace_still_accepts_the_old_lsp_only_symbol_name_as_deprecated_fallback() {
         let index = make_test_index();
         let root = std::path::Path::new("/tmp");
         let result = handle_custom_method(
@@ -1359,9 +1371,27 @@ mod tests {
             root,
         );
         assert!(
-            matches!(result, Err(LspMethodError::Internal(_))),
-            "cxpak/trace must no longer accept the old 'symbol' name: {result:?}"
+            result.is_ok(),
+            "cxpak/trace must still accept the deprecated 'symbol' fallback: {result:?}"
         );
+        let value = result.unwrap().unwrap();
+        assert_eq!(value["count"], 1);
+    }
+
+    #[test]
+    fn trace_prefers_target_over_symbol_when_both_present() {
+        let index = make_test_index();
+        let root = std::path::Path::new("/tmp");
+        // `target` must win when both are present — `symbol` is a fallback,
+        // not an alias with equal priority.
+        let result = handle_custom_method(
+            "cxpak/trace",
+            serde_json::json!({"target": "main", "symbol": "nonexistent"}),
+            &index,
+            root,
+        );
+        let value = result.unwrap().unwrap();
+        assert_eq!(value["count"], 1, "target must take priority over symbol");
     }
 
     #[test]
@@ -1377,6 +1407,24 @@ mod tests {
         assert!(
             result.is_ok(),
             "cxpak/search must accept 'pattern': {result:?}"
+        );
+        let value = result.unwrap().unwrap();
+        assert_eq!(value["matches"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_still_accepts_the_old_lsp_only_query_name_as_deprecated_fallback() {
+        let index = make_test_index();
+        let root = std::path::Path::new("/tmp");
+        let result = handle_custom_method(
+            "cxpak/search",
+            serde_json::json!({"query": "main"}),
+            &index,
+            root,
+        );
+        assert!(
+            result.is_ok(),
+            "cxpak/search must still accept the deprecated 'query' fallback: {result:?}"
         );
         let value = result.unwrap().unwrap();
         assert_eq!(value["matches"].as_array().unwrap().len(), 1);
