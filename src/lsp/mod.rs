@@ -42,12 +42,18 @@ pub fn workspace_root(path: &std::path::Path) -> std::io::Result<std::path::Path
 /// independent of whatever the transport does with stdin afterward.
 ///
 /// Every OTHER request's future is wrapped to hold `in_flight` above zero
-/// for its duration, so `run_stdio`'s `exit` handler can tell whether
-/// there is a response still being written and skip the drain grace
-/// entirely when there is not (#114 follow-up: `exit` with nothing
-/// outstanding was waiting out the full grace window regardless).
-/// `exit` itself is excluded from this count — its own resolution is
-/// near-instant and irrelevant to "is there something to drain".
+/// for its duration. `exit`'s own dispatch (see `call`) waits, bounded,
+/// for `in_flight` to settle before delegating to `inner` — see the field
+/// doc below for why. `run_stdio`'s `exit` handler does NOT use
+/// `in_flight` to decide whether to skip its drain grace: an earlier
+/// version did (skipping it entirely once `in_flight` read zero), but
+/// zero only means a request's future RESOLVED, not that its response has
+/// finished travelling through tower-lsp's own forwarding stream to the
+/// actual stdout write — a real but narrower race than the one `in_flight`
+/// was introduced to close. The grace is unconditional now; `in_flight`'s
+/// only remaining job is the bounded wait below. `exit` itself is
+/// excluded from the count — its own resolution is near-instant and
+/// irrelevant to either use.
 struct ExitWatch<S> {
     // `Option` so `exit`'s handling (see `call`) can `take()` it: tower-lsp's
     // own `ExitService::call` — reached by delegating to `inner` at all,
@@ -367,32 +373,29 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
                 // Same drain rationale as the SIGTERM branch below: a
                 // request sent just before `exit` may still be in flight on
                 // the runtime, so give it the same grace window to finish
-                // writing its response before cutting the process — but
-                // ONLY if there is actually something in flight. The common
-                // case (`shutdown` answered, then `exit`, nothing else
-                // outstanding) has nothing to drain, and a client waiting
-                // on this process to go away shouldn't eat a fixed ~1.5s
-                // for no reason (#114 follow-up).
+                // writing its response before cutting the process.
+                //
+                // ALWAYS applied, unconditionally — an earlier version of
+                // this skipped the sleep entirely when `in_flight` read
+                // zero (the common "shutdown answered, then exit, nothing
+                // else outstanding" case), to avoid the full ~1.5s when
+                // there was supposedly nothing to drain. That was racy:
+                // `in_flight` reading zero only means a request's future
+                // RESOLVED, not that its response has finished travelling
+                // through tower-lsp's own forwarding stream to the actual
+                // stdout write — `process::exit` does not wait for that
+                // write to land, so the fast path could truncate output.
+                // A fixed short cushion on that path narrowed the window
+                // without closing it. There is no reliable way to KNOW the
+                // write has landed from here without tokio exposing it, so
+                // the grace is now unconditional; it still keeps total
+                // exit time well under 2s by default.
                 eprintln!("cxpak lsp: exit notification received, shutting down...");
-                if in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                    let grace_ms: u64 = std::env::var("CXPAK_LSP_SHUTDOWN_GRACE_MS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(1500);
-                    tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
-                } else {
-                    // `in_flight` can read zero because a request's future
-                    // (most notably a pipelined `shutdown`, dispatched
-                    // immediately before this `exit`) resolved microseconds
-                    // ago — the VALUE is ready, but it still has to travel
-                    // through tower-lsp's own response-forwarding stream to
-                    // the actual stdout write, which needs its own poll. A
-                    // short, fixed flush cushion — far below the drain grace
-                    // and well under what any caller would notice — gives
-                    // that one write a realistic chance to land before
-                    // `process::exit` pulls the rug.
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+                let grace_ms: u64 = std::env::var("CXPAK_LSP_SHUTDOWN_GRACE_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1500);
+                tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
                 // Spec: 0 if `exit` followed a `shutdown` request, 1 (a
                 // "non-zero code", left unspecified beyond that) otherwise.
                 if shutdown_received.load(std::sync::atomic::Ordering::SeqCst) {

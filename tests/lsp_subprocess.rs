@@ -1105,12 +1105,17 @@ fn lsp_exit_after_shutdown_rejected_pre_initialize_exits_with_status_1() {
     );
 }
 
-/// `exit` with no request in flight must return near-instantly — the grace
-/// window exists to let an in-flight response finish writing, and has
-/// nothing to wait for in the common case (shutdown, then exit, with
-/// nothing else outstanding). Bounded well under the ~1.5s default grace.
+/// `exit` with no request in flight must still apply the drain grace
+/// before exiting — unconditionally, even in the common case (shutdown,
+/// then exit, nothing else outstanding). An earlier version skipped the
+/// grace entirely once `in_flight` read zero, which is racy: `in_flight`
+/// reading zero only means a request's future resolved, not that its
+/// response has finished travelling through tower-lsp's own forwarding
+/// stream to the actual stdout write, which `process::exit` does not
+/// wait for. The grace stays bounded (under 2s with the default
+/// ~1.5s window) either way.
 #[test]
-fn lsp_exit_with_no_in_flight_request_is_near_instant() {
+fn lsp_exit_with_no_in_flight_request_still_applies_the_grace() {
     let repo = make_test_repo();
     let mut child = spawn_lsp(&repo);
 
@@ -1147,9 +1152,15 @@ fn lsp_exit_with_no_in_flight_request_is_near_instant() {
         "exit after shutdown must be status 0; got {status:?}"
     );
     assert!(
-        elapsed < Duration::from_millis(750),
-        "exit with no in-flight request took {elapsed:?} — the drain grace (~1.5s default) \
-         must be skipped when there is nothing to drain"
+        elapsed >= Duration::from_millis(1000),
+        "exit with no in-flight request took only {elapsed:?} — the drain grace \
+         (~1.5s default) must be applied UNCONDITIONALLY, not skipped just because \
+         `in_flight` happened to read zero"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "exit took {elapsed:?} — the grace must still keep total exit time bounded \
+         well under 2s"
     );
 }
 
@@ -1206,8 +1217,8 @@ fn lsp_pipelined_shutdown_then_exit_terminates_process_with_status_0() {
 
 /// `exit` arriving while a request is genuinely in flight must still
 /// deliver that request's response rather than cutting it to EOF.
-/// Companion to `lsp_exit_with_no_in_flight_request_is_near_instant`, at
-/// the subprocess/real-binary level; the precise bookkeeping this depends
+/// Companion to `lsp_exit_with_no_in_flight_request_still_applies_the_grace`,
+/// at the subprocess/real-binary level; the precise bookkeeping this depends
 /// on (`in_flight` actually reflecting "still running", and for however
 /// long that takes) is pinned down deterministically by the
 /// `lsp::tests::exit_watch` unit tests instead of by timing a real
