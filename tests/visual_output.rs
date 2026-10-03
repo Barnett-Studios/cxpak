@@ -413,6 +413,42 @@ mod visual_tests {
     }
 
     // -------------------------------------------------------------------------
+    // Default output path — lands under .cxpak/, not the repo root (issue #102)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn visual_default_out_path_lands_under_cxpak_dir_and_clean_removes_it() {
+        let repo = make_test_repo();
+
+        cxpak()
+            .args(["visual", "--visual-type", "dashboard", "--format", "html"])
+            .arg(repo.path())
+            .assert()
+            .success();
+
+        // The dashboard must NOT be written to the repo root.
+        assert!(
+            !repo.path().join("cxpak-dashboard.html").exists(),
+            "default `cxpak visual` output must not land in the repo root"
+        );
+
+        // It must be written under .cxpak/, where `cxpak clean` can remove it.
+        let expected = repo.path().join(".cxpak").join("cxpak-dashboard.html");
+        assert!(
+            expected.exists(),
+            "default `cxpak visual` output must be written under .cxpak/, expected {}",
+            expected.display()
+        );
+
+        cxpak().args(["clean"]).arg(repo.path()).assert().success();
+
+        assert!(
+            !expected.exists(),
+            "`cxpak clean` must remove the default visual output along with .cxpak/"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Diff — well-formed HTML
     // -------------------------------------------------------------------------
 
