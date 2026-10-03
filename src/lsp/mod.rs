@@ -21,7 +21,74 @@ pub fn workspace_root(path: &std::path::Path) -> std::io::Result<std::path::Path
     std::fs::canonicalize(path)
 }
 
-/// Entry point for `cxpak lsp` — runs the LSP server over stdio until stdin closes.
+/// Wraps the built `LspService` to observe the `shutdown`/`exit` lifecycle
+/// from OUTSIDE tower-lsp's own state machine (#114).
+///
+/// tower-lsp's internal `exit` handling (`ExitService::call`) only stops
+/// the service from accepting further requests — it does not, and cannot,
+/// break the stdin read loop in `Server::serve` on its own, because that
+/// loop only ends when `framed_stdin.next()` sees EOF. A client that sends
+/// `exit` and then leaves stdin OPEN (perfectly spec-legal: `exit` alone is
+/// "a notification to ask the server to exit its process" — closing the
+/// pipe is a separate, optional step) would otherwise park the server
+/// forever waiting for bytes that never arrive.
+///
+/// This layer watches every incoming request's method name as it passes
+/// through: `shutdown` flips `shutdown_received` (read by the `exit`
+/// handler in `run_stdio` to pick the spec-mandated exit code), and `exit`
+/// fires `exit_tx` the moment the notification is seen — independent of
+/// whatever the transport does with stdin afterward.
+struct ExitWatch<S> {
+    inner: S,
+    shutdown_received: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exit_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+}
+
+impl<S> tower::Service<tower_lsp::jsonrpc::Request> for ExitWatch<S>
+where
+    S: tower::Service<
+        tower_lsp::jsonrpc::Request,
+        Response = Option<tower_lsp::jsonrpc::Response>,
+        Error = tower_lsp::ExitedError,
+    >,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: tower_lsp::jsonrpc::Request) -> Self::Future {
+        match req.method() {
+            "shutdown" => {
+                self.shutdown_received
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            "exit" => {
+                // `take()` makes this a one-shot signal even if a
+                // (spec-violating) client sends `exit` twice — the second
+                // send simply has nowhere to go rather than panicking on a
+                // closed channel.
+                if let Ok(mut slot) = self.exit_tx.lock() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.inner.call(req)
+    }
+}
+
+/// Entry point for `cxpak lsp` — runs the LSP server over stdio until stdin
+/// closes OR the client sends `exit` (#114: both must terminate the
+/// process, not just end an in-process loop).
 pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     use tower_lsp::{LspService, Server};
     // Anchor before indexing: a root that cannot be resolved is an error the
@@ -60,6 +127,18 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     )
     .custom_method("cxpak/dataFlow", CxpakLspBackend::custom_data_flow)
     .finish();
+
+    // #114: observe `shutdown`/`exit` independently of tower-lsp's own
+    // stdin-driven loop — see `ExitWatch` for why that loop alone cannot
+    // be trusted to end the process on `exit`.
+    let shutdown_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<()>();
+    let service = ExitWatch {
+        inner: service,
+        shutdown_received: std::sync::Arc::clone(&shutdown_received),
+        exit_tx: std::sync::Arc::new(std::sync::Mutex::new(Some(exit_tx))),
+    };
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         // Spawn the signal listener on its OWN task so it's polled
@@ -125,10 +204,47 @@ pub fn run_stdio(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
         let serve_handle = tokio::spawn(Server::new(stdin, stdout, socket).serve(service));
         tokio::select! {
             res = serve_handle => {
-                // Normal in-protocol exit: client closed stdin.  Returning
-                // from the async block lets `block_on` unwind and the
-                // process exits via `main`'s normal return path.
+                // Normal in-protocol exit: client closed stdin, with no
+                // `exit` notification (or tower-lsp's own loop happened to
+                // observe EOF before our `exit_rx` branch below fired).
+                // Falling off the end of `run_stdio` and letting `rt` drop
+                // normally is NOT safe here (#114): `tokio::io::stdin()`
+                // parks a dedicated thread in a blocking `read()` that is
+                // never told to stop, and `Runtime::drop` blocks
+                // indefinitely waiting for that thread to finish — so an
+                // ordinary return would hang the process forever even
+                // though the LSP transport itself ended cleanly. Exit
+                // explicitly instead.
                 let _ = res;
+                std::process::exit(0);
+            }
+            _ = exit_rx => {
+                // #114: the client sent the `exit` notification. tower-lsp's
+                // own `exit` handling only stops it from accepting further
+                // requests — it does not break `Server::serve`'s stdin read
+                // loop, so a client that sends `exit` without also closing
+                // stdin (spec-legal: the two are independent) would
+                // otherwise park this process forever. `ExitWatch` observes
+                // the notification directly and fires `exit_tx` the moment
+                // it is dispatched, regardless of stdin's state.
+                //
+                // Same drain rationale as the SIGTERM branch below: a
+                // request sent just before `exit` may still be in flight on
+                // the runtime, so give it the same grace window to finish
+                // writing its response before cutting the process.
+                eprintln!("cxpak lsp: exit notification received, shutting down...");
+                let grace_ms: u64 = std::env::var("CXPAK_LSP_SHUTDOWN_GRACE_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1500);
+                tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+                // Spec: 0 if `exit` followed a `shutdown` request, 1 (a
+                // "non-zero code", left unspecified beyond that) otherwise.
+                if shutdown_received.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::process::exit(0);
+                } else {
+                    std::process::exit(1);
+                }
             }
             _ = shutdown_rx => {
                 // Signal-driven shutdown.  `tokio::io::stdin()` internally
