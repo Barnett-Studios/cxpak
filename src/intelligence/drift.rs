@@ -71,6 +71,18 @@ pub struct DriftReport {
     pub hotspots: Vec<DriftHotspot>,
 }
 
+impl DriftReport {
+    /// Restrict `hotspots` to modules whose prefix starts with `focus`.
+    /// Shared by every surface that honours `focus` (HTTP's `drift_handler`
+    /// and `v1_drift_handler`, and the MCP `drift` arm) so none of them can
+    /// drift from the others' filtering rule (cxpak#81).
+    pub fn apply_focus(&mut self, focus: Option<&str>) {
+        if let Some(prefix) = focus {
+            self.hotspots.retain(|h| h.module.starts_with(prefix));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot logic
 // ---------------------------------------------------------------------------
@@ -495,6 +507,47 @@ fn types_equivalent(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_report(modules: &[&str]) -> DriftReport {
+        DriftReport {
+            baseline: None,
+            trend: None,
+            hotspots: modules
+                .iter()
+                .map(|m| DriftHotspot {
+                    module: m.to_string(),
+                    issue: "High coupling: 0.80".to_string(),
+                    severity: 0.8,
+                    contributing_commits: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    /// cxpak#81: `drift`'s MCP arm declared `focus` but never called this
+    /// filter; HTTP's two handlers already did. Shared helper so all three
+    /// surfaces agree.
+    #[test]
+    fn test_apply_focus_narrows_hotspots_to_prefix() {
+        let mut report = make_report(&["src/api", "src/db", "widget"]);
+        report.apply_focus(Some("src/"));
+        assert_eq!(report.hotspots.len(), 2);
+        assert!(report.hotspots.iter().all(|h| h.module.starts_with("src/")));
+    }
+
+    #[test]
+    fn test_apply_focus_none_leaves_hotspots_untouched() {
+        let mut report = make_report(&["src/api", "widget"]);
+        report.apply_focus(None);
+        assert_eq!(report.hotspots.len(), 2);
+    }
+
+    #[test]
+    fn test_apply_focus_matching_nothing_empties_hotspots() {
+        let mut report = make_report(&["src/api", "widget"]);
+        report.apply_focus(Some("nosuchdir/"));
+        assert!(report.hotspots.is_empty());
+    }
 
     fn make_snapshot(coupling: f64, cohesion: f64, cycle_count: usize) -> ArchitectureSnapshot {
         ArchitectureSnapshot {

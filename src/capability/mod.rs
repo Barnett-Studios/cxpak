@@ -433,11 +433,21 @@ fn build_catalog() -> Vec<Capability> {
             s(true, false, false, false, false),
         ),
         // ---- Intent::Insight — health, risk, architecture ------------------
+        // `focus` is deliberately NOT declared here (cxpak#81). `health`'s
+        // six dimensions (conventions, test_coverage, churn_stability,
+        // coupling, cycles, dead_code) are each a whole-index aggregate —
+        // unlike `drift`'s hotspots or `data_flow`'s paths, there is no
+        // per-entry list to filter post-hoc by path prefix. Honouring
+        // `focus` honestly would mean re-deriving a sub-index and scoring
+        // that, which is a different (and much larger) capability, not a
+        // missing filter call. A declared-but-unimplementable parameter is
+        // worse than an honest one fewer, so it is dropped from the catalog
+        // rather than half-implemented.
         cap(
             "health",
             "Composite codebase health score across six dimensions.",
             Intent::Insight,
-            &["focus"],
+            &[],
             false,
             s(true, true, false, true, true),
         ),
@@ -485,11 +495,20 @@ fn build_catalog() -> Vec<Capability> {
             s(true, true, false, true, false),
         ),
         // `visual` — interactive diagrams; MCP + CLI (`cxpak visual`) + visual.
+        //
+        // `focus` is deliberately NOT declared here (cxpak#81, comment on
+        // #81 found a 5th dropped-param instance). The MCP handler reads
+        // `focus` out of `args` and then explicitly discards it
+        // (`let _ = focus; // focus reserved for future scoped rendering`)
+        // — an acknowledged, unimplemented intention, not an oversight. A
+        // parameter `tools/list` advertises as working is worse than one
+        // honestly left off until scoped rendering is built; re-add it to
+        // this list in the same commit that implements it.
         cap(
             "visual",
             "Interactive visual diagram (dashboard, architecture, risk, flow, ...).",
             Intent::Insight,
-            &["type", "format", "focus", "symbol", "files"],
+            &["type", "format", "symbol", "files"],
             false,
             s(true, false, true, false, true),
         ),

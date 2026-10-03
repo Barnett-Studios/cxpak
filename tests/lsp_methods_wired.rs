@@ -72,8 +72,8 @@ fn all_15_lsp_methods_return_non_stub() {
     ];
     for m in methods {
         let params = match m {
-            "cxpak/trace" => serde_json::json!({"symbol": "main"}),
-            "cxpak/search" => serde_json::json!({"query": "main"}),
+            "cxpak/trace" => serde_json::json!({"target": "main"}),
+            "cxpak/search" => serde_json::json!({"pattern": "main"}),
             "cxpak/predict" => serde_json::json!({"files": ["src/main.rs"]}),
             "cxpak/dataFlow" => serde_json::json!({"symbol": "main"}),
             "cxpak/blastRadius" => serde_json::json!({"file": "src/main.rs"}),

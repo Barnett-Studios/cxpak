@@ -553,11 +553,14 @@ pub fn handle_custom_method(
             "languages": index.language_stats.len(),
         }))),
         "cxpak/trace" => {
+            // `target` is the name `capability/mod.rs` declares for `trace`
+            // and the name MCP's `cxpak_graph {op: "trace"}` requires
+            // (cxpak#82) — accept the catalog's name, not an LSP-only one.
             let sym = params
-                .get("symbol")
+                .get("target")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    LspMethodError::Internal("cxpak/trace requires 'symbol' (string) param".into())
+                    LspMethodError::Internal("cxpak/trace requires 'target' (string) param".into())
                 })?;
             let matches = index.find_symbol(sym);
             let locations: Vec<_> = matches
@@ -627,16 +630,21 @@ pub fn handle_custom_method(
             }
         }
         "cxpak/search" => {
+            // `pattern` is the name `capability/mod.rs` declares for `search`
+            // (cxpak#82) — align to the catalog's name rather than the
+            // LSP-only `query` this arm used to require.
             let query = params
-                .get("query")
+                .get("pattern")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    LspMethodError::Internal("cxpak/search requires 'query' (string) param".into())
+                    LspMethodError::Internal(
+                        "cxpak/search requires 'pattern' (string) param".into(),
+                    )
                 })?
                 .to_lowercase();
             if query.is_empty() {
                 return Err(LspMethodError::Internal(
-                    "cxpak/search 'query' must be non-empty".into(),
+                    "cxpak/search 'pattern' must be non-empty".into(),
                 ));
             }
             let matches: Vec<_> = index
@@ -649,8 +657,18 @@ pub fn handle_custom_method(
             Ok(Some(serde_json::json!({"matches": matches})))
         }
         "cxpak/apiSurface" => {
-            let surface =
-                crate::intelligence::api_surface::extract_api_surface(index, None, "all", 5000);
+            let focus = params.get("focus").and_then(|v| v.as_str());
+            let include = params
+                .get("include")
+                .and_then(|v| v.as_str())
+                .unwrap_or("all");
+            let tokens = params
+                .get("tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5000) as usize;
+            let surface = crate::intelligence::api_surface::extract_api_surface(
+                index, focus, include, tokens,
+            );
             Ok(Some(serde_json::to_value(surface).map_err(|e| {
                 LspMethodError::Internal(format!("serialization failed: {e}"))
             })?))
@@ -766,7 +784,17 @@ pub fn handle_custom_method(
                         "cxpak/dataFlow requires 'symbol' (string) param".into(),
                     )
                 })?;
-            let result = crate::intelligence::data_flow::trace_data_flow(sym, None, 6, index);
+            let sink = params.get("sink").and_then(|v| v.as_str());
+            let depth = params
+                .get("depth")
+                .and_then(|v| v.as_u64())
+                .map(|d| d as usize)
+                .unwrap_or(6)
+                .min(crate::intelligence::data_flow::MAX_DEPTH);
+            // `focus` is out of scope here — it is part of the broader
+            // 11-method LSP `focus` census (cxpak#82) tracked as a
+            // follow-up, not the sink/depth hardcoding this arm fixes.
+            let result = crate::intelligence::data_flow::trace_data_flow(sym, sink, depth, index);
             Ok(Some(serde_json::to_value(result).map_err(|e| {
                 LspMethodError::Internal(format!("serialization failed: {e}"))
             })?))
@@ -1245,9 +1273,9 @@ mod tests {
                 serde_json::json!({"file": "src/main.rs"}),
             ),
             ("cxpak/overview", serde_json::Value::Null),
-            ("cxpak/trace", serde_json::json!({"symbol": "main"})),
+            ("cxpak/trace", serde_json::json!({"target": "main"})),
             ("cxpak/diff", serde_json::Value::Null),
-            ("cxpak/search", serde_json::json!({"query": "main"})),
+            ("cxpak/search", serde_json::json!({"pattern": "main"})),
             ("cxpak/apiSurface", serde_json::Value::Null),
             ("cxpak/deadCode", serde_json::Value::Null),
             ("cxpak/callGraph", serde_json::Value::Null),
@@ -1282,7 +1310,7 @@ mod tests {
         let cases = [
             ("cxpak/trace", serde_json::Value::Null),
             ("cxpak/search", serde_json::Value::Null),
-            ("cxpak/search", serde_json::json!({"query": ""})),
+            ("cxpak/search", serde_json::json!({"pattern": ""})),
             ("cxpak/predict", serde_json::Value::Null),
             ("cxpak/predict", serde_json::json!({"files": []})),
             ("cxpak/dataFlow", serde_json::Value::Null),
@@ -1297,6 +1325,197 @@ mod tests {
                 "method {m} with missing params must Err(Internal), got {r:?}"
             );
         }
+    }
+
+    // --- cxpak#82: cxpak/trace and cxpak/search must accept the catalog's
+    // param names (`target`/`pattern`), not LSP-only ones (`symbol`/`query`).
+
+    #[test]
+    fn trace_accepts_target_the_catalog_declared_name() {
+        let index = make_test_index();
+        let root = std::path::Path::new("/tmp");
+        let result = handle_custom_method(
+            "cxpak/trace",
+            serde_json::json!({"target": "main"}),
+            &index,
+            root,
+        );
+        assert!(
+            result.is_ok(),
+            "cxpak/trace must accept 'target': {result:?}"
+        );
+        let value = result.unwrap().unwrap();
+        assert_eq!(value["count"], 1);
+    }
+
+    #[test]
+    fn trace_rejects_the_old_lsp_only_symbol_name() {
+        let index = make_test_index();
+        let root = std::path::Path::new("/tmp");
+        let result = handle_custom_method(
+            "cxpak/trace",
+            serde_json::json!({"symbol": "main"}),
+            &index,
+            root,
+        );
+        assert!(
+            matches!(result, Err(LspMethodError::Internal(_))),
+            "cxpak/trace must no longer accept the old 'symbol' name: {result:?}"
+        );
+    }
+
+    #[test]
+    fn search_accepts_pattern_the_catalog_declared_name() {
+        let index = make_test_index();
+        let root = std::path::Path::new("/tmp");
+        let result = handle_custom_method(
+            "cxpak/search",
+            serde_json::json!({"pattern": "main"}),
+            &index,
+            root,
+        );
+        assert!(
+            result.is_ok(),
+            "cxpak/search must accept 'pattern': {result:?}"
+        );
+        let value = result.unwrap().unwrap();
+        assert_eq!(value["matches"].as_array().unwrap().len(), 1);
+    }
+
+    // --- cxpak#82: cxpak/apiSurface must stop hardcoding focus/include/tokens.
+
+    fn make_two_file_test_index() -> crate::index::CodebaseIndex {
+        use crate::parser::language::{ParseResult, Symbol, SymbolKind, Visibility};
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "widget.py".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/widget.py"),
+                language: Some("python".to_string()),
+                size_bytes: 20,
+            },
+            ScannedFile {
+                relative_path: "leaf.py".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/leaf.py"),
+                language: Some("python".to_string()),
+                size_bytes: 20,
+            },
+        ];
+        let mut parse_results = HashMap::new();
+        parse_results.insert(
+            "widget.py".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "Widget".to_string(),
+                    kind: SymbolKind::Class,
+                    visibility: Visibility::Public,
+                    signature: "class Widget".to_string(),
+                    body: "class Widget: pass".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        parse_results.insert(
+            "leaf.py".to_string(),
+            ParseResult {
+                symbols: vec![Symbol {
+                    name: "Leaf".to_string(),
+                    kind: SymbolKind::Class,
+                    visibility: Visibility::Public,
+                    signature: "class Leaf".to_string(),
+                    body: "class Leaf: pass".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                }],
+                imports: vec![],
+                exports: vec![],
+            },
+        );
+        let mut content_map = HashMap::new();
+        content_map.insert("widget.py".to_string(), "class Widget: pass".to_string());
+        content_map.insert("leaf.py".to_string(), "class Leaf: pass".to_string());
+        crate::index::CodebaseIndex::build_with_content(files, parse_results, &counter, content_map)
+    }
+
+    #[test]
+    fn api_surface_focus_narrows_symbols_to_the_prefix() {
+        let index = make_two_file_test_index();
+        let root = std::path::Path::new("/tmp");
+
+        let unfiltered =
+            handle_custom_method("cxpak/apiSurface", serde_json::Value::Null, &index, root)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            unfiltered["symbols"]["total"], 2,
+            "both files must contribute a symbol"
+        );
+
+        let filtered = handle_custom_method(
+            "cxpak/apiSurface",
+            serde_json::json!({"focus": "widget.py"}),
+            &index,
+            root,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            filtered["symbols"]["total"], 1,
+            "focus=widget.py must drop leaf.py's symbol, got {filtered}"
+        );
+    }
+
+    // --- cxpak#82: cxpak/dataFlow must stop hardcoding sink (None) and depth (6).
+
+    #[test]
+    fn data_flow_wires_sink_and_depth_from_args() {
+        use crate::intelligence::call_graph::{CallConfidence, CallEdge, CallGraph};
+        let mut index = make_test_index();
+        index.call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "src/main.rs".into(),
+                caller_symbol: "main".into(),
+                callee_file: "src/main.rs".into(),
+                callee_symbol: "helper".into(),
+                confidence: CallConfidence::Exact,
+                resolution_note: None,
+            }],
+            unresolved: Vec::new(),
+        };
+        let root = std::path::Path::new("/tmp");
+
+        // depth=0 must short-circuit to a single-node path (the source
+        // only); the pinned depth=6 default would traverse the edge above.
+        let shallow = handle_custom_method(
+            "cxpak/dataFlow",
+            serde_json::json!({"symbol": "main", "depth": 0}),
+            &index,
+            root,
+        )
+        .unwrap()
+        .unwrap();
+        let paths = shallow["paths"].as_array().unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0]["nodes"].as_array().unwrap().len(),
+            1,
+            "depth=0 must stop at the source node, proving depth is no longer pinned at 6"
+        );
+
+        // sink="main" (the source itself) must stop the trace at hop 0
+        // too, proving `sink` is read rather than hardcoded to None.
+        let sunk = handle_custom_method(
+            "cxpak/dataFlow",
+            serde_json::json!({"symbol": "main", "sink": "main"}),
+            &index,
+            root,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sunk["sink"]["symbol"], "main");
     }
 
     #[test]

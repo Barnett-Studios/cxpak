@@ -1204,9 +1204,7 @@ async fn v1_drift_handler(
         )
     })?;
     let mut report = crate::intelligence::drift::build_drift_report(&idx, &repo, false);
-    if let Some(ref prefix) = focus {
-        report.hotspots.retain(|h| h.module.starts_with(prefix));
-    }
+    report.apply_focus(focus.as_deref());
     Ok(axum::Json(serde_json::to_value(report).map_err(|_| {
         v1_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1919,11 +1917,9 @@ async fn context_diff_handler(
             // wall-clock order).
             if let Some(threshold) = params.since.as_deref() {
                 if snap.generated_at.as_str() < threshold {
-                    let mut rec = crate::auto_context::diff::no_snapshot_recommendation();
-                    rec.recommendation = format!(
-                        "snapshot generated_at {} predates `since` threshold {}; \
-                         call /auto_context to refresh the baseline before diffing",
-                        snap.generated_at, threshold
+                    let rec = crate::auto_context::diff::stale_snapshot_recommendation(
+                        &snap.generated_at,
+                        threshold,
                     );
                     return Ok(Json(
                         serde_json::to_value(&rec)
@@ -2184,9 +2180,7 @@ async fn drift_handler(
     let save_baseline = params.save_baseline.unwrap_or(false);
     let mut report =
         crate::intelligence::drift::build_drift_report(&idx, &repo_path, save_baseline);
-    if let Some(prefix) = params.focus.as_deref() {
-        report.hotspots.retain(|h| h.module.starts_with(prefix));
-    }
+    report.apply_focus(params.focus.as_deref());
     Ok(Json(serde_json::to_value(&report).unwrap_or_else(
         |_| json!({"error": "serialization failed"}),
     )))
@@ -2247,14 +2241,7 @@ async fn data_flow_handler(
         depth,
         &idx,
     );
-    if let Some(prefix) = params.focus.as_deref() {
-        // Keep only paths whose source OR sink file lives under the focus
-        // prefix.  An empty result is meaningful — the caller asked for
-        // a specific area and got nothing.
-        result
-            .paths
-            .retain(|p| p.nodes.iter().any(|n| n.file.starts_with(prefix)));
-    }
+    result.apply_focus(params.focus.as_deref());
     Ok(Json(serde_json::to_value(&result).unwrap_or_else(
         |_| json!({"error": "serialization failed"}),
     )))
@@ -3219,14 +3206,30 @@ fn dispatch_capability_op(
             )
         }
         "review" => {
+            let since = args.get("since").and_then(|s| s.as_str());
+            let focus = args.get("focus").and_then(|f| f.as_str());
             let snap_guard = snapshot.read();
-            let delta = match snap_guard {
+            let mut delta = match snap_guard {
                 Ok(guard) => match guard.as_ref() {
                     None => crate::auto_context::diff::no_snapshot_recommendation(),
-                    Some(snap) => crate::auto_context::diff::compute_diff(snap, index),
+                    Some(snap) => match since {
+                        // Honour `since`: lexicographic comparison works for
+                        // ISO-8601-ish timestamps (generated_at is RFC-3339,
+                        // which sorts the same way as wall-clock order).
+                        Some(threshold) if snap.generated_at.as_str() < threshold => {
+                            crate::auto_context::diff::stale_snapshot_recommendation(
+                                &snap.generated_at,
+                                threshold,
+                            )
+                        }
+                        _ => crate::auto_context::diff::compute_diff(snap, index),
+                    },
                 },
                 Err(_) => crate::auto_context::diff::no_snapshot_recommendation(),
             };
+            if let Some(prefix) = focus {
+                delta.apply_focus(prefix);
+            }
             mcp_tool_result(
                 id,
                 &serde_json::to_string_pretty(&delta).unwrap_or_default(),
@@ -4242,8 +4245,10 @@ fn dispatch_capability_op(
                 .get("save_baseline")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let report =
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let mut report =
                 crate::intelligence::drift::build_drift_report(index, repo_path, save_baseline);
+            report.apply_focus(focus);
             mcp_tool_result(
                 id,
                 &serde_json::to_string_pretty(&report).unwrap_or_default(),
@@ -4276,8 +4281,10 @@ fn dispatch_capability_op(
                 .map(|d| d as usize)
                 .unwrap_or(10)
                 .min(crate::intelligence::data_flow::MAX_DEPTH);
-            let result =
+            let focus = args.get("focus").and_then(|f| f.as_str());
+            let mut result =
                 crate::intelligence::data_flow::trace_data_flow(symbol, sink, depth, index);
+            result.apply_focus(focus);
             mcp_tool_result(
                 id,
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -4316,7 +4323,13 @@ fn dispatch_capability_op(
                 .get("format")
                 .and_then(|v| v.as_str())
                 .unwrap_or("html");
-            let focus = args.get("focus").and_then(|v| v.as_str());
+            // `focus` is deliberately not read: the capability catalog no
+            // longer declares it for `visual` (cxpak#81) — it was accepted
+            // and silently discarded here ("reserved for future scoped
+            // rendering") while still being advertised as a working
+            // parameter, which is the exact defect #81 describes. Re-add
+            // both the read and the catalog entry together when scoped
+            // rendering is implemented.
             let symbol = args.get("symbol").and_then(|v| v.as_str());
             let files_arg = args.get("files").and_then(|v| v.as_str());
 
@@ -4335,8 +4348,6 @@ fn dispatch_capability_op(
                 use crate::visual::export;
                 use crate::visual::layout::{self, LayoutConfig};
                 use crate::visual::render::{self};
-
-                let _ = focus; // focus reserved for future scoped rendering
 
                 // Single source of truth — call commands::visual::make_metadata
                 // directly so the SPA/standalone renderers and this MCP path
@@ -4799,6 +4810,39 @@ mod tests {
 
     fn make_shared_index() -> SharedIndex {
         Arc::new(RwLock::new(Arc::new(make_test_index())))
+    }
+
+    /// Two-file index (`src/main.rs`, `src/lib.rs`) whose content is keyed by
+    /// `variant`, so calling this twice with different variants produces a
+    /// snapshot/current pair where both files register as modified — the
+    /// fixture `test_mcp_review_honours_focus` and `test_mcp_review_honours_since`
+    /// need to exercise `review`'s `focus`/`since` params.
+    fn make_two_file_index(main_variant: &str, lib_variant: &str) -> CodebaseIndex {
+        let counter = TokenCounter::new();
+        let files = vec![
+            ScannedFile {
+                relative_path: "src/main.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/main.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 100,
+            },
+            ScannedFile {
+                relative_path: "src/lib.rs".to_string(),
+                absolute_path: std::path::PathBuf::from("/tmp/src/lib.rs"),
+                language: Some("rust".to_string()),
+                size_bytes: 50,
+            },
+        ];
+        let mut content_map = HashMap::new();
+        content_map.insert(
+            "src/main.rs".to_string(),
+            format!("fn main() {{ /* {main_variant} */ }}"),
+        );
+        content_map.insert(
+            "src/lib.rs".to_string(),
+            format!("pub fn hello() {{ /* {lib_variant} */ }}"),
+        );
+        CodebaseIndex::build_with_content(files, HashMap::new(), &counter, content_map)
     }
 
     fn make_shared_snapshot() -> SharedSnapshot {
@@ -6483,6 +6527,132 @@ mod tests {
         assert!(
             text.contains("required"),
             "missing symbol should error with 'required', got: {text}"
+        );
+    }
+
+    /// cxpak#81: the MCP `data_flow` arm declares `focus` but never called
+    /// the filter `data_flow_handler` (HTTP) already applies. Build an index
+    /// with a populated call graph so the trace actually produces a path
+    /// under `src/api.rs`, then assert `focus="src/db"` (which matches
+    /// neither node) empties the result the same way the HTTP handler does.
+    #[test]
+    fn test_mcp_data_flow_honours_focus() {
+        use crate::intelligence::call_graph::{CallConfidence, CallEdge, CallGraph};
+        let mut index = make_test_index();
+        index.call_graph = CallGraph {
+            edges: vec![CallEdge {
+                caller_file: "src/main.rs".into(),
+                caller_symbol: "main".into(),
+                callee_file: "src/lib.rs".into(),
+                callee_symbol: "hello".into(),
+                confidence: CallConfidence::Exact,
+                resolution_note: None,
+            }],
+            unresolved: Vec::new(),
+        };
+        let snap = make_shared_snapshot();
+
+        let unfiltered = handle_tool_call(
+            Some(json!(12)),
+            "cxpak_data_flow",
+            &json!({"symbol": "main"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let unfiltered_text = unfiltered["result"]["content"][0]["text"].as_str().unwrap();
+        let unfiltered_parsed: Value = serde_json::from_str(unfiltered_text).unwrap();
+        assert!(
+            !unfiltered_parsed["paths"].as_array().unwrap().is_empty(),
+            "fixture call graph must produce at least one path"
+        );
+
+        let filtered = handle_tool_call(
+            Some(json!(13)),
+            "cxpak_data_flow",
+            &json!({"symbol": "main", "focus": "nosuchdir/"}),
+            &index,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let filtered_text = filtered["result"]["content"][0]["text"].as_str().unwrap();
+        let filtered_parsed: Value = serde_json::from_str(filtered_text).unwrap();
+        assert!(
+            filtered_parsed["paths"].as_array().unwrap().is_empty(),
+            "focus matching nothing must empty paths, got {filtered_parsed}"
+        );
+    }
+
+    /// cxpak#81: `review`'s only handler read neither of its declared
+    /// params. `focus` must narrow `modified_files` to the prefix.
+    #[test]
+    fn test_mcp_review_honours_focus() {
+        let original = make_two_file_index("before", "before");
+        let snap: SharedSnapshot = Arc::new(RwLock::new(Some(
+            crate::auto_context::diff::create_snapshot(&original),
+        )));
+        let changed = make_two_file_index("after", "after");
+
+        let unfiltered = handle_tool_call(
+            Some(json!(20)),
+            "cxpak_context_diff",
+            &json!({}),
+            &changed,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let unfiltered_text = unfiltered["result"]["content"][0]["text"].as_str().unwrap();
+        let unfiltered_parsed: Value = serde_json::from_str(unfiltered_text).unwrap();
+        assert_eq!(
+            unfiltered_parsed["modified_files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let filtered = handle_tool_call(
+            Some(json!(21)),
+            "cxpak_context_diff",
+            &json!({"focus": "src/main.rs"}),
+            &changed,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let filtered_text = filtered["result"]["content"][0]["text"].as_str().unwrap();
+        let filtered_parsed: Value = serde_json::from_str(filtered_text).unwrap();
+        let modified = filtered_parsed["modified_files"].as_array().unwrap();
+        assert_eq!(modified.len(), 1, "focus must narrow to src/main.rs only");
+        assert_eq!(modified[0]["path"], "src/main.rs");
+    }
+
+    /// cxpak#81: `review`'s `since` must reject a snapshot older than the
+    /// caller-supplied threshold, mirroring HTTP's `context_diff_handler`.
+    #[test]
+    fn test_mcp_review_honours_since() {
+        let original = make_two_file_index("before", "before");
+        let mut old_snapshot = crate::auto_context::diff::create_snapshot(&original);
+        old_snapshot.generated_at = "2020-01-01T00:00:00Z".to_string();
+        let snap: SharedSnapshot = Arc::new(RwLock::new(Some(old_snapshot)));
+        let changed = make_two_file_index("after", "after");
+
+        let resp = handle_tool_call(
+            Some(json!(22)),
+            "cxpak_context_diff",
+            &json!({"since": "2026-01-01T00:00:00Z"}),
+            &changed,
+            Path::new("/tmp"),
+            &snap,
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed["modified_files"].as_array().unwrap().is_empty(),
+            "a stale snapshot must not be diffed"
+        );
+        assert!(
+            parsed["recommendation"].as_str().unwrap().contains("since"),
+            "recommendation must explain the `since` rejection, got {parsed}"
         );
     }
 

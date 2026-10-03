@@ -367,6 +367,35 @@ pub fn no_snapshot_recommendation() -> ContextDelta {
     }
 }
 
+/// Build the empty delta returned when a stored snapshot predates the
+/// caller-supplied `since` threshold. Shared by every surface that honours
+/// `since` so the message stays identical regardless of transport.
+pub fn stale_snapshot_recommendation(generated_at: &str, threshold: &str) -> ContextDelta {
+    let mut rec = no_snapshot_recommendation();
+    rec.recommendation = format!(
+        "snapshot generated_at {generated_at} predates `since` threshold {threshold}; \
+         call cxpak_context (op: \"context\") to refresh the baseline before diffing"
+    );
+    rec
+}
+
+impl ContextDelta {
+    /// Restrict every change list to entries whose path (or, for graph
+    /// changes, either endpoint) starts with `prefix`. Mirrors the `focus`
+    /// semantics `drift` and `data_flow` already apply to their own
+    /// path-bearing lists, so a caller can scope a review delta to one
+    /// subtree instead of the whole repo.
+    pub fn apply_focus(&mut self, prefix: &str) {
+        self.modified_files.retain(|f| f.path.starts_with(prefix));
+        self.new_files.retain(|p| p.starts_with(prefix));
+        self.deleted_files.retain(|p| p.starts_with(prefix));
+        self.new_symbols.retain(|s| s.path.starts_with(prefix));
+        self.removed_symbols.retain(|s| s.path.starts_with(prefix));
+        self.graph_changes
+            .retain(|g| g.from.starts_with(prefix) || g.to.starts_with(prefix));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -879,5 +908,64 @@ mod tests {
         assert_eq!(added_edges.len(), 1);
         assert_eq!(added_edges[0].from, "src/a.rs");
         assert_eq!(added_edges[0].to, "src/b.rs");
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_focus (cxpak#81: `review`'s declared `focus` param was never
+    // read by its only handler)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_focus_narrows_every_list_to_the_prefix() {
+        let original = make_index(&[("widget.py", "class Widget: pass"), ("leaf.py", "x = 1")]);
+        let snapshot = create_snapshot(&original);
+
+        let changed = make_index(&[
+            ("widget.py", "class Widget: render()"),
+            ("leaf.py", "x = 2"),
+            ("widget_new.py", "y = 1"),
+        ]);
+        let mut delta = compute_diff(&snapshot, &changed);
+        // Unfiltered: both modified files and the new file are present.
+        assert_eq!(delta.modified_files.len(), 2);
+        assert_eq!(delta.new_files, vec!["widget_new.py".to_string()]);
+
+        delta.apply_focus("widget");
+
+        assert_eq!(
+            delta.modified_files.len(),
+            1,
+            "focus must drop leaf.py, got {:?}",
+            delta.modified_files
+        );
+        assert_eq!(delta.modified_files[0].path, "widget.py");
+        assert_eq!(delta.new_files, vec!["widget_new.py".to_string()]);
+        assert!(delta.deleted_files.is_empty());
+    }
+
+    #[test]
+    fn test_apply_focus_matching_nothing_empties_every_list() {
+        let original = make_index(&[("widget.py", "class Widget: pass")]);
+        let snapshot = create_snapshot(&original);
+        let changed = make_index(&[("widget.py", "class Widget: render()")]);
+        let mut delta = compute_diff(&snapshot, &changed);
+        assert!(!delta.modified_files.is_empty());
+
+        delta.apply_focus("nosuchdir/");
+
+        assert!(delta.modified_files.is_empty());
+        assert!(delta.new_files.is_empty());
+        assert!(delta.deleted_files.is_empty());
+        assert!(delta.new_symbols.is_empty());
+        assert!(delta.removed_symbols.is_empty());
+        assert!(delta.graph_changes.is_empty());
+    }
+
+    #[test]
+    fn test_stale_snapshot_recommendation_names_both_timestamps() {
+        let rec = stale_snapshot_recommendation("2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z");
+        assert!(rec.modified_files.is_empty());
+        assert!(rec.recommendation.contains("2026-01-01T00:00:00Z"));
+        assert!(rec.recommendation.contains("2026-06-01T00:00:00Z"));
     }
 }
