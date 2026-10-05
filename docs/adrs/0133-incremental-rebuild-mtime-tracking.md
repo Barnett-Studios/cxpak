@@ -24,6 +24,8 @@ Add `mtime_ns: Option<u64>` to `IndexedFile`, populated from `std::fs::metadata`
 
 > **Update (cxpak#36, superseding the comparison above — field renamed `mtime_secs` → `mtime_ns`):** the "Negative"/"Revisit if" risk below materialized: mtime was truncated to whole seconds (`.as_secs()`) and compared with a strict `new > old`, so a same-size edit landing within the same wall-clock second as the prior index was never re-parsed, and an mtime reset to `<=` the stored value (e.g. after a `git checkout`/rebase) was also missed. Fixed by switching `IndexedFile`'s field to nanosecond precision (`mtime_ns`) and the comparison to `new != old || file.size_bytes != existing.size_bytes` — equality-based, not one-directional. See `src/index/mod.rs::incremental_rebuild` and its tests for the current behavior; the `new > old` form described above is historical.
 
+> **Update (settle check vs. mtime tick):** nanosecond *precision* is not nanosecond *resolution*. The kernel stamps mtime from a coarse clock (about 1–10 ms on ext4), so a same-size edit landing in the same tick as the settle check's pre-read stat left both stats equal and the pre-edit content was cached as settled. `settled_read_with` now waits until the file's mtime is at least `MTIME_TICK_WINDOW` (50 ms) in the past and re-stats before reading, so any edit from then on carries a later mtime and the pre/post comparison sees it. The wait only applies to files modified within the window. Filesystems with coarser mtimes (FAT's 2 s, some network mounts) remain out of reach of this check.
+
 ## Consequences
 
 ### Positive

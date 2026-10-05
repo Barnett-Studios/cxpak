@@ -127,6 +127,30 @@ fn stat_fingerprint(path: &std::path::Path) -> Option<(Option<u64>, u64)> {
     Some((mtime_ns, m.len()))
 }
 
+/// How long after a file's mtime the settle check waits before trusting a
+/// read of it. It must cover the filesystem's mtime granularity plus the lag
+/// between the kernel's coarse timestamp clock and `SystemTime::now()` (up
+/// to one scheduler tick each, 10 ms at HZ=100). Filesystems with coarser
+/// mtimes (FAT's 2 s, some network mounts) are not covered.
+const MTIME_TICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Sleep until at least [`MTIME_TICK_WINDOW`] has passed since `mtime_ns`,
+/// so that any later write to the file gets a strictly later mtime. Returns
+/// whether it slept. The sleep is capped at one window, so a file stamped in
+/// the future (clock skew) costs one window instead of blocking.
+fn wait_out_mtime_tick(mtime_ns: u64) -> bool {
+    let window_ns = MTIME_TICK_WINDOW.as_nanos() as u64;
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let remaining_ns = mtime_ns.saturating_add(window_ns).saturating_sub(now_ns);
+    if remaining_ns == 0 {
+        return false;
+    }
+    std::thread::sleep(std::time::Duration::from_nanos(remaining_ns.min(window_ns)));
+    true
+}
+
 /// Core settle check (cxpak#36 follow-up): run `read` and require the stat
 /// it ran under (`pre`, taken by the caller before invoking this) to still
 /// hold after `read` returns.
@@ -151,11 +175,25 @@ fn stat_fingerprint(path: &std::path::Path) -> Option<(Option<u64>, u64)> {
 /// deterministically inside the pre/post stat window — proving the settle
 /// check actually catches a race rather than relying on a timing-dependent
 /// background thread that may or may not land inside that window in CI.
+///
+/// The pre/post comparison alone is blind to an edit that lands in the same
+/// mtime tick as `pre` with the same byte size: the kernel stamps mtime from
+/// a coarse clock (about 1-10 ms on ext4), so both stats agree even though
+/// the bytes read are no longer the bytes on disk. Before reading, this
+/// therefore waits until `pre`'s tick is safely over (see
+/// [`wait_out_mtime_tick`]) and re-stats: any edit from then on carries a
+/// later mtime and is caught by the comparison, and an edit still inside the
+/// tick has already happened by the time the read starts.
 fn settled_read_with(
     path: &std::path::Path,
     pre: Option<(Option<u64>, u64)>,
     read: impl FnOnce() -> Option<String>,
 ) -> Option<(String, Option<u64>)> {
+    if let Some((Some(mtime_ns), _)) = pre {
+        if wait_out_mtime_tick(mtime_ns) && stat_fingerprint(path) != pre {
+            return None;
+        }
+    }
     let content = read()?;
     let post = stat_fingerprint(path);
     if pre != post {
@@ -1930,6 +1968,30 @@ mod tests {
             result, None,
             "a file that changes between the pre- and post-read stat must not be cached"
         );
+    }
+
+    #[test]
+    fn test_read_indexable_settled_catches_same_tick_same_size_edit() {
+        // The mid-read edit lands immediately after the previous write -- no
+        // sleep -- so on a coarse-mtime filesystem it usually gets the SAME
+        // mtime as the pre-stat, and with the same byte size the pre/post
+        // comparison alone cannot see it. Before the tick wait this failed on
+        // roughly half the iterations on ext4; repeat so a regression shows.
+        let dir = tempfile::TempDir::new().unwrap();
+        let fp = dir.path().join("a.rs");
+        for _ in 0..20 {
+            std::fs::write(&fp, "fn b() {}").unwrap();
+            let result =
+                read_indexable_settled_with(&fp, 9, max_file_bytes(), |path, size, cap| {
+                    let content = read_indexable(path, size, cap);
+                    std::fs::write(path, "fn c() {}").unwrap();
+                    content
+                });
+            assert_eq!(
+                result, None,
+                "a same-tick, same-size edit during the read must not be cached"
+            );
+        }
     }
 
     #[test]
