@@ -1,4 +1,5 @@
 use crate::budget::counter::TokenCounter;
+use crate::cache::artifacts::{merge_store_entries, ArtifactEntry, ArtifactStore};
 use crate::commands::watch::{apply_incremental_update, classify_changes};
 use crate::context_quality::annotation::{annotate_file, AnnotationContext};
 use crate::context_quality::degradation::{allocate_with_degradation, FileRole};
@@ -18,8 +19,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -192,116 +193,303 @@ pub fn build_index_with_workspace(
     path: &Path,
     workspace: Option<&str>,
 ) -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
+    build_index_reported(path, workspace).map(|(index, _)| index)
+}
+
+/// Per-phase wall time of one index build.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BuildTimings {
+    pub(crate) scan: Duration,
+    pub(crate) store_load: Duration,
+    pub(crate) per_file: Duration,
+    pub(crate) fingerprint: Duration,
+    pub(crate) derived_load: Duration,
+    pub(crate) assemble: Duration,
+    pub(crate) total: Duration,
+}
+
+/// What one index build reused and what it recomputed (ADR-0210).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BuildReport {
+    /// Files whose stored artifacts matched the bytes read and were complete.
+    pub(crate) artifact_hits: usize,
+    /// Files whose stored parse result was reused but tokens / terms were computed.
+    pub(crate) artifact_partial: usize,
+    /// Files computed from scratch.
+    pub(crate) artifact_misses: usize,
+    pub(crate) derived_hit: bool,
+    /// Whether this build wrote the artifact store.
+    pub(crate) store_saved: bool,
+    pub(crate) timings: BuildTimings,
+}
+
+/// Artifact-store write deferred until after the caller has published its
+/// index, so the save never sits on the path to readiness.
+pub(crate) struct PendingStore {
+    cache_dir: PathBuf,
+    changed: BTreeMap<String, ArtifactEntry>,
+    scanned: BTreeSet<String>,
+    workspace: Option<String>,
+    dirty: bool,
+}
+
+impl PendingStore {
+    /// Merge this build's entries into the persisted store. Returns whether a
+    /// write happened; a failed save is not an indexing error (C3).
+    pub(crate) fn save(self) -> bool {
+        if !self.dirty {
+            return false;
+        }
+        let Self {
+            cache_dir,
+            changed,
+            scanned,
+            workspace,
+            ..
+        } = self;
+        ArtifactStore::update(&cache_dir, |store| {
+            merge_store_entries(&mut store.entries, changed, &scanned, workspace.as_deref());
+        })
+        .is_ok()
+    }
+}
+
+/// Build the index and write the artifact store synchronously.
+pub(crate) fn build_index_reported(
+    path: &Path,
+    workspace: Option<&str>,
+) -> Result<(CodebaseIndex, BuildReport), Box<dyn std::error::Error>> {
+    let (index, mut report, pending) = build_index_pending(path, workspace)?;
+    report.store_saved = pending.save();
+    Ok((index, report))
+}
+
+enum Reuse {
+    Hit,
+    Partial,
+    Miss,
+}
+
+/// One file after the parallel stage: ready for assembly, plus the fresh store
+/// entry when its artifacts were not (fully) reused.
+struct Prepared {
+    file: crate::index::ArtifactFile,
+    body_sha: String,
+    reuse: Reuse,
+    fresh: Option<ArtifactEntry>,
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn store_entry(
+    content_sha256: String,
+    mtime_ns: Option<u64>,
+    file: &crate::scanner::ScannedFile,
+    artifacts: &crate::index::FileArtifacts,
+) -> ArtifactEntry {
+    ArtifactEntry {
+        content_sha256,
+        mtime_ns: mtime_ns.unwrap_or(0),
+        size_bytes: file.size_bytes,
+        language: file.language.clone(),
+        parse_result: artifacts.parse_result.clone(),
+        token_count: Some(artifacts.token_count),
+        term_frequencies: Some(
+            artifacts
+                .term_frequencies
+                .iter()
+                .map(|(term, n)| (term.clone(), *n))
+                .collect(),
+        ),
+    }
+}
+
+/// Build the index, reusing content-validated per-file artifacts and the
+/// derived cache, and hand back the artifact-store write instead of doing it.
+///
+/// Reuse is keyed on the SHA-256 of the bytes this build's settled read
+/// returned, never on mtime (C2). Files are processed in parallel; rayon's
+/// indexed collect keeps scanner order (C5).
+pub(crate) fn build_index_pending(
+    path: &Path,
+    workspace: Option<&str>,
+) -> Result<(CodebaseIndex, BuildReport, PendingStore), Box<dyn std::error::Error>> {
+    use rayon::prelude::*;
+
+    let started = std::time::Instant::now();
+    let mut timings = BuildTimings::default();
     let counter = TokenCounter::new();
     let registry = LanguageRegistry::new();
 
+    let phase = std::time::Instant::now();
     let scanner = Scanner::new(path)?;
     let files = scanner.scan_workspace(workspace)?;
+    timings.scan = phase.elapsed();
 
-    let mut parse_results = HashMap::new();
-    let mut settled_map: HashMap<String, crate::index::SettledRead> = HashMap::new();
-    // Capture mtime_ns + size_bytes per file before `files` is consumed by
-    // build_with_settled_content.  These feed the stat-index to skip
-    // re-hashing files whose (mtime_ns, size_bytes) are unchanged (Task 0.2).
-    let mut file_stats: HashMap<String, (u64, u64)> = HashMap::new();
-    let cap_bytes = crate::index::max_file_bytes();
-    for file in &files {
-        // An unreadable file leaves no trace here: no parse, no settled-map
-        // entry, and no stat-index row. `fp_files` below is built from
-        // `index.files`, so dropping it in `build_with_settled_content` keeps
-        // it out of the fingerprint too — which is what stops `sha256("")`
-        // being stored under the file's real (mtime, size) key and served
-        // back later (#40).
-        //
-        // `SettledRead::from_disk` (cxpak#36 TOCTOU follow-up) replaces the
-        // old `read_indexable` + a later, separate `file_mtime_ns` call: that
-        // ordering let an edit land between the content read and the mtime
-        // stat, caching pre-edit content under a post-edit mtime. One settled
-        // read now produces both `source` and `mtime_ns` together, and that
-        // same pair feeds BOTH the stat-index below AND `IndexedFile.mtime_ns`
-        // via `build_with_settled_content` — previously these were two
-        // independently-stat'd values that could disagree with each other.
-        let Some(settled) =
-            crate::index::SettledRead::from_disk(&file.absolute_path, file.size_bytes, cap_bytes)
-        else {
-            continue;
-        };
-        if let Some(lang_name) = &file.language {
-            if let Some(lang) = registry.get(lang_name) {
-                let ts_lang = lang.ts_language();
-                let mut parser = tree_sitter::Parser::new();
-                parser.set_language(&ts_lang).ok();
-                if let Some(tree) = parser.parse(settled.content(), None) {
-                    let result = lang.extract(settled.content(), &tree);
-                    parse_results.insert(file.relative_path.clone(), result);
-                }
-            }
-        }
-        file_stats.insert(
-            file.relative_path.clone(),
-            (settled.mtime_ns().unwrap_or(0), file.size_bytes),
-        );
-        settled_map.insert(file.relative_path.clone(), settled);
-    }
-
-    let mut index =
-        CodebaseIndex::build_with_settled_content(files, parse_results, &counter, settled_map);
-
-    // Derived-index cache (ADR-0167): on a content+HEAD fingerprint hit, restore
-    // the derived analysis — crucially skipping the expensive git-mined
-    // conventions/co-changes recompute — instead of re-mining history. The
-    // fingerprint is content-based, so the cache is portable across clones/CI
-    // and never serves stale data on a same-size edit. Fail-closed: any miss /
-    // corruption falls through to a full rebuild.
-    let cache_dir = path.join(cache_namespace(path, workspace));
-    let head_oid = git_head_oid(path);
-
-    // Build file list with mtime_ns + size_bytes for the stat-index fast-path.
-    // Files not present in file_stats (shouldn't happen — metadata read failed)
-    // fall back to (0, 0), a degenerate value that will only hit a stat-index
-    // entry previously stored with the same (0, 0) key; in practice this means
-    // a failed-metadata file is re-hashed on every build, which is safe.
-    let fp_files: Vec<(String, String, u64, u64)> = index
-        .files
+    // The artifact store lives in the flat cache dir (shared by every
+    // workspace); the derived cache lives in the namespaced one.
+    let store_dir = path.join(".cxpak").join("cache");
+    let phase = std::time::Instant::now();
+    let mut store = ArtifactStore::load(&store_dir);
+    // Entries are moved out per file (never cloned) into a vec aligned with
+    // `files`; what stays in the map afterwards was not scanned.
+    let stored: Vec<Option<ArtifactEntry>> = files
         .iter()
-        .map(|f| {
-            let (mtime_ns, size_bytes) =
-                file_stats.get(&f.relative_path).copied().unwrap_or((0, 0));
-            (
-                f.relative_path.clone(),
-                f.content.clone(),
-                mtime_ns,
-                size_bytes,
-            )
+        .map(|f| store.entries.remove(&f.relative_path))
+        .collect();
+    let had_entry: Vec<bool> = stored.iter().map(Option::is_some).collect();
+    let stale_in_scope = store
+        .entries
+        .keys()
+        .any(|k| workspace.is_none_or(|ws| crate::scanner::path_starts_with_workspace(k, ws)));
+    drop(store);
+    timings.store_load = phase.elapsed();
+
+    let phase = std::time::Instant::now();
+    let cap_bytes = crate::index::max_file_bytes();
+    let prepared: Vec<Option<Prepared>> = files
+        .par_iter()
+        .zip(stored.into_par_iter())
+        .map(|(file, stored)| {
+            // An unreadable file leaves no trace: no index entry, no store
+            // entry, no fingerprint input (C4, #40).
+            let settled = crate::index::SettledRead::from_disk(
+                &file.absolute_path,
+                file.size_bytes,
+                cap_bytes,
+            )?;
+            let mtime_ns = settled.mtime_ns();
+            let (content, _) = settled.into_parts();
+            let raw_sha = sha256_hex(&content);
+            let body = crate::cache::strip_md_frontmatter(&content);
+            let body_sha = if body.len() == content.len() {
+                raw_sha.clone()
+            } else {
+                sha256_hex(body)
+            };
+
+            let matching =
+                stored.filter(|e| e.content_sha256 == raw_sha && e.language == file.language);
+            let (artifacts, reuse, fresh) = match matching {
+                Some(ArtifactEntry {
+                    parse_result,
+                    token_count: Some(token_count),
+                    term_frequencies: Some(terms),
+                    ..
+                }) => (
+                    crate::index::FileArtifacts {
+                        parse_result,
+                        token_count,
+                        term_frequencies: terms.into_iter().collect(),
+                    },
+                    Reuse::Hit,
+                    None,
+                ),
+                Some(entry) => {
+                    let artifacts = crate::index::FileArtifacts {
+                        parse_result: entry.parse_result,
+                        token_count: counter.count_or_zero(&content),
+                        term_frequencies: crate::index::compute_term_frequencies(&content),
+                    };
+                    let fresh = store_entry(raw_sha, mtime_ns, file, &artifacts);
+                    (artifacts, Reuse::Partial, Some(fresh))
+                }
+                None => {
+                    let artifacts = crate::index::compute_file_artifacts(
+                        &content,
+                        file.language.as_deref(),
+                        &registry,
+                        &counter,
+                    );
+                    let fresh = store_entry(raw_sha, mtime_ns, file, &artifacts);
+                    (artifacts, Reuse::Miss, Some(fresh))
+                }
+            };
+            Some(Prepared {
+                file: crate::index::ArtifactFile {
+                    relative_path: file.relative_path.clone(),
+                    language: file.language.clone(),
+                    size_bytes: file.size_bytes,
+                    content,
+                    mtime_ns,
+                    artifacts,
+                },
+                body_sha,
+                reuse,
+                fresh,
+            })
         })
         .collect();
+    timings.per_file = phase.elapsed();
 
-    // Load the stat-index (fail-closed: empty on any error).
-    let mut stat_index = crate::cache::StatIndex::load(&cache_dir);
+    let mut report = BuildReport::default();
+    let mut changed: BTreeMap<String, ArtifactEntry> = BTreeMap::new();
+    let mut scanned: BTreeSet<String> = BTreeSet::new();
+    let mut body_shas: Vec<String> = Vec::with_capacity(prepared.len());
+    let mut artifact_files = Vec::with_capacity(prepared.len());
+    let mut dropped_entry = false;
+    for (slot, had) in prepared.into_iter().zip(had_entry) {
+        let Some(item) = slot else {
+            dropped_entry |= had;
+            continue;
+        };
+        match item.reuse {
+            Reuse::Hit => report.artifact_hits += 1,
+            Reuse::Partial => report.artifact_partial += 1,
+            Reuse::Miss => report.artifact_misses += 1,
+        }
+        scanned.insert(item.file.relative_path.clone());
+        if let Some(entry) = item.fresh {
+            changed.insert(item.file.relative_path.clone(), entry);
+        }
+        body_shas.push(item.body_sha);
+        artifact_files.push(item.file);
+    }
 
-    // Production content hasher: strips markdown frontmatter, then SHA-256.
-    let fingerprint = crate::cache::content_fingerprint_with_stat_index(
-        &fp_files,
+    // Derived-index cache (ADR-0167): the fingerprint comes from this build's
+    // fresh hashes, so a hit means the content really is the content the
+    // derived analysis was built from. Fail-closed: any miss / corruption
+    // falls through to a full derived rebuild.
+    let phase = std::time::Instant::now();
+    let head_oid = git_head_oid(path);
+    let fingerprint = crate::cache::fingerprint_from_hashes(
+        artifact_files
+            .iter()
+            .zip(body_shas)
+            .map(|(f, sha)| (f.relative_path.as_str(), sha))
+            .collect(),
         &head_oid,
-        &mut stat_index,
-        |content| {
-            use sha2::{Digest, Sha256};
-            let body = crate::cache::strip_md_frontmatter(content);
-            format!("{:x}", Sha256::digest(body.as_bytes()))
-        },
     );
+    timings.fingerprint = phase.elapsed();
 
-    // Persist the updated stat-index (best-effort; a write failure must not
-    // fail indexing).
-    let _ = stat_index.save(&cache_dir);
+    let cache_dir = path.join(cache_namespace(path, workspace));
+    let phase = std::time::Instant::now();
+    let derived = crate::cache::DerivedCache::load(&cache_dir, &fingerprint);
+    timings.derived_load = phase.elapsed();
+    report.derived_hit = derived.is_some();
 
-    match crate::cache::DerivedCache::load(&cache_dir, &fingerprint) {
-        Some(derived) => {
-            index.graph = derived.graph;
-            index.pagerank = derived.pagerank;
-            index.call_graph = derived.call_graph;
-            index.conventions = derived.conventions;
-            index.co_changes = derived.co_changes;
+    let phase = std::time::Instant::now();
+    let (precomputed, restored) = match derived {
+        Some(d) => (
+            Some(crate::index::Precomputed {
+                graph: d.graph,
+                pagerank: d.pagerank,
+                call_graph: d.call_graph,
+            }),
+            Some((d.conventions, d.co_changes)),
+        ),
+        None => (None, None),
+    };
+    let mut index = CodebaseIndex::from_artifacts(artifact_files, precomputed);
+    timings.assemble = phase.elapsed();
+
+    match restored {
+        Some((conventions, co_changes)) => {
+            index.conventions = conventions;
+            index.co_changes = co_changes;
         }
         None => {
             index.conventions = crate::conventions::build_convention_profile(&index, path);
@@ -336,7 +524,17 @@ pub fn build_index_with_workspace(
             let _ = derived.save(&cache_dir);
         }
     }
-    Ok(index)
+
+    timings.total = started.elapsed();
+    report.timings = timings;
+    let pending = PendingStore {
+        cache_dir: store_dir,
+        dirty: !changed.is_empty() || dropped_entry || stale_in_scope,
+        changed,
+        scanned,
+        workspace: workspace.map(str::to_string),
+    };
+    Ok((index, report, pending))
 }
 
 // Ungated since #140: `commands::hook` needs them in every build, and the daemon feature gates
@@ -2334,6 +2532,7 @@ pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 /// panics in the test harness.
 ///
 /// `path` is used only for the stderr diagnostic in the error/panic branches.
+#[cfg(test)]
 fn classify_build_outcome(
     path: &Path,
     outcome: Result<
@@ -2341,12 +2540,36 @@ fn classify_build_outcome(
         Box<dyn std::any::Any + Send>,
     >,
 ) -> IndexReadiness {
+    classify_reported_outcome(path, outcome.map(|built| built.map(|idx| (idx, None))))
+}
+
+/// Result of a panic-guarded build that may carry its [`BuildReport`].
+type ReportedBuildOutcome = Result<
+    Result<(CodebaseIndex, Option<BuildReport>), Box<dyn std::error::Error>>,
+    Box<dyn std::any::Any + Send>,
+>;
+
+/// `classify_build_outcome` for a build that also produced a [`BuildReport`]:
+/// the ready line then says what was reused.
+fn classify_reported_outcome(path: &Path, outcome: ReportedBuildOutcome) -> IndexReadiness {
     match outcome {
-        Ok(Ok(idx)) => {
-            eprintln!(
-                "cxpak: MCP index ready ({} files indexed, {} tokens)",
-                idx.total_files, idx.total_tokens
-            );
+        Ok(Ok((idx, report))) => {
+            match report {
+                Some(r) => eprintln!(
+                    "cxpak: MCP index ready ({} files indexed, {} tokens; artifacts {} hit/{} partial/{} miss, derived {}, {:.2}s)",
+                    idx.total_files,
+                    idx.total_tokens,
+                    r.artifact_hits,
+                    r.artifact_partial,
+                    r.artifact_misses,
+                    if r.derived_hit { "hit" } else { "miss" },
+                    r.timings.total.as_secs_f64(),
+                ),
+                None => eprintln!(
+                    "cxpak: MCP index ready ({} files indexed, {} tokens)",
+                    idx.total_files, idx.total_tokens
+                ),
+            }
             IndexReadiness::Ready(Arc::new(idx))
         }
         Ok(Err(e)) => {
@@ -2388,8 +2611,17 @@ pub fn spawn_mcp_index_build(
 ) -> std::thread::JoinHandle<()> {
     let path = path.to_path_buf();
     std::thread::spawn(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_index(&path)));
-        let next = classify_build_outcome(&path, outcome);
+        let mut pending_store = None;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_index_pending(&path, None)
+        }))
+        .map(|built| {
+            built.map(|(idx, report, pending)| {
+                pending_store = Some(pending);
+                (idx, Some(report))
+            })
+        });
+        let next = classify_reported_outcome(&path, outcome);
         // Capture the ready base *before* the move-consuming publish so phase 2
         // can enrich it without re-reading the cell. Only `Ready` is enrichable.
         #[cfg(feature = "embeddings")]
@@ -2403,6 +2635,10 @@ pub fn spawn_mcp_index_build(
         match readiness.write() {
             Ok(mut g) => *g = next,
             Err(poisoned) => *poisoned.into_inner() = next,
+        }
+        // The artifact store is written only now: readiness never waits on it.
+        if let Some(pending) = pending_store {
+            pending.save();
         }
         // Phase 2 (R-E1, ADR-0186): once the base index is published `Ready`,
         // build the embedding index in this same background thread — off the
