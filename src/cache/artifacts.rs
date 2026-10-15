@@ -52,9 +52,14 @@ impl ArtifactStore {
     /// Read the store without taking the lock. Fail-closed: a missing,
     /// truncated, corrupt, version- or grammar-mismatched file is an empty store.
     fn read(cache_root: &Path) -> Self {
-        std::fs::read_to_string(cache_root.join(ARTIFACT_STORE_FILE))
+        // Streamed: the store can be tens of MB and must not be held as text
+        // next to its parsed form.
+        std::fs::File::open(cache_root.join(ARTIFACT_STORE_FILE))
             .ok()
-            .and_then(|text| serde_json::from_str::<Self>(&text).ok())
+            .and_then(|file| {
+                serde_json::from_reader::<_, Self>(std::io::BufReader::with_capacity(1 << 16, file))
+                    .ok()
+            })
             .filter(|s| {
                 s.version == ARTIFACT_STORE_VERSION && s.grammar_hash == CURRENT_GRAMMAR_HASH
             })
