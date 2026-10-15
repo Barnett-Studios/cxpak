@@ -457,3 +457,33 @@ fn files_keep_scanner_order() {
     let unique: BTreeSet<_> = got.iter().collect();
     assert_eq!(unique.len(), got.len());
 }
+
+#[test]
+fn cli_touch_preserves_complete_entry() {
+    let dir = warm_repo();
+    let root = dir.path();
+    build_index_reported(root, None).unwrap();
+
+    let path = root.join("src/a.rs");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(10))
+        .unwrap();
+    let files = Scanner::new(root).unwrap().scan_workspace(None).unwrap();
+    let counter = TokenCounter::new();
+    crate::cache::parse::parse_with_cache(&files, root, &counter, false);
+
+    let store = ArtifactStore::load(&store_dir(root));
+    let entry = &store.entries["src/a.rs"];
+    assert!(
+        entry.token_count.is_some() && entry.term_frequencies.is_some(),
+        "same bytes, new mtime: the CLI must carry the computed fields over"
+    );
+
+    let (idx, r) = build_index_reported(root, None).unwrap();
+    assert_eq!(r.artifact_partial, 0);
+    assert_eq!(r.artifact_hits, idx.total_files);
+    assert_eq!(r.artifact_misses, 0);
+}

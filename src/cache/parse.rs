@@ -382,4 +382,27 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------
+    // The CLI path honours the same file-size cap as the index path.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_parse_with_cache_capped_skips_over_cap_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_test_repo(&tmp, "pub fn small() {}");
+        let big = format!("pub fn big() {{}}\n// {}\n", "x".repeat(200));
+        fs::write(root.join("src").join("big.rs"), big).unwrap();
+        let counter = TokenCounter::new();
+        let files = scan_files(&root);
+        assert!(files.iter().any(|f| f.relative_path == "src/big.rs"));
+
+        let (results, content) = parse_with_cache_capped(&files, &root, &counter, false, 100);
+
+        assert!(!results.contains_key("src/big.rs"));
+        assert!(!content.contains_key("src/big.rs"));
+        assert!(results.contains_key("src/lib.rs"));
+        let store = ArtifactStore::load(&root.join(".cxpak").join("cache"));
+        assert!(!store.entries.contains_key("src/big.rs"));
+        assert!(store.entries.contains_key("src/lib.rs"));
+    }
 }
