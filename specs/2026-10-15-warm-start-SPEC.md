@@ -213,7 +213,7 @@ The baseline and the results go in `benches/BASELINES.md`.
 |---|---|---|
 | A1 | Warm, unchanged: median `index_ready_s` ≤ 40 % of the baseline median on the scriptorium clone (14.9 → ≤ 6.0 s), and ≤ baseline on the claude clone | §5.7 |
 | A2 | Cold: median ≤ baseline median × 1.10, with non-overlapping spreads reported honestly | §5.7 |
-| A3 | Peak RSS (warm) ≤ baseline × 1.10 | §5.7 |
+| A3 | Peak RSS (warm) ≤ baseline × 1.10 | §5.7. **Result:** not met on RSS (+15–45 %, noisy); peak `phys_footprint` −14 %, steady flat. See `benches/BASELINES.md`. |
 | A4 | Parity, derived hit: report `derived_hit && hits == total_files`, and C1 fields equal | test |
 | A5 | Parity, derived miss with artifacts hitting: report `!derived_hit && hits == total_files`, and C1 fields equal | test |
 | A6 | Reuse is real: a sentinel `parse_result` planted under a matching hash is exposed | test |

@@ -1,7 +1,7 @@
 ---
 id: '0210'
 title: Warm start — an internal content-validated artifact store, a fingerprint from fresh hashes, and a derived hit that skips the derived passes
-status: PROPOSED
+status: ACCEPTED
 date: 2026-10-15
 triggered_by: specs/2026-10-15-warm-start-SPEC.md (scriptorium MCP index-ready 14.9 s on an unchanged repo)
 loop: planning

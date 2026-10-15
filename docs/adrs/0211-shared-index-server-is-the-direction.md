@@ -1,7 +1,7 @@
 ---
 id: '0211'
 title: A shared per-repo index server is the direction for cross-session memory — specified separately, after warm start
-status: PROPOSED
+status: ACCEPTED
 date: 2026-10-15
 triggered_by: specs/2026-10-15-warm-start-SPEC.md; comparison with code-review-graph's `crg-daemon`; measured MCP footprints
 loop: planning
