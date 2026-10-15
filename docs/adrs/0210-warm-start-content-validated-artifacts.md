@@ -90,6 +90,7 @@ Alongside these, `detect_cross_lang_edges` returns sorted output and `serde_json
   on the warm path and is measured in `BuildReport`.
 - Deprecated public types and the unused stat-index code stay until 4.0.
 - The first start after upgrade is cold for per-file work. The derived cache still hits.
+- A concurrent writer's freshly-added in-scope entry can be pruned by another build's save; costs a later recompute, never correctness.
 
 ### Neutral
 - The watcher's in-session incremental path is unchanged. Edits made during a session reach the

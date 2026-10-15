@@ -9,10 +9,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-/// Files larger than this are skipped by the parser to avoid runaway memory
-/// usage (e.g. large generated files that slipped through the blocklist).
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
-
 /// Parse all `files` using tree-sitter, with a persistent disk cache stored
 /// under `<repo_root>/.cxpak/cache/` (the artifact store, ADR-0210).
 ///
@@ -31,8 +27,26 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
 pub fn parse_with_cache(
     files: &[ScannedFile],
     repo_root: &Path,
+    counter: &TokenCounter,
+    verbose: bool,
+) -> (HashMap<String, ParseResult>, HashMap<String, String>) {
+    parse_with_cache_capped(
+        files,
+        repo_root,
+        counter,
+        verbose,
+        crate::index::max_file_bytes(),
+    )
+}
+
+/// [`parse_with_cache`] with an explicit file-size cap, so the CLI skips
+/// exactly the files the index path skips (`CXPAK_MAX_FILE_BYTES`).
+fn parse_with_cache_capped(
+    files: &[ScannedFile],
+    repo_root: &Path,
     _counter: &TokenCounter,
     verbose: bool,
+    cap_bytes: u64,
 ) -> (HashMap<String, ParseResult>, HashMap<String, String>) {
     if verbose {
         eprintln!("cxpak: parsing with tree-sitter");
@@ -50,6 +64,17 @@ pub fn parse_with_cache(
             let mtime_ns = crate::cache::file_mtime_ns(&file.absolute_path);
             let size_bytes = file.size_bytes;
 
+            // Skip files that exceed the size cap to avoid runaway memory usage.
+            if size_bytes > cap_bytes {
+                eprintln!(
+                    "cxpak: skipping parse of {} ({} bytes > {} byte limit)",
+                    file.absolute_path.display(),
+                    size_bytes,
+                    cap_bytes
+                );
+                return None;
+            }
+
             if let Some(entry) = store.entries.get(&file.relative_path) {
                 if mtime_ns != 0
                     && entry.mtime_ns == mtime_ns
@@ -61,17 +86,6 @@ pub fn parse_with_cache(
                         fresh: None,
                     });
                 }
-            }
-
-            // Skip files that exceed the size cap to avoid runaway memory usage.
-            if size_bytes > MAX_FILE_BYTES {
-                eprintln!(
-                    "cxpak: skipping parse of {} ({} bytes > {} byte limit)",
-                    file.absolute_path.display(),
-                    size_bytes,
-                    MAX_FILE_BYTES
-                );
-                return None;
             }
 
             let source = match std::fs::read_to_string(&file.absolute_path) {
@@ -86,14 +100,21 @@ pub fn parse_with_cache(
                 }
             };
             let parse_result = parse_source(&source, file.language.as_deref(), &registry);
+            let content_sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
+            // Same bytes under a new mtime (a touch, a checkout): the fields
+            // this path does not compute are still valid, so carry them over.
+            let unchanged = store
+                .entries
+                .get(&file.relative_path)
+                .filter(|e| e.content_sha256 == content_sha256 && e.language == file.language);
             let entry = ArtifactEntry {
-                content_sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
+                content_sha256,
                 mtime_ns,
                 size_bytes,
                 language: file.language.clone(),
                 parse_result: parse_result.clone(),
-                token_count: None,
-                term_frequencies: None,
+                token_count: unchanged.and_then(|e| e.token_count),
+                term_frequencies: unchanged.and_then(|e| e.term_frequencies.clone()),
             };
             Some(Outcome {
                 parse_result,

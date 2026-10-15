@@ -2626,8 +2626,11 @@ pub fn spawn_mcp_index_build(
             Err(poisoned) => *poisoned.into_inner() = next,
         }
         // The artifact store is written only now: readiness never waits on it.
+        // A panic in the save must not skip the enrichment phase below.
         if let Some(pending) = pending_store {
-            pending.save();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.save())).is_err() {
+                eprintln!("cxpak: warning: artifact store save panicked; continuing without it");
+            }
         }
         // Phase 2 (R-E1, ADR-0186): once the base index is published `Ready`,
         // build the embedding index in this same background thread — off the

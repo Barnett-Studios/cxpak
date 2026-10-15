@@ -17,9 +17,10 @@ pub(crate) const ARTIFACT_STORE_FILE: &str = "artifacts.json";
 /// Bumped when the on-disk shape of [`ArtifactStore`] changes.
 pub(crate) const ARTIFACT_STORE_VERSION: u32 = 1;
 
-/// Everything computed from one file's bytes. A `Some` field was computed from
-/// the bytes `content_sha256` names; a writer that did not compute a field
-/// stores `None` (C6).
+/// Everything computed from one file's bytes, all of it valid for the bytes
+/// `content_sha256` names (C6). `parse_result: None` means the file has no
+/// grammar or failed to parse (every writer computes it); only `token_count`
+/// and `term_frequencies` use `None` for "this writer did not compute it".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ArtifactEntry {
     pub(crate) content_sha256: String,
