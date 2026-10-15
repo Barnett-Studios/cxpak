@@ -2524,7 +2524,13 @@ pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// Map the outcome of a [`std::panic::catch_unwind`]-wrapped [`build_index`]
+/// Result of a panic-guarded build that may carry its [`BuildReport`].
+type ReportedBuildOutcome = Result<
+    Result<(CodebaseIndex, Option<BuildReport>), Box<dyn std::error::Error>>,
+    Box<dyn std::any::Any + Send>,
+>;
+
+/// Map the outcome of a [`std::panic::catch_unwind`]-wrapped [`build_index_pending`]
 /// call to the appropriate [`IndexReadiness`] variant (Task R0 panic fix).
 ///
 /// Extracted as a pure function so all three branches — success, build `Err`,
@@ -2532,25 +2538,8 @@ pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 /// panics in the test harness.
 ///
 /// `path` is used only for the stderr diagnostic in the error/panic branches.
-#[cfg(test)]
-fn classify_build_outcome(
-    path: &Path,
-    outcome: Result<
-        Result<CodebaseIndex, Box<dyn std::error::Error>>,
-        Box<dyn std::any::Any + Send>,
-    >,
-) -> IndexReadiness {
-    classify_reported_outcome(path, outcome.map(|built| built.map(|idx| (idx, None))))
-}
-
-/// Result of a panic-guarded build that may carry its [`BuildReport`].
-type ReportedBuildOutcome = Result<
-    Result<(CodebaseIndex, Option<BuildReport>), Box<dyn std::error::Error>>,
-    Box<dyn std::any::Any + Send>,
->;
-
-/// `classify_build_outcome` for a build that also produced a [`BuildReport`]:
-/// the ready line then says what was reused.
+///
+/// With a [`BuildReport`] the ready line says what was reused.
 fn classify_reported_outcome(path: &Path, outcome: ReportedBuildOutcome) -> IndexReadiness {
     match outcome {
         Ok(Ok((idx, report))) => {
@@ -2598,7 +2587,7 @@ fn classify_reported_outcome(path: &Path, outcome: ReportedBuildOutcome) -> Inde
 /// thread-local `next`, and only the O(1) enum publish holds the write lock — so
 /// a concurrent `tools/call` never blocks on (nor is blocked by) the build. A
 /// build error **or panic** is captured as [`IndexReadiness::Failed`] via
-/// [`std::panic::catch_unwind`] + [`classify_build_outcome`] so the cell never
+/// [`std::panic::catch_unwind`] + [`classify_reported_outcome`] so the cell never
 /// stays `Building` forever — every tool call surfaces a clear status either way.
 ///
 /// Extension point (Phase R-E1): after publishing `Ready`, a second background
@@ -5108,29 +5097,23 @@ mod tests {
         Arc::new(RwLock::new(None))
     }
 
-    // --- R0 panic fix: classify_build_outcome covers all three arms ---
+    // --- R0 panic fix: classify_reported_outcome covers all three arms ---
 
     /// Success arm: `Ok(Ok(idx))` → `Ready` carrying the built index.
     #[test]
-    fn classify_build_outcome_ok_yields_ready() {
+    fn classify_reported_outcome_ok_yields_ready() {
         let idx = make_test_index();
-        let outcome: Result<
-            Result<CodebaseIndex, Box<dyn std::error::Error>>,
-            Box<dyn std::any::Any + Send>,
-        > = Ok(Ok(idx));
-        let result = classify_build_outcome(Path::new("/tmp"), outcome);
+        let outcome: ReportedBuildOutcome = Ok(Ok((idx, Some(BuildReport::default()))));
+        let result = classify_reported_outcome(Path::new("/tmp"), outcome);
         assert!(matches!(result, IndexReadiness::Ready(_)));
     }
 
     /// Error arm: `Ok(Err(e))` → `Failed` carrying the error message.
     #[test]
-    fn classify_build_outcome_err_yields_failed() {
+    fn classify_reported_outcome_err_yields_failed() {
         let e: Box<dyn std::error::Error> = "scanner failed".into();
-        let outcome: Result<
-            Result<CodebaseIndex, Box<dyn std::error::Error>>,
-            Box<dyn std::any::Any + Send>,
-        > = Ok(Err(e));
-        let result = classify_build_outcome(Path::new("/tmp"), outcome);
+        let outcome: ReportedBuildOutcome = Ok(Err(e));
+        let result = classify_reported_outcome(Path::new("/tmp"), outcome);
         match result {
             IndexReadiness::Failed(msg) => assert!(msg.contains("scanner failed"), "msg: {msg}"),
             IndexReadiness::Building => panic!("expected Failed, got Building"),
@@ -5142,16 +5125,13 @@ mod tests {
     /// Panic arm: `Err(payload)` → `Failed("indexing panicked: …")`.
     ///
     /// This is the R0 fix: a panicking `build_index` call must never leave the
-    /// shared readiness cell at `Building` forever. `classify_build_outcome`
+    /// shared readiness cell at `Building` forever. `classify_reported_outcome`
     /// is the single place that converts a panic payload to `Failed`.
     #[test]
-    fn classify_build_outcome_panic_yields_failed() {
+    fn classify_reported_outcome_panic_yields_failed() {
         let panic_payload: Box<dyn std::any::Any + Send> = Box::new("tree-sitter exploded");
-        let outcome: Result<
-            Result<CodebaseIndex, Box<dyn std::error::Error>>,
-            Box<dyn std::any::Any + Send>,
-        > = Err(panic_payload);
-        let result = classify_build_outcome(Path::new("/tmp"), outcome);
+        let outcome: ReportedBuildOutcome = Err(panic_payload);
+        let result = classify_reported_outcome(Path::new("/tmp"), outcome);
         match result {
             IndexReadiness::Failed(msg) => {
                 assert!(msg.contains("indexing panicked"), "msg: {msg}");
@@ -5166,7 +5146,7 @@ mod tests {
     /// Integration: a thread that panics during indexing publishes `Failed` into
     /// the shared cell — the cell must never stay `Building`.
     ///
-    /// Exercises the full `catch_unwind` + `classify_build_outcome` + write-lock
+    /// Exercises the full `catch_unwind` + `classify_reported_outcome` + write-lock
     /// path that `spawn_mcp_index_build` uses in production.
     #[test]
     fn panicking_build_thread_publishes_failed_not_building() {
@@ -5175,11 +5155,11 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> Result<CodebaseIndex, Box<dyn std::error::Error>> {
+                || -> Result<(CodebaseIndex, Option<BuildReport>), Box<dyn std::error::Error>> {
                     panic!("deliberate panic in indexing thread");
                 },
             ));
-            let next = classify_build_outcome(Path::new("/tmp"), outcome);
+            let next = classify_reported_outcome(Path::new("/tmp"), outcome);
             match readiness_clone.write() {
                 Ok(mut g) => *g = next,
                 Err(poisoned) => *poisoned.into_inner() = next,
