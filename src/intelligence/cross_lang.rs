@@ -2130,4 +2130,55 @@ subprocess.run(["my-binary", "--arg"])
         );
         assert_eq!(edges[0].target_file, "tools/helper.sh");
     }
+
+    /// ADR-0210: cross-language edges come back in a total order, so a restored
+    /// index and a freshly built one compare equal and output is reproducible.
+    /// The fixture lists the later-sorting caller first, so detection order
+    /// alone is not sorted.
+    #[test]
+    fn cross_lang_edges_are_sorted() {
+        let index = build_index(&[
+            (
+                "zz/client.ts",
+                "typescript",
+                r#"async function a() { return fetch("/api/users"); }"#,
+            ),
+            (
+                "aa/client.ts",
+                "typescript",
+                r#"async function b() { return fetch("/api/users"); }"#,
+            ),
+            (
+                "backend/users.py",
+                "python",
+                r#"from fastapi import FastAPI
+@app.get("/api/users")
+def get_users():
+    return []
+"#,
+            ),
+        ]);
+        let edges = detect_cross_lang_edges(&index);
+        assert!(
+            edges.len() >= 2,
+            "fixture must yield two bridges: {edges:?}"
+        );
+        let key = |e: &CrossLangEdge| {
+            (
+                e.source_file.clone(),
+                e.target_file.clone(),
+                e.bridge_type.clone(),
+                e.source_symbol.clone(),
+                e.target_symbol.clone(),
+                e.source_language.clone(),
+                e.target_language.clone(),
+            )
+        };
+        let mut sorted = edges.clone();
+        sorted.sort_by_key(key);
+        assert_eq!(
+            edges.iter().map(key).collect::<Vec<_>>(),
+            sorted.iter().map(key).collect::<Vec<_>>()
+        );
+    }
 }

@@ -11202,3 +11202,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "warm_start_tests.rs"]
+mod warm_start_tests;

@@ -1,3 +1,4 @@
+pub(crate) mod artifacts;
 pub mod parse;
 
 use crate::parser::language::ParseResult;
@@ -1020,5 +1021,32 @@ mod tests {
         assert_eq!(lib_entry.size_bytes, 1024);
 
         assert!(!map.contains_key("src/unknown.rs"));
+    }
+
+    /// ADR-0210: the digest step is shared — a fingerprint built from
+    /// already-computed stripped-body hashes is byte-identical to the one
+    /// `content_fingerprint` computes from content.
+    #[test]
+    fn fingerprint_from_hashes_matches_content_fingerprint() {
+        use sha2::{Digest, Sha256};
+        let files = vec![
+            ("src/b.rs".to_string(), "fn b() {}\n".to_string()),
+            (
+                "docs/note.md".to_string(),
+                "---\ntitle: x\n---\nbody\n".to_string(),
+            ),
+            ("src/a.rs".to_string(), "fn a() {}\n".to_string()),
+        ];
+        let pairs: Vec<(&str, String)> = files
+            .iter()
+            .map(|(p, c)| {
+                let body = strip_md_frontmatter(c);
+                (p.as_str(), format!("{:x}", Sha256::digest(body.as_bytes())))
+            })
+            .collect();
+        assert_eq!(
+            fingerprint_from_hashes(pairs, "abc123"),
+            content_fingerprint(&files, "abc123")
+        );
     }
 }

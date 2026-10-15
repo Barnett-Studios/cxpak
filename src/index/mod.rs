@@ -2358,4 +2358,48 @@ mod tests {
         );
         assert!(paths.contains(&"src/ok.rs"), "control — got {paths:?}");
     }
+
+    /// ADR-0210: `compute_file_artifacts` is the single source of per-file
+    /// work — it must produce exactly what an index build stores for the file.
+    #[test]
+    fn compute_file_artifacts_matches_index_build() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = "use std::fmt;\n\n/// Adds.\npub fn add_numbers(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub struct Point { pub x: i32 }\n";
+        std::fs::write(root.join("src/lib.rs"), source).unwrap();
+        git2::Repository::init(root).unwrap();
+
+        let index = crate::commands::serve::build_index(root).unwrap();
+        let built = index
+            .files
+            .iter()
+            .find(|f| f.relative_path == "src/lib.rs")
+            .expect("src/lib.rs indexed");
+
+        let registry = crate::parser::LanguageRegistry::new();
+        let counter = TokenCounter::new();
+        let art = compute_file_artifacts(source, Some("rust"), &registry, &counter);
+
+        assert_eq!(art.token_count, built.token_count);
+        assert_eq!(
+            serde_json::to_value(&art.parse_result).unwrap(),
+            serde_json::to_value(&built.parse_result).unwrap()
+        );
+        assert!(art.parse_result.is_some(), "rust must parse");
+        assert_eq!(&art.term_frequencies, &index.term_frequencies["src/lib.rs"]);
+    }
+
+    #[test]
+    fn compute_file_artifacts_unknown_language_has_no_parse() {
+        let registry = crate::parser::LanguageRegistry::new();
+        let counter = TokenCounter::new();
+        let art = compute_file_artifacts("plain words here", None, &registry, &counter);
+        assert!(art.parse_result.is_none());
+        assert_eq!(art.token_count, counter.count_or_zero("plain words here"));
+        assert_eq!(
+            art.term_frequencies,
+            compute_term_frequencies("plain words here")
+        );
+    }
 }
