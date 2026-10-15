@@ -245,9 +245,71 @@ impl SettledRead {
     /// [`CodebaseIndex::build_with_settled_content`]) that are about to move
     /// the content into an `IndexedFile` anyway and would otherwise pay an
     /// extra clone.
-    fn into_parts(self) -> (String, Option<u64>) {
+    pub(crate) fn into_parts(self) -> (String, Option<u64>) {
         (self.content, self.mtime_ns)
     }
+}
+
+/// Everything derived from one file's content: the unit of work the artifact
+/// store persists (ADR-0210).
+pub(crate) struct FileArtifacts {
+    pub(crate) parse_result: Option<ParseResult>,
+    pub(crate) token_count: usize,
+    pub(crate) term_frequencies: HashMap<String, u32>,
+}
+
+// Per-file work runs on rayon threads sharing one counter and one registry.
+const _: fn() = || {
+    fn sync<T: Sync>() {}
+    sync::<TokenCounter>();
+    sync::<crate::parser::LanguageRegistry>();
+};
+
+/// Parse `content` with the tree-sitter grammar for `language`, if one is
+/// registered. `None` for an unknown language or a failed parse.
+pub(crate) fn parse_source(
+    content: &str,
+    language: Option<&str>,
+    registry: &crate::parser::LanguageRegistry,
+) -> Option<ParseResult> {
+    let lang = registry.get(language?)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang.ts_language()).ok();
+    let tree = parser.parse(content, None)?;
+    Some(lang.extract(content, &tree))
+}
+
+/// Parse, count tokens and compute term frequencies for one file's content.
+pub(crate) fn compute_file_artifacts(
+    content: &str,
+    language: Option<&str>,
+    registry: &crate::parser::LanguageRegistry,
+    counter: &TokenCounter,
+) -> FileArtifacts {
+    FileArtifacts {
+        parse_result: parse_source(content, language, registry),
+        token_count: counter.count_or_zero(content),
+        term_frequencies: compute_term_frequencies(content),
+    }
+}
+
+/// One file ready for index assembly: scan metadata, the settled content and
+/// its per-file artifacts.
+pub(crate) struct ArtifactFile {
+    pub(crate) relative_path: String,
+    pub(crate) language: Option<String>,
+    pub(crate) size_bytes: u64,
+    pub(crate) content: String,
+    pub(crate) mtime_ns: Option<u64>,
+    pub(crate) artifacts: FileArtifacts,
+}
+
+/// Graph, PageRank and call graph restored from a derived-cache hit, so
+/// `finish_build` does not compute what it would immediately overwrite.
+pub(crate) struct Precomputed {
+    pub(crate) graph: DependencyGraph,
+    pub(crate) pagerank: HashMap<String, f64>,
+    pub(crate) call_graph: CallGraph,
 }
 
 impl CodebaseIndex {
@@ -307,6 +369,7 @@ impl CodebaseIndex {
             total_tokens,
             total_bytes,
             term_frequencies,
+            None,
         )
     }
 
@@ -315,8 +378,8 @@ impl CodebaseIndex {
     // (cxpak 3.0.0 Phase 0 de-cycle). The orchestration constructors below stay
     // here.
 
-    /// Construction tail shared by `build`, `build_with_content`, and
-    /// `build_with_settled_content`: wraps the already-populated per-file
+    /// Construction tail shared by `build`, `build_with_content`,
+    /// `build_with_settled_content` and `from_artifacts`: wraps the already-populated per-file
     /// data into a `CodebaseIndex` and runs the schema/graph/pagerank/
     /// test_map/call_graph/cross-language passes, which are identical
     /// regardless of how each file's content was obtained.
@@ -326,6 +389,7 @@ impl CodebaseIndex {
         total_tokens: usize,
         total_bytes: u64,
         term_frequencies: HashMap<String, HashMap<String, u32>>,
+        precomputed: Option<Precomputed>,
     ) -> Self {
         let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
 
@@ -351,9 +415,22 @@ impl CodebaseIndex {
             health_cache: Arc::new(OnceLock::new()),
         };
         index.schema = crate::schema::detect::build_schema_index(&index);
-        index.graph =
-            crate::index::graph::build_dependency_graph(&index.files, index.schema.as_ref());
-        index.pagerank = crate::intelligence::pagerank::compute_pagerank(&index.graph, 0.85, 100);
+        let restored = precomputed.is_some();
+        match precomputed {
+            Some(p) => {
+                index.graph = p.graph;
+                index.pagerank = p.pagerank;
+                index.call_graph = p.call_graph;
+            }
+            None => {
+                index.graph = crate::index::graph::build_dependency_graph(
+                    &index.files,
+                    index.schema.as_ref(),
+                );
+                index.pagerank =
+                    crate::intelligence::pagerank::compute_pagerank(&index.graph, 0.85, 100);
+            }
+        }
         let all_paths: std::collections::HashSet<String> = index
             .files
             .iter()
@@ -365,18 +442,24 @@ impl CodebaseIndex {
             &all_paths,
             crate_name.as_deref(),
         );
-        index.call_graph = crate::intelligence::call_graph::build_call_graph(&index);
+        if !restored {
+            index.call_graph = crate::intelligence::call_graph::build_call_graph(&index);
+        }
 
         // v1.5.0: detect cross-language boundaries (HTTP, FFI, gRPC, GraphQL,
         // SharedSchema, CommandExec) and inject them as CrossLanguage edges
-        // so PageRank, blast-radius, and auto_context all see them.
+        // so PageRank, blast-radius, and auto_context all see them. A restored
+        // graph already holds those edges, so they are detected but not
+        // injected again.
         let cross_edges = crate::intelligence::cross_lang::detect_cross_lang_edges(&index);
-        for e in &cross_edges {
-            index.graph.add_edge(
-                &e.source_file,
-                &e.target_file,
-                crate::index::graph::EdgeType::CrossLanguage(e.bridge_type.clone()),
-            );
+        if !restored {
+            for e in &cross_edges {
+                index.graph.add_edge(
+                    &e.source_file,
+                    &e.target_file,
+                    crate::index::graph::EdgeType::CrossLanguage(e.bridge_type.clone()),
+                );
+            }
         }
         index.cross_lang_edges = cross_edges;
 
@@ -486,6 +569,7 @@ impl CodebaseIndex {
             total_tokens,
             total_bytes,
             term_frequencies,
+            None,
         )
     }
 
@@ -508,26 +592,55 @@ impl CodebaseIndex {
         counter: &TokenCounter,
         mut settled: HashMap<String, SettledRead>,
     ) -> Self {
+        let cap_bytes = max_file_bytes();
+        let artifact_files = files
+            .into_iter()
+            .filter_map(|file| {
+                let (content, mtime_ns) = match settled.remove(&file.relative_path) {
+                    Some(s) => s.into_parts(),
+                    None => {
+                        SettledRead::from_disk(&file.absolute_path, file.size_bytes, cap_bytes)?
+                            .into_parts()
+                    }
+                };
+                let artifacts = FileArtifacts {
+                    parse_result: parse_results.get(&file.relative_path).cloned(),
+                    token_count: counter.count_or_zero(&content),
+                    term_frequencies: compute_term_frequencies(&content),
+                };
+                Some(ArtifactFile {
+                    relative_path: file.relative_path,
+                    language: file.language,
+                    size_bytes: file.size_bytes,
+                    content,
+                    mtime_ns,
+                    artifacts,
+                })
+            })
+            .collect();
+        Self::from_artifacts(artifact_files, None)
+    }
+
+    /// Assemble an index from files whose per-file artifacts are already
+    /// computed (or restored from the artifact store), in input order. With
+    /// `precomputed` set, the graph, PageRank and call graph are restored
+    /// instead of recomputed (ADR-0210).
+    pub(crate) fn from_artifacts(
+        files: Vec<ArtifactFile>,
+        precomputed: Option<Precomputed>,
+    ) -> Self {
         let mut language_stats: HashMap<String, LanguageStats> = HashMap::new();
-        let mut indexed_files = Vec::new();
+        let mut indexed_files = Vec::with_capacity(files.len());
         let mut total_tokens = 0usize;
         let mut total_bytes = 0u64;
-        let mut term_frequencies = HashMap::new();
+        let mut term_frequencies = HashMap::with_capacity(files.len());
 
-        let cap_bytes = max_file_bytes();
-        for file in &files {
-            let (file_content, mtime_ns) = match settled.remove(&file.relative_path) {
-                Some(s) => s.into_parts(),
-                None => {
-                    let Some(s) =
-                        SettledRead::from_disk(&file.absolute_path, file.size_bytes, cap_bytes)
-                    else {
-                        continue;
-                    };
-                    s.into_parts()
-                }
-            };
-            let token_count = counter.count_or_zero(&file_content);
+        for file in files {
+            let FileArtifacts {
+                parse_result,
+                token_count,
+                term_frequencies: file_terms,
+            } = file.artifacts;
             total_tokens += token_count;
             total_bytes += file.size_bytes;
 
@@ -542,20 +655,15 @@ impl CodebaseIndex {
                 stats.total_tokens += token_count;
             }
 
-            term_frequencies.insert(
-                file.relative_path.clone(),
-                compute_term_frequencies(&file_content),
-            );
-
-            let parse_result = parse_results.get(&file.relative_path).cloned();
+            term_frequencies.insert(file.relative_path.clone(), file_terms);
             indexed_files.push(Arc::new(IndexedFile {
-                relative_path: file.relative_path.clone(),
-                language: file.language.clone(),
+                relative_path: file.relative_path,
+                language: file.language,
                 size_bytes: file.size_bytes,
                 token_count,
                 parse_result,
-                content: file_content,
-                mtime_ns,
+                content: file.content,
+                mtime_ns: file.mtime_ns,
             }));
         }
 
@@ -565,6 +673,7 @@ impl CodebaseIndex {
             total_tokens,
             total_bytes,
             term_frequencies,
+            precomputed,
         )
     }
 
@@ -2357,5 +2466,49 @@ mod tests {
             "the incremental path reads too, and had the same default — got {paths:?}"
         );
         assert!(paths.contains(&"src/ok.rs"), "control — got {paths:?}");
+    }
+
+    /// ADR-0210: `compute_file_artifacts` is the single source of per-file
+    /// work — it must produce exactly what an index build stores for the file.
+    #[test]
+    fn compute_file_artifacts_matches_index_build() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = "use std::fmt;\n\n/// Adds.\npub fn add_numbers(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub struct Point { pub x: i32 }\n";
+        std::fs::write(root.join("src/lib.rs"), source).unwrap();
+        git2::Repository::init(root).unwrap();
+
+        let index = crate::commands::serve::build_index(root).unwrap();
+        let built = index
+            .files
+            .iter()
+            .find(|f| f.relative_path == "src/lib.rs")
+            .expect("src/lib.rs indexed");
+
+        let registry = crate::parser::LanguageRegistry::new();
+        let counter = TokenCounter::new();
+        let art = compute_file_artifacts(source, Some("rust"), &registry, &counter);
+
+        assert_eq!(art.token_count, built.token_count);
+        assert_eq!(
+            serde_json::to_value(&art.parse_result).unwrap(),
+            serde_json::to_value(&built.parse_result).unwrap()
+        );
+        assert!(art.parse_result.is_some(), "rust must parse");
+        assert_eq!(&art.term_frequencies, &index.term_frequencies["src/lib.rs"]);
+    }
+
+    #[test]
+    fn compute_file_artifacts_unknown_language_has_no_parse() {
+        let registry = crate::parser::LanguageRegistry::new();
+        let counter = TokenCounter::new();
+        let art = compute_file_artifacts("plain words here", None, &registry, &counter);
+        assert!(art.parse_result.is_none());
+        assert_eq!(art.token_count, counter.count_or_zero("plain words here"));
+        assert_eq!(
+            art.term_frequencies,
+            compute_term_frequencies("plain words here")
+        );
     }
 }

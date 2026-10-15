@@ -26,7 +26,9 @@ pub use crate::core_graph::intel::CrossLangEdge;
 // Public entry point: chain every sub-detector.
 // ---------------------------------------------------------------------------
 
-/// Run every cross-language detector and return the merged list of edges.
+/// Run every cross-language detector and return the merged list of edges,
+/// sorted by (source_file, target_file, bridge_type, source_symbol,
+/// target_symbol, source_language, target_language).
 pub fn detect_cross_lang_edges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
     let mut out = Vec::new();
     out.extend(detect_http_bridges(index));
@@ -35,6 +37,27 @@ pub fn detect_cross_lang_edges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
     out.extend(detect_graphql_bridges(index));
     out.extend(detect_shared_schema_bridges(index));
     out.extend(detect_command_exec_bridges(index));
+    // Total order: sub-detectors iterate hash maps, so detection order is arbitrary.
+    out.sort_by(|a, b| {
+        (
+            &a.source_file,
+            &a.target_file,
+            &a.bridge_type,
+            &a.source_symbol,
+            &a.target_symbol,
+            &a.source_language,
+            &a.target_language,
+        )
+            .cmp(&(
+                &b.source_file,
+                &b.target_file,
+                &b.bridge_type,
+                &b.source_symbol,
+                &b.target_symbol,
+                &b.source_language,
+                &b.target_language,
+            ))
+    });
     out
 }
 
@@ -2129,5 +2152,56 @@ subprocess.run(["my-binary", "--arg"])
             "one unambiguous binary must still link — got {edges:?}"
         );
         assert_eq!(edges[0].target_file, "tools/helper.sh");
+    }
+
+    /// ADR-0210: cross-language edges come back in a total order, so a restored
+    /// index and a freshly built one compare equal and output is reproducible.
+    /// The fixture lists the later-sorting caller first, so detection order
+    /// alone is not sorted.
+    #[test]
+    fn cross_lang_edges_are_sorted() {
+        let index = build_index(&[
+            (
+                "zz/client.ts",
+                "typescript",
+                r#"async function a() { return fetch("/api/users"); }"#,
+            ),
+            (
+                "aa/client.ts",
+                "typescript",
+                r#"async function b() { return fetch("/api/users"); }"#,
+            ),
+            (
+                "backend/users.py",
+                "python",
+                r#"from fastapi import FastAPI
+@app.get("/api/users")
+def get_users():
+    return []
+"#,
+            ),
+        ]);
+        let edges = detect_cross_lang_edges(&index);
+        assert!(
+            edges.len() >= 2,
+            "fixture must yield two bridges: {edges:?}"
+        );
+        let key = |e: &CrossLangEdge| {
+            (
+                e.source_file.clone(),
+                e.target_file.clone(),
+                e.bridge_type.clone(),
+                e.source_symbol.clone(),
+                e.target_symbol.clone(),
+                e.source_language.clone(),
+                e.target_language.clone(),
+            )
+        };
+        let mut sorted = edges.clone();
+        sorted.sort_by_key(key);
+        assert_eq!(
+            edges.iter().map(key).collect::<Vec<_>>(),
+            sorted.iter().map(key).collect::<Vec<_>>()
+        );
     }
 }

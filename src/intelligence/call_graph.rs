@@ -723,6 +723,14 @@ fn collect_calls_by_symbol(
 // Cross-file call graph construction
 // ---------------------------------------------------------------------------
 
+// Counts `build_call_graph` calls per thread so tests can prove a derived-cache
+// hit skips the pass (ADR-0210).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BUILD_CALL_GRAPH_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Build the full cross-file call graph from an indexed codebase.
 ///
 /// Algorithm:
@@ -735,6 +743,8 @@ fn collect_calls_by_symbol(
 ///    Approximate (the call exists but we cannot prove it's this specific file).
 /// 3. Unresolvable calls (name not exported anywhere) go into `unresolved`.
 pub fn build_call_graph(index: &crate::core_graph::CodebaseIndex) -> CallGraph {
+    #[cfg(test)]
+    BUILD_CALL_GRAPH_CALLS.with(|c| c.set(c.get() + 1));
     // Build a lookup: symbol_name -> Vec<file_path> (files that export this symbol)
     let mut symbol_exports: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();

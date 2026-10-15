@@ -1,3 +1,7 @@
+// The stat-index API is deprecated since 3.5.0 (ADR-0210) but stays public until 4.0,
+// so its contract is still tested.
+#![allow(deprecated)]
+
 /// Integration tests for the stat-index fast-path (Task 0.2).
 ///
 /// The stat-index accelerates `content_fingerprint` by skipping SHA-256

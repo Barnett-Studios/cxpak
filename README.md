@@ -364,7 +364,7 @@ grammar parses badly. `.cxpakignore.example` in this repo is a starting point.
 
 ## Caching
 
-Parse results cached in `.cxpak/cache/` keyed on file mtime and size. Cache invalidates automatically when tree-sitter grammar versions change. Atomic writes with advisory locking for concurrent process safety. `cxpak clean .` to reset.
+Per-file artifacts (parse result, token count, term frequencies) are cached in `.cxpak/cache/artifacts.json`, each keyed on the SHA-256 of the bytes it was computed from, so a restart re-does work only for files whose content changed (ADR-0210). The derived graph/PageRank/call graph cache is keyed on a fingerprint of the same fresh hashes plus `HEAD`. Both invalidate automatically when tree-sitter grammar versions change, use atomic writes with advisory locking for concurrent processes, and are safe to delete. `cxpak clean .` to reset.
 
 ## Rust client (non-default `client` feature)
 

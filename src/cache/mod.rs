@@ -1,3 +1,9 @@
+// FileCache, CacheEntry, StatIndex and content_fingerprint_with_stat_index are
+// deprecated for external callers (ADR-0210) but keep their implementations and
+// tests here until 4.0.
+#![allow(deprecated)]
+
+pub(crate) mod artifacts;
 pub mod parse;
 
 use crate::parser::language::ParseResult;
@@ -25,6 +31,10 @@ use std::path::Path;
 pub const CACHE_VERSION: u32 = 6;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[deprecated(
+    since = "3.5.0",
+    note = "superseded by the internal artifact store and exact fingerprint (ADR-0210); removed in 4.0"
+)]
 pub struct FileCache {
     pub version: u32,
     /// SHA-like hash of all tree-sitter grammar versions at compile time.
@@ -35,6 +45,10 @@ pub struct FileCache {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[deprecated(
+    since = "3.5.0",
+    note = "superseded by the internal artifact store and exact fingerprint (ADR-0210); removed in 4.0"
+)]
 pub struct CacheEntry {
     pub relative_path: String,
     pub mtime: i64,
@@ -53,9 +67,9 @@ pub struct CacheEntry {
 }
 
 /// Grammar hash computed at compile time by build.rs.
-const CURRENT_GRAMMAR_HASH: &str = env!("CXPAK_GRAMMAR_HASH");
+pub(crate) const CURRENT_GRAMMAR_HASH: &str = env!("CXPAK_GRAMMAR_HASH");
 
-fn lock_cache(cache_dir: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn lock_cache(cache_dir: &Path) -> std::io::Result<std::fs::File> {
     let lock_path = cache_dir.join("cache.lock");
     let lock_file = OpenOptions::new()
         .write(true)
@@ -134,6 +148,10 @@ impl Default for FileCache {
 
 /// A single entry in the stat-index.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[deprecated(
+    since = "3.5.0",
+    note = "superseded by the internal artifact store and exact fingerprint (ADR-0210); removed in 4.0"
+)]
 pub struct StatIndexEntry {
     /// Mtime of the file in nanoseconds since UNIX epoch.
     pub mtime_ns: u64,
@@ -148,6 +166,10 @@ pub struct StatIndexEntry {
 /// Stored as `.cxpak/cache/<namespace>/stat_index.json`.  Invalidated on
 /// `CACHE_VERSION` mismatch (same lock/atomic-save infra as `FileCache`).
 #[derive(Debug, Serialize, Deserialize)]
+#[deprecated(
+    since = "3.5.0",
+    note = "superseded by the internal artifact store and exact fingerprint (ADR-0210); removed in 4.0"
+)]
 pub struct StatIndex {
     pub version: u32,
     pub entries: HashMap<String, StatIndexEntry>,
@@ -266,6 +288,24 @@ pub fn strip_md_frontmatter(content: &str) -> &str {
 // hashes are not). Fail-closed: any mismatch / corruption → full rebuild.
 // ---------------------------------------------------------------------------
 
+/// Digest step shared by every fingerprint: `pairs` are `(relative_path,
+/// sha256 of the frontmatter-stripped body)`; sorted here, so input order is
+/// irrelevant.
+pub(crate) fn fingerprint_from_hashes(mut pairs: Vec<(&str, String)>, head_oid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = Sha256::new();
+    for (path, content_hash) in &pairs {
+        hasher.update(path.as_bytes());
+        hasher.update(b":");
+        hasher.update(content_hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(b"HEAD:");
+    hasher.update(head_oid.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// SHA-256 content fingerprint over `(relative_path, sha256(content))` pairs
 /// (sorted for determinism) plus the git HEAD oid. Two checkouts with identical
 /// file contents and HEAD produce the same fingerprint on any machine; a
@@ -279,7 +319,7 @@ pub fn strip_md_frontmatter(content: &str) -> &str {
 /// [`content_fingerprint_with_stat_index`] to skip re-hashing unchanged files.
 pub fn content_fingerprint(files: &[(String, String)], head_oid: &str) -> String {
     use sha2::{Digest, Sha256};
-    let mut pairs: Vec<(&str, String)> = files
+    let pairs: Vec<(&str, String)> = files
         .iter()
         .map(|(path, content)| {
             let body = strip_md_frontmatter(content);
@@ -289,17 +329,7 @@ pub fn content_fingerprint(files: &[(String, String)], head_oid: &str) -> String
             )
         })
         .collect();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-    let mut hasher = Sha256::new();
-    for (path, content_hash) in &pairs {
-        hasher.update(path.as_bytes());
-        hasher.update(b":");
-        hasher.update(content_hash.as_bytes());
-        hasher.update(b"\n");
-    }
-    hasher.update(b"HEAD:");
-    hasher.update(head_oid.as_bytes());
-    format!("{:x}", hasher.finalize())
+    fingerprint_from_hashes(pairs, head_oid)
 }
 
 /// Stat-index-accelerated variant of [`content_fingerprint`].
@@ -321,6 +351,10 @@ pub fn content_fingerprint(files: &[(String, String)], head_oid: &str) -> String
 ///
 /// The `stat_index` is mutated in place to record updated entries so the
 /// caller can persist it after the call.
+#[deprecated(
+    since = "3.5.0",
+    note = "superseded by the internal exact content fingerprint (ADR-0210); removed in 4.0"
+)]
 pub fn content_fingerprint_with_stat_index<F>(
     files: &[(String, String, u64, u64)],
     head_oid: &str,
@@ -330,8 +364,7 @@ pub fn content_fingerprint_with_stat_index<F>(
 where
     F: Fn(&str) -> String,
 {
-    use sha2::{Digest, Sha256};
-    let mut pairs: Vec<(&str, String)> = files
+    let pairs: Vec<(&str, String)> = files
         .iter()
         .map(|(path, content, mtime_ns, size_bytes)| {
             let content_hash = if let Some(entry) = stat_index.entries.get(path.as_str()) {
@@ -367,17 +400,7 @@ where
             (path.as_str(), content_hash)
         })
         .collect();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-    let mut hasher = Sha256::new();
-    for (path, content_hash) in &pairs {
-        hasher.update(path.as_bytes());
-        hasher.update(b":");
-        hasher.update(content_hash.as_bytes());
-        hasher.update(b"\n");
-    }
-    hasher.update(b"HEAD:");
-    hasher.update(head_oid.as_bytes());
-    format!("{:x}", hasher.finalize())
+    fingerprint_from_hashes(pairs, head_oid)
 }
 
 /// Persisted derived analysis. Validated on load by `version` + `grammar_hash`
@@ -1020,5 +1043,32 @@ mod tests {
         assert_eq!(lib_entry.size_bytes, 1024);
 
         assert!(!map.contains_key("src/unknown.rs"));
+    }
+
+    /// ADR-0210: the digest step is shared — a fingerprint built from
+    /// already-computed stripped-body hashes is byte-identical to the one
+    /// `content_fingerprint` computes from content.
+    #[test]
+    fn fingerprint_from_hashes_matches_content_fingerprint() {
+        use sha2::{Digest, Sha256};
+        let files = vec![
+            ("src/b.rs".to_string(), "fn b() {}\n".to_string()),
+            (
+                "docs/note.md".to_string(),
+                "---\ntitle: x\n---\nbody\n".to_string(),
+            ),
+            ("src/a.rs".to_string(), "fn a() {}\n".to_string()),
+        ];
+        let pairs: Vec<(&str, String)> = files
+            .iter()
+            .map(|(p, c)| {
+                let body = strip_md_frontmatter(c);
+                (p.as_str(), format!("{:x}", Sha256::digest(body.as_bytes())))
+            })
+            .collect();
+        assert_eq!(
+            fingerprint_from_hashes(pairs, "abc123"),
+            content_fingerprint(&files, "abc123")
+        );
     }
 }

@@ -235,10 +235,14 @@ fn test_trace_creates_cache() {
         .assert()
         .success();
 
-    let cache_file = repo.path().join(".cxpak").join("cache").join("cache.json");
+    let cache_file = repo
+        .path()
+        .join(".cxpak")
+        .join("cache")
+        .join("artifacts.json");
     assert!(
         cache_file.exists(),
-        "cache.json should be created after trace"
+        "artifacts.json should be created after trace"
     );
 }
 

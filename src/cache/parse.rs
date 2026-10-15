@@ -1,45 +1,24 @@
 use crate::budget::counter::TokenCounter;
-use crate::cache::{CacheEntry, FileCache};
+use crate::cache::artifacts::{merge_store_entries, ArtifactEntry, ArtifactStore};
+use crate::index::parse_source;
 use crate::parser::language::ParseResult;
 use crate::parser::LanguageRegistry;
 use crate::scanner::ScannedFile;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-/// Files larger than this are skipped by the parser to avoid runaway memory
-/// usage (e.g. large generated files that slipped through the blocklist).
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
-
-/// Get the mtime of a file in nanoseconds since UNIX epoch, or 0 on failure.
-///
-/// Delegates to [`crate::cache::file_mtime_ns`] rather than stat'ing
-/// independently. This used to truncate to whole seconds (`.as_secs()`): a
-/// same-size edit landing within the same wall-clock second as the cached
-/// entry then had an identical `(mtime, size)` pair and the cache-hit check
-/// below (`entry.mtime == mtime`) silently served the stale parse — the
-/// cxpak#36 bug, here in the parse cache rather than the index's
-/// `incremental_rebuild`. Nanosecond precision closes that window.
-///
-/// `CacheEntry.mtime`'s historical type (`i64`) is unchanged: a cache
-/// written before this fix holds a whole-second value, many orders of
-/// magnitude smaller than a freshly stat'd nanosecond value, so it simply
-/// never equals a fresh stat post-upgrade — a one-time, safe cache miss
-/// (always re-parsed) rather than a silent corrupt match. No `CACHE_VERSION`
-/// bump is needed: the field still deserializes fine, and every mismatch
-/// path here already falls back to a full re-parse, never a stale read.
-fn file_mtime(path: &Path) -> i64 {
-    crate::cache::file_mtime_ns(path) as i64
-}
-
 /// Parse all `files` using tree-sitter, with a persistent disk cache stored
-/// under `<repo_root>/.cxpak/cache/`.
+/// under `<repo_root>/.cxpak/cache/` (the artifact store, ADR-0210).
 ///
 /// For each file the function:
-/// 1. Checks whether a valid cache entry exists (matching mtime + size).
-/// 2. On a cache hit, reuses the stored `ParseResult`.
-/// 3. On a cache miss, parses the file with tree-sitter and records the result.
-/// 4. Saves the updated cache back to disk.
+/// 1. Checks whether the store holds an entry whose (mtime_ns, size) match.
+/// 2. On a hit, reuses the stored `ParseResult` without reading the file.
+/// 3. On a miss, reads the file, hashes its bytes, parses it with tree-sitter
+///    and records an entry that leaves `token_count` and `term_frequencies`
+///    unset (this path computes neither).
+/// 4. Merges the fresh entries into the store and saves it.
 ///
 /// Returns a tuple of:
 /// - A `HashMap` mapping `relative_path → ParseResult` for every file that could be parsed.
@@ -51,175 +30,137 @@ pub fn parse_with_cache(
     counter: &TokenCounter,
     verbose: bool,
 ) -> (HashMap<String, ParseResult>, HashMap<String, String>) {
+    parse_with_cache_capped(
+        files,
+        repo_root,
+        counter,
+        verbose,
+        crate::index::max_file_bytes(),
+    )
+}
+
+/// [`parse_with_cache`] with an explicit file-size cap, so the CLI skips
+/// exactly the files the index path skips (`CXPAK_MAX_FILE_BYTES`).
+fn parse_with_cache_capped(
+    files: &[ScannedFile],
+    repo_root: &Path,
+    _counter: &TokenCounter,
+    verbose: bool,
+    cap_bytes: u64,
+) -> (HashMap<String, ParseResult>, HashMap<String, String>) {
     if verbose {
         eprintln!("cxpak: parsing with tree-sitter");
     }
 
     let cache_dir = repo_root.join(".cxpak").join("cache");
-    let existing_cache = FileCache::load(&cache_dir);
-    let cache_map = existing_cache.as_map();
-
+    let store = ArtifactStore::load(&cache_dir);
     let registry = LanguageRegistry::new();
 
-    // Parse all files in parallel. Each iteration is independent: it reads the
-    // cache map (shared read-only), creates its own tree-sitter Parser, and
-    // reads source from disk. Results are collected and then assembled
-    // sequentially below.
-    //
-    // The tuple carries an `Option<String>` for the source that was read on a
-    // cache miss so that callers can avoid re-reading files that we already
-    // read here.
-    let per_file_results: Vec<(Option<ParseResult>, CacheEntry, Option<String>)> = files
+    // Each iteration is independent: it reads the store (shared, read-only),
+    // creates its own tree-sitter Parser and reads source from disk.
+    let outcomes: Vec<Option<Outcome>> = files
         .par_iter()
         .map(|file| {
-            let mtime = file_mtime(&file.absolute_path);
+            let mtime_ns = crate::cache::file_mtime_ns(&file.absolute_path);
             let size_bytes = file.size_bytes;
 
-            // Check for a valid cache hit.
-            let cached_parse = if let Some(entry) = cache_map.get(file.relative_path.as_str()) {
-                if entry.mtime == mtime && entry.size_bytes == size_bytes {
-                    Some((entry.parse_result.clone(), entry.token_count))
-                } else {
-                    None
+            // Skip files that exceed the size cap to avoid runaway memory usage.
+            if size_bytes > cap_bytes {
+                eprintln!(
+                    "cxpak: skipping parse of {} ({} bytes > {} byte limit)",
+                    file.absolute_path.display(),
+                    size_bytes,
+                    cap_bytes
+                );
+                return None;
+            }
+
+            if let Some(entry) = store.entries.get(&file.relative_path) {
+                if mtime_ns != 0
+                    && entry.mtime_ns == mtime_ns
+                    && entry.size_bytes == size_bytes
+                    && entry.language == file.language
+                {
+                    return Some(Outcome {
+                        parse_result: entry.parse_result.clone(),
+                        fresh: None,
+                    });
                 }
-            } else {
-                None
-            };
+            }
 
-            let (parse_result, source_opt) = if let Some((pr, _token_count)) = cached_parse {
-                // Cache hit — no disk read needed.
-                (pr, None)
-            } else {
-                // Cache miss — parse with tree-sitter. Each thread creates its
-                // own Parser so there is no shared mutable state.
-                let mut result = None;
-                let mut source_read: Option<String> = None;
-
-                // Skip files that exceed the size cap to avoid runaway memory usage.
-                if size_bytes > MAX_FILE_BYTES {
+            let source = match std::fs::read_to_string(&file.absolute_path) {
+                Ok(source) => source,
+                Err(e) => {
                     eprintln!(
-                        "cxpak: skipping parse of {} ({} bytes > {} byte limit)",
+                        "cxpak: failed to read {}: {}",
                         file.absolute_path.display(),
-                        size_bytes,
-                        MAX_FILE_BYTES
+                        e
                     );
-                    return (
-                        None,
-                        CacheEntry {
-                            relative_path: file.relative_path.clone(),
-                            mtime,
-                            size_bytes,
-                            language: file.language.clone(),
-                            token_count: 0,
-                            parse_result: None,
-                            mtime_ns: None,
-                            content_sha256: None,
-                        },
-                        None,
-                    );
+                    return None;
                 }
-
-                if let Some(lang_name) = &file.language {
-                    if let Some(lang) = registry.get(lang_name) {
-                        let source =
-                            std::fs::read_to_string(&file.absolute_path).unwrap_or_else(|e| {
-                                eprintln!(
-                                    "cxpak: failed to read {}: {}",
-                                    file.absolute_path.display(),
-                                    e
-                                );
-                                String::new()
-                            });
-                        let mut parser = tree_sitter::Parser::new();
-                        if parser.set_language(&lang.ts_language()).is_ok() {
-                            if let Some(tree) = parser.parse(&source, None) {
-                                result = Some(lang.extract(&source, &tree));
-                            }
-                        }
-                        source_read = Some(source);
-                    }
-                }
-                (result, source_read)
             };
-
-            // Preserve the cached token_count; it will be updated by the
-            // caller after indexing.
-            let token_count = cache_map
-                .get(file.relative_path.as_str())
-                .map(|e| e.token_count)
-                .unwrap_or(0);
-
-            let cache_entry = CacheEntry {
-                relative_path: file.relative_path.clone(),
-                mtime,
+            let parse_result = parse_source(&source, file.language.as_deref(), &registry);
+            let content_sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
+            // Same bytes under a new mtime (a touch, a checkout): the fields
+            // this path does not compute are still valid, so carry them over.
+            let unchanged = store
+                .entries
+                .get(&file.relative_path)
+                .filter(|e| e.content_sha256 == content_sha256 && e.language == file.language);
+            let entry = ArtifactEntry {
+                content_sha256,
+                mtime_ns,
                 size_bytes,
                 language: file.language.clone(),
-                token_count,
                 parse_result: parse_result.clone(),
-                mtime_ns: None,
-                content_sha256: None,
+                token_count: unchanged.and_then(|e| e.token_count),
+                term_frequencies: unchanged.and_then(|e| e.term_frequencies.clone()),
             };
-
-            (parse_result, cache_entry, source_opt)
+            Some(Outcome {
+                parse_result,
+                fresh: Some((source, entry)),
+            })
         })
         .collect();
 
-    // Assemble results sequentially from the parallel output.
     let mut parse_results: HashMap<String, ParseResult> = HashMap::new();
     let mut content_map: HashMap<String, String> = HashMap::new();
-    let mut new_cache_entries: Vec<CacheEntry> = Vec::new();
-    for (pr_opt, cache_entry, source_opt) in per_file_results {
-        if let Some(ref pr) = pr_opt {
-            parse_results.insert(cache_entry.relative_path.clone(), pr.clone());
+    let mut changed: BTreeMap<String, ArtifactEntry> = BTreeMap::new();
+    let mut scanned: BTreeSet<String> = BTreeSet::new();
+    for (file, outcome) in files.iter().zip(outcomes) {
+        let Some(outcome) = outcome else { continue };
+        scanned.insert(file.relative_path.clone());
+        if let Some(pr) = outcome.parse_result {
+            parse_results.insert(file.relative_path.clone(), pr);
         }
-        if let Some(src) = source_opt {
-            content_map.insert(cache_entry.relative_path.clone(), src);
+        if let Some((source, entry)) = outcome.fresh {
+            content_map.insert(file.relative_path.clone(), source);
+            changed.insert(file.relative_path.clone(), entry);
         }
-        new_cache_entries.push(cache_entry);
     }
 
     if verbose {
         eprintln!("cxpak: parsed {} files", parse_results.len());
     }
 
-    // Persist the updated cache.  Token counts are not yet finalised (the
-    // caller will update them after building the index), but we at least
-    // preserve the previously-cached values so repeated invocations benefit
-    // from caching.
-    let mut new_cache = FileCache::new();
-    // Re-compute a rough token count for new entries from the parse result so
-    // that a subsequent call without indexing still gets a useful estimate.
-    for entry in new_cache_entries {
-        let token_count = if entry.token_count == 0 {
-            entry
-                .parse_result
-                .as_ref()
-                .map(|pr| {
-                    let text: String = pr
-                        .symbols
-                        .iter()
-                        .map(|s| s.signature.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    counter.count(&text)
-                })
-                .unwrap_or(0)
-        } else {
-            entry.token_count
-        };
-        new_cache.entries.push(CacheEntry {
-            token_count,
-            ..entry
+    let prune = store.entries.keys().any(|path| !scanned.contains(path));
+    if !changed.is_empty() || prune {
+        let saved = ArtifactStore::update(&cache_dir, |persisted| {
+            merge_store_entries(&mut persisted.entries, changed, &scanned, None);
         });
-    }
-
-    if let Err(e) = new_cache.save(&cache_dir) {
-        if verbose {
+        if let (Err(e), true) = (saved, verbose) {
             eprintln!("cxpak: warning: failed to save cache: {e}");
         }
     }
 
     (parse_results, content_map)
+}
+
+/// One file's result: its parse result, plus the content and store entry when
+/// it was read (a miss).
+struct Outcome {
+    parse_result: Option<ParseResult>,
+    fresh: Option<(String, ArtifactEntry)>,
 }
 
 #[cfg(test)]
@@ -270,10 +211,10 @@ mod tests {
 
         let (_parse_results, _content_map) = parse_with_cache(&files, &root, &counter, false);
 
-        let cache_file = root.join(".cxpak").join("cache").join("cache.json");
+        let cache_file = root.join(".cxpak").join("cache").join("artifacts.json");
         assert!(
             cache_file.exists(),
-            "cache.json should have been created at {cache_file:?}"
+            "artifacts.json should have been created at {cache_file:?}"
         );
     }
 
@@ -314,7 +255,7 @@ mod tests {
         let (results_first, _) = parse_with_cache(&files, &root, &counter, false);
 
         // Verify cache exists.
-        let cache_file = root.join(".cxpak").join("cache").join("cache.json");
+        let cache_file = root.join(".cxpak").join("cache").join("artifacts.json");
         assert!(cache_file.exists());
 
         // Read the cache JSON before the second call.
@@ -461,5 +402,28 @@ mod tests {
                 "expected symbol '{expected_fn}' in parallel parse results, got: {all_symbols:?}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The CLI path honours the same file-size cap as the index path.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_parse_with_cache_capped_skips_over_cap_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_test_repo(&tmp, "pub fn small() {}");
+        let big = format!("pub fn big() {{}}\n// {}\n", "x".repeat(200));
+        fs::write(root.join("src").join("big.rs"), big).unwrap();
+        let counter = TokenCounter::new();
+        let files = scan_files(&root);
+        assert!(files.iter().any(|f| f.relative_path == "src/big.rs"));
+
+        let (results, content) = parse_with_cache_capped(&files, &root, &counter, false, 100);
+
+        assert!(!results.contains_key("src/big.rs"));
+        assert!(!content.contains_key("src/big.rs"));
+        assert!(results.contains_key("src/lib.rs"));
+        let store = ArtifactStore::load(&root.join(".cxpak").join("cache"));
+        assert!(!store.entries.contains_key("src/big.rs"));
+        assert!(store.entries.contains_key("src/lib.rs"));
     }
 }
