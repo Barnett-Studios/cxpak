@@ -71,30 +71,6 @@ pub fn run(
         eprintln!("cxpak [timing]: index      {:.1?}", index_start.elapsed());
     }
 
-    // 4. Refresh the cache with accurate post-index token counts.
-    {
-        let cache_dir = path.join(".cxpak").join("cache");
-        let existing = crate::cache::FileCache::load(&cache_dir);
-        let mut updated = crate::cache::FileCache::new();
-        for entry in existing.entries {
-            let token_count = index
-                .files
-                .iter()
-                .find(|f| f.relative_path == entry.relative_path)
-                .map(|f| f.token_count)
-                .unwrap_or(entry.token_count);
-            updated.entries.push(crate::cache::CacheEntry {
-                token_count,
-                ..entry
-            });
-        }
-        if let Err(e) = updated.save(&cache_dir) {
-            if verbose {
-                eprintln!("cxpak: warning: failed to save cache: {e}");
-            }
-        }
-    }
-
     // 5. Graph is cached on index
     let graph_start = Instant::now();
     if timing {

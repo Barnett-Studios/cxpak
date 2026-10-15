@@ -458,16 +458,20 @@ fn test_cache_created_on_first_run() {
         .assert()
         .success();
 
-    let cache_file = repo.path().join(".cxpak").join("cache").join("cache.json");
+    let cache_file = repo
+        .path()
+        .join(".cxpak")
+        .join("cache")
+        .join("artifacts.json");
     assert!(
         cache_file.exists(),
-        "cache.json should be created after first run"
+        "artifacts.json should be created after first run"
     );
 
     let content = std::fs::read_to_string(&cache_file).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert!(
-        !parsed["entries"].as_array().unwrap().is_empty(),
+        !parsed["entries"].as_object().unwrap().is_empty(),
         "cache should have entries"
     );
 }
@@ -483,7 +487,11 @@ fn test_cache_survives_stale_cleanup() {
         .assert()
         .success();
 
-    let cache_file = repo.path().join(".cxpak").join("cache").join("cache.json");
+    let cache_file = repo
+        .path()
+        .join(".cxpak")
+        .join("cache")
+        .join("artifacts.json");
     assert!(cache_file.exists(), "cache should exist after first run");
 
     // Second run should clean detail files but preserve cache
@@ -551,7 +559,7 @@ fn test_clean_removes_cache_too() {
         .path()
         .join(".cxpak")
         .join("cache")
-        .join("cache.json")
+        .join("artifacts.json")
         .exists());
 
     // Clean removes everything including cache
