@@ -26,7 +26,9 @@ pub use crate::core_graph::intel::CrossLangEdge;
 // Public entry point: chain every sub-detector.
 // ---------------------------------------------------------------------------
 
-/// Run every cross-language detector and return the merged list of edges.
+/// Run every cross-language detector and return the merged list of edges,
+/// sorted by (source_file, target_file, bridge_type, source_symbol,
+/// target_symbol, source_language, target_language).
 pub fn detect_cross_lang_edges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
     let mut out = Vec::new();
     out.extend(detect_http_bridges(index));
@@ -35,6 +37,27 @@ pub fn detect_cross_lang_edges(index: &CodebaseIndex) -> Vec<CrossLangEdge> {
     out.extend(detect_graphql_bridges(index));
     out.extend(detect_shared_schema_bridges(index));
     out.extend(detect_command_exec_bridges(index));
+    // Total order: sub-detectors iterate hash maps, so detection order is arbitrary.
+    out.sort_by(|a, b| {
+        (
+            &a.source_file,
+            &a.target_file,
+            &a.bridge_type,
+            &a.source_symbol,
+            &a.target_symbol,
+            &a.source_language,
+            &a.target_language,
+        )
+            .cmp(&(
+                &b.source_file,
+                &b.target_file,
+                &b.bridge_type,
+                &b.source_symbol,
+                &b.target_symbol,
+                &b.source_language,
+                &b.target_language,
+            ))
+    });
     out
 }
 
