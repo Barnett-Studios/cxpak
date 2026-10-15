@@ -73,3 +73,8 @@ memory before entries move into the index. If this matters, revisit through a bi
 store encoding (ADR-0210, "Revisit if").
 
 The artifact store for scriptorium is 55 MB of JSON (`.cxpak/cache/artifacts.json`).
+
+**Phase 2 gate (spec §8):** a post-commit warm start on the scriptorium clone (an empty commit before
+each start, so per-file artifacts all hit and the derived cache misses) measured **11.7–11.9 s
+(median 11.79 s, n = 5)**, against a 6.0 s gate. The gate fired. The next step is incremental derived
+work (a call graph from cached parse results, and conventions after `Ready`) in its own spec.
