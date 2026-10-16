@@ -15,7 +15,7 @@ use std::path::Path;
 /// File name of the store inside the flat cache dir.
 pub(crate) const ARTIFACT_STORE_FILE: &str = "artifacts.json";
 /// Bumped when the on-disk shape of [`ArtifactStore`] changes.
-pub(crate) const ARTIFACT_STORE_VERSION: u32 = 1;
+pub(crate) const ARTIFACT_STORE_VERSION: u32 = 2;
 
 /// Everything computed from one file's bytes, all of it valid for the bytes
 /// `content_sha256` names (C6). `parse_result: None` means the file has no
@@ -31,6 +31,11 @@ pub(crate) struct ArtifactEntry {
     pub(crate) parse_result: Option<ParseResult>,
     pub(crate) token_count: Option<usize>,
     pub(crate) term_frequencies: Option<BTreeMap<String, u32>>,
+    /// Calls made inside each function, by function name (ADR-0212). `None`
+    /// means not computed by the writer or no tree-sitter extractor for the
+    /// language; the call graph then recomputes it.
+    #[serde(default)]
+    pub(crate) call_sites_by_symbol: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// Content-validated per-file artifacts, keyed by repo-relative path.

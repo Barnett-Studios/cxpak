@@ -687,6 +687,8 @@ fn extract_calls_by_symbol(
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang).ok()?;
     let tree = parser.parse(source, None)?;
+    #[cfg(test)]
+    PARSED_SOURCES.with(|p| p.borrow_mut().push(source.to_string()));
     let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     collect_calls_by_symbol(
         &tree.root_node(),
@@ -729,6 +731,10 @@ fn collect_calls_by_symbol(
 thread_local! {
     pub(crate) static BUILD_CALL_GRAPH_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Every source `extract_calls_by_symbol` parsed on this thread, so tests
+    /// can prove a cached call-site entry replaced the tree-sitter parse.
+    pub(crate) static PARSED_SOURCES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Build the full cross-file call graph from an indexed codebase.
@@ -743,6 +749,25 @@ thread_local! {
 ///    Approximate (the call exists but we cannot prove it's this specific file).
 /// 3. Unresolvable calls (name not exported anywhere) go into `unresolved`.
 pub fn build_call_graph(index: &crate::core_graph::CodebaseIndex) -> CallGraph {
+    build_call_graph_cached(index, &std::collections::HashMap::new()).0
+}
+
+/// Per-file call sites by function name, as persisted in the artifact store.
+pub(crate) type CallSites = std::collections::BTreeMap<String, Vec<String>>;
+
+/// [`build_call_graph`] with per-file call sites supplied by the caller
+/// (ADR-0212).
+///
+/// `cache` maps a repo-relative path to call sites the caller has already
+/// validated against that file's current bytes and language; a hit skips the
+/// tree-sitter parse. The second return value holds the call sites computed
+/// here (cache misses for languages with an extractor) for the caller to
+/// persist. Languages without an extractor keep the per-symbol regex fallback
+/// and appear in neither side.
+pub(crate) fn build_call_graph_cached(
+    index: &crate::core_graph::CodebaseIndex,
+    cache: &std::collections::HashMap<String, CallSites>,
+) -> (CallGraph, std::collections::HashMap<String, CallSites>) {
     #[cfg(test)]
     BUILD_CALL_GRAPH_CALLS.with(|c| c.set(c.get() + 1));
     // Build a lookup: symbol_name -> Vec<file_path> (files that export this symbol)
@@ -800,6 +825,8 @@ pub fn build_call_graph(index: &crate::core_graph::CodebaseIndex) -> CallGraph {
 
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut unresolved: Vec<UnresolvedCall> = Vec::new();
+    let mut computed: std::collections::HashMap<String, CallSites> =
+        std::collections::HashMap::new();
 
     for file in &index.files {
         let Some(pr) = &file.parse_result else {
@@ -811,7 +838,17 @@ pub fn build_call_graph(index: &crate::core_graph::CodebaseIndex) -> CallGraph {
         // Parse each file exactly once (was: once per symbol — quadratic).
         // `None` for languages without a tree-sitter extractor → the per-symbol
         // regex fallback below, unchanged.
-        let call_map = extract_calls_by_symbol(&file.content, lang);
+        if !cache.contains_key(&file.relative_path) {
+            if let Some(map) = extract_calls_by_symbol(&file.content, lang) {
+                computed.insert(
+                    file.relative_path.clone(),
+                    map.into_iter().collect::<CallSites>(),
+                );
+            }
+        }
+        let call_map: Option<&CallSites> = cache
+            .get(&file.relative_path)
+            .or_else(|| computed.get(&file.relative_path));
 
         for symbol in &pr.symbols {
             let called_names = match &call_map {
@@ -930,7 +967,7 @@ pub fn build_call_graph(index: &crate::core_graph::CodebaseIndex) -> CallGraph {
             && a.callee_symbol == b.callee_symbol
     });
 
-    CallGraph { edges, unresolved }
+    (CallGraph { edges, unresolved }, computed)
 }
 
 #[cfg(test)]

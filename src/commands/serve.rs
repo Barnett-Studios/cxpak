@@ -4,9 +4,11 @@ use crate::commands::watch::{apply_incremental_update, classify_changes};
 use crate::context_quality::annotation::{annotate_file, AnnotationContext};
 use crate::context_quality::degradation::{allocate_with_degradation, FileRole};
 use crate::context_quality::expansion::{expand_query, Domain};
+use crate::core_graph::conventions::ConventionsStatus;
 use crate::daemon::watcher::FileWatcher;
 use crate::index::CodebaseIndex;
 use crate::intelligence::api_surface::extract_api_surface;
+use crate::intelligence::call_graph::CallSites;
 use crate::parser::LanguageRegistry;
 use crate::scanner::Scanner;
 use crate::schema::{EdgeConfidence, EdgeType};
@@ -228,12 +230,77 @@ pub(crate) struct BuildReport {
 pub(crate) struct PendingStore {
     cache_dir: PathBuf,
     changed: BTreeMap<String, ArtifactEntry>,
+    /// Call sites computed this build: `(path, content sha256, sites)`. Applied
+    /// only to a stored entry whose hash still matches (ADR-0212).
+    call_sites: Vec<(String, String, CallSites)>,
     scanned: BTreeSet<String>,
     workspace: Option<String>,
     dirty: bool,
+    conventions: Option<PendingConventions>,
+}
+
+/// Conventions mining deferred past `Ready` (ADR-0212).
+pub(crate) struct PendingConventions {
+    path: PathBuf,
+    cache_dir: PathBuf,
+    fingerprint: String,
+    base_commit: Option<String>,
+}
+
+/// Freshly mined conventions and the co-changes mined in the same walk.
+pub(crate) struct MinedConventions {
+    conventions: crate::conventions::ConventionProfile,
+    co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
+}
+
+impl PendingConventions {
+    /// Fingerprint the complete derived cache will be saved under.
+    #[cfg(test)]
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Mine conventions for `base` and save the complete derived cache under
+    /// the current fingerprint. This is the only place a derived cache is
+    /// written while conventions were `StalePending`, so an interrupted start
+    /// can never leave stale conventions on disk as fresh.
+    pub(crate) fn mine(self, base: &CodebaseIndex) -> MinedConventions {
+        let conventions = crate::conventions::build_convention_profile(base, &self.path);
+        let co_changes = conventions.git_health.co_changes.clone();
+        let derived = crate::cache::DerivedCache::new(
+            self.fingerprint,
+            base.graph.clone(),
+            base.call_graph.clone(),
+            base.pagerank.clone(),
+            conventions.clone(),
+            co_changes.clone(),
+            self.base_commit,
+        );
+        // Persisting is best-effort; a write failure must not fail the republish.
+        let _ = derived.save(&self.cache_dir);
+        MinedConventions {
+            conventions,
+            co_changes,
+        }
+    }
+}
+
+impl MinedConventions {
+    /// Replace the carried conventions and co-changes (one derived unit) and
+    /// mark them fresh.
+    pub(crate) fn apply_to(self, index: &mut CodebaseIndex) {
+        index.conventions = self.conventions;
+        index.co_changes = self.co_changes;
+        index.conventions_status = crate::core_graph::conventions::ConventionsStatus::Fresh;
+    }
 }
 
 impl PendingStore {
+    /// Take the conventions mining this build deferred, if any.
+    pub(crate) fn take_conventions(&mut self) -> Option<PendingConventions> {
+        self.conventions.take()
+    }
+
     /// Merge this build's entries into the persisted store. Returns whether a
     /// write happened; a failed save is not an indexing error (C3).
     pub(crate) fn save(self) -> bool {
@@ -243,12 +310,22 @@ impl PendingStore {
         let Self {
             cache_dir,
             changed,
+            call_sites,
             scanned,
             workspace,
             ..
         } = self;
         ArtifactStore::update(&cache_dir, |store| {
             merge_store_entries(&mut store.entries, changed, &scanned, workspace.as_deref());
+            for (path, sha, sites) in call_sites {
+                if let Some(entry) = store
+                    .entries
+                    .get_mut(&path)
+                    .filter(|e| e.content_sha256 == sha)
+                {
+                    entry.call_sites_by_symbol = Some(sites);
+                }
+            }
         })
         .is_ok()
     }
@@ -275,6 +352,7 @@ enum Reuse {
 struct Prepared {
     file: crate::index::ArtifactFile,
     body_sha: String,
+    raw_sha: String,
     reuse: Reuse,
     fresh: Option<ArtifactEntry>,
 }
@@ -289,6 +367,7 @@ fn store_entry(
     mtime_ns: Option<u64>,
     file: &crate::scanner::ScannedFile,
     artifacts: &crate::index::FileArtifacts,
+    call_sites_by_symbol: Option<CallSites>,
 ) -> ArtifactEntry {
     ArtifactEntry {
         content_sha256,
@@ -304,6 +383,7 @@ fn store_entry(
                 .map(|(term, n)| (term.clone(), *n))
                 .collect(),
         ),
+        call_sites_by_symbol,
     }
 }
 
@@ -316,6 +396,26 @@ fn store_entry(
 pub(crate) fn build_index_pending(
     path: &Path,
     workspace: Option<&str>,
+) -> Result<(CodebaseIndex, BuildReport, PendingStore), Box<dyn std::error::Error>> {
+    build_index_pending_with(path, workspace, false)
+}
+
+/// [`build_index_pending`] for the MCP start path (ADR-0212): on a derived
+/// miss with a loadable prior derived cache, conventions and co-changes are
+/// carried from that snapshot (`StalePending`) and the mining is handed back
+/// through [`PendingStore::take_conventions`] instead of running before
+/// `Ready`. No derived cache is saved until that mining completes.
+pub(crate) fn build_index_pending_deferred(
+    path: &Path,
+    workspace: Option<&str>,
+) -> Result<(CodebaseIndex, BuildReport, PendingStore), Box<dyn std::error::Error>> {
+    build_index_pending_with(path, workspace, true)
+}
+
+fn build_index_pending_with(
+    path: &Path,
+    workspace: Option<&str>,
+    defer_conventions: bool,
 ) -> Result<(CodebaseIndex, BuildReport, PendingStore), Box<dyn std::error::Error>> {
     use rayon::prelude::*;
 
@@ -373,11 +473,12 @@ pub(crate) fn build_index_pending(
 
             let matching =
                 stored.filter(|e| e.content_sha256 == raw_sha && e.language == file.language);
-            let (artifacts, reuse, fresh) = match matching {
+            let (artifacts, reuse, fresh, call_sites) = match matching {
                 Some(ArtifactEntry {
                     parse_result,
                     token_count: Some(token_count),
                     term_frequencies: Some(terms),
+                    call_sites_by_symbol,
                     ..
                 }) => (
                     crate::index::FileArtifacts {
@@ -387,6 +488,7 @@ pub(crate) fn build_index_pending(
                     },
                     Reuse::Hit,
                     None,
+                    call_sites_by_symbol,
                 ),
                 Some(entry) => {
                     let artifacts = crate::index::FileArtifacts {
@@ -394,8 +496,15 @@ pub(crate) fn build_index_pending(
                         token_count: counter.count_or_zero(&content),
                         term_frequencies: crate::index::compute_term_frequencies(&content),
                     };
-                    let fresh = store_entry(raw_sha, mtime_ns, file, &artifacts);
-                    (artifacts, Reuse::Partial, Some(fresh))
+                    let call_sites = entry.call_sites_by_symbol;
+                    let fresh = store_entry(
+                        raw_sha.clone(),
+                        mtime_ns,
+                        file,
+                        &artifacts,
+                        call_sites.clone(),
+                    );
+                    (artifacts, Reuse::Partial, Some(fresh), call_sites)
                 }
                 None => {
                     let artifacts = crate::index::compute_file_artifacts(
@@ -404,8 +513,8 @@ pub(crate) fn build_index_pending(
                         &registry,
                         &counter,
                     );
-                    let fresh = store_entry(raw_sha, mtime_ns, file, &artifacts);
-                    (artifacts, Reuse::Miss, Some(fresh))
+                    let fresh = store_entry(raw_sha.clone(), mtime_ns, file, &artifacts, None);
+                    (artifacts, Reuse::Miss, Some(fresh), None)
                 }
             };
             Some(Prepared {
@@ -416,8 +525,10 @@ pub(crate) fn build_index_pending(
                     content,
                     mtime_ns,
                     artifacts,
+                    call_sites,
                 },
                 body_sha,
+                raw_sha,
                 reuse,
                 fresh,
             })
@@ -431,6 +542,7 @@ pub(crate) fn build_index_pending(
     let mut body_shas: Vec<String> = Vec::with_capacity(prepared.len());
     let mut artifact_files = Vec::with_capacity(prepared.len());
     let mut dropped_entry = false;
+    let mut content_shas: HashMap<String, String> = HashMap::with_capacity(prepared.len());
     for (slot, had) in prepared.into_iter().zip(had_entry) {
         let Some(item) = slot else {
             dropped_entry |= had;
@@ -442,6 +554,7 @@ pub(crate) fn build_index_pending(
             Reuse::Miss => report.artifact_misses += 1,
         }
         scanned.insert(item.file.relative_path.clone());
+        content_shas.insert(item.file.relative_path.clone(), item.raw_sha);
         if let Some(entry) = item.fresh {
             changed.insert(item.file.relative_path.clone(), entry);
         }
@@ -483,17 +596,24 @@ pub(crate) fn build_index_pending(
         ),
         None => (None, None),
     };
-    let mut index = CodebaseIndex::from_artifacts(artifact_files, precomputed);
+    let (mut index, computed_call_sites) =
+        CodebaseIndex::from_artifacts_with_call_sites(artifact_files, precomputed);
     timings.assemble = phase.elapsed();
+    let call_sites: Vec<(String, String, CallSites)> = computed_call_sites
+        .into_iter()
+        .filter_map(|(file, sites)| {
+            let sha = content_shas.remove(&file)?;
+            Some((file, sha, sites))
+        })
+        .collect();
 
+    let mut pending_conventions = None;
     match restored {
         Some((conventions, co_changes)) => {
             index.conventions = conventions;
             index.co_changes = co_changes;
         }
         None => {
-            index.conventions = crate::conventions::build_convention_profile(&index, path);
-            index.co_changes = index.conventions.git_health.co_changes.clone();
             // Stamp the HEAD SHA this analysis was built at so the next
             // post-commit edge-delta can validate its base (ADR-0179). The stamp
             // means "graph == committed tree at this SHA", so it is recorded ONLY
@@ -511,17 +631,47 @@ pub(crate) fn build_index_pending(
                     _ => None,
                 }
             };
-            let derived = crate::cache::DerivedCache::new(
-                fingerprint,
-                index.graph.clone(),
-                index.call_graph.clone(),
-                index.pagerank.clone(),
-                index.conventions.clone(),
-                index.co_changes.clone(),
-                base_commit,
-            );
-            // Persisting is best-effort; a write failure must not fail indexing.
-            let _ = derived.save(&cache_dir);
+            // ADR-0212: the MCP start path publishes the previous snapshot's
+            // conventions and co-changes (one derived unit) and mines in the
+            // background. Grammar/version mismatch or no prior cache → inline.
+            let prior = if defer_conventions {
+                crate::cache::DerivedCache::load_for_delta(&cache_dir)
+            } else {
+                None
+            };
+            match prior {
+                Some(prior) => {
+                    index.conventions = prior.conventions;
+                    index.co_changes = prior.co_changes;
+                    index.conventions_status = ConventionsStatus::StalePending {
+                        base_commit: prior.base_commit.unwrap_or_default(),
+                    };
+                    // No derived cache is saved here: the background phase saves
+                    // the complete one, so an interrupted start cannot leave
+                    // stale conventions on disk under this fingerprint.
+                    pending_conventions = Some(PendingConventions {
+                        path: path.to_path_buf(),
+                        cache_dir: cache_dir.clone(),
+                        fingerprint,
+                        base_commit,
+                    });
+                }
+                None => {
+                    index.conventions = crate::conventions::build_convention_profile(&index, path);
+                    index.co_changes = index.conventions.git_health.co_changes.clone();
+                    let derived = crate::cache::DerivedCache::new(
+                        fingerprint,
+                        index.graph.clone(),
+                        index.call_graph.clone(),
+                        index.pagerank.clone(),
+                        index.conventions.clone(),
+                        index.co_changes.clone(),
+                        base_commit,
+                    );
+                    // Persisting is best-effort; a write failure must not fail indexing.
+                    let _ = derived.save(&cache_dir);
+                }
+            }
         }
     }
 
@@ -529,10 +679,12 @@ pub(crate) fn build_index_pending(
     report.timings = timings;
     let pending = PendingStore {
         cache_dir: store_dir,
-        dirty: !changed.is_empty() || dropped_entry || stale_in_scope,
+        dirty: !changed.is_empty() || !call_sites.is_empty() || dropped_entry || stale_in_scope,
         changed,
+        call_sites,
         scanned,
         workspace: workspace.map(str::to_string),
+        conventions: pending_conventions,
     };
     Ok((index, report, pending))
 }
@@ -2602,7 +2754,7 @@ pub fn spawn_mcp_index_build(
     std::thread::spawn(move || {
         let mut pending_store = None;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            build_index_pending(&path, None)
+            build_index_pending_deferred(&path, None)
         }))
         .map(|built| {
             built.map(|(idx, report, pending)| {
@@ -2613,7 +2765,6 @@ pub fn spawn_mcp_index_build(
         let next = classify_reported_outcome(&path, outcome);
         // Capture the ready base *before* the move-consuming publish so phase 2
         // can enrich it without re-reading the cell. Only `Ready` is enrichable.
-        #[cfg(feature = "embeddings")]
         let ready_base = match &next {
             IndexReadiness::Ready(idx) => Some(Arc::clone(idx)),
             _ => None,
@@ -2625,6 +2776,19 @@ pub fn spawn_mcp_index_build(
             Ok(mut g) => *g = next,
             Err(poisoned) => *poisoned.into_inner() = next,
         }
+        // Conventions phase (ADR-0212): a `StalePending` base is mined fresh and
+        // republished. It runs before the store save and the embeddings phase so
+        // the stale window is as short as possible; a panic in it is contained
+        // and leaves the carried snapshot in place.
+        let deferred = pending_store
+            .as_mut()
+            .and_then(PendingStore::take_conventions);
+        let ready_base = match (deferred, ready_base) {
+            (Some(pending), Some(base)) => Some(republish_conventions(&readiness, &base, pending)),
+            (_, base) => base,
+        };
+        #[cfg(not(feature = "embeddings"))]
+        let _ = ready_base;
         // The artifact store is written only now: readiness never waits on it.
         // A panic in the save must not skip the enrichment phase below.
         if let Some(pending) = pending_store {
@@ -2643,6 +2807,79 @@ pub fn spawn_mcp_index_build(
             enrich_ready_with_embeddings(&readiness, &base, &path);
         }
     })
+}
+
+/// Mine the conventions a `StalePending` base deferred and publish them into
+/// the readiness cell (ADR-0212). Returns the index the cell now holds (the
+/// republished one, or `base` when nothing was published) so the embeddings
+/// phase compare-and-swaps against the right `Arc`.
+///
+/// The republished index is built from whatever the cell holds *now* (the
+/// freshness watcher may have republished an edited index in the window), so a
+/// watcher edit is never discarded. The clone happens outside the lock and the
+/// swap is a pointer-equality compare-and-swap, retried if the watcher wins the
+/// race. A panic in the mining is contained; the carried snapshot stays.
+fn republish_conventions(
+    readiness: &SharedReadiness,
+    base: &Arc<CodebaseIndex>,
+    pending: PendingConventions,
+) -> Arc<CodebaseIndex> {
+    const ATTEMPTS: usize = 3;
+    let mined = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.mine(base)))
+    {
+        Ok(mined) => mined,
+        Err(_) => {
+            eprintln!("cxpak: conventions mining panicked — serving the previous snapshot's");
+            return Arc::clone(base);
+        }
+    };
+    let mut mined = Some(mined);
+    for _ in 0..ATTEMPTS {
+        let current = match readiness.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let (cur, enriched) = match &current {
+            IndexReadiness::Ready(cur) => (cur, false),
+            IndexReadiness::ReadyEnriched(cur) => (cur, true),
+            _ => return Arc::clone(base),
+        };
+        if cur.conventions_status == ConventionsStatus::Fresh {
+            return Arc::clone(cur);
+        }
+        let mut next = (**cur).clone();
+        let Some(m) = mined.take() else {
+            return Arc::clone(base);
+        };
+        // Keep a copy so a lost race can retry against the watcher's index.
+        let retry = MinedConventions {
+            conventions: m.conventions.clone(),
+            co_changes: m.co_changes.clone(),
+        };
+        m.apply_to(&mut next);
+        let next = Arc::new(next);
+        let mut guard = match readiness.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let unchanged = match &*guard {
+            IndexReadiness::Ready(now) | IndexReadiness::ReadyEnriched(now) => {
+                Arc::ptr_eq(now, cur)
+            }
+            _ => false,
+        };
+        if unchanged {
+            *guard = if enriched {
+                IndexReadiness::ReadyEnriched(Arc::clone(&next))
+            } else {
+                IndexReadiness::Ready(Arc::clone(&next))
+            };
+            return next;
+        }
+        mined = Some(retry);
+    }
+    eprintln!("cxpak: index kept changing during conventions republish — still serving the previous snapshot's");
+    Arc::clone(base)
 }
 
 /// Phase 2 of the MCP background build (R-E1, ADR-0186): build the embedding

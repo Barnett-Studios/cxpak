@@ -75,6 +75,22 @@ pub struct FileContribution {
 
 // ─── top-level profile ────────────────────────────────────────────────────────
 
+/// Whether `CodebaseIndex::conventions` / `co_changes` describe the commit the
+/// index was built at (ADR-0212).
+///
+/// An MCP start publishes `Ready` with the previous derived snapshot's
+/// conventions while the current commit's are mined in the background; the
+/// window is visible here instead of silently stale.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConventionsStatus {
+    /// Mined at (or incrementally kept current for) this index's content.
+    #[default]
+    Fresh,
+    /// Carried from an earlier snapshot; a fresh mine is in flight.
+    /// `base_commit` is that snapshot's HEAD, empty when it was not recorded.
+    StalePending { base_commit: String },
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConventionProfile {
     pub naming: NamingConventions,

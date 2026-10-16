@@ -115,6 +115,7 @@ fn parse_with_cache_capped(
                 parse_result: parse_result.clone(),
                 token_count: unchanged.and_then(|e| e.token_count),
                 term_frequencies: unchanged.and_then(|e| e.term_frequencies.clone()),
+                call_sites_by_symbol: unchanged.and_then(|e| e.call_sites_by_symbol.clone()),
             };
             Some(Outcome {
                 parse_result,

@@ -8,6 +8,7 @@ use crate::core_graph::graph::DependencyGraph;
 use crate::core_graph::intel::CallGraph;
 use crate::core_graph::intel::DeadSymbol;
 use crate::core_graph::intel::HealthScore;
+use crate::intelligence::call_graph::CallSites;
 use crate::parser::language::ParseResult;
 use crate::scanner::ScannedFile;
 use std::collections::HashMap;
@@ -302,6 +303,9 @@ pub(crate) struct ArtifactFile {
     pub(crate) content: String,
     pub(crate) mtime_ns: Option<u64>,
     pub(crate) artifacts: FileArtifacts,
+    /// Stored call sites already validated against `content` and `language`
+    /// (ADR-0212); `None` computes them when the call graph is built.
+    pub(crate) call_sites: Option<CallSites>,
 }
 
 /// Graph, PageRank and call graph restored from a derived-cache hit, so
@@ -370,7 +374,9 @@ impl CodebaseIndex {
             total_bytes,
             term_frequencies,
             None,
+            HashMap::new(),
         )
+        .0
     }
 
     // `all_public_symbols`, `all_imports`, `find_symbol`, `find_content_matches`
@@ -390,7 +396,8 @@ impl CodebaseIndex {
         total_bytes: u64,
         term_frequencies: HashMap<String, HashMap<String, u32>>,
         precomputed: Option<Precomputed>,
-    ) -> Self {
+        call_sites: HashMap<String, CallSites>,
+    ) -> (Self, HashMap<String, CallSites>) {
         let domains = crate::context_quality::expansion::detect_domains(&indexed_files);
 
         let mut index = Self {
@@ -407,6 +414,7 @@ impl CodebaseIndex {
             test_map: HashMap::new(),
             call_graph: CallGraph::default(),
             conventions: ConventionProfile::default(),
+            conventions_status: Default::default(),
             co_changes: Vec::new(),
             cross_lang_edges: Vec::new(),
             #[cfg(feature = "embeddings")]
@@ -442,8 +450,12 @@ impl CodebaseIndex {
             &all_paths,
             crate_name.as_deref(),
         );
+        let mut computed_call_sites = HashMap::new();
         if !restored {
-            index.call_graph = crate::intelligence::call_graph::build_call_graph(&index);
+            let (call_graph, computed) =
+                crate::intelligence::call_graph::build_call_graph_cached(&index, &call_sites);
+            index.call_graph = call_graph;
+            computed_call_sites = computed;
         }
 
         // v1.5.0: detect cross-language boundaries (HTTP, FFI, gRPC, GraphQL,
@@ -467,7 +479,7 @@ impl CodebaseIndex {
         // via build_embedding_index() — model download should not block CLI commands.
         // NOTE: conventions is NOT built here. It's built after index construction
         // via build_convention_profile() — needs repo_path for git2 access.
-        index
+        (index, computed_call_sites)
     }
 
     /// Build a `CodebaseIndex` using pre-read file content instead of reading from disk.
@@ -570,7 +582,9 @@ impl CodebaseIndex {
             total_bytes,
             term_frequencies,
             None,
+            HashMap::new(),
         )
+        .0
     }
 
     /// Build a `CodebaseIndex` from content that is already proven to have
@@ -615,6 +629,7 @@ impl CodebaseIndex {
                     content,
                     mtime_ns,
                     artifacts,
+                    call_sites: None,
                 })
             })
             .collect();
@@ -629,13 +644,26 @@ impl CodebaseIndex {
         files: Vec<ArtifactFile>,
         precomputed: Option<Precomputed>,
     ) -> Self {
+        Self::from_artifacts_with_call_sites(files, precomputed).0
+    }
+
+    /// [`Self::from_artifacts`], also returning the call sites computed for
+    /// files that had none stored, for the caller to persist (ADR-0212).
+    pub(crate) fn from_artifacts_with_call_sites(
+        files: Vec<ArtifactFile>,
+        precomputed: Option<Precomputed>,
+    ) -> (Self, HashMap<String, CallSites>) {
         let mut language_stats: HashMap<String, LanguageStats> = HashMap::new();
         let mut indexed_files = Vec::with_capacity(files.len());
         let mut total_tokens = 0usize;
         let mut total_bytes = 0u64;
         let mut term_frequencies = HashMap::with_capacity(files.len());
 
+        let mut call_sites = HashMap::new();
         for file in files {
+            if let Some(sites) = file.call_sites {
+                call_sites.insert(file.relative_path.clone(), sites);
+            }
             let FileArtifacts {
                 parse_result,
                 token_count,
@@ -674,6 +702,7 @@ impl CodebaseIndex {
             total_bytes,
             term_frequencies,
             precomputed,
+            call_sites,
         )
     }
 
