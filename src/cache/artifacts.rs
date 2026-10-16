@@ -146,7 +146,33 @@ mod tests {
             }),
             token_count: Some(3),
             term_frequencies: Some(BTreeMap::from([("helper".to_string(), 2u32)])),
+            call_sites_by_symbol: Some(BTreeMap::from([(
+                "go".to_string(),
+                vec!["helper".to_string()],
+            )])),
         }
+    }
+
+    #[test]
+    fn artifact_store_v2_rejects_v1() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = ArtifactStore::new();
+        store.entries.insert("src/a.rs".to_string(), entry("aa"));
+        store.version = 1;
+        store.save(dir.path()).unwrap();
+        assert_eq!(ARTIFACT_STORE_VERSION, 2);
+        assert!(ArtifactStore::load(dir.path()).entries.is_empty());
+    }
+
+    #[test]
+    fn entry_without_call_sites_field_deserializes_to_none() {
+        let mut value = serde_json::to_value(entry("aa")).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("call_sites_by_symbol");
+        let parsed: ArtifactEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.call_sites_by_symbol, None);
     }
 
     #[test]

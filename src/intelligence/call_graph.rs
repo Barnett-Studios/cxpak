@@ -936,6 +936,7 @@ pub fn build_call_graph(index: &crate::core_graph::CodebaseIndex) -> CallGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn test_call_graph_default_is_empty() {
@@ -1294,6 +1295,39 @@ fn helper(_y: i32) -> i32 { 0 }
         content_map.insert("lib.rs".to_string(), src.to_string());
 
         CodebaseIndex::build_with_content(files, parse_results, &counter, content_map)
+    }
+
+    #[test]
+    fn build_call_graph_wrapper_matches_cached_empty() {
+        let index = make_intra_file_index();
+        let wrapped = build_call_graph(&index);
+        let (cached, computed) = build_call_graph_cached(&index, &HashMap::new());
+        assert_eq!(
+            serde_json::to_value(&wrapped).unwrap(),
+            serde_json::to_value(&cached).unwrap()
+        );
+        assert_eq!(
+            computed.keys().collect::<Vec<_>>(),
+            vec!["lib.rs"],
+            "an empty cache computes every file with an extractor"
+        );
+    }
+
+    #[test]
+    fn cached_call_sites_replace_the_parse() {
+        let index = make_intra_file_index();
+        let cache = HashMap::from([(
+            "lib.rs".to_string(),
+            BTreeMap::from([("caller".to_string(), vec!["SENTINEL_CALLEE".to_string()])]),
+        )]);
+        PARSED_SOURCES.with(|p| p.borrow_mut().clear());
+        let (graph, computed) = build_call_graph_cached(&index, &cache);
+        assert!(PARSED_SOURCES.with(|p| p.borrow().is_empty()));
+        assert!(computed.is_empty(), "hits are not recomputed");
+        assert!(graph
+            .unresolved
+            .iter()
+            .any(|u| u.callee_name == "SENTINEL_CALLEE"));
     }
 
     #[test]

@@ -12,6 +12,10 @@ use std::path::PathBuf;
 const FIXED_TIME: i64 = 1_700_000_000;
 
 fn commit_all(root: &Path, message: &str) {
+    commit_all_at(root, message, FIXED_TIME);
+}
+
+fn commit_all_at(root: &Path, message: &str, time: i64) {
     let repo = git2::Repository::open(root).expect("open repo");
     let mut index = repo.index().expect("repo index");
     index
@@ -21,7 +25,7 @@ fn commit_all(root: &Path, message: &str) {
     let tree = repo
         .find_tree(index.write_tree().expect("write tree"))
         .expect("find tree");
-    let sig = git2::Signature::new("t", "t@t", &git2::Time::new(FIXED_TIME, 0)).expect("sig");
+    let sig = git2::Signature::new("t", "t@t", &git2::Time::new(time, 0)).expect("sig");
     let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
     let parents: Vec<&git2::Commit> = parent.iter().collect();
     repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
@@ -32,7 +36,13 @@ fn commit_all(root: &Path, message: &str) {
 /// a cross-language edge exists, and a markdown file with frontmatter.
 fn warm_repo() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().unwrap();
-    let root = dir.path();
+    write_warm_files(dir.path());
+    git2::Repository::init(dir.path()).expect("git init");
+    commit_all(dir.path(), "init");
+    dir
+}
+
+fn write_warm_files(root: &Path) {
     for (rel, body) in [
         ("src/a.rs", "pub fn helper() -> i32 {\n    1\n}\n"),
         (
@@ -53,9 +63,6 @@ fn warm_repo() -> tempfile::TempDir {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
     }
-    git2::Repository::init(root).expect("git init");
-    commit_all(root, "init");
-    dir
 }
 
 fn store_dir(root: &Path) -> PathBuf {
@@ -486,4 +493,370 @@ fn cli_touch_preserves_complete_entry() {
     assert_eq!(r.artifact_partial, 0);
     assert_eq!(r.artifact_hits, idx.total_files);
     assert_eq!(r.artifact_misses, 0);
+}
+
+// ─── Phase 2 (ADR-0212): conventions off the Ready path, cached call sites ───
+
+use crate::cache::DerivedCache;
+use crate::core_graph::conventions::ConventionsStatus;
+use crate::intelligence::call_graph::PARSED_SOURCES;
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// The warm fixture with commits dated now, so git-history mining (180-day
+/// window) and co-change mining see real history. `.cxpak/` is ignored so the
+/// cache never makes the working tree dirty (the derived cache's `base_commit`
+/// is recorded only for a clean tree).
+fn history_repo() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    write_warm_files(root);
+    std::fs::write(root.join(".gitignore"), ".cxpak/\n").unwrap();
+    git2::Repository::init(root).expect("git init");
+    commit_all_at(root, "init", now_secs());
+    dir
+}
+
+/// A second commit touching two files together, so HEAD moves and the
+/// derived fingerprint misses while every other artifact still hits.
+fn second_commit(root: &Path) {
+    let a = root.join("src/a.rs");
+    let b = root.join("src/b.rs");
+    std::fs::write(&a, "pub fn helper() -> i32 {\n    2\n}\n").unwrap();
+    std::fs::write(
+        &b,
+        "use crate::a::helper;\npub fn go() -> i32 {\n    helper() + 1\n}\n",
+    )
+    .unwrap();
+    commit_all_at(root, "fix helper", now_secs());
+}
+
+fn json_of<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    norm(serde_json::to_value(value).unwrap())
+}
+
+fn ns_dir(root: &Path) -> PathBuf {
+    derived_path(root).parent().unwrap().to_path_buf()
+}
+
+fn rewrite_store(root: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let path = store_dir(root).join(ARTIFACT_STORE_FILE);
+    let mut store = load_json(&path);
+    edit(&mut store);
+    save_json(&path, &store);
+}
+
+fn parsed_sources() -> Vec<String> {
+    PARSED_SOURCES.with(|p| p.borrow().clone())
+}
+
+fn clear_parsed_sources() {
+    PARSED_SOURCES.with(|p| p.borrow_mut().clear());
+}
+
+fn source_of(root: &Path, rel: &str) -> String {
+    std::fs::read_to_string(root.join(rel)).unwrap()
+}
+
+#[test]
+fn conventions_status_fresh_on_first_build() {
+    let dir = history_repo();
+    let (idx, _, mut pending) = build_index_pending_deferred(dir.path(), None).unwrap();
+    assert_eq!(idx.conventions_status, ConventionsStatus::Fresh);
+    assert!(
+        pending.take_conventions().is_none(),
+        "no prior derived cache: nothing to defer"
+    );
+    assert!(
+        DerivedCache::load_for_delta(&ns_dir(dir.path())).is_some(),
+        "the inline path saves the derived cache"
+    );
+}
+
+#[test]
+fn conventions_status_stale_pending_after_commit() {
+    let dir = history_repo();
+    let root = dir.path();
+    let (first, _) = build_index_reported(root, None).unwrap();
+    let head1 = git_head_oid(root);
+    assert!(!head1.is_empty());
+    second_commit(root);
+
+    let (stale, report, mut pending) = build_index_pending_deferred(root, None).unwrap();
+    assert!(!report.derived_hit);
+    assert_eq!(
+        stale.conventions_status,
+        ConventionsStatus::StalePending { base_commit: head1 }
+    );
+    assert_eq!(json_of(&stale.conventions), json_of(&first.conventions));
+    assert!(pending.take_conventions().is_some());
+}
+
+#[test]
+fn stale_window_carries_prior_co_changes() {
+    let dir = history_repo();
+    let root = dir.path();
+    let (first, _) = build_index_reported(root, None).unwrap();
+    assert!(
+        !first.co_changes.is_empty(),
+        "fixture must have co-change history"
+    );
+    second_commit(root);
+
+    let (stale, _, _pending) = build_index_pending_deferred(root, None).unwrap();
+    assert!(matches!(
+        stale.conventions_status,
+        ConventionsStatus::StalePending { .. }
+    ));
+    assert!(
+        !stale.co_changes.is_empty(),
+        "conventions and co_changes are one derived unit"
+    );
+    assert_eq!(json_of(&stale.co_changes), json_of(&first.co_changes));
+}
+
+#[test]
+fn conventions_republish_matches_cold() {
+    let dir = history_repo();
+    let root = dir.path();
+    build_index_reported(root, None).unwrap();
+    second_commit(root);
+
+    let (stale, _, mut pending) = build_index_pending_deferred(root, None).unwrap();
+    let pending = pending.take_conventions().expect("stale build defers");
+    let fingerprint = pending.fingerprint().to_string();
+    let mut republished = stale.clone();
+    pending.mine(&stale).apply_to(&mut republished);
+    assert_eq!(republished.conventions_status, ConventionsStatus::Fresh);
+    assert!(
+        DerivedCache::load(&ns_dir(root), &fingerprint).is_some(),
+        "the background phase saves the complete derived cache under the current fingerprint"
+    );
+
+    std::fs::remove_dir_all(root.join(".cxpak")).unwrap();
+    let (cold, _) = build_index_reported(root, None).unwrap();
+    assert_eq!(cold.conventions_status, ConventionsStatus::Fresh);
+    assert_eq!(snapshot(&republished), snapshot(&cold));
+}
+
+#[test]
+fn stale_build_never_saves_derived_under_current_fingerprint() {
+    let dir = history_repo();
+    let root = dir.path();
+    let (_, r1) = build_index_reported(root, None).unwrap();
+    assert!(!r1.derived_hit);
+    let before = DerivedCache::load_for_delta(&ns_dir(root)).unwrap();
+    second_commit(root);
+
+    let (_stale, _, mut pending) = build_index_pending_deferred(root, None).unwrap();
+    let pending = pending.take_conventions().expect("stale build defers");
+    assert_ne!(pending.fingerprint(), before.fingerprint);
+    assert!(
+        DerivedCache::load(&ns_dir(root), pending.fingerprint()).is_none(),
+        "an interrupted start must not leave stale conventions under the current fingerprint"
+    );
+    let after = DerivedCache::load_for_delta(&ns_dir(root)).unwrap();
+    assert_eq!(after.fingerprint, before.fingerprint);
+}
+
+#[test]
+fn conventions_inline_when_no_prior_cache() {
+    let dir = history_repo();
+    let root = dir.path();
+    build_index_reported(root, None).unwrap();
+    std::fs::remove_file(derived_path(root)).unwrap();
+    second_commit(root);
+
+    let (idx, _, mut pending) = build_index_pending_deferred(root, None).unwrap();
+    assert_eq!(idx.conventions_status, ConventionsStatus::Fresh);
+    assert!(pending.take_conventions().is_none());
+}
+
+#[test]
+fn conventions_load_for_delta_grammar_mismatch_falls_back_inline() {
+    let dir = history_repo();
+    let root = dir.path();
+    build_index_reported(root, None).unwrap();
+    let mut derived = load_json(&derived_path(root));
+    derived["grammar_hash"] = json!("not-this-build");
+    save_json(&derived_path(root), &derived);
+    assert!(DerivedCache::load_for_delta(&ns_dir(root)).is_none());
+    second_commit(root);
+
+    let (idx, _, mut pending) = build_index_pending_deferred(root, None).unwrap();
+    assert_eq!(idx.conventions_status, ConventionsStatus::Fresh);
+    assert!(pending.take_conventions().is_none());
+}
+
+#[test]
+fn non_deferring_build_always_mines_inline() {
+    let dir = history_repo();
+    let root = dir.path();
+    build_index_reported(root, None).unwrap();
+    second_commit(root);
+
+    let (idx, _) = build_index_reported(root, None).unwrap();
+    assert_eq!(idx.conventions_status, ConventionsStatus::Fresh);
+    let saved = DerivedCache::load_for_delta(&ns_dir(root)).unwrap();
+    assert_eq!(
+        saved.base_commit.as_deref(),
+        Some(git_head_oid(root).as_str())
+    );
+}
+
+#[test]
+fn cold_builds_are_deterministic() {
+    let dir = history_repo();
+    let root = dir.path();
+    second_commit(root);
+    let (one, _) = build_index_reported(root, None).unwrap();
+    assert!(!one.co_changes.is_empty());
+    std::fs::remove_dir_all(root.join(".cxpak")).unwrap();
+    let (two, _) = build_index_reported(root, None).unwrap();
+
+    assert_eq!(json_of(&one.conventions), json_of(&two.conventions));
+    assert_eq!(json_of(&one.co_changes), json_of(&two.co_changes));
+}
+
+#[test]
+fn call_sites_cache_hit_skips_reparse() {
+    let dir = warm_repo();
+    let root = dir.path();
+    let (cold, _) = build_index_reported(root, None).unwrap();
+    let store = ArtifactStore::load(&store_dir(root));
+    assert!(
+        store.entries["src/b.rs"].call_sites_by_symbol.is_some(),
+        "the first build writes call sites back"
+    );
+
+    std::fs::remove_file(derived_path(root)).unwrap();
+    clear_parsed_sources();
+    let (warm, r) = build_index_reported(root, None).unwrap();
+    assert!(!r.derived_hit);
+    assert!(
+        parsed_sources().is_empty(),
+        "every call site came from the store, yet tree-sitter parsed {:?}",
+        parsed_sources().len()
+    );
+    assert_eq!(json_of(&warm.call_graph), json_of(&cold.call_graph));
+
+    rewrite_store(root, |store| {
+        store["entries"]["src/b.rs"]["call_sites_by_symbol"] =
+            json!({"go": ["helper", "SENTINEL_CALLEE"]});
+    });
+    std::fs::remove_file(derived_path(root)).unwrap();
+    let (sentinel, _) = build_index_reported(root, None).unwrap();
+    assert!(sentinel
+        .call_graph
+        .unresolved
+        .iter()
+        .any(|u| u.callee_name == "SENTINEL_CALLEE"));
+}
+
+#[test]
+fn call_sites_cache_miss_on_content_change() {
+    let dir = warm_repo();
+    let root = dir.path();
+    build_index_reported(root, None).unwrap();
+    let a_before = ArtifactStore::load(&store_dir(root)).entries["src/a.rs"].clone();
+    std::fs::write(
+        root.join("src/b.rs"),
+        "use crate::a::helper;\npub fn go() -> i32 {\n    helper() + other()\n}\n",
+    )
+    .unwrap();
+    std::fs::remove_file(derived_path(root)).unwrap();
+
+    clear_parsed_sources();
+    let (idx, _) = build_index_reported(root, None).unwrap();
+    let parsed = parsed_sources();
+    assert!(parsed.contains(&source_of(root, "src/b.rs")));
+    assert!(!parsed.contains(&source_of(root, "src/a.rs")));
+    assert!(idx
+        .call_graph
+        .unresolved
+        .iter()
+        .any(|u| u.callee_name == "other"));
+
+    let store = ArtifactStore::load(&store_dir(root));
+    let sites = store.entries["src/b.rs"]
+        .call_sites_by_symbol
+        .as_ref()
+        .expect("recomputed call sites are written back");
+    assert!(sites["go"].contains(&"other".to_string()), "{sites:?}");
+    assert_eq!(store.entries["src/a.rs"], a_before);
+}
+
+#[test]
+fn call_sites_cache_miss_on_language_change() {
+    let dir = warm_repo();
+    let root = dir.path();
+    build_index_reported(root, None).unwrap();
+    rewrite_store(root, |store| {
+        store["entries"]["src/b.rs"]["language"] = json!("python");
+        store["entries"]["src/b.rs"]["call_sites_by_symbol"] =
+            json!({"go": ["helper", "SENTINEL_CALLEE"]});
+    });
+    std::fs::remove_file(derived_path(root)).unwrap();
+
+    clear_parsed_sources();
+    let (idx, _) = build_index_reported(root, None).unwrap();
+    assert!(!idx
+        .call_graph
+        .unresolved
+        .iter()
+        .any(|u| u.callee_name == "SENTINEL_CALLEE"));
+    assert!(parsed_sources().contains(&source_of(root, "src/b.rs")));
+    let store = ArtifactStore::load(&store_dir(root));
+    assert_eq!(store.entries["src/b.rs"].language.as_deref(), Some("rust"));
+    assert!(!store.entries["src/b.rs"]
+        .call_sites_by_symbol
+        .as_ref()
+        .unwrap()
+        .values()
+        .flatten()
+        .any(|c| c == "SENTINEL_CALLEE"));
+}
+
+#[test]
+fn call_sites_none_and_v1_store_are_per_file_misses() {
+    let dir = warm_repo();
+    let root = dir.path();
+    let (cold, _) = build_index_reported(root, None).unwrap();
+
+    rewrite_store(root, |store| {
+        for entry in store["entries"].as_object_mut().unwrap().values_mut() {
+            entry["call_sites_by_symbol"] = serde_json::Value::Null;
+        }
+    });
+    std::fs::remove_file(derived_path(root)).unwrap();
+    clear_parsed_sources();
+    let (idx, r) = build_index_reported(root, None).unwrap();
+    assert_eq!(
+        r.artifact_hits, idx.total_files,
+        "per-file artifacts still hit"
+    );
+    assert!(parsed_sources().contains(&source_of(root, "src/a.rs")));
+    assert_eq!(json_of(&idx.call_graph), json_of(&cold.call_graph));
+    assert!(ArtifactStore::load(&store_dir(root)).entries["src/a.rs"]
+        .call_sites_by_symbol
+        .is_some());
+
+    rewrite_store(root, |store| {
+        store["version"] = json!(1);
+        for entry in store["entries"].as_object_mut().unwrap().values_mut() {
+            entry
+                .as_object_mut()
+                .unwrap()
+                .remove("call_sites_by_symbol");
+        }
+    });
+    std::fs::remove_file(derived_path(root)).unwrap();
+    let (idx, r) = build_index_reported(root, None).unwrap();
+    assert_eq!(r.artifact_misses, idx.total_files);
+    assert_eq!(json_of(&idx.call_graph), json_of(&cold.call_graph));
 }
