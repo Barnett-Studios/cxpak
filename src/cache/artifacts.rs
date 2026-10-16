@@ -15,7 +15,7 @@ use std::path::Path;
 /// File name of the store inside the flat cache dir.
 pub(crate) const ARTIFACT_STORE_FILE: &str = "artifacts.json";
 /// Bumped when the on-disk shape of [`ArtifactStore`] changes.
-pub(crate) const ARTIFACT_STORE_VERSION: u32 = 1;
+pub(crate) const ARTIFACT_STORE_VERSION: u32 = 2;
 
 /// Everything computed from one file's bytes, all of it valid for the bytes
 /// `content_sha256` names (C6). `parse_result: None` means the file has no
@@ -31,6 +31,11 @@ pub(crate) struct ArtifactEntry {
     pub(crate) parse_result: Option<ParseResult>,
     pub(crate) token_count: Option<usize>,
     pub(crate) term_frequencies: Option<BTreeMap<String, u32>>,
+    /// Calls made inside each function, by function name (ADR-0212). `None`
+    /// means not computed by the writer or no tree-sitter extractor for the
+    /// language; the call graph then recomputes it.
+    #[serde(default)]
+    pub(crate) call_sites_by_symbol: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// Content-validated per-file artifacts, keyed by repo-relative path.
@@ -146,7 +151,33 @@ mod tests {
             }),
             token_count: Some(3),
             term_frequencies: Some(BTreeMap::from([("helper".to_string(), 2u32)])),
+            call_sites_by_symbol: Some(BTreeMap::from([(
+                "go".to_string(),
+                vec!["helper".to_string()],
+            )])),
         }
+    }
+
+    #[test]
+    fn artifact_store_v2_rejects_v1() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = ArtifactStore::new();
+        store.entries.insert("src/a.rs".to_string(), entry("aa"));
+        store.version = 1;
+        store.save(dir.path()).unwrap();
+        assert_eq!(ARTIFACT_STORE_VERSION, 2);
+        assert!(ArtifactStore::load(dir.path()).entries.is_empty());
+    }
+
+    #[test]
+    fn entry_without_call_sites_field_deserializes_to_none() {
+        let mut value = serde_json::to_value(entry("aa")).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("call_sites_by_symbol");
+        let parsed: ArtifactEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.call_sites_by_symbol, None);
     }
 
     #[test]
