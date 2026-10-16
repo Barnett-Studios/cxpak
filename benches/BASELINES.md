@@ -94,7 +94,8 @@ the call sites. Load average 4.5 (1 min) at the end of the run.
 
 Individual post-commit runs: 3.55, 3.26, 3.18, 3.11, 3.13 s. Gate B1 (median <= 6.0 s): **met**.
 Server ready line on a post-commit start: `artifacts 4384 hit/0 partial/0 miss, derived miss, 3.20s`
-(the first, cold-store start after the upgrade reads `artifacts 0 hit/.../4384 miss`, 5.4 s once the
-v1 store is rejected). The unchanged-repo figure is lower than Phase 1's 1.85 s because the machine
+(the first start after the upgrade rejects the v1 store: `artifacts 0 hit/0 partial/4384 miss`, 2.2 s
+with a derived hit; the first post-commit start after that took 5.4 s with the machine at a 10+ load
+average, before the 5-run series above). The unchanged-repo figure is lower than Phase 1's 1.85 s because the machine
 was less loaded; it shows no regression, not a speedup. `artifacts.json` grew from 55 MB to 59.8 MB
 with the call sites (2,390 of 4,384 entries have an extractor for their language).
