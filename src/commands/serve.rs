@@ -245,15 +245,26 @@ pub(crate) struct PendingConventions {
     cache_dir: PathBuf,
     fingerprint: String,
     base_commit: Option<String>,
+    /// HEAD of the snapshot whose conventions are being served meanwhile;
+    /// `None` when that snapshot did not record one.
+    stale_base: Option<String>,
 }
 
 /// Freshly mined conventions and the co-changes mined in the same walk.
+#[derive(Clone)]
 pub(crate) struct MinedConventions {
     conventions: crate::conventions::ConventionProfile,
     co_changes: Vec<crate::intelligence::co_change::CoChangeEdge>,
 }
 
 impl PendingConventions {
+    /// Status of the conventions served until this mining is published.
+    pub(crate) fn status(&self) -> ConventionsStatus {
+        ConventionsStatus::StalePending {
+            base_commit: self.stale_base.clone(),
+        }
+    }
+
     /// Fingerprint the complete derived cache will be saved under.
     #[cfg(test)]
     pub(crate) fn fingerprint(&self) -> &str {
@@ -286,16 +297,23 @@ impl PendingConventions {
 }
 
 impl MinedConventions {
-    /// Replace the carried conventions and co-changes (one derived unit) and
-    /// mark them fresh.
+    /// Replace the carried conventions and co-changes (one derived unit).
     pub(crate) fn apply_to(self, index: &mut CodebaseIndex) {
         index.conventions = self.conventions;
         index.co_changes = self.co_changes;
-        index.conventions_status = crate::core_graph::conventions::ConventionsStatus::Fresh;
     }
 }
 
 impl PendingStore {
+    /// Status of the conventions this build published: `StalePending` while a
+    /// mining is deferred, `Fresh` otherwise. Kept off `CodebaseIndex` so the
+    /// public index shape is unchanged.
+    pub(crate) fn conventions_status(&self) -> ConventionsStatus {
+        self.conventions
+            .as_ref()
+            .map_or(ConventionsStatus::Fresh, PendingConventions::status)
+    }
+
     /// Take the conventions mining this build deferred, if any.
     pub(crate) fn take_conventions(&mut self) -> Option<PendingConventions> {
         self.conventions.take()
@@ -643,9 +661,6 @@ fn build_index_pending_with(
                 Some(prior) => {
                     index.conventions = prior.conventions;
                     index.co_changes = prior.co_changes;
-                    index.conventions_status = ConventionsStatus::StalePending {
-                        base_commit: prior.base_commit.unwrap_or_default(),
-                    };
                     // No derived cache is saved here: the background phase saves
                     // the complete one, so an interrupted start cannot leave
                     // stale conventions on disk under this fingerprint.
@@ -654,6 +669,7 @@ fn build_index_pending_with(
                         cache_dir: cache_dir.clone(),
                         fingerprint,
                         base_commit,
+                        stale_base: prior.base_commit,
                     });
                 }
                 None => {
@@ -2780,11 +2796,21 @@ pub fn spawn_mcp_index_build(
         // republished. It runs before the store save and the embeddings phase so
         // the stale window is as short as possible; a panic in it is contained
         // and leaves the carried snapshot in place.
+        let conventions_status = RwLock::new(
+            pending_store
+                .as_ref()
+                .map_or(ConventionsStatus::Fresh, PendingStore::conventions_status),
+        );
         let deferred = pending_store
             .as_mut()
             .and_then(PendingStore::take_conventions);
         let ready_base = match (deferred, ready_base) {
-            (Some(pending), Some(base)) => Some(republish_conventions(&readiness, &base, pending)),
+            (Some(pending), Some(base)) => Some(republish_conventions(
+                &readiness,
+                &conventions_status,
+                &base,
+                pending,
+            )),
             (_, base) => base,
         };
         #[cfg(not(feature = "embeddings"))]
@@ -2814,15 +2840,34 @@ pub fn spawn_mcp_index_build(
 /// republished one, or `base` when nothing was published) so the embeddings
 /// phase compare-and-swaps against the right `Arc`.
 ///
+/// `status` is the serve-internal conventions status; it flips to `Fresh`
+/// while the readiness write lock is held, so no reader sees fresh conventions
+/// with a stale status.
+///
 /// The republished index is built from whatever the cell holds *now* (the
 /// freshness watcher may have republished an edited index in the window), so a
 /// watcher edit is never discarded. The clone happens outside the lock and the
-/// swap is a pointer-equality compare-and-swap, retried if the watcher wins the
-/// race. A panic in the mining is contained; the carried snapshot stays.
+/// swap is a pointer-equality compare-and-swap. If the watcher wins every
+/// attempt, the last resort applies the mined conventions to the current value
+/// under one write lock (an O(index) clone, paid once). A panic in the mining
+/// is contained; the carried snapshot stays.
 fn republish_conventions(
     readiness: &SharedReadiness,
+    status: &RwLock<ConventionsStatus>,
     base: &Arc<CodebaseIndex>,
     pending: PendingConventions,
+) -> Arc<CodebaseIndex> {
+    republish_conventions_with(readiness, status, base, pending, &mut || {})
+}
+
+/// [`republish_conventions`] with `before_swap` run after each attempt's clone
+/// and before its compare-and-swap, so a test can force a lost race.
+fn republish_conventions_with(
+    readiness: &SharedReadiness,
+    status: &RwLock<ConventionsStatus>,
+    base: &Arc<CodebaseIndex>,
+    pending: PendingConventions,
+    before_swap: &mut dyn FnMut(),
 ) -> Arc<CodebaseIndex> {
     const ATTEMPTS: usize = 3;
     let mined = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.mine(base)))
@@ -2833,7 +2878,17 @@ fn republish_conventions(
             return Arc::clone(base);
         }
     };
-    let mut mined = Some(mined);
+    let publish_fresh = |guard: &mut IndexReadiness, next: &Arc<CodebaseIndex>, enriched: bool| {
+        *guard = if enriched {
+            IndexReadiness::ReadyEnriched(Arc::clone(next))
+        } else {
+            IndexReadiness::Ready(Arc::clone(next))
+        };
+        match status.write() {
+            Ok(mut s) => *s = ConventionsStatus::Fresh,
+            Err(poisoned) => *poisoned.into_inner() = ConventionsStatus::Fresh,
+        }
+    };
     for _ in 0..ATTEMPTS {
         let current = match readiness.read() {
             Ok(g) => g.clone(),
@@ -2844,20 +2899,17 @@ fn republish_conventions(
             IndexReadiness::ReadyEnriched(cur) => (cur, true),
             _ => return Arc::clone(base),
         };
-        if cur.conventions_status == ConventionsStatus::Fresh {
+        let already_fresh = match status.read() {
+            Ok(s) => *s == ConventionsStatus::Fresh,
+            Err(poisoned) => *poisoned.into_inner() == ConventionsStatus::Fresh,
+        };
+        if already_fresh {
             return Arc::clone(cur);
         }
         let mut next = (**cur).clone();
-        let Some(m) = mined.take() else {
-            return Arc::clone(base);
-        };
-        // Keep a copy so a lost race can retry against the watcher's index.
-        let retry = MinedConventions {
-            conventions: m.conventions.clone(),
-            co_changes: m.co_changes.clone(),
-        };
-        m.apply_to(&mut next);
+        mined.clone().apply_to(&mut next);
         let next = Arc::new(next);
+        before_swap();
         let mut guard = match readiness.write() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -2869,17 +2921,25 @@ fn republish_conventions(
             _ => false,
         };
         if unchanged {
-            *guard = if enriched {
-                IndexReadiness::ReadyEnriched(Arc::clone(&next))
-            } else {
-                IndexReadiness::Ready(Arc::clone(&next))
-            };
+            publish_fresh(&mut guard, &next, enriched);
             return next;
         }
-        mined = Some(retry);
     }
-    eprintln!("cxpak: index kept changing during conventions republish — still serving the previous snapshot's");
-    Arc::clone(base)
+    // Every attempt lost the race: apply to the current value under one lock.
+    let mut guard = match readiness.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let (cur, enriched) = match &*guard {
+        IndexReadiness::Ready(cur) => (Arc::clone(cur), false),
+        IndexReadiness::ReadyEnriched(cur) => (Arc::clone(cur), true),
+        _ => return Arc::clone(base),
+    };
+    let mut next = (*cur).clone();
+    mined.apply_to(&mut next);
+    let next = Arc::new(next);
+    publish_fresh(&mut guard, &next, enriched);
+    next
 }
 
 /// Phase 2 of the MCP background build (R-E1, ADR-0186): build the embedding

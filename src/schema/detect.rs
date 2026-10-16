@@ -1075,7 +1075,6 @@ mod tests {
             test_map: HashMap::new(),
             call_graph: crate::intelligence::call_graph::CallGraph::default(),
             conventions: crate::conventions::ConventionProfile::default(),
-            conventions_status: Default::default(),
             co_changes: Vec::new(),
             cross_lang_edges: Vec::new(),
             files: arc_files,

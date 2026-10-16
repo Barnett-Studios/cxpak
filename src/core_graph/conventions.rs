@@ -87,8 +87,8 @@ pub enum ConventionsStatus {
     #[default]
     Fresh,
     /// Carried from an earlier snapshot; a fresh mine is in flight.
-    /// `base_commit` is that snapshot's HEAD, empty when it was not recorded.
-    StalePending { base_commit: String },
+    /// `base_commit` is that snapshot's HEAD, `None` when it was not recorded.
+    StalePending { base_commit: Option<String> },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

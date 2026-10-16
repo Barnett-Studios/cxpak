@@ -13,7 +13,7 @@
 //! into scanner/parser/schema/intelligence/conventions/embeddings and therefore
 //! belong above this boundary.
 
-use crate::core_graph::conventions::{ConventionProfile, ConventionsStatus};
+use crate::core_graph::conventions::ConventionProfile;
 use crate::core_graph::domain::Domain;
 use crate::core_graph::graph::DependencyGraph;
 use crate::core_graph::intel::{CallGraph, CoChangeEdge, CrossLangEdge, DeadSymbol, HealthScore};
@@ -37,9 +37,6 @@ pub struct CodebaseIndex {
     pub pagerank: HashMap<String, f64>,
     pub test_map: HashMap<String, Vec<crate::core_graph::intel::TestFileRef>>,
     pub conventions: ConventionProfile,
-    /// Whether `conventions` and `co_changes` (one derived unit) are current
-    /// for this index or carried from the previous snapshot (ADR-0212).
-    pub conventions_status: ConventionsStatus,
     pub call_graph: CallGraph,
     pub co_changes: Vec<CoChangeEdge>,
     /// Cross-language boundary edges detected during index build (v1.5.0).
@@ -239,7 +236,6 @@ impl CodebaseIndex {
             test_map: HashMap::new(),
             call_graph: CallGraph::default(),
             conventions: ConventionProfile::default(),
-            conventions_status: Default::default(),
             co_changes: Vec::new(),
             cross_lang_edges: Vec::new(),
             #[cfg(feature = "embeddings")]

@@ -414,7 +414,6 @@ impl CodebaseIndex {
             test_map: HashMap::new(),
             call_graph: CallGraph::default(),
             conventions: ConventionProfile::default(),
-            conventions_status: Default::default(),
             co_changes: Vec::new(),
             cross_lang_edges: Vec::new(),
             #[cfg(feature = "embeddings")]

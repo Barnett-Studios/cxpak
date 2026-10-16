@@ -566,8 +566,8 @@ fn source_of(root: &Path, rel: &str) -> String {
 #[test]
 fn conventions_status_fresh_on_first_build() {
     let dir = history_repo();
-    let (idx, _, mut pending) = build_index_pending_deferred(dir.path(), None).unwrap();
-    assert_eq!(idx.conventions_status, ConventionsStatus::Fresh);
+    let (_idx, _, mut pending) = build_index_pending_deferred(dir.path(), None).unwrap();
+    assert_eq!(pending.conventions_status(), ConventionsStatus::Fresh);
     assert!(
         pending.take_conventions().is_none(),
         "no prior derived cache: nothing to defer"
@@ -590,8 +590,10 @@ fn conventions_status_stale_pending_after_commit() {
     let (stale, report, mut pending) = build_index_pending_deferred(root, None).unwrap();
     assert!(!report.derived_hit);
     assert_eq!(
-        stale.conventions_status,
-        ConventionsStatus::StalePending { base_commit: head1 }
+        pending.conventions_status(),
+        ConventionsStatus::StalePending {
+            base_commit: Some(head1)
+        }
     );
     assert_eq!(json_of(&stale.conventions), json_of(&first.conventions));
     assert!(pending.take_conventions().is_some());
@@ -608,9 +610,9 @@ fn stale_window_carries_prior_co_changes() {
     );
     second_commit(root);
 
-    let (stale, _, _pending) = build_index_pending_deferred(root, None).unwrap();
+    let (stale, _, pending) = build_index_pending_deferred(root, None).unwrap();
     assert!(matches!(
-        stale.conventions_status,
+        pending.conventions_status(),
         ConventionsStatus::StalePending { .. }
     ));
     assert!(
@@ -632,7 +634,6 @@ fn conventions_republish_matches_cold() {
     let fingerprint = pending.fingerprint().to_string();
     let mut republished = stale.clone();
     pending.mine(&stale).apply_to(&mut republished);
-    assert_eq!(republished.conventions_status, ConventionsStatus::Fresh);
     assert!(
         DerivedCache::load(&ns_dir(root), &fingerprint).is_some(),
         "the background phase saves the complete derived cache under the current fingerprint"
@@ -640,7 +641,6 @@ fn conventions_republish_matches_cold() {
 
     std::fs::remove_dir_all(root.join(".cxpak")).unwrap();
     let (cold, _) = build_index_reported(root, None).unwrap();
-    assert_eq!(cold.conventions_status, ConventionsStatus::Fresh);
     assert_eq!(snapshot(&republished), snapshot(&cold));
 }
 
@@ -672,8 +672,8 @@ fn conventions_inline_when_no_prior_cache() {
     std::fs::remove_file(derived_path(root)).unwrap();
     second_commit(root);
 
-    let (idx, _, mut pending) = build_index_pending_deferred(root, None).unwrap();
-    assert_eq!(idx.conventions_status, ConventionsStatus::Fresh);
+    let (_idx, _, mut pending) = build_index_pending_deferred(root, None).unwrap();
+    assert_eq!(pending.conventions_status(), ConventionsStatus::Fresh);
     assert!(pending.take_conventions().is_none());
 }
 
@@ -688,8 +688,8 @@ fn conventions_load_for_delta_grammar_mismatch_falls_back_inline() {
     assert!(DerivedCache::load_for_delta(&ns_dir(root)).is_none());
     second_commit(root);
 
-    let (idx, _, mut pending) = build_index_pending_deferred(root, None).unwrap();
-    assert_eq!(idx.conventions_status, ConventionsStatus::Fresh);
+    let (_idx, _, mut pending) = build_index_pending_deferred(root, None).unwrap();
+    assert_eq!(pending.conventions_status(), ConventionsStatus::Fresh);
     assert!(pending.take_conventions().is_none());
 }
 
@@ -700,8 +700,7 @@ fn non_deferring_build_always_mines_inline() {
     build_index_reported(root, None).unwrap();
     second_commit(root);
 
-    let (idx, _) = build_index_reported(root, None).unwrap();
-    assert_eq!(idx.conventions_status, ConventionsStatus::Fresh);
+    build_index_reported(root, None).unwrap();
     let saved = DerivedCache::load_for_delta(&ns_dir(root)).unwrap();
     assert_eq!(
         saved.base_commit.as_deref(),
@@ -861,14 +860,17 @@ fn call_sites_none_and_v1_store_are_per_file_misses() {
     assert_eq!(json_of(&idx.call_graph), json_of(&cold.call_graph));
 }
 
-/// A stale-pending index (built after a second commit) plus the mining it deferred.
-fn stale_base(root: &Path) -> (CodebaseIndex, PendingConventions) {
+/// A stale-pending index (built after a second commit), the mining it deferred,
+/// and the serve-internal status cell that goes with it.
+fn stale_base(root: &Path) -> (CodebaseIndex, PendingConventions, RwLock<ConventionsStatus>) {
     build_index_reported(root, None).unwrap();
     second_commit(root);
     let (stale, _, mut pending) = build_index_pending_deferred(root, None).unwrap();
+    let status = RwLock::new(pending.conventions_status());
     (
         stale,
         pending.take_conventions().expect("stale build defers"),
+        status,
     )
 }
 
@@ -876,41 +878,45 @@ fn readiness_of(next: IndexReadiness) -> SharedReadiness {
     Arc::new(RwLock::new(next))
 }
 
+fn status_of(status: &RwLock<ConventionsStatus>) -> ConventionsStatus {
+    status.read().unwrap().clone()
+}
+
 #[test]
 fn republish_swaps_fresh_conventions_into_ready_cell() {
     let dir = history_repo();
-    let (stale, pending) = stale_base(dir.path());
+    let (stale, pending, status) = stale_base(dir.path());
+    assert!(matches!(
+        status_of(&status),
+        ConventionsStatus::StalePending { .. }
+    ));
     let base = Arc::new(stale);
     let cell = readiness_of(IndexReadiness::Ready(Arc::clone(&base)));
 
-    let published = republish_conventions(&cell, &base, pending);
-    assert_eq!(published.conventions_status, ConventionsStatus::Fresh);
+    let published = republish_conventions(&cell, &status, &base, pending);
+    assert_eq!(status_of(&status), ConventionsStatus::Fresh);
     match &*cell.read().unwrap() {
         IndexReadiness::Ready(now) => assert!(Arc::ptr_eq(now, &published)),
         _ => panic!("cell must stay Ready"),
-    }
-    assert!(matches!(
-        base.conventions_status,
-        ConventionsStatus::StalePending { .. }
-    ));
+    };
 }
 
 #[test]
 fn republish_keeps_a_watcher_edit_and_the_enriched_variant() {
     let dir = history_repo();
-    let (stale, pending) = stale_base(dir.path());
+    let (stale, pending, status) = stale_base(dir.path());
     let base = Arc::new(stale);
     let mut edited = (*base).clone();
     edited.total_bytes += 7;
     let edited = Arc::new(edited);
     let cell = readiness_of(IndexReadiness::ReadyEnriched(Arc::clone(&edited)));
 
-    let published = republish_conventions(&cell, &base, pending);
+    let published = republish_conventions(&cell, &status, &base, pending);
     assert_eq!(
         published.total_bytes, edited.total_bytes,
         "watcher edit kept"
     );
-    assert_eq!(published.conventions_status, ConventionsStatus::Fresh);
+    assert_eq!(status_of(&status), ConventionsStatus::Fresh);
     assert!(matches!(
         &*cell.read().unwrap(),
         IndexReadiness::ReadyEnriched(now) if Arc::ptr_eq(now, &published)
@@ -920,25 +926,55 @@ fn republish_keeps_a_watcher_edit_and_the_enriched_variant() {
 #[test]
 fn republish_leaves_a_non_ready_or_already_fresh_cell_alone() {
     let dir = history_repo();
-    let (stale, pending) = stale_base(dir.path());
+    let (stale, pending, status) = stale_base(dir.path());
     let base = Arc::new(stale);
     let failed = readiness_of(IndexReadiness::Failed("boom".into()));
-    let out = republish_conventions(&failed, &base, pending);
+    let out = republish_conventions(&failed, &status, &base, pending);
     assert!(Arc::ptr_eq(&out, &base));
     assert!(matches!(
         &*failed.read().unwrap(),
         IndexReadiness::Failed(_)
     ));
+    assert!(matches!(
+        status_of(&status),
+        ConventionsStatus::StalePending { .. }
+    ));
 
     let dir = history_repo();
-    let (stale, pending) = stale_base(dir.path());
+    let (stale, pending, status) = stale_base(dir.path());
     let base = Arc::new(stale);
-    let mut fresh = (*base).clone();
-    fresh.conventions_status = ConventionsStatus::Fresh;
-    let fresh = Arc::new(fresh);
-    let cell = readiness_of(IndexReadiness::Ready(Arc::clone(&fresh)));
-    let out = republish_conventions(&cell, &base, pending);
-    assert!(Arc::ptr_eq(&out, &fresh));
+    *status.write().unwrap() = ConventionsStatus::Fresh;
+    let cell = readiness_of(IndexReadiness::Ready(Arc::clone(&base)));
+    let out = republish_conventions(&cell, &status, &base, pending);
+    assert!(Arc::ptr_eq(&out, &base));
+}
+
+#[test]
+fn republish_survives_a_contender_that_wins_every_attempt() {
+    let dir = history_repo();
+    let (stale, pending, status) = stale_base(dir.path());
+    let base = Arc::new(stale);
+    let cell = readiness_of(IndexReadiness::ReadyEnriched(Arc::clone(&base)));
+    let swaps = std::cell::Cell::new(0u64);
+    let mut contend = || {
+        swaps.set(swaps.get() + 1);
+        let mut edited = (*base).clone();
+        edited.total_bytes += swaps.get();
+        *cell.write().unwrap() = IndexReadiness::ReadyEnriched(Arc::new(edited));
+    };
+
+    let published = republish_conventions_with(&cell, &status, &base, pending, &mut contend);
+    assert!(swaps.get() >= 3, "every CAS attempt must have been lost");
+    assert_eq!(status_of(&status), ConventionsStatus::Fresh);
+    assert_eq!(
+        published.total_bytes,
+        base.total_bytes + swaps.get(),
+        "the contender's latest index content is preserved"
+    );
+    match &*cell.read().unwrap() {
+        IndexReadiness::ReadyEnriched(now) => assert!(Arc::ptr_eq(now, &published)),
+        _ => panic!("the enriched variant must be preserved"),
+    };
 }
 
 #[test]
@@ -961,9 +997,7 @@ fn mcp_start_after_commit_republishes_fresh_conventions() {
         .unwrap();
 
     match &*cell.read().unwrap() {
-        IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => {
-            assert_eq!(idx.conventions_status, ConventionsStatus::Fresh)
-        }
+        IndexReadiness::Ready(_) | IndexReadiness::ReadyEnriched(_) => {}
         _ => panic!("the build must publish a ready index"),
     }
     assert!(DerivedCache::load(&ns_dir(root), &fingerprint).is_some());
