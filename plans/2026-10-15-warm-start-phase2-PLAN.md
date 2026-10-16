@@ -64,6 +64,10 @@ Extends `warm_repo()` (`src/commands/warm_start_tests.rs`) with a second commit 
 | P2.7 `call_sites_cache_hit_skips_reparse` | warm_start_tests.rs | unchanged `src/a.rs` across two builds: a `#[cfg(test)]` thread-local parse counter in `extract_calls_by_symbol` reads 0 for `src/a.rs` on the second build's `build_call_graph_cached` call; `CallGraph` output is identical to the first build's | `build_call_graph_cached` does not exist (compile red) |
 | P2.8 `call_sites_cache_miss_on_content_change` | warm_start_tests.rs | `src/a.rs` edited (new fn body): the counter reads ≥ 1 for `src/a.rs`; the stored `call_sites_by_symbol` entry for `src/a.rs` is overwritten with the new call sites | same |
 | P2.9 `call_sites_cache_miss_on_language_change` | warm_start_tests.rs | a cached entry's `language` differs from the current build's detected language for that path: treated as a miss, not a false hit | same |
+| P2.12 `stale_window_carries_prior_co_changes` | warm_start_tests.rs | in the `StalePending` window `index.co_changes` equals the prior snapshot's and is non-empty | `ConventionsStatus` does not exist (compile red) |
+| P2.13 `stale_build_never_saves_derived_under_current_fingerprint` | warm_start_tests.rs | after a `StalePending` build whose background phase is not run, `DerivedCache::load(dir, current_fp)` is `None` | same |
+| P2.14 `cold_builds_are_deterministic` | warm_start_tests.rs | two independent cold builds of the same `HEAD` give identical `conventions` and `co_changes` (B10) | compile red (shares the new fixture helpers) |
+| P2.15 `call_sites_none_and_v1_store_are_per_file_misses` | warm_start_tests.rs | an entry with `call_sites_by_symbol: None` is recomputed and written back; a v1 store is a full miss, not an error (B8) | same |
 | P2.10 `build_call_graph_wrapper_matches_cached_empty` | call_graph.rs | `build_call_graph(index)` output equals `build_call_graph_cached(index, &HashMap::new()).0` on the existing call_graph.rs fixtures (all four existing tests' indexes) | `build_call_graph_cached` does not exist |
 | P2.11 `post_commit_gate_measurement` | not a unit test — recorded in BASELINES, gated by B1 | — | — |
 
@@ -82,18 +86,22 @@ The `ConventionsStatus` fields used by tests: `Fresh`, `StalePending { base_comm
   only the constant bump and the field. Turns P2.6 green.
 - **T3. `build_call_graph_cached`.** `src/intelligence/call_graph.rs`: extract the body of
   `build_call_graph` into
-  `pub(crate) fn build_call_graph_cached(index: &CodebaseIndex, cache: &HashMap<(String, String), BTreeMap<String, Vec<String>>>) -> (CallGraph, HashMap<(String, String), BTreeMap<String, Vec<String>>>)`
-  keyed by `(relative_path, content_sha256)` — language is checked via the stored entry's `language`
-  field before trusting a hit (P2.9), so the key stays two-part and the language check is an explicit
-  guard, not folded into the key. For each file: cache hit → reuse `call_map`, no
+  `pub(crate) fn build_call_graph_cached(index: &CodebaseIndex, cache: &HashMap<String, BTreeMap<String, Vec<String>>>) -> (CallGraph, HashMap<String, BTreeMap<String, Vec<String>>>)`
+  keyed by `relative_path` (spec §5) — the caller (`build_index_pending`) admits an entry into the
+  cache only after its `content_sha256` and `language` matched the bytes just read (the existing
+  `matching` filter, so a language change is a whole-entry miss, P2.9), and writes computed call
+  sites back only if the store entry's sha still matches. For each file: cache hit → reuse `call_map`, no
   `extract_calls_by_symbol` call; miss → call it, record the result for the caller to write back.
   `pub fn build_call_graph(index)` becomes `build_call_graph_cached(index, &HashMap::new()).0`.
   Turns P2.7, P2.8, P2.9, P2.10 green.
 - **T4. Deferred conventions in `serve.rs`.**
-  - `build_index_with_workspace_reported` (or its post-3.5.0 equivalent): on a derived-cache miss,
-    attempt `DerivedCache::load_for_delta(ns_dir)`. On `Some(prior)`: use `prior.conventions`,
+  - `build_index_pending` gains a deferring sibling used only by `spawn_mcp_index_build`
+    (`build_index_pending_deferred`); all other callers stay inline. On a derived-cache miss it
+    attempts `DerivedCache::load_for_delta(ns_dir)`. On `Some(prior)`: use `prior.conventions` **and
+    `prior.co_changes`** (one derived unit),
     `conventions_status = StalePending { base_commit: prior.base_commit.unwrap_or_default() }`,
-    skip the inline `build_convention_profile` call. On `None`: today's inline mining,
+    skip the inline `build_convention_profile` call **and do not save a `DerivedCache`** (the background
+    phase saves the complete one under the current fingerprint). On `None`: today's inline mining,
     `conventions_status = Fresh`.
   - `spawn_mcp_index_build`: after publishing `Ready`, if the published index carries
     `StalePending`, spawn (or extend the existing embeddings thread-spawn site) a second phase that
@@ -141,7 +149,7 @@ at least one passing test.
   "execution-manifest": [
     {"id": "conventions-status-type", "files": ["src/core_graph/conventions.rs", "src/index/mod.rs"], "change": "Add ConventionsStatus enum (Fresh / StalePending{base_commit}) and a defaulted conventions_status field on CodebaseIndex.", "accept": "set -o pipefail; cargo test --lib conventions_status_fresh_on_first_build 2>&1 | grep -E 'test result: ok\\. [1-9]'", "forbid": ["new_deps"], "local": true},
     {"id": "artifact-store-v2", "files": ["src/cache/artifacts.rs"], "change": "Bump ARTIFACT_STORE_VERSION to 2; add call_sites_by_symbol: Option<BTreeMap<String, Vec<String>>> to ArtifactEntry.", "accept": "set -o pipefail; cargo test --lib artifact_store_v2_rejects_v1 2>&1 | grep -E 'test result: ok\\. [1-9]'", "forbid": ["new_deps"], "local": true},
-    {"id": "call-graph-cached", "files": ["src/intelligence/call_graph.rs"], "change": "Extract build_call_graph into build_call_graph_cached(index, cache) keyed by (relative_path, content_sha256) with a language guard; build_call_graph wraps it with an empty cache.", "accept": "set -o pipefail; cargo test --lib call_graph:: 2>&1 | grep -E 'test result: ok\\. [1-9]'", "forbid": ["new_deps"], "local": false},
+    {"id": "call-graph-cached", "files": ["src/intelligence/call_graph.rs"], "change": "Extract build_call_graph into build_call_graph_cached(index, cache) keyed by relative_path with caller-validated entries (sha and language checked in build_index_pending); build_call_graph wraps it with an empty cache.", "accept": "set -o pipefail; cargo test --lib call_graph:: 2>&1 | grep -E 'test result: ok\\. [1-9]'", "forbid": ["new_deps"], "local": false},
     {"id": "deferred-conventions", "files": ["src/commands/serve.rs"], "change": "On a derived miss, try DerivedCache::load_for_delta for conventions (StalePending); otherwise mine inline (Fresh). Background phase on spawn_mcp_index_build remines and republishes Fresh, sequenced independently of the embeddings phase.", "accept": "set -o pipefail; cargo test --lib warm_start_tests 2>&1 | grep -E 'test result: ok\\. [1-9]'", "local": false},
     {"id": "phase2-gate-measurement", "files": ["benches/BASELINES.md"], "change": "Record the post-commit warm-start gate measurement (scripts/mcp-ready.py, n>=5, git commit --allow-empty before each run) against the 6.0s target.", "accept": "test -f benches/BASELINES.md && grep -q 'Phase 2 gate result' benches/BASELINES.md && echo ok", "local": false}
   ]

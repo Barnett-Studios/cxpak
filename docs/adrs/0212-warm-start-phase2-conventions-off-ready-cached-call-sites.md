@@ -87,8 +87,12 @@ trade; it has to be chosen and recorded.
 ## Decision
 
 **B (conventions) + E (call graph).** `Ready` publishes with `DerivedCache::load_for_delta`'s
-conventions tagged `ConventionsStatus::StalePending { base_commit }` when a prior derived cache
-exists; a background phase mines fresh conventions and republishes `Fresh`. The call graph is built
+conventions **and `co_changes`** (one derived unit, persisted and restored together) tagged
+`ConventionsStatus::StalePending { base_commit }` when a prior derived cache exists; a background phase mines fresh conventions and republishes `Fresh`. The Ready-time build path **never saves a
+`DerivedCache` while conventions are `StalePending`**: only the background phase, after fresh
+mining, saves the complete `DerivedCache` under the current fingerprint (an interrupted start must
+not leave stale conventions on disk under this commit's fingerprint). Only the MCP start path
+defers; all other build callers mine inline. The call graph is built
 from `call_sites_by_symbol` cached per file in the artifact store (version 2), with the public
 `build_call_graph` unchanged and a new `pub(crate)` cached variant underneath it.
 

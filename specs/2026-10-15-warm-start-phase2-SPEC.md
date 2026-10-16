@@ -54,7 +54,7 @@ already parsed for this build.
 | ID | Constraint |
 |---|---|
 | C1 Parity | Once background work settles, the published index equals a cold build on every Phase 1 C1 field, plus `conventions` and `call_graph` explicitly. |
-| C2 Honest window | What a tool call sees in the window between `Ready` and the background republish is documented, not silently stale: a `ConventionsStatus` discriminator (`Fresh` / `StalePending { base_commit }`) is exposed on the index so a caller can tell. |
+| C2 Honest window | What a tool call sees in the window between `Ready` and the background republish is documented, not silently stale: a `ConventionsStatus` discriminator (`Fresh` / `StalePending { base_commit }`) is exposed on the index so a caller can tell. Conventions and `co_changes` are one derived unit (both come from the same history walk and are persisted together in `DerivedCache`); in the window the index carries the prior snapshot's `conventions` **and** `co_changes` together, never one without the other. |
 | C3 Fail-closed | A missing, corrupt, or version/grammar-mismatched artifact-store call-site entry, or a `load_for_delta` miss, gives a full recompute — never an indexing error. |
 | C4 No API break | `build_call_graph`'s existing public signature is unchanged (ADR-0210 C7 precedent extends here). `ArtifactEntry`, `ArtifactStore` stay `pub(crate)`. |
 | C5 Determinism | The republished conventions, once settled, are bit-for-bit what a cold build of the same `HEAD` produces. The call graph built from cached call sites is identical to one built from a fresh parse. |
@@ -65,12 +65,21 @@ already parsed for this build.
 See ADR-0212 for the decision and rejected options. Summary of the chosen shape:
 
 1. **Conventions stop blocking `Ready`.** On a derived miss, `Ready` publishes with conventions
-   loaded via `DerivedCache::load_for_delta` (ignores fingerprint, validates grammar/version) from
-   the *previous* on-disk derived cache — i.e. last commit's conventions — tagged
-   `StalePending { base_commit }`. A background phase (reusing the existing snapshot-then-swap
+   **and `co_changes`** loaded via `DerivedCache::load_for_delta` (ignores fingerprint, validates
+   grammar/version) from the *previous* on-disk derived cache — i.e. last commit's conventions and
+   co-change edges — tagged `StalePending { base_commit }`. The deferral is opt-in: only the MCP
+   start path (`spawn_mcp_index_build`) defers; every other caller of the build (CLI commands, the
+   HTTP server, tests that call `build_index_reported`) mines inline and always sees `Fresh`.
+   **Save rule:** the Ready-time build path never saves a `DerivedCache` while conventions are
+   `StalePending`. Only the background phase, after fresh mining, saves the complete `DerivedCache`
+   under the current fingerprint. Otherwise a start interrupted before the background phase
+   finishes would leave last commit's conventions on disk under this commit's fingerprint, and the
+   next start would restore them as `Fresh`. A background phase (reusing the existing snapshot-then-swap
    enrichment pattern at `spawn_mcp_index_build`, used today for embeddings) then runs the full
    `build_convention_profile`, and republishes `Ready` with `Fresh` conventions and the now-complete
-   `DerivedCache` write. No prior derived cache (first start in the repo, or `load_for_delta` fails
+   `DerivedCache` write. If the watcher republished the cell in the window, the background phase
+   patches the freshly mined conventions into whatever index the cell now holds (it never discards a
+   watcher edit and never leaves the cell `StalePending`). No prior derived cache (first start in the repo, or `load_for_delta` fails
    grammar/version) means conventions are mined inline before `Ready`, unchanged from today — a
    repo's first post-upgrade start pays once, as Phase 1's "Negative" already documents for artifacts.
 2. **Call graph stops re-parsing.** `ArtifactEntry` gains
@@ -97,7 +106,9 @@ See ADR-0212 for the decision and rejected options. Summary of the chosen shape:
 | B7 | `build_call_graph`'s public signature and behaviour are unchanged for every existing caller | existing call_graph.rs tests stay green unmodified |
 | B8 | C3: a v1 artifact store, or a `call_sites_by_symbol: None` entry, is a per-file miss, not an error | test |
 | B9 | C3: `load_for_delta` returning `None` (no prior cache, grammar mismatch) falls back to inline mining | test |
-| B10 | Determinism: the republished `ConventionProfile` is identical across two independent cold builds of the same `HEAD` | test |
+| B10 | Determinism: `ConventionProfile` and `co_changes` are identical across two independent cold builds of the same `HEAD` | test |
+| B12 | Window carries `co_changes` with conventions: in the `StalePending` window `index.co_changes` equals the prior snapshot's (non-empty on a fixture with co-change history) | test |
+| B13 | Save rule: after a `StalePending` build whose background phase never runs, `DerivedCache::load(dir, current_fingerprint)` is `None` | test |
 | B11 | Gates: `cargo fmt --check`, `clippy --all-targets --all-features -D warnings`, `cargo test --all-features`, `scripts/feature-matrix.sh`, tarpaulin ≥ 90 % | CI |
 
 ## 7. Risks
