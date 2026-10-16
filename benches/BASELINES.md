@@ -78,3 +78,23 @@ The artifact store for scriptorium is 55 MB of JSON (`.cxpak/cache/artifacts.jso
 each start, so per-file artifacts all hit and the derived cache misses) measured **11.7–11.9 s
 (median 11.79 s, n = 5)**, against a 6.0 s gate. The gate fired. The next step is incremental derived
 work (a call graph from cached parse results, and conventions after `Ready`) in its own spec.
+
+### Phase 2 gate result (ADR-0212)
+
+Scriptorium clone (4,384 files), release build of `perf/warm-start-p2`, `scripts/mcp-ready.py`, an
+empty commit before each start (per-file artifacts and call sites all hit, derived cache misses),
+primed once with a long-lived server so the background phase saved the complete derived cache and
+the call sites. Load average 4.5 (1 min) at the end of the run.
+
+| Start | n | `index_ready_s` median | min–max | peak RSS |
+|---|---|---|---|---|
+| post-commit, 3.5.0 (Phase 1 table above) | 5 | 11.79 s | 11.7–11.9 s | n/a |
+| **post-commit, Phase 2** | 5 | **3.18 s** | 3.11–3.55 s | 357–379 MB |
+| warm, unchanged (derived hit) | 3 | 0.75 s | 0.70–0.82 s | 364–376 MB |
+
+Individual post-commit runs: 3.55, 3.26, 3.18, 3.11, 3.13 s. Gate B1 (median <= 6.0 s): **met**.
+Server ready line on a post-commit start: `artifacts 4384 hit/0 partial/0 miss, derived miss, 3.20s`
+(the first, cold-store start after the upgrade reads `artifacts 0 hit/.../4384 miss`, 5.4 s once the
+v1 store is rejected). The unchanged-repo figure is lower than Phase 1's 1.85 s because the machine
+was less loaded; it shows no regression, not a speedup. `artifacts.json` grew from 55 MB to 59.8 MB
+with the call sites (2,390 of 4,384 entries have an extractor for their language).
