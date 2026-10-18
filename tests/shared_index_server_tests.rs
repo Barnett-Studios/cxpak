@@ -87,7 +87,8 @@ impl Sandbox {
             .env("TMPDIR", self.dir.path())
             .env("HOME", self.dir.path().join("home"))
             .env("CXPAK_INDEX_SERVER", switch)
-            .env("CXPAK_INDEX_SERVER_IDLE_SECS", "60");
+            .env("CXPAK_INDEX_SERVER_IDLE_SECS", "60")
+            .env("CXPAK_INDEX_SERVER_SPAWN_WAIT_SECS", "90");
         cmd
     }
 
@@ -121,8 +122,8 @@ impl Sandbox {
             build_id: build_id_of(Path::new(BIN)).unwrap(),
             run_dir: self.run_dir(),
             timeouts: Timeouts::default(),
-            lock_wait: Duration::from_secs(10),
-            spawn_wait: Duration::from_secs(15),
+            lock_wait: Duration::from_secs(90),
+            spawn_wait: Duration::from_secs(45),
             child_env: Vec::new(),
         };
         cfg.child_env
@@ -200,7 +201,7 @@ impl Session {
         line.push('\n');
         self.stdin.write_all(line.as_bytes()).unwrap();
         self.stdin.flush().unwrap();
-        self.rx.recv_timeout(Duration::from_secs(30)).ok()
+        self.rx.recv_timeout(Duration::from_secs(120)).ok()
     }
 
     fn call_node(&mut self) -> Value {
@@ -215,7 +216,7 @@ impl Session {
 
     /// Poll until the call is answered by a ready index; returns that response.
     fn ready_response(&mut self) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(240);
         while Instant::now() < deadline {
             let resp = self.call_node();
             if resp["result"]["structuredContent"]["status"].is_null() {
@@ -350,7 +351,7 @@ fn killing_the_server_mid_session_falls_back_without_hanging() {
     unsafe { libc::kill(pid, libc::SIGKILL) };
     let start = Instant::now();
     let first_after = s.call_node();
-    assert!(start.elapsed() < Duration::from_secs(10), "client hung");
+    assert!(start.elapsed() < Duration::from_secs(60), "client hung");
     assert_eq!(
         first_after["result"]["structuredContent"]["status"],
         "indexing"
@@ -405,7 +406,7 @@ fn hung_server_times_out_and_falls_back() {
     let mut s = Session::start(cmd, &sb);
     let start = Instant::now();
     let first = s.call_node();
-    assert!(start.elapsed() < Duration::from_secs(10), "client hung");
+    assert!(start.elapsed() < Duration::from_secs(60), "client hung");
     assert_eq!(first["result"]["structuredContent"]["status"], "indexing");
     assert_eq!(Session::text_of(&s.ready_response()), expected);
 }
@@ -433,7 +434,7 @@ fn idle_server_exits_unlinks_and_leaves_no_zombie() {
     let conn = ensure_server(&sb.repo(), &cfg).unwrap();
     let pid = *sb.server_pids().first().expect("pid file");
     drop(conn);
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while alive(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }

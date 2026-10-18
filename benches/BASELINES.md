@@ -164,3 +164,20 @@ In place on all 5 C runs. Gate (footprint <= 3.4.0 x 1.10): **met** (U 372.8 vs 
 Resident set size alone: U met (384.9 vs 434.8); C **not met** (569.5 vs 504.2).
 3.5.1 is indistinguishable from 3.5.0 on both metrics here: in this series the footprint was already
 below 3.4.0's, and the in-place republish and borrowed save did not change it measurably.
+
+## Shared index server, N=4 concurrent sessions (ADR-0214, 2026-10-18)
+
+Method: `/tmp/frz-srv/measure.py` starts 4 `serve --mcp /tmp/frz-srv/scriptorium` sessions (frozen
+clone of `/tmp/frz/scriptorium`, HEAD ccbab5d0, 4,384 files), each polling one `cxpak_graph` call
+until the index answers, waits 5 s, then sums `footprint` per process (server included). Same
+release binary both ways: `CXPAK_INDEX_SERVER=off` is the 3.5.1 in-process path. Per-run totals, MB.
+
+| Mode | Run 1 | Run 2 | Run 3 | Composition (run 3) |
+|---|---|---|---|---|
+| off (4 x in-process) | 2756 | 1287 | 1285 | 4 x 321 |
+| on (1 server + 4 clients) | 349.5 | 348.8 | 350.1 | 332 server + 4 x ~4.5 |
+
+Run 1 of the `off` series built the derived cache cold (690 MB each); runs 2-3 are warm-cache.
+Target: total <= (one in-process footprint + 4 x thin-client footprint) x 1.2 = (322 + 18) x 1.2 =
+408 MB. Measured 349-350 MB: **met**, 3.7x below the warm in-process total (1285 MB). The idle-exit
+default (600 s) is reasoned, not measured.

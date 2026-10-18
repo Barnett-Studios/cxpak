@@ -14,6 +14,7 @@ use std::time::Duration;
 
 pub const ENV_SWITCH: &str = "CXPAK_INDEX_SERVER";
 pub const ENV_IDLE_SECS: &str = "CXPAK_INDEX_SERVER_IDLE_SECS";
+pub const ENV_SPAWN_WAIT_SECS: &str = "CXPAK_INDEX_SERVER_SPAWN_WAIT_SECS";
 pub const ENV_REQUEST_TIMEOUT_SECS: &str = "CXPAK_INDEX_SERVER_REQ_TIMEOUT_SECS";
 pub const ENV_ROLE: &str = "CXPAK_INDEX_SERVER_ROLE";
 pub const ENV_SOCKET: &str = "CXPAK_INDEX_SERVER_SOCKET";
@@ -231,13 +232,21 @@ impl ClientConfig {
         {
             timeouts.request = Duration::from_secs(secs);
         }
+        let secs = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|s| *s > 0)
+                .unwrap_or(default)
+        };
+        let spawn_wait = Duration::from_secs(secs(ENV_SPAWN_WAIT_SECS, 10));
         Ok(Self {
             exe: std::env::current_exe().map_err(IpcError::Io)?,
             build_id: build_id()?,
             run_dir: private_run_dir(&base)?,
             timeouts,
-            lock_wait: Duration::from_secs(10),
-            spawn_wait: Duration::from_secs(10),
+            lock_wait: spawn_wait,
+            spawn_wait,
             child_env: Vec::new(),
         })
     }
