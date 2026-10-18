@@ -2709,8 +2709,9 @@ struct SharedSession {
 
 impl SharedSession {
     fn new(path: &Path) -> Self {
+        // The server indexes the canonical root; the fallback must see the same path.
         Self {
-            path: path.to_path_buf(),
+            path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
             backend: SessionBackend::Unresolved,
         }
     }
@@ -5516,6 +5517,18 @@ fn mcp_error_response(id: Option<Value>, code: i32, message: &str) -> Value {
 mod tests {
     use super::*;
     use crate::budget::counter::TokenCounter;
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_session_root_is_canonical_like_the_servers() {
+        let real = tempfile::tempdir().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("repo-link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let session = SharedSession::new(&link);
+        assert_eq!(session.path, real.path().canonicalize().unwrap());
+    }
+
     use crate::index::CodebaseIndex;
     use crate::scanner::ScannedFile;
     use tower::ServiceExt;

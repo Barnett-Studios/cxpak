@@ -493,3 +493,105 @@ fn failed_index_makes_the_server_exit_and_unlink() {
     result.unwrap();
     assert!(!sock.exists());
 }
+
+/// Run dir for in-process servers, apart from the one the sandbox guard reads pid files from: an
+/// in-process server writes the test process's own pid there.
+fn inproc_dir(sb: &Sandbox) -> PathBuf {
+    private_run_dir(&sb.dir.path().join("run2")).unwrap()
+}
+
+/// Spawn `run_index_server` in-process and wait for its socket to appear.
+fn start_in_process_server(
+    sb: &Sandbox,
+    name: &str,
+    cfg: ServerConfig,
+) -> (PathBuf, mpsc::Receiver<Result<(), IpcError>>) {
+    let role = ServerRole {
+        sock: inproc_dir(sb).join(name),
+        build_id: cxpak::daemon::ipc::build_id().unwrap(),
+    };
+    let sock = role.sock.clone();
+    let repo = sb.repo();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_index_server(&repo, &role, &cfg));
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !sock.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(sock.exists(), "server never bound");
+    (sock, rx)
+}
+
+#[test]
+fn client_in_the_backlog_at_the_idle_edge_is_served() {
+    use cxpak::daemon::ipc::{Handshake, SharedIndexTransport, UnixTransport};
+    use fs2::FileExt;
+    let sb = Sandbox::new();
+    let root = sb.repo().canonicalize().unwrap();
+    let name = "idle.sock";
+    // The probing client of `ensure_server` holds this lock while it connects.
+    let lock = std::fs::File::create(inproc_dir(&sb).join("idle.lock")).unwrap();
+    lock.lock_exclusive().unwrap();
+    let (sock, done) = start_in_process_server(
+        &sb,
+        name,
+        ServerConfig::with_idle(Duration::from_millis(500)),
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    let conn = UnixTransport { path: sock }
+        .connect(&Handshake::local(&root).unwrap(), &Timeouts::default())
+        .map_err(|e| e.to_string());
+    assert!(conn.is_ok(), "{:?}", conn.err());
+    lock.unlock().unwrap();
+    drop(conn);
+    done.recv_timeout(Duration::from_secs(60))
+        .expect("server must idle-exit once the client leaves")
+        .unwrap();
+}
+
+#[test]
+fn lock_contention_at_the_idle_edge_does_not_abort_the_server() {
+    use fs2::FileExt;
+    let sb = Sandbox::new();
+    let lock = std::fs::File::create(inproc_dir(&sb).join("held.lock")).unwrap();
+    lock.lock_exclusive().unwrap();
+    let cfg = ServerConfig::with_idle(Duration::from_millis(200));
+    let (sock, done) = start_in_process_server(&sb, "held.sock", cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        done.try_recv().is_err(),
+        "a lock timeout must not end the server"
+    );
+    lock.unlock().unwrap();
+    let result = done
+        .recv_timeout(Duration::from_secs(60))
+        .expect("server exits once the lock is free");
+    result.unwrap();
+    assert!(!sock.exists());
+}
+
+#[test]
+fn over_cap_connection_is_dropped_on_the_accept_thread() {
+    use cxpak::daemon::ipc::{Handshake, SharedIndexTransport, UnixTransport};
+    use std::os::unix::net::UnixStream;
+    let sb = Sandbox::new();
+    let root = sb.repo().canonicalize().unwrap();
+    let mut cfg = ServerConfig::with_idle(Duration::from_secs(60));
+    cfg.max_clients = 1;
+    let (sock, _done) = start_in_process_server(&sb, "cap.sock", cfg);
+    let _held = UnixTransport { path: sock.clone() }
+        .connect(&Handshake::local(&root).unwrap(), &Timeouts::default())
+        .map_err(|e| e.to_string())
+        .unwrap();
+    let mut extra = UnixStream::connect(&sock).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_millis(1000)))
+        .unwrap();
+    let err = read_frame(&mut extra).unwrap_err();
+    assert!(
+        err.is_disconnect(),
+        "expected an immediate close, got {err}"
+    );
+}

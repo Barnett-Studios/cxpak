@@ -15,6 +15,7 @@ use std::time::Duration;
 pub const ENV_SWITCH: &str = "CXPAK_INDEX_SERVER";
 pub const ENV_IDLE_SECS: &str = "CXPAK_INDEX_SERVER_IDLE_SECS";
 pub const ENV_SPAWN_WAIT_SECS: &str = "CXPAK_INDEX_SERVER_SPAWN_WAIT_SECS";
+pub const ENV_LOCK_WAIT_SECS: &str = "CXPAK_INDEX_SERVER_LOCK_WAIT_SECS";
 pub const ENV_REQUEST_TIMEOUT_SECS: &str = "CXPAK_INDEX_SERVER_REQ_TIMEOUT_SECS";
 pub const ENV_ROLE: &str = "CXPAK_INDEX_SERVER_ROLE";
 pub const ENV_SOCKET: &str = "CXPAK_INDEX_SERVER_SOCKET";
@@ -23,6 +24,8 @@ pub const ENV_BUILD_ID: &str = "CXPAK_INDEX_SERVER_BUILD_ID";
 /// macOS `sun_path` is 104 bytes including the NUL; keep headroom.
 pub const MAX_SOCKET_PATH: usize = 100;
 const DEFAULT_IDLE_SECS: u64 = 600;
+/// Bound on waiting for the per-server lock; a first call can wait this plus connect and spawn.
+const DEFAULT_LOCK_WAIT_SECS: u64 = 3;
 const LOG_ROTATE_BYTES: u64 = 256 * 1024;
 
 /// Whether the shared server is enabled. `off`, `0`, `false` and `no` (any case) disable it.
@@ -97,7 +100,7 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// `dir` must be a real directory (not a symlink) owned by us and not group/world writable.
+/// `dir` must be a real directory (not a symlink) owned by us with no group or world access.
 #[cfg(unix)]
 pub fn validate_run_dir(dir: &Path) -> Result<(), IpcError> {
     use std::os::unix::fs::MetadataExt;
@@ -109,8 +112,8 @@ pub fn validate_run_dir(dir: &Path) -> Result<(), IpcError> {
     if meta.uid() != effective_uid() {
         return Err(unsafe_dir("not owned by the current user"));
     }
-    if meta.mode() & 0o022 != 0 {
-        return Err(unsafe_dir("group- or world-writable"));
+    if meta.mode() & 0o077 != 0 {
+        return Err(unsafe_dir("accessible by group or others"));
     }
     Ok(())
 }
@@ -245,7 +248,7 @@ impl ClientConfig {
             build_id: build_id()?,
             run_dir: private_run_dir(&base)?,
             timeouts,
-            lock_wait: spawn_wait,
+            lock_wait: Duration::from_secs(secs(ENV_LOCK_WAIT_SECS, DEFAULT_LOCK_WAIT_SECS)),
             spawn_wait,
             child_env: Vec::new(),
         })
@@ -407,7 +410,6 @@ pub struct ServerConfig {
     pub max_clients: usize,
     pub failed_grace: Duration,
     pub poll: Duration,
-    pub lock_wait: Duration,
 }
 
 impl ServerConfig {
@@ -417,7 +419,6 @@ impl ServerConfig {
             max_clients: 64,
             failed_grace: Duration::from_secs(2),
             poll: Duration::from_millis(20),
-            lock_wait: Duration::from_secs(10),
         }
     }
 
@@ -462,7 +463,13 @@ pub fn run_index_server(
         .parent()
         .ok_or_else(|| IpcError::Unavailable("socket path has no parent".into()))?;
     validate_run_dir(run_dir)?;
-    let listener = match UnixListener::bind(&role.sock) {
+    // SAFETY: `umask` takes and returns a plain mode, cannot fail, and touches no memory. The
+    // server is still single-threaded here, so no other thread creates files under the mask.
+    let previous_mask = unsafe { libc::umask(0o077) };
+    let bound = UnixListener::bind(&role.sock);
+    // SAFETY: as above; restores the mask saved just before.
+    unsafe { libc::umask(previous_mask) };
+    let listener = match bound {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Ok(()),
         Err(e) => return Err(IpcError::Io(e)),
@@ -499,50 +506,63 @@ pub fn run_index_server(
         }
     }
 
-    loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let admitted = clients.fetch_add(1, Ordering::SeqCst) < cfg.max_clients;
-                let guard = ClientGuard {
-                    clients: Arc::clone(&clients),
-                    idle_since: Arc::clone(&idle_since),
-                };
-                let expected = expected.clone();
-                let readiness = Arc::clone(&readiness);
-                let root = root.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("cxpak-index-conn".into())
-                    .spawn(move || {
-                        let _guard = guard;
-                        let timeout = Some(Duration::from_secs(2));
-                        let ready = stream.set_nonblocking(false).is_ok()
-                            && stream.set_read_timeout(timeout).is_ok()
-                            && stream
-                                .set_write_timeout(Some(Duration::from_secs(120)))
-                                .is_ok();
-                        if !ready {
-                            return;
-                        }
-                        let admit = if admitted { Ok(()) } else { Err("busy") };
-                        if server_handshake(&mut stream, &expected, admit).is_err() {
-                            return;
-                        }
-                        if stream.set_read_timeout(None).is_err() {
-                            return;
-                        }
-                        let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
-                        let result = serve_requests(&mut stream, &mut |request| {
-                            dispatch_tools_call(request, &readiness, &root, &snapshot)
-                        });
-                        if let Err(e) = result {
-                            eprintln!("cxpak index-server: connection ended: {e}");
-                        }
-                    });
-                if let Err(e) = spawned {
-                    eprintln!("cxpak index-server: cannot start a connection thread: {e}");
+    // Over-cap connections are dropped here, with no thread. Returns whether one was accepted.
+    let accept_one = || -> std::io::Result<bool> {
+        let (stream, _) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if clients.fetch_add(1, Ordering::SeqCst) >= cfg.max_clients {
+            clients.fetch_sub(1, Ordering::SeqCst);
+            return Ok(true);
+        }
+        let guard = ClientGuard {
+            clients: Arc::clone(&clients),
+            idle_since: Arc::clone(&idle_since),
+        };
+        let expected = expected.clone();
+        let readiness = Arc::clone(&readiness);
+        let root = root.clone();
+        let mut stream = stream;
+        let spawned = std::thread::Builder::new()
+            .name("cxpak-index-conn".into())
+            .spawn(move || {
+                let _guard = guard;
+                let timeout = Some(Duration::from_secs(2));
+                let ready = stream.set_nonblocking(false).is_ok()
+                    && stream.set_read_timeout(timeout).is_ok()
+                    && stream
+                        .set_write_timeout(Some(Duration::from_secs(120)))
+                        .is_ok();
+                if !ready {
+                    return;
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(cfg.poll),
+                if server_handshake(&mut stream, &expected, Ok(())).is_err() {
+                    return;
+                }
+                if stream.set_read_timeout(None).is_err() {
+                    return;
+                }
+                let snapshot: SharedSnapshot = Arc::new(RwLock::new(None));
+                let result = serve_requests(&mut stream, &mut |request| {
+                    dispatch_tools_call(request, &readiness, &root, &snapshot)
+                });
+                if let Err(e) = result {
+                    eprintln!("cxpak index-server: connection ended: {e}");
+                }
+            });
+        if let Err(e) = spawned {
+            // The closure, and with it the guard, was dropped: the count is already restored.
+            eprintln!("cxpak index-server: cannot start a connection thread: {e}");
+        }
+        Ok(true)
+    };
+
+    loop {
+        match accept_one() {
+            Ok(true) => {}
+            Ok(false) => std::thread::sleep(cfg.poll),
             Err(e) => {
                 eprintln!("cxpak index-server: accept failed: {e}");
                 std::thread::sleep(cfg.poll);
@@ -567,8 +587,20 @@ pub fn run_index_server(
             continue;
         }
         // The decision is re-checked under the lock: a client that connected after the idle
-        // decision keeps the server alive, and clients cannot probe while we unlink.
-        let _lock = lock_exclusive(&paths.lock, cfg.lock_wait)?;
+        // decision keeps the server alive, and clients cannot probe while we unlink. A probing
+        // client holds the lock while it waits to be accepted, so contention must never block the
+        // loop: keep accepting and retry on the next pass.
+        let _lock = match lock_exclusive(&paths.lock, Duration::ZERO) {
+            Ok(lock) => lock,
+            Err(IpcError::Timeout) => continue,
+            Err(e) => {
+                eprintln!("cxpak index-server: cannot take the lock: {e}");
+                std::thread::sleep(cfg.poll);
+                continue;
+            }
+        };
+        // Clients that connected before we took the lock are in the backlog; admit them first.
+        while matches!(accept_one(), Ok(true)) {}
         if !failed_due && clients.load(Ordering::SeqCst) != 0 {
             continue;
         }
@@ -684,6 +716,19 @@ mod tests {
             private_run_dir(base.path()),
             Err(IpcError::Unavailable(_))
         ));
+    }
+
+    #[test]
+    fn run_dir_rejects_group_and_other_readable() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = private_run_dir(base.path()).unwrap();
+        for bad in [0o750, 0o740, 0o705, 0o701, 0o755] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(bad)).unwrap();
+            assert!(
+                matches!(validate_run_dir(&dir), Err(IpcError::Unavailable(_))),
+                "{bad:o}"
+            );
+        }
     }
 
     #[test]

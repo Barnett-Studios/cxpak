@@ -14,14 +14,23 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Bump when the frame or handshake layout changes. Mixed into [`wire_schema_hash`].
-pub const WIRE_SCHEMA: &str = "1";
+pub const WIRE_SCHEMA: &str = "2";
 
 /// Largest accepted frame. A longer claimed length is rejected before any allocation.
 pub const MAX_FRAME_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Environment variables that change index or tool output. Their values are hashed into the
 /// handshake so a server built under a different environment is never silently reused.
-pub const OUTPUT_ENV_VARS: &[&str] = &["CXPAK_MAX_FILE_BYTES", "CXPAK_MYSQL_DSN", "CXPAK_PG_DSN"];
+///
+/// `HOME`/`USERPROFILE` locate the embedding model cache. The variable named by a repo's configured
+/// `api_key_env` is not listed here: its name comes from `.cxpak.json`, see [`env_fingerprint_for`].
+pub const OUTPUT_ENV_VARS: &[&str] = &[
+    "CXPAK_MAX_FILE_BYTES",
+    "CXPAK_MYSQL_DSN",
+    "CXPAK_PG_DSN",
+    "HOME",
+    "USERPROFILE",
+];
 
 /// Failure of the shared-server transport. Every variant means "fall back to the in-process index".
 #[derive(Debug)]
@@ -167,8 +176,14 @@ pub fn wire_schema_hash() -> String {
 /// Fingerprint of the output-affecting environment, from an injectable lookup. Values are hashed so
 /// DSN secrets never cross the socket.
 pub fn env_fingerprint_with(get: impl Fn(&str) -> Option<String>) -> String {
+    fingerprint_of(&get, None)
+}
+
+fn fingerprint_of(get: &dyn Fn(&str) -> Option<String>, api_key_env: Option<&str>) -> String {
     let mut pairs: Vec<String> = OUTPUT_ENV_VARS
         .iter()
+        .copied()
+        .chain(api_key_env)
         .filter_map(|name| get(name).map(|v| format!("{name}={v}")))
         .collect();
     pairs.sort();
@@ -176,9 +191,19 @@ pub fn env_fingerprint_with(get: impl Fn(&str) -> Option<String>) -> String {
     short_hash(&refs)
 }
 
-/// [`env_fingerprint_with`] over the process environment.
-pub fn env_fingerprint() -> String {
-    env_fingerprint_with(|k| std::env::var(k).ok())
+/// [`env_fingerprint_with`] plus the variable the repo's embedding config names as its API key.
+pub fn env_fingerprint_for(root: &Path, get: impl Fn(&str) -> Option<String>) -> String {
+    let key_env = crate::embeddings::EmbeddingConfig::from_repo_root(root).api_key_env;
+    fingerprint_of(&get, Some(key_env.as_str()).filter(|n| !n.is_empty()))
+}
+
+/// Hash of the repo's `.cxpak.json` bytes (empty when absent): config changes alter output but
+/// the file watcher never rebuilds for them.
+pub fn config_hash(root: &Path) -> String {
+    match std::fs::read(root.join(".cxpak.json")) {
+        Ok(bytes) => short_hash(&[&String::from_utf8_lossy(&bytes)]),
+        Err(_) => String::new(),
+    }
 }
 
 /// Identity a client and a server must agree on before any tool call is forwarded.
@@ -189,6 +214,7 @@ pub struct Handshake {
     pub wire_schema_hash: String,
     pub repo_root: String,
     pub env_fingerprint: String,
+    pub config_hash: String,
 }
 
 impl Handshake {
@@ -204,7 +230,8 @@ impl Handshake {
             build_id,
             wire_schema_hash: wire_schema_hash(),
             repo_root: canonical_root.to_string_lossy().into_owned(),
-            env_fingerprint: env_fingerprint(),
+            env_fingerprint: env_fingerprint_for(canonical_root, |k| std::env::var(k).ok()),
+            config_hash: config_hash(canonical_root),
         }
     }
 
@@ -220,6 +247,8 @@ impl Handshake {
             Some("repo_root")
         } else if self.env_fingerprint != other.env_fingerprint {
             Some("env_fingerprint")
+        } else if self.config_hash != other.config_hash {
+            Some("config_hash")
         } else {
             None
         }
@@ -411,6 +440,7 @@ mod tests {
             wire_schema_hash: "bbbb".into(),
             repo_root: "/r".into(),
             env_fingerprint: "cccc".into(),
+            config_hash: "dddd".into(),
         }
     }
 
@@ -454,12 +484,13 @@ mod tests {
         let a = hello();
         assert_eq!(a.mismatch(&a), None);
         type Mutation = fn(&mut Handshake);
-        let cases: [(Mutation, &str); 5] = [
+        let cases: [(Mutation, &str); 6] = [
             (|h| h.version = "9".into(), "version"),
             (|h| h.build_id = "x".into(), "build_id"),
             (|h| h.wire_schema_hash = "x".into(), "wire_schema_hash"),
             (|h| h.repo_root = "/other".into(), "repo_root"),
             (|h| h.env_fingerprint = "x".into(), "env_fingerprint"),
+            (|h| h.config_hash = "x".into(), "config_hash"),
         ];
         for (mutate, field) in cases {
             let mut b = hello();
@@ -477,8 +508,49 @@ mod tests {
         let other_cap =
             env_fingerprint_with(|k| (k == "CXPAK_MAX_FILE_BYTES").then(|| "11".to_string()));
         assert_ne!(with_cap, other_cap);
-        let unrelated = env_fingerprint_with(|k| (k == "HOME").then(|| "x".to_string()));
+        let unrelated = env_fingerprint_with(|k| (k == "CXPAK_UNRELATED").then(|| "x".to_string()));
         assert_eq!(base, unrelated);
+    }
+
+    #[test]
+    fn env_fingerprint_tracks_home() {
+        let base = env_fingerprint_with(|_| None);
+        let home = env_fingerprint_with(|k| (k == "HOME").then(|| "/h/a".to_string()));
+        assert_ne!(base, home);
+    }
+
+    fn repo_with_config(config: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".cxpak.json"), config).unwrap();
+        dir
+    }
+
+    #[test]
+    fn handshake_tracks_the_value_of_the_configured_api_key_variable() {
+        let var = "CXPAK_TEST_IPC_EMBED_KEY";
+        let repo = repo_with_config(&format!(
+            r#"{{"embeddings":{{"provider":"openai","api_key_env":"{var}"}}}}"#
+        ));
+        std::env::set_var(var, "secret-a");
+        let a = Handshake::local_with(repo.path(), "b".into());
+        std::env::set_var(var, "secret-b");
+        let b = Handshake::local_with(repo.path(), "b".into());
+        std::env::remove_var(var);
+        assert_ne!(a.env_fingerprint, b.env_fingerprint);
+        assert!(!a.env_fingerprint.contains("secret"));
+    }
+
+    #[test]
+    fn handshake_tracks_the_config_file_content() {
+        let repo = repo_with_config(r#"{"embeddings":{"provider":"local"}}"#);
+        let before = Handshake::local_with(repo.path(), "b".into());
+        std::fs::write(
+            repo.path().join(".cxpak.json"),
+            r#"{"embeddings":{"provider":"local","model":"other"}}"#,
+        )
+        .unwrap();
+        let after = Handshake::local_with(repo.path(), "b".into());
+        assert!(before.mismatch(&after).is_some(), "config differs");
     }
 
     #[test]

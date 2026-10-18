@@ -114,19 +114,21 @@ falls back at once. The server must outlive any one session. A validation pass a
 3. **Private run dir, log, pid file.** Base: `$XDG_RUNTIME_DIR` if set and absolute, else on macOS
    `std::env::temp_dir()` (per-user 0700 `/var/folders/.../T/`), else `<cache dir>/cxpak`. Under it
    a subdirectory `cxpak-<uid>` created 0700. Before bind or connect it must be a real directory
-   (`symlink_metadata`, not a symlink), owned by the effective uid, and neither group- nor
-   world-writable; otherwise no server, in-process. Files live ONLY there: `.sock` (chmod 0600
-   after bind), `.lock`, `.pid` (written by the server after bind), `.log`. The log is NOT in the
+   (`symlink_metadata`, not a symlink), owned by the effective uid, and have no group or
+   other permission bits (`mode & 0o077 == 0`); otherwise no server, in-process. Files live ONLY there: `.sock` (chmod 0600
+   after bind; the bind itself runs under `umask 077`, restored afterwards), `.lock`, `.pid` (written by the server after bind), `.log`. The log is NOT in the
    repo (a repo-planted `.cxpak/` symlink plus truncate-on-start could wipe a user file). It is
    opened `O_NOFOLLOW|O_APPEND`, 0600, never truncated; if it exceeds 256 KiB at spawn time it is
    rotated by `rename` to `.log.1` (replacing the previous one), inside the private dir. The total
    socket path must be <= 100 bytes (`sun_path` is 104 on macOS) else no server.
 4. **Spawn race, stale socket, unlink race.** An exclusive `flock` (`fs2`, polled with
-   `try_lock_exclusive`, <= 10 s, then fallback) on `cxpak-<h>.lock` serializes every decision to
+   `try_lock_exclusive`, <= 3 s by default via `CXPAK_INDEX_SERVER_LOCK_WAIT_SECS`, then fallback) on `cxpak-<h>.lock` serializes every decision to
    probe, spawn or unlink. Client under the lock: connect-probe; success -> use it;
    ECONNREFUSED/ENOENT -> unlink the stale path, spawn, poll-connect (<= 10 s, 50 ms steps; a cold debug binary on a loaded machine needs more than 5 s), release.
    The child never takes the lock; `bind` failing AddrInUse (lost race) exits 0 silently. Server
-   exit: take the lock, re-check `clients == 0` (a client that connected after the idle decision
+   exit: try the lock WITHOUT blocking (a probing client holds it while it waits to be accepted, so
+   blocking would starve that client; on contention the loop keeps accepting and retries), drain
+   the accept backlog once, re-check `clients == 0` (a client that connected after the idle decision
    aborts the exit), then unlink ONLY if `(dev, ino)` of the path still equals what the server
    recorded right after its own `bind`; otherwise leave it (a newer server owns the path). Because
    only a lock holder unlinks or spawns and `bind` is atomic, exactly one server per
@@ -137,9 +139,10 @@ falls back at once. The server must outlive any one session. A validation pass a
    spans the gap between factory role sessions. Revisit with data.
 6. **Wire protocol.** Frames: u32 BE length then UTF-8 JSON; max 64 MiB; larger/short read ->
    protocol error without allocating the claimed size. First client frame is
-   `{"version","build_id","wire_schema_hash","repo_root","env_fingerprint"}`; the server replies
-   `{"ok":true}` or `{"ok":false,"reason"}` and closes on mismatch or when it already serves 64
-   clients. `wire_schema_hash` = sha256 of a const `WIRE_SCHEMA` revision plus serialized
+   `{"version","build_id","wire_schema_hash","repo_root","env_fingerprint","config_hash"}`; the server
+   replies `{"ok":true}` or `{"ok":false,"reason"}` and closes on mismatch. Beyond 64 clients the
+   accept thread drops the stream at once (no thread is spawned); the client sees a close and falls
+   back. `wire_schema_hash` = sha256 of a const `WIRE_SCHEMA` revision plus serialized
    `mcp_tool_schemas()`. After the handshake each frame is a full JSON-RPC `tools/call` request and
    the reply is the full JSON-RPC response; the client writes it to stdout unchanged. Both the stdio
    loop and the server call ONE shared function, `dispatch_tools_call`, so output equality holds by
@@ -155,8 +158,12 @@ falls back at once. The server must outlive any one session. A validation pass a
    config-driven. The tool handlers read no cwd and no relative paths; the child is started with
    `current_dir` = canonical repo root and the root is always passed canonical. `env_fingerprint` =
    sha256 over the sorted `(name, value)` pairs of those variables that are set (hashed, so DSN
-   secrets never cross the socket); a mismatch -> client falls back in-process. The embeddings
-   `api_key_env` value is not fingerprinted (config-driven name; documented risk).
+   secrets never cross the socket); a mismatch -> client falls back in-process. The set is also
+   `HOME`/`USERPROFILE` (embedding model cache) and the variable named by the repo's configured
+   `embeddings.api_key_env`, resolved from `.cxpak.json`; only its hashed value is fingerprinted.
+   `config_hash` is a hash of the `.cxpak.json` bytes: the watcher does not rebuild on config
+   changes, so a client whose config differs falls back. The in-process fallback canonicalizes the
+   repo root exactly as the server does.
 8. **Failed server.** The server exits (under the lock, with the dev/ino-guarded unlink) 2 s after
    its readiness becomes `Failed`. Attached clients see EOF on their next request, fall back, and
    their own local build reports the same terminal `Failed` text, so the "restart the MCP server"
@@ -196,6 +203,11 @@ falls back at once. The server must outlive any one session. A validation pass a
   correctness surface in an otherwise single-machine feature.
 - The IPC trait's Windows arm is unbuilt until Windows support ships — a design-now, build-later
   risk that the trait boundary turns out wrong for named pipes.
+
+- Clients with a different `HOME`, API key value or `.cxpak.json` never share a server; each such
+  session indexes in-process.
+- Security notes: the run dir admits no group or other access; the lock wait is bounded at 3 s so a
+  first `tools/call` waits at most about 3 s (lock) + 2 s (connect) + 10 s (spawn).
 
 ### Neutral
 - `cxpak serve` (HTTP) can become a thin client of the same shared server internals later, or stay
