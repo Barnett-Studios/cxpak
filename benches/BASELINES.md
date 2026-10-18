@@ -139,3 +139,28 @@ Gate (full-lifecycle peak <= 3.4.0 x 1.10 in U and C; `index_ready_s` <= 3.5.0 +
   its derived-cache save run in the same window). Not explained by this series.
 - `index_ready_s`: U 0.81 vs 0.73 (+11 %); C 3.26-3.38 vs 2.90 (+12-16 %) against 3.5.0 in the same-day
   series; against the spec's reference figures (U 0.85, C 2.86) U passes and C is at +14-18 %.
+
+### 3.5.1 peak RSS, round 2 (batching reverted; borrowed derived-cache save) — `/usr/bin/time -l`
+
+The bounded-batch change in the section above was reverted (no benefit, +11-16 % ready time). This
+round adds `DerivedCacheRef` (derived cache saved by reference and streamed to disk) to the in-place
+republish and watcher release.
+
+Method: `/usr/bin/time -l <bin> serve --mcp /tmp/frz/scriptorium < <(sleep N)`, alive about 20 s past
+ready, n=5 interleaved, each run preceded by an untimed priming run of the same binary (C: empty commit
+between prime and measured run). 3.5.0 is the v3.5.0 release binary. Load average (1 min) during the
+series: 2.6-5.8. Medians with `[min-max]`, in MB. `peak memory footprint` is the gate metric.
+
+| Scenario | Binary | peak memory footprint | maximum resident set size |
+|---|---|---|---|
+| U | 3.4.0 | 422.8 [388.2-424.4] | 395.3 [355.6-456.0] |
+| U | 3.5.0 | 372.8 [372.5-373.6] | 385.0 [384.6-385.7] |
+| U | 3.5.1 | 372.8 [372.5-373.3] | 384.9 [384.7-385.4] |
+| C | 3.4.0 | 692.1 [688.9-694.9] | 458.4 [447.1-601.0] |
+| C | 3.5.0 | 646.2 [621.8-649.0] | 568.0 [498.4-600.4] |
+| C | 3.5.1 | 647.7 [643.5-650.4] | 569.5 [502.6-592.6] |
+
+In place on all 5 C runs. Gate (footprint <= 3.4.0 x 1.10): **met** (U 372.8 vs 465.1; C 647.7 vs 761.3).
+Resident set size alone: U met (384.9 vs 434.8); C **not met** (569.5 vs 504.2).
+3.5.1 is indistinguishable from 3.5.0 on both metrics here: in this series the footprint was already
+below 3.4.0's, and the in-place republish and borrowed save did not change it measurably.
