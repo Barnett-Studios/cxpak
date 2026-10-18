@@ -220,6 +220,8 @@ pub(crate) struct BuildReport {
     /// Files computed from scratch.
     pub(crate) artifact_misses: usize,
     pub(crate) derived_hit: bool,
+    /// Per-file batches the build processed.
+    pub(crate) batches: usize,
     /// Whether this build wrote the artifact store.
     pub(crate) store_saved: bool,
     pub(crate) timings: BuildTimings,
@@ -435,6 +437,19 @@ fn build_index_pending_with(
     workspace: Option<&str>,
     defer_conventions: bool,
 ) -> Result<(CodebaseIndex, BuildReport, PendingStore), Box<dyn std::error::Error>> {
+    build_index_pending_batched(path, workspace, defer_conventions, None)
+}
+
+/// The one build implementation. `batch` is the per-file working-set size
+/// (`None` = derived from the file count and core count); tests pin it to
+/// exercise chunk boundaries.
+fn build_index_pending_batched(
+    path: &Path,
+    workspace: Option<&str>,
+    defer_conventions: bool,
+    batch: Option<usize>,
+) -> Result<(CodebaseIndex, BuildReport, PendingStore), Box<dyn std::error::Error>> {
+    let _ = batch;
     use rayon::prelude::*;
 
     let started = std::time::Instant::now();
@@ -554,7 +569,10 @@ fn build_index_pending_with(
         .collect();
     timings.per_file = phase.elapsed();
 
-    let mut report = BuildReport::default();
+    let mut report = BuildReport {
+        batches: 1,
+        ..BuildReport::default()
+    };
     let mut changed: BTreeMap<String, ArtifactEntry> = BTreeMap::new();
     let mut scanned: BTreeSet<String> = BTreeSet::new();
     let mut body_shas: Vec<String> = Vec::with_capacity(prepared.len());
@@ -2779,12 +2797,6 @@ pub fn spawn_mcp_index_build(
             })
         });
         let next = classify_reported_outcome(&path, outcome);
-        // Capture the ready base *before* the move-consuming publish so phase 2
-        // can enrich it without re-reading the cell. Only `Ready` is enrichable.
-        let ready_base = match &next {
-            IndexReadiness::Ready(idx) => Some(Arc::clone(idx)),
-            _ => None,
-        };
         // Brief write lock: `next` is already built, so this is an O(1) swap.
         // Recover from a poisoned lock (a reader panicked) and still publish, so
         // tool calls stop reporting "Building" once the build has completed.
@@ -2804,17 +2816,11 @@ pub fn spawn_mcp_index_build(
         let deferred = pending_store
             .as_mut()
             .and_then(PendingStore::take_conventions);
-        let ready_base = match (deferred, ready_base) {
-            (Some(pending), Some(base)) => Some(republish_conventions(
-                &readiness,
-                &conventions_status,
-                &base,
-                pending,
-            )),
-            (_, base) => base,
-        };
-        #[cfg(not(feature = "embeddings"))]
-        let _ = ready_base;
+        if let (Some(pending), Some(base)) = (deferred, ready_base_of(&readiness)) {
+            // `base` is moved in: republish drops it after mining, so no strong
+            // ref held here can defeat its in-place `Arc::get_mut` (ADR-0213).
+            let _ = republish_conventions(&readiness, &conventions_status, base, pending);
+        }
         // The artifact store is written only now: readiness never waits on it.
         // A panic in the save must not skip the enrichment phase below.
         if let Some(pending) = pending_store {
@@ -2829,16 +2835,30 @@ pub fn spawn_mcp_index_build(
         // and strictly non-fatal: any failure or panic leaves the already-ready
         // base untouched (6-signal), never `Failed`, never a hang.
         #[cfg(feature = "embeddings")]
-        if let Some(base) = ready_base {
+        if let Some(base) = ready_base_of(&readiness) {
             enrich_ready_with_embeddings(&readiness, &base, &path);
         }
     })
 }
 
+/// The `Ready` index the cell holds right now, as a fresh strong ref. Taken at
+/// the point of use rather than pre-captured, so no long-lived clone of the
+/// published index exists between phases (ADR-0213).
+fn ready_base_of(readiness: &SharedReadiness) -> Option<Arc<CodebaseIndex>> {
+    let guard = match readiness.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match &*guard {
+        IndexReadiness::Ready(idx) => Some(Arc::clone(idx)),
+        _ => None,
+    }
+}
+
 /// Mine the conventions a `StalePending` base deferred and publish them into
-/// the readiness cell (ADR-0212). Returns the index the cell now holds (the
-/// republished one, or `base` when nothing was published) so the embeddings
-/// phase compare-and-swaps against the right `Arc`.
+/// the readiness cell (ADR-0212). Returns the index the cell now holds, or
+/// `None` when nothing was published (mining panicked, or the cell is not
+/// `Ready`/`ReadyEnriched`). `base` is taken by value and dropped after mining.
 ///
 /// `status` is the serve-internal conventions status; it flips to `Fresh`
 /// while the readiness write lock is held, so no reader sees fresh conventions
@@ -2854,9 +2874,9 @@ pub fn spawn_mcp_index_build(
 fn republish_conventions(
     readiness: &SharedReadiness,
     status: &RwLock<ConventionsStatus>,
-    base: &Arc<CodebaseIndex>,
+    base: Arc<CodebaseIndex>,
     pending: PendingConventions,
-) -> Arc<CodebaseIndex> {
+) -> Option<Arc<CodebaseIndex>> {
     republish_conventions_with(readiness, status, base, pending, &mut || {})
 }
 
@@ -2865,19 +2885,22 @@ fn republish_conventions(
 fn republish_conventions_with(
     readiness: &SharedReadiness,
     status: &RwLock<ConventionsStatus>,
-    base: &Arc<CodebaseIndex>,
+    base: Arc<CodebaseIndex>,
     pending: PendingConventions,
     before_swap: &mut dyn FnMut(),
-) -> Arc<CodebaseIndex> {
+) -> Option<Arc<CodebaseIndex>> {
     const ATTEMPTS: usize = 3;
-    let mined = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.mine(base)))
+    let mined = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.mine(&base)))
     {
         Ok(mined) => mined,
         Err(_) => {
             eprintln!("cxpak: conventions mining panicked — serving the previous snapshot's");
-            return Arc::clone(base);
+            return None;
         }
     };
+    // Mining is done: release this strong ref before touching the cell so it
+    // cannot be the reason an in-place update fails.
+    drop(base);
     let publish_fresh = |guard: &mut IndexReadiness, next: &Arc<CodebaseIndex>, enriched: bool| {
         *guard = if enriched {
             IndexReadiness::ReadyEnriched(Arc::clone(next))
@@ -2897,14 +2920,14 @@ fn republish_conventions_with(
         let (cur, enriched) = match &current {
             IndexReadiness::Ready(cur) => (cur, false),
             IndexReadiness::ReadyEnriched(cur) => (cur, true),
-            _ => return Arc::clone(base),
+            _ => return None,
         };
         let already_fresh = match status.read() {
             Ok(s) => *s == ConventionsStatus::Fresh,
             Err(poisoned) => *poisoned.into_inner() == ConventionsStatus::Fresh,
         };
         if already_fresh {
-            return Arc::clone(cur);
+            return Some(Arc::clone(cur));
         }
         let mut next = (**cur).clone();
         mined.clone().apply_to(&mut next);
@@ -2922,7 +2945,7 @@ fn republish_conventions_with(
         };
         if unchanged {
             publish_fresh(&mut guard, &next, enriched);
-            return next;
+            return Some(next);
         }
     }
     // Every attempt lost the race: apply to the current value under one lock.
@@ -2933,13 +2956,13 @@ fn republish_conventions_with(
     let (cur, enriched) = match &*guard {
         IndexReadiness::Ready(cur) => (Arc::clone(cur), false),
         IndexReadiness::ReadyEnriched(cur) => (Arc::clone(cur), true),
-        _ => return Arc::clone(base),
+        _ => return None,
     };
     let mut next = (*cur).clone();
     mined.apply_to(&mut next);
     let next = Arc::new(next);
     publish_fresh(&mut guard, &next, enriched);
-    next
+    Some(next)
 }
 
 /// Phase 2 of the MCP background build (R-E1, ADR-0186): build the embedding

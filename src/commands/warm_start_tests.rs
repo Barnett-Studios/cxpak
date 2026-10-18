@@ -893,7 +893,8 @@ fn republish_swaps_fresh_conventions_into_ready_cell() {
     let base = Arc::new(stale);
     let cell = readiness_of(IndexReadiness::Ready(Arc::clone(&base)));
 
-    let published = republish_conventions(&cell, &status, &base, pending);
+    let published =
+        republish_conventions(&cell, &status, Arc::clone(&base), pending).expect("published");
     assert_eq!(status_of(&status), ConventionsStatus::Fresh);
     match &*cell.read().unwrap() {
         IndexReadiness::Ready(now) => assert!(Arc::ptr_eq(now, &published)),
@@ -911,7 +912,8 @@ fn republish_keeps_a_watcher_edit_and_the_enriched_variant() {
     let edited = Arc::new(edited);
     let cell = readiness_of(IndexReadiness::ReadyEnriched(Arc::clone(&edited)));
 
-    let published = republish_conventions(&cell, &status, &base, pending);
+    let published =
+        republish_conventions(&cell, &status, Arc::clone(&base), pending).expect("published");
     assert_eq!(
         published.total_bytes, edited.total_bytes,
         "watcher edit kept"
@@ -929,8 +931,8 @@ fn republish_leaves_a_non_ready_or_already_fresh_cell_alone() {
     let (stale, pending, status) = stale_base(dir.path());
     let base = Arc::new(stale);
     let failed = readiness_of(IndexReadiness::Failed("boom".into()));
-    let out = republish_conventions(&failed, &status, &base, pending);
-    assert!(Arc::ptr_eq(&out, &base));
+    let out = republish_conventions(&failed, &status, Arc::clone(&base), pending);
+    assert!(out.is_none());
     assert!(matches!(
         &*failed.read().unwrap(),
         IndexReadiness::Failed(_)
@@ -945,7 +947,7 @@ fn republish_leaves_a_non_ready_or_already_fresh_cell_alone() {
     let base = Arc::new(stale);
     *status.write().unwrap() = ConventionsStatus::Fresh;
     let cell = readiness_of(IndexReadiness::Ready(Arc::clone(&base)));
-    let out = republish_conventions(&cell, &status, &base, pending);
+    let out = republish_conventions(&cell, &status, Arc::clone(&base), pending).expect("fresh");
     assert!(Arc::ptr_eq(&out, &base));
 }
 
@@ -956,14 +958,21 @@ fn republish_survives_a_contender_that_wins_every_attempt() {
     let base = Arc::new(stale);
     let cell = readiness_of(IndexReadiness::ReadyEnriched(Arc::clone(&base)));
     let swaps = std::cell::Cell::new(0u64);
+    // Each contender index stays referenced (as a reader mid-request would),
+    // so the republish cannot take the in-place path and must lose the CAS.
+    let readers = std::cell::RefCell::new(Vec::new());
     let mut contend = || {
         swaps.set(swaps.get() + 1);
         let mut edited = (*base).clone();
         edited.total_bytes += swaps.get();
-        *cell.write().unwrap() = IndexReadiness::ReadyEnriched(Arc::new(edited));
+        let edited = Arc::new(edited);
+        readers.borrow_mut().push(Arc::clone(&edited));
+        *cell.write().unwrap() = IndexReadiness::ReadyEnriched(edited);
     };
 
-    let published = republish_conventions_with(&cell, &status, &base, pending, &mut contend);
+    let published =
+        republish_conventions_with(&cell, &status, Arc::clone(&base), pending, &mut contend)
+            .expect("published");
     assert!(swaps.get() >= 3, "every CAS attempt must have been lost");
     assert_eq!(status_of(&status), ConventionsStatus::Fresh);
     assert_eq!(
@@ -1001,4 +1010,196 @@ fn mcp_start_after_commit_republishes_fresh_conventions() {
         _ => panic!("the build must publish a ready index"),
     }
     assert!(DerivedCache::load(&ns_dir(root), &fingerprint).is_some());
+}
+
+fn cell_strong_count(cell: &SharedReadiness) -> Option<usize> {
+    match &*cell.read().unwrap() {
+        IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => {
+            Some(Arc::strong_count(idx))
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn republish_conventions_mutates_in_place_when_sole_owner() {
+    let dir = history_repo();
+    let (stale, pending, status) = stale_base(dir.path());
+    let before = (json_of(&stale.conventions), json_of(&stale.co_changes));
+    let cell = readiness_of(IndexReadiness::Ready(Arc::new(stale)));
+    let cell_arc = ready_base_of(&cell).expect("ready");
+    let ptr = Arc::as_ptr(&cell_arc);
+    let base = Arc::clone(&cell_arc);
+    drop(cell_arc);
+
+    let published = republish_conventions(&cell, &status, base, pending).expect("published");
+    assert_eq!(
+        Arc::as_ptr(&published),
+        ptr,
+        "mutated in place, not swapped"
+    );
+    assert!(matches!(
+        &*cell.read().unwrap(),
+        IndexReadiness::Ready(now) if std::ptr::eq(Arc::as_ptr(now), ptr)
+    ));
+    assert_eq!(status_of(&status), ConventionsStatus::Fresh);
+    assert_ne!(
+        (
+            json_of(&published.conventions),
+            json_of(&published.co_changes)
+        ),
+        before,
+        "the mined values landed"
+    );
+}
+
+#[test]
+fn republish_conventions_clones_when_a_reader_holds_the_index() {
+    let dir = history_repo();
+    let (stale, pending, status) = stale_base(dir.path());
+    let stale_conventions = json_of(&stale.conventions);
+    let cell = readiness_of(IndexReadiness::Ready(Arc::new(stale)));
+    let reader = ready_base_of(&cell).expect("ready");
+    let ptr = Arc::as_ptr(&reader);
+    let base = Arc::clone(&reader);
+
+    let published = republish_conventions(&cell, &status, base, pending).expect("published");
+    assert_ne!(Arc::as_ptr(&published), ptr, "fell back to clone-and-swap");
+    assert_eq!(
+        json_of(&reader.conventions),
+        stale_conventions,
+        "the reader keeps the pre-republish snapshot"
+    );
+    assert_eq!(status_of(&status), ConventionsStatus::Fresh);
+}
+
+/// Start the build on a repo with a pending conventions republish, then the
+/// MCP watcher, and wait until the watcher has run past its seed.
+fn started_watcher(
+    root: &Path,
+) -> (
+    SharedReadiness,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    build_index_reported(root, None).unwrap();
+    second_commit(root);
+    let cell = readiness_of(IndexReadiness::Building);
+    spawn_mcp_index_build(root, Arc::clone(&cell))
+        .join()
+        .unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handle = spawn_mcp_watcher(root, Arc::clone(&cell), Arc::clone(&shutdown));
+    (cell, shutdown, handle)
+}
+
+fn poll_until(deadline: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + deadline;
+    while std::time::Instant::now() < end {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    done()
+}
+
+/// Long enough for the watcher to have left its seed wait and be blocked in
+/// its first debounce poll.
+const WATCHER_SETTLE: Duration = Duration::from_millis(1500);
+
+#[test]
+fn watcher_seed_does_not_pin_the_published_index() {
+    let dir = history_repo();
+    let (cell, shutdown, handle) = started_watcher(dir.path());
+
+    std::thread::sleep(WATCHER_SETTLE);
+    let count = cell_strong_count(&cell);
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+    assert_eq!(
+        count,
+        Some(1),
+        "no tool call in flight: the cell must hold the only strong ref"
+    );
+}
+
+#[test]
+fn watcher_edit_after_republish_still_lands() {
+    let dir = history_repo();
+    let root = dir.path();
+    let (cell, shutdown, handle) = started_watcher(root);
+    std::thread::sleep(WATCHER_SETTLE);
+
+    let has = |rel: &str| {
+        ready_base_of(&cell).is_some_and(|idx| idx.files.iter().any(|f| f.relative_path == rel))
+    };
+    let mut writes = 0;
+    let landed = poll_until(Duration::from_secs(30), || {
+        if writes % 10 == 0 {
+            std::fs::write(
+                root.join("src/c.rs"),
+                format!("pub fn landed() -> i32 {{\n    {writes}\n}}\n"),
+            )
+            .unwrap();
+        }
+        writes += 1;
+        has("src/c.rs")
+    });
+    let settled = poll_until(Duration::from_secs(5), || {
+        cell_strong_count(&cell) == Some(1)
+    });
+    let kept = has("src/a.rs");
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+    assert!(landed, "the watcher edit must be published to the cell");
+    assert!(kept, "the rest of the index survives the edit");
+    assert!(settled, "the watcher releases its ref after publishing");
+}
+
+#[test]
+fn build_index_batched_matches_unbatched() {
+    let dir = warm_repo();
+    let root = dir.path();
+    for round in 0..2 {
+        let (whole, whole_report, whole_pending) =
+            build_index_pending_batched(root, None, false, None).unwrap();
+        let files = whole.total_files;
+        assert!(files >= 4, "fixture must span several chunks");
+        for batch in [1, 2, files, files + 5] {
+            let (idx, report, pending) =
+                build_index_pending_batched(root, None, false, Some(batch)).unwrap();
+            assert_eq!(
+                snapshot(&idx),
+                snapshot(&whole),
+                "round {round} batch {batch}"
+            );
+            assert_eq!(
+                (
+                    report.artifact_hits,
+                    report.artifact_partial,
+                    report.artifact_misses
+                ),
+                (
+                    whole_report.artifact_hits,
+                    whole_report.artifact_partial,
+                    whole_report.artifact_misses
+                ),
+                "round {round} batch {batch}"
+            );
+            assert_eq!(
+                pending.changed.keys().collect::<Vec<_>>(),
+                whole_pending.changed.keys().collect::<Vec<_>>(),
+                "round {round} batch {batch}"
+            );
+            assert_eq!(pending.dirty, whole_pending.dirty);
+            assert_eq!(
+                report.batches,
+                files.div_ceil(batch),
+                "round {round} batch {batch}"
+            );
+        }
+        // Second round runs warm: the first round's store is on disk.
+        whole_pending.save();
+    }
 }
