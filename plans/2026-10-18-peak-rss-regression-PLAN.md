@@ -1,5 +1,5 @@
 ---
-title: cxpak 3.5.1 — bounded-batch build_index, doc fix for ConventionsStatus
+title: cxpak 3.5.1 — Arc-share CodebaseIndex heavy fields, doc fix for ConventionsStatus
 status: DRAFT
 created: 2026-10-18
 updated: 2026-10-18
@@ -13,23 +13,32 @@ adrs: 0213
 
 ```
 cargo fmt --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 scripts/feature-matrix.sh
 cargo tarpaulin --all-features --out Stdout 2>&1 | tail -5   # >= 90%
 ```
 
-## Phase 1 — pin current semantics (RED, author-committed)
+## Phase 1 — pin current semantics + audit (RED, author-committed)
 
-Node `pin-merge-store-semantics` (local: false — this is the RED baseline the local nodes build
-against; author it, don't let a local model write its own test). Add
-`src/commands/warm_start_tests.rs::build_index_batched_matches_unbatched` asserting that
-`build_index` run on a small fixture repo (reuse the existing warm-start fixture builder) produces
-byte-identical `BuildReport` counts, identical `changed` key set, and identical `CodebaseIndex`
-term-frequency/call-graph output regardless of an internal batch-size override (test two
-sizes: 1 and `usize::MAX`, i.e. unbatched). This test must compile against today's `build_index`
-signature (it will need a `#[cfg(test)]` batch-size hook added as a RED step too — see node
-`batch-size-seam`) and must FAIL before `bounded-batch-fold` lands (today's code has no seam).
+Node `pin-no-deep-clone-on-republish` (local: false — this is the RED baseline the local nodes
+build against; author it, don't let a local model write its own test). Add
+`src/commands/warm_start_tests.rs::republish_conventions_shares_untouched_fields` that calls
+`republish_conventions_with` on a fixture `CodebaseIndex` and asserts, via `Arc::ptr_eq`, that the
+returned index's `files`, `graph`, `call_graph`, `pagerank`, and `term_frequencies` `Arc`s are
+*identical pointers* to the input's (proving no deep clone happened for fields the mining pass does
+not touch), while `conventions` and `co_changes` point at *different* `Arc`s (proving the mined
+values were actually applied). This test must FAIL to compile against today's plain (non-`Arc`)
+field types — that compile failure is the RED signal; it will only compile and pass once
+`arc-wrap-codebase-index` and `republish-no-deep-clone` land.
+
+Node `audit-external-field-access` (local: false — a judgment call, not a mechanical edit). Grep
+this repo and, if reachable, `conductr-core`'s vendored/pinned `cxpak` usage for direct field access
+or struct-literal construction of `CodebaseIndex` outside `src/core_graph/index.rs` and
+`src/commands/serve.rs`. Read access is unaffected by `Arc`'s auto-deref; construction or
+move-out sites need `Arc::new(..)`/cloning adjustment. Record findings as a short comment block atop
+`arc-wrap-codebase-index`'s diff; if any out-of-crate construction site is found, stop and escalate
+(ADR-0213's "Revisit if" — this is the risk that ADR flagged as unverified).
 
 ## Phase 2 — the fix
 
@@ -39,19 +48,19 @@ signature (it will need a `#[cfg(test)]` batch-size hook added as a RED step too
 {
   "execution-manifest": [
     {
-      "id": "batch-size-seam",
-      "files": ["src/commands/serve.rs"],
-      "change": "Add a #[cfg(test)]-only way for warm_start_tests.rs to override build_index's internal batch size (a thread-local or a parameter threaded only under cfg(test)); production code path keeps today's single call site with a real default computed from num_cpus. Do not change build_index's public behavior or signature.",
-      "accept": "cargo test --lib warm_start_tests::build_index_batched_matches_unbatched 2>&1 | grep -E 'test result: FAILED|error\\[' ",
+      "id": "arc-wrap-codebase-index",
+      "files": ["src/core_graph/index.rs"],
+      "change": "Wrap CodebaseIndex's term_frequencies, graph, call_graph, pagerank, conventions, and co_changes fields in Arc, following the existing embedding_index: Option<Arc<EmbeddingIndex>> pattern (ADR-0205) at lines 48-55. Update the struct's constructor(s) and every in-crate construction/move-out site flagged by audit-external-field-access to Arc::new(..) the value. Do not change field names or add/remove fields.",
+      "accept": "cargo build --lib 2>&1 | grep -E 'error\\[E0308\\]|error\\[E0277\\]' ; test $? -ne 0",
       "forbid": ["new_deps"],
       "local": false,
       "kind": "edit"
     },
     {
-      "id": "bounded-batch-fold",
+      "id": "republish-no-deep-clone",
       "files": ["src/commands/serve.rs"],
-      "change": "Replace build_index's single files.par_iter().zip(stored.into_par_iter()).map(..).collect() (lines ~471-554) with a loop over fixed-size chunks of (files, stored) pairs: run the existing per-file closure unchanged within each chunk via par_iter/collect, then fold that chunk's Vec<Option<Prepared>> into the running report/changed/scanned/content_shas/artifact_files/body_shas accumulators (the loop body at lines ~564-581) before processing the next chunk. Chunk size comes from the seam added in batch-size-seam. Per-file logic and merge_store_entries semantics must not change.",
-      "accept": "set -o pipefail; cargo test --lib warm_start_tests::build_index_batched_matches_unbatched 2>&1 | grep -E 'test result: ok\\. 1'",
+      "change": "Replace republish_conventions_with's `let mut next = (**cur).clone(); mined.clone().apply_to(&mut next);` (lines ~2909-2910) with: construct `next` by cloning cur's now-cheap Arc fields directly (files, graph, call_graph, pagerank, term_frequencies, plus the scalar fields total_files/total_bytes/total_tokens/language_stats/domains/schema/test_map/cross_lang_edges/embedding_index unchanged), then compute the mined conventions/co_changes as fresh values and assign them as new Arcs on next — ConventionProfile::apply_to (or its replacement) must build a fresh ConventionProfile and co_changes Vec rather than mutating through the Arc. No field of next may be a freshly deep-copied value except conventions and co_changes.",
+      "accept": "set -o pipefail; cargo test --lib warm_start_tests::republish_conventions_shares_untouched_fields 2>&1 | grep -E 'test result: ok\\. 1'",
       "forbid": ["new_deps"],
       "local": true,
       "kind": "edit"
@@ -69,16 +78,22 @@ signature (it will need a `#[cfg(test)]` batch-size hook added as a RED step too
 }
 ```
 
-## Phase 3 — measure and tune
+## Phase 3 — measure
 
-Not local-executable: run `scripts/mcp-ready.py` interleaved, 3.4.0 (tag/binary) vs the fix, n ≥ 5,
-on `/tmp/frz/scriptorium`, for warm start. Tune the batch-size default in `bounded-batch-fold` until
-median peak RSS ≤ 3.4.0 × 1.10 and median `index_ready_s` ≤ 3.5.0's warm figure × 1.10. Record the
-final numbers and chosen batch-size formula in `benches/BASELINES.md` (new dated section) and in
-this plan's changelog before merge.
+Not local-executable: run `scripts/mcp-ready.py --lifecycle 20` interleaved, 3.4.0 (binary) vs the
+fix, n ≥ 5, on `/tmp/frz/scriptorium`, scenarios U (warm unchanged) and C (warm after an empty
+commit — exercises the `StalePending`/`republish_conventions` path this fix targets). Confirm median
+`peak_mb` (full lifecycle, not just at Ready) ≤ 3.4.0 × 1.10 on both scenarios and median
+`index_ready_s` ≤ 3.5.0's measured figure × 1.10 per scenario. If scenario U alone still fails the
+RSS gate after this fix (ADR-0213 predicts Option B does not target the build-phase peak), pull in
+bounded-batch-fold (ADR-0213 Option A) as a follow-up node, tuned and measured the same way, before
+this release ships. Record final numbers in `benches/BASELINES.md` (new dated section) and in this
+plan's changelog before merge.
 
 ## Phase 4 — release
 
-Bump `Cargo.toml` to 3.5.1, update `CHANGELOG`/release notes per repo convention, confirm
-`docs-with-code` (no public-surface doc needs updating beyond the `conventions.rs` comment already
-in the manifest).
+Bump `Cargo.toml` to 3.5.1, update `CHANGELOG`/release notes per repo convention — note the
+`CodebaseIndex` field-type change (same names, `Arc`-wrapped) as a source-compat note for any
+out-of-crate consumer even though it is not a `cxpak::cache` public-surface or on-disk format
+change. Confirm `docs-with-code` (no public-surface doc needs updating beyond the `conventions.rs`
+comment already in the manifest and this release-notes line).

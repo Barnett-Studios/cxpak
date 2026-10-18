@@ -32,6 +32,9 @@ until Phase 1's trait shape is chosen in code, not just in ADR-0214's prose.
 - Exclusive-bind race protocol (ADR-0214 Option C): bind-or-connect at a deterministic per-repo
   socket path (derived from the canonicalized repo root, matching ADR-0209's absolute-root
   anchoring).
+- Before bind, validate the socket path's parent directory ownership and permissions (reject a
+  world-writable or not-owned-by-us parent) — a shared path (e.g. `/tmp`) is swappable for a
+  symlink by another local user between path derivation and bind, redirecting the bind elsewhere.
 - Idle-exit timer, default TBD by measurement (candidate starting point: 10 minutes idle, no
   attached clients) — tune against a realistic multi-session factory workload before fixing it.
 - Gate: a race test — N processes started concurrently against a fresh repo, exactly one becomes
