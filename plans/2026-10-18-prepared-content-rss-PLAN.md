@@ -1,6 +1,6 @@
 ---
 title: Prepared-content RSS — plan
-status: DRAFT
+status: DONE (T1 attribution and T4 measurement executed; no T2/T3 lever pursued, see ADR-0215 Outcome)
 created: 2026-10-18
 updated: 2026-10-18
 spec: specs/2026-10-18-prepared-content-rss-SPEC.md
@@ -11,22 +11,25 @@ adrs: 0215
 
 Constraints: no public API change; byte-identical outputs; each task RED first. Run tests via the test-runner.
 
-## T1 — Phase-attributed RSS (measurement, no product change)
-Sample RSS at 50 ms (`ps -o rss= -p`) during `scripts/mcp-ready.py --lifecycle 20` and tag phases from
-`BuildTimings` / log timestamps (build per-file, fold, derived load, assemble, mining, republish, saves).
-Output: per-phase peak for U and C. Decides T2's lever. Stop and report if no phase exceeds 480 MB-equivalent
-headroom (then ADR-0215 Option D).
+## T1 — Attribution (measurement, no product change)
+`/usr/bin/time -l` is the arbiter for every number. A `ps` sampler (50 ms) is used only to tag which phase
+a peak falls in. Scenarios: U, C, and M = U with the derived fingerprint forced to miss (derived cache
+file removed, HEAD unchanged). U vs M isolates build-time derived analysis; M vs C isolates stale-base
+mining/republish effects. Confirm "republished in place" fires in every C run.
 
-## T2 — RED: transient duplicate is not retained
-Pick the lever the T1 data names. Candidate RED tests (in `src/commands/warm_start_tests.rs`):
-1. `Prepared.fresh` built only for entries that are written: test that on a full artifact-store hit
-   `build_index_pending` returns a `PendingStore` with zero `changed` entries and that no `ArtifactEntry`
-   is constructed (counter via the existing `BuildReport.artifact_hits == N`, `changed.is_empty()`).
-2. Build transients released before mining: test that `PendingStore` handed to the background phase
-   does not own `artifact_files`/`Prepared` (structural: type no longer has the field; compile-level).
-3. Convention mining borrows `IndexedFile.content` without cloning (assert via `Arc::strong_count`/ptr equality
-   of content between the published index and the miner input).
-Watch the chosen test fail for the right reason.
+## T2 — RED tests, one per lever actually pursued
+Each RED must fail on today's code for a behavioural or structural reason. Candidates:
+1. `git_health` mining must not hold duplicate path lists: unit test over a temp git repo asserting the
+   co-change input is built by move (a counting allocator or an API shape test is not used; instead assert
+   `build_git_health` output equal to a recorded golden and that the new `commit_file_sets` borrow/move
+   path is exercised) - if no behavioural RED exists, justify and protect by the existing determinism
+   tests plus measurement.
+2. `MinedConventions.co_changes` is moved out of `git_health.co_changes`, not cloned: test that
+   `conventions.git_health.co_changes` is empty after `mine` only if the field contract allows it; else
+   skip and say so.
+3. libgit2 cache bound (`git2::opts::set_cache_max_size`): not unit-testable for RSS; protected by the
+   conventions determinism tests plus measurement.
+Watch each chosen test fail for the right reason.
 
 ## T3 — GREEN
 Minimal change in `src/commands/serve.rs` (and `src/index/mod.rs` crate-private items only). Confirm

@@ -1,11 +1,11 @@
 ---
 title: cxpak 3.5.2 — scenario C max RSS after the in-place republish (prepared-content lever)
-status: DRAFT
+status: DONE (T1 attribution and T4 measurement executed; no T2/T3 lever pursued, see ADR-0215 Outcome)
 created: 2026-10-18
 updated: 2026-10-18
 target: cxpak 3.5.2 (PATCH — no public API change)
 adrs: 0215
-spec: specs/2026-10-18-peak-rss-regression-SPEC.md
+predecessor: specs/2026-10-18-peak-rss-regression-SPEC.md (the 3.5.1 spec; its section 4 gate is the one this spec finishes for max RSS)
 ---
 
 # Prepared-content RSS — Spec
@@ -20,9 +20,14 @@ spec: specs/2026-10-18-peak-rss-regression-SPEC.md
 | C | 3.4.0 / 3.5.1 | 692.1 / 647.7 | 458.4 / **569.5** |
 
 Footprint meets the gate (<= 3.4.0 x 1.10). Max RSS in scenario C does not: 569.5 MB against 504.2 MB
-(+24% over 3.4.0). Scenario U meets it. C minus U is about 185 MB, so the excess is not the build
-(shared by U) but what C adds: HEAD moved, the derived cache hits on content, conventions are
-`StalePending` and are re-mined in the background (ADR-0212/0213).
+(+24% over 3.4.0). Scenario U meets it.
+
+C is a **derived-cache miss**, not only a stale base: `head_oid` feeds `fingerprint_from_hashes`
+(`serve.rs:588-596`), so an empty commit changes the fingerprint (BASELINES.md "derived miss"). C
+therefore also rebuilds graph, PageRank and call graph at build time (`finish_build`, reached from
+`from_artifacts_with_call_sites`, `src/index/mod.rs:~700`), then publishes `StalePending` conventions
+and runs mining plus republish in the background (ADR-0212/0213). The ~185 MB C-minus-U gap is the sum
+of build-time derived analysis and the mining/republish phase; the split is unmeasured.
 
 ## 2. Where file content is held (evidence)
 
@@ -41,10 +46,8 @@ Consequence: content is **moved, never duplicated**, between steps 1-3. Removing
 cannot lower the peak: the same bytes would simply be owned by `ArtifactFile` or `IndexedFile`
 earlier. Dropping it from the *index* is a public field/behaviour change and is out of scope. So the
 ADR-0213 "drop `content` from `Prepared`" fallback, as worded, is expected to be a no-op. The
-duplicated, transient state during build is elsewhere: `Prepared.fresh` (`ArtifactEntry` cloning
-`parse_result`, term frequencies and call sites, `serve.rs:~452-475`) and the `changed` map that
-`PendingStore` carries to the store write (`serve.rs:564-573`), alongside the same data in
-`FileArtifacts`.
+transient per-file `ArtifactEntry` (`Prepared.fresh`) and the `changed` map are empty on warm runs
+(U and C both hit the artifact store), so they cannot explain C-minus-U.
 
 ## 3. Unknown to resolve first
 

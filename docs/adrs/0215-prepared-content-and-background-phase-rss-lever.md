@@ -1,7 +1,7 @@
 ---
 id: '0215'
 title: Attribute scenario C max RSS by phase before cutting; "drop content from Prepared" is a no-op because content moves into the index
-status: PROPOSED
+status: ACCEPTED
 date: 2026-10-18
 triggered_by: ADR-0213 Outcome (scenario C max RSS 570 MB vs 504 MB limit) and its "Revisit if" naming Prepared.content
 loop: planning
@@ -16,8 +16,9 @@ scenario U meet the gate. Its fallback was to drop `content` from `Prepared` (`s
 Tracing shows the file text is moved from the settled read (`serve.rs:483`) into `Prepared`
 (`serve.rs:543`) and then into the public `IndexedFile.content` (`src/index/mod.rs:692`), where
 tools, LSP, hooks and convention miners read it. It is never copied, so removing it from `Prepared`
-frees nothing; removing it from the index is a public-API and behaviour change. The 185 MB gap
-between C and U comes from the background mining/republish phase, which is not yet attributed.
+frees nothing; removing it from the index is a public-API and behaviour change. Scenario C is a derived-cache
+miss (HEAD is part of the fingerprint), so the 185 MB gap to U is build-time graph/PageRank/call-graph
+analysis plus background mining and republish; the split is not yet attributed.
 
 ## Options considered
 
@@ -29,8 +30,7 @@ between C and U comes from the background mining/republish phase, which is not y
   section 2 of the spec reads the field; this is a semver-minor/major design (separate ADR).
 - **Option C — attribute first, then cut the transient duplicates.** Add phase-tagged RSS sampling
   (build, fold, derived load, mining, republish, store/derived save). Then target what the data
-  names, within no public API change: the `Prepared.fresh`/`changed` artifact duplicates, mining
-  allocations, release of build transients before the mining phase starts. Pros: evidence-led, API
+  names, within no public API change: mining allocations (`git_health` revwalk and path-list copies, the `co_changes` double hold), `finish_build` transient maps, release of build transients before the mining phase starts. Pros: evidence-led, API
   safe. Cons: may not reach 504 MB; macOS max RSS is a high-water mark that frees do not lower, so
   only avoided peaks count.
 - **Option D — accept 570 MB.** Footprint (the gate metric the product cares about) passes; document
@@ -57,3 +57,25 @@ reduction (or none) with an honest unmet-gate note, and open a separate ADR for 
 - Attribution shows the C-only peak is mining allocations inherent to `build_convention_profile`
   (not duplicates): then only Option B or a streaming miner moves it.
 - A consumer audit shows `IndexedFile.content` can become lazy without breaking its readers.
+
+## Outcome (2026-10-18)
+
+Option C's attribution step ran; no cutting lever was implemented, and the RSS gate is neither met nor
+shown to be missed on stable ground (Option D in effect). Measured on a fresh scriptorium clone
+(`benches/BASELINES.md`, "max RSS re-measurement"), n=5 interleaved, load average 8-38:
+
+- Peak memory footprint: 3.5.1 below 3.4.0 (U 376.7 vs 429.6; C 650.7 vs 689.0).
+- Max RSS, 3.5.1: U 314.3, C 350.2; 3.4.0: U 252.9, C 306.8. C is under the fixed 504 MB limit and
+  above 3.4.0 x 1.10 (337); U is above 3.4.0 x 1.10 (278). The 570 MB of ADR-0213 did not reproduce, and
+  3.4.0's own RSS read 40-45 % lower than in that series, so the RSS metric moves with host memory
+  pressure by more than the effect being chased.
+- The maximum falls in the build phase (build peak 329-334 MB at 0.6-0.9 s, post-ready peak 254-339 MB),
+  not in conventions mining or republish. This reverses the C-minus-U premise: the lever candidates in
+  `git_health` (path-list copy, libgit2 cache) and `co_changes` sit in the non-binding phase and were
+  not pursued; jemalloc decay tuning gave no reduction.
+- `Prepared.content` removal remains a no-op (content is moved into the public `IndexedFile`).
+
+Decision stands for any future attempt: attribute on `footprint` (stable) and a quiet host before
+cutting. The remaining build-phase candidate, not tried, is the resident artifact store (57.6 MB JSON
+loaded whole as `BTreeMap` entries at `serve.rs:~455`, ahead of the per-file stage); it needs streaming
+parse and its own ADR.
