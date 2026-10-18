@@ -124,7 +124,7 @@ falls back at once. The server must outlive any one session. A validation pass a
 4. **Spawn race, stale socket, unlink race.** An exclusive `flock` (`fs2`, polled with
    `try_lock_exclusive`, <= 10 s, then fallback) on `cxpak-<h>.lock` serializes every decision to
    probe, spawn or unlink. Client under the lock: connect-probe; success -> use it;
-   ECONNREFUSED/ENOENT -> unlink the stale path, spawn, poll-connect (<= 5 s, 50 ms steps), release.
+   ECONNREFUSED/ENOENT -> unlink the stale path, spawn, poll-connect (<= 10 s, 50 ms steps; a cold debug binary on a loaded machine needs more than 5 s), release.
    The child never takes the lock; `bind` failing AddrInUse (lost race) exits 0 silently. Server
    exit: take the lock, re-check `clients == 0` (a client that connected after the idle decision
    aborts the exit), then unlink ONLY if `(dev, ino)` of the path still equals what the server

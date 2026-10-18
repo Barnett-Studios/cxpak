@@ -2656,6 +2656,120 @@ async fn cross_lang_handler(
 // --- MCP server mode (JSON-RPC over stdio) ---
 
 pub fn run_mcp(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::daemon::index_server;
+    // The shared index server is this same invocation re-exec'd under internal env vars
+    // (ADR-0214), so no CLI surface changes.
+    if let Some(role) = index_server::server_role_from_env() {
+        return Ok(index_server::run_index_server(
+            path,
+            &role,
+            &index_server::ServerConfig::from_env(),
+        )?);
+    }
+    if index_server::enabled_with(|k| std::env::var(k).ok()) && cfg!(unix) {
+        return run_mcp_shared(path);
+    }
+    run_mcp_local(path)
+}
+
+/// One MCP session whose index lives in a shared per-repo server when one is reachable. The
+/// server is looked up lazily on the first `tools/call`, so `initialize` and `tools/list` stay
+/// instant. Any transport failure starts today's in-process build and stays there.
+fn run_mcp_shared(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut session = SharedSession::new(path);
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let result = mcp_stdio_loop_backend(stdin.lock(), &mut stdout.lock(), &mut |request| {
+        session.tools_call(request)
+    });
+    session.finish();
+    result
+}
+
+/// The in-process fallback of a [`SharedSession`]: exactly the state `run_mcp_local` builds.
+struct LocalIndex {
+    readiness: SharedReadiness,
+    snapshot: SharedSnapshot,
+    shutdown: Arc<AtomicBool>,
+    build: std::thread::JoinHandle<()>,
+    watcher: std::thread::JoinHandle<()>,
+}
+
+enum SessionBackend {
+    /// Not yet looked up; the first `tools/call` resolves it.
+    Unresolved,
+    Remote(Box<dyn crate::daemon::ipc::SharedIndexConnection>),
+    Local(LocalIndex),
+}
+
+struct SharedSession {
+    path: PathBuf,
+    backend: SessionBackend,
+}
+
+impl SharedSession {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            backend: SessionBackend::Unresolved,
+        }
+    }
+
+    fn start_local(&mut self) {
+        let readiness: SharedReadiness = Arc::new(RwLock::new(IndexReadiness::Building));
+        eprintln!(
+            "cxpak: MCP server indexing {} in-process in the background",
+            self.path.display()
+        );
+        let build = spawn_mcp_index_build(&self.path, Arc::clone(&readiness));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let watcher = spawn_mcp_watcher(&self.path, Arc::clone(&readiness), Arc::clone(&shutdown));
+        self.backend = SessionBackend::Local(LocalIndex {
+            readiness,
+            snapshot: Arc::new(RwLock::new(None)),
+            shutdown,
+            build,
+            watcher,
+        });
+    }
+
+    fn tools_call(&mut self, request: &Value) -> Value {
+        if matches!(self.backend, SessionBackend::Unresolved) {
+            match crate::daemon::index_server::connect_for_session(&self.path) {
+                Some(conn) => self.backend = SessionBackend::Remote(conn),
+                None => {
+                    self.start_local();
+                    return indexing_status_for(request);
+                }
+            }
+        }
+        match &mut self.backend {
+            SessionBackend::Remote(conn) => match conn.call(request) {
+                Ok(response) => response,
+                Err(e) => {
+                    eprintln!("cxpak: shared index server failed ({e}); indexing in-process");
+                    self.start_local();
+                    indexing_status_for(request)
+                }
+            },
+            SessionBackend::Local(local) => {
+                dispatch_tools_call(request, &local.readiness, &self.path, &local.snapshot)
+            }
+            SessionBackend::Unresolved => indexing_status_for(request),
+        }
+    }
+
+    fn finish(self) {
+        if let SessionBackend::Local(local) = self.backend {
+            local.shutdown.store(true, Ordering::Relaxed);
+            let _ = local.watcher.join();
+            let _ = local.build.join();
+        }
+    }
+}
+
+/// The 3.5.1 session: a private in-process index and watcher, no shared server.
+fn run_mcp_local(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Non-blocking startup (Task R0, ADR-0185): the full index build is 13–34s
     // on a large repo, which straddles Claude Code's ~30s MCP timeout when done
     // synchronously before the `initialize` handshake. Instead, publish a
@@ -3403,6 +3517,48 @@ pub fn mcp_stdio_loop_readiness(
     reader: impl std::io::BufRead,
     writer: &mut impl std::io::Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    mcp_stdio_loop_backend(reader, writer, &mut |request| {
+        dispatch_tools_call(request, readiness, repo_path, snapshot)
+    })
+}
+
+/// Answer one JSON-RPC `tools/call` request against `readiness`: the single dispatch shared by the
+/// stdio loop and the shared index server (ADR-0214), so both produce the same bytes. Gates on
+/// background-build readiness (Task R0): once ready, run against the base index; before ready,
+/// return a graceful tool result carrying a machine-readable status discriminator (ADR-0201) --
+/// retryable `Indexing`, terminal `Failed` -- never a bare error indistinguishable from a
+/// param/capability failure.
+#[doc(hidden)]
+pub fn dispatch_tools_call(
+    request: &Value,
+    readiness: &SharedReadiness,
+    repo_path: &Path,
+    snapshot: &SharedSnapshot,
+) -> Value {
+    let id = request.get("id").cloned();
+    let params = request.get("params").cloned().unwrap_or(json!({}));
+    let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+    match snapshot_ready_index(readiness) {
+        Ok(idx) => handle_tool_call(id, tool_name, &arguments, &idx, repo_path, snapshot),
+        Err(not_ready) => mcp_tool_status(id, &not_ready),
+    }
+}
+
+/// Retryable `Indexing` status for `request`: what a call returns while the base index is still
+/// building (also the answer to the request that triggers a fallback to the in-process index).
+pub(crate) fn indexing_status_for(request: &Value) -> Value {
+    mcp_tool_status(request.get("id").cloned(), &NotReady::Indexing)
+}
+
+/// The JSON-RPC loop with the `tools/call` backend injected. `initialize`, `ping`, `tools/list`,
+/// notifications and parse errors are answered here; `tools_call` receives each `tools/call`
+/// request and returns the complete JSON-RPC response.
+pub(crate) fn mcp_stdio_loop_backend(
+    reader: impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+    tools_call: &mut dyn FnMut(&Value) -> Value,
+) -> Result<(), Box<dyn std::error::Error>> {
     for line in reader.lines() {
         let line = line?;
         if line.is_empty() {
@@ -3469,23 +3625,7 @@ pub fn mcp_stdio_loop_readiness(
                     "tools": crate::capability::adapter::mcp_tool_schemas()
                 }),
             ),
-            "tools/call" => {
-                let params = request.get("params").cloned().unwrap_or(json!({}));
-                let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                // Gate on background-build readiness (Task R0): once ready, run
-                // against the base index exactly as before; before ready, return
-                // a graceful tool result carrying a machine-readable status
-                // discriminator (ADR-0201) — retryable `Indexing`, terminal
-                // `Failed` — never a bare error indistinguishable from a
-                // param/capability failure.
-                match snapshot_ready_index(readiness) {
-                    Ok(idx) => {
-                        handle_tool_call(id, tool_name, &arguments, &idx, repo_path, snapshot)
-                    }
-                    Err(not_ready) => mcp_tool_status(id, &not_ready),
-                }
-            }
+            "tools/call" => tools_call(&request),
             _ => mcp_error_response(id, -32601, "Method not found"),
         };
 

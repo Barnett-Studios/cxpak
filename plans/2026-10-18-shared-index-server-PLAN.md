@@ -62,7 +62,7 @@ RED tests (`tests/shared_index_server_tests.rs`, real binary, temp repo, short i
 - server is detached: killing the spawning client does not kill the server.
 - spawn failure (current_exe unusable via injected path) -> `Unavailable`.
 Implement: flock'd lock, probe, unlink-if-stale, detached spawn (`setsid` via `pre_exec`, null stdin,
-private-dir log, reaper thread), poll-connect <= 5 s.
+private-dir log, reaper thread), poll-connect <= 10 s.
 
 Additional RED tests (validation findings): log symlink planted in the repo is never followed or
 truncated; old server exit does not unlink a newer server's socket (dev/ino guard, run against two
