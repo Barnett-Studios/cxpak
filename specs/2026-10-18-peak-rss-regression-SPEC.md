@@ -89,11 +89,12 @@ is false as written. Fix: reword the comment (out of scope: surfacing it in a to
 - Every existing `warm_start_tests.rs` assertion stays green (parity with 3.5.0 behavior otherwise).
 - `ConventionsStatus`'s doc comment no longer claims externally-visible status without a tool surface
   exposing it.
-- No public API change to `cxpak::cache`; no `CACHE_VERSION`/`ARTIFACT_STORE_VERSION` bump. (The
-  chosen fix in ADR-0213 does change `core_graph::CodebaseIndex`'s field *types* — same field names,
-  `Arc`-wrapped — for fields not already externally read through a stable accessor; §6/ADR-0213
-  records why this is judged in-scope for a patch and what, if anything, needs an accessor to stay
-  source-compatible for any out-of-crate reader.)
+- No public API change anywhere: `core_graph::CodebaseIndex`'s field set *and* field types stay
+  exactly as published in 3.5.0; no `cxpak::cache` change; no `CACHE_VERSION`/`ARTIFACT_STORE_VERSION`
+  bump. (An earlier revision of ADR-0213 proposed `Arc`-wrapping some `CodebaseIndex` fields — a
+  semver-visible type change on a `pub` struct in a `pub mod` — and was rejected on review for
+  exactly that reason, same rule applied to PR #175. The current ADR-0213 fixes both scenarios
+  without touching any field's type.)
 
 ## 5. Non-goals
 
@@ -101,25 +102,36 @@ is false as written. Fix: reword the comment (out of scope: surfacing it in a to
   separately — store *load time*, not RSS).
 - Surfacing `ConventionsStatus` in a tool response (new API surface, needs its own decision).
 - The shared index-server work (ADR-0211/0214; see the separate 2026-10-18 triad).
-- Eliminating the build-phase peak beyond what the ADR-0213 fix yields as a side effect — if §4's
-  gate is met without also chunking `build_index` (bounded-batch-fold), that chunking stays a
-  follow-up, not a requirement of this patch (§1 shows it is not the binding peak in scenario C).
+- A narrower non-pub sharing mechanism for `conventions`/`co_changes` (ADR-0213's "Revisit if") —
+  pulled in only if the chosen fix's own measurement shows `Arc::get_mut` rarely succeeding under
+  realistic concurrent tool traffic.
 
 ## 6. Approach
 
-See ADR-0213 for the chosen design. Summary: `republish_conventions`'s clone-and-mutate
-(serve.rs:2909) is O(repo) because most of `CodebaseIndex`'s heavy fields are plain (not `Arc`);
-wrap them so a struct-level `.clone()` is a handful of refcount bumps, and replace `conventions`/
-`co_changes` by assigning a new `Arc` rather than cloning the struct that holds them. Bounded-batch
-chunking of `build_index`'s collect (the original plan's Option A) is retained only if §4's gate is
-not met by the `Arc`-sharing fix alone, measured — not assumed necessary up front.
+See ADR-0213 for the chosen design (two independent, no-API-change fixes):
+
+- **Scenario C** (post-ready peak, dominant overall): `republish_conventions`'s clone-and-mutate
+  (serve.rs:2909) runs unconditionally today. The fix stops the background-build closure from
+  holding a persistent extra clone of the published index (`ready_base`, serve.rs:2785) across the
+  republish window, then has `republish_conventions` attempt `Arc::get_mut` on the cell's own `Arc`
+  under the write lock — mutating `conventions`/`co_changes` in place with zero clone when no
+  concurrent MCP/HTTP tool call holds a snapshot (`snapshot_ready_index`, serve.rs:3263) — and falls
+  back to today's deep-clone-and-swap only when `get_mut` fails. No field of `CodebaseIndex` changes
+  type.
+- **Scenario U** (build-phase peak): bounded-batch chunking of `build_index`'s whole-repo
+  `par_iter().collect()` (the first ADR-0213 revision's Option A, unchanged) — caps the resident
+  `Prepared` set at O(batch) instead of O(repo).
 
 ## 7. Risks
 
-- `Arc`-wrapping fields read directly (not through an accessor) outside this crate is a
-  source-compat break; ADR-0213 records the audit of call sites and the mitigation (accessor
-  methods / `Deref`) if any exist.
-- A chunk boundary for `build_index` (if still needed after measurement) that is too small loses
-  rayon's parallel efficiency — chunk size would need measuring, not guessing.
-- The small-n (n=2) numbers in §1 are triage evidence, not the gate measurement; §4's n ≥ 5
-  interleaved run is required before claiming the gate is met.
+- Scenario C's fix is **contention-dependent**: `Arc::get_mut` only succeeds when no concurrent
+  tool call holds a snapshot at that instant. §4's measurement must include a concurrent-tool-traffic
+  run, not only an idle-server run, before claiming the gate is met (ADR-0213 Consequences).
+- Dropping the `ready_base` pre-capture changes the embeddings-phase trigger condition (today gated
+  on that clone's presence) — must be re-derived from a non-owning check or the embeddings phase
+  silently stops running (ADR-0213 Negative consequences).
+- A chunk boundary for `build_index` that is too small loses rayon's parallel efficiency — chunk
+  size needs measuring, not guessing.
+- The small-n (n=2) numbers in §1 are triage evidence from the pre-fix binary, not the gate
+  measurement; §4's n ≥ 5 interleaved run, on both the idle and concurrent-traffic workloads, is
+  required before claiming the gate is met.
