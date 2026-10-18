@@ -1,6 +1,6 @@
 ---
 title: Shared per-repo index server — implementation phasing
-status: DRAFT
+status: READY
 created: 2026-10-18
 updated: 2026-10-18
 spec: specs/2026-10-18-shared-index-server-SPEC.md
@@ -9,65 +9,92 @@ adrs: 0211, 0214
 
 # Plan — shared index server
 
-This triad is design-complete but implementation-deferred (ADR-0211: specified separately, after
-warm start, which is still landing as 3.5.1). No code lands from this plan yet; it records the
-phasing so the next planning pass can decompose into an execution manifest without re-deriving the
-protocol decisions. Every phase below is cross-cutting (new IPC module, lifecycle state machine,
-touches `serve.rs`'s existing readiness seam) — marked `local: false` in spirit; this plan does not
-emit a `local: true` execution manifest because there is no RED-testable single-function node yet
-until Phase 1's trait shape is chosen in code, not just in ADR-0214's prose.
+Implementation-ready. All protocol, lifecycle and path decisions are fixed in ADR-0214 "Resolved
+design"; this plan only sequences them. Every phase is cross-cutting (new IPC module, lifecycle
+state machine, edit to `serve.rs`'s readiness seam), so tasks are `local: false`. Each task writes
+its RED test first, watches it fail for the right reason, then implements.
 
-## Phase 1 — IPC trait + Unix socket arm
+Module layout: `src/daemon/ipc.rs` (frames, handshake, `SharedIndexTransport` trait, Unix arm
+`#[cfg(unix)]`), `src/daemon/index_server.rs` (server loop, idle exit, spawn/lock/path logic),
+hidden `Commands::IndexServer { path }` in `src/cli/mod.rs` dispatched from `src/main.rs`, client
+fold in `run_mcp`. Tests: `tests/shared_index_server_tests.rs` (spawns the real binary via
+`CARGO_BIN_EXE_cxpak`), unit tests beside each module. All env overrides read in one place
+(`ServerConfig::from_env`) so tests inject values without mutating process env.
 
-- Define a `SharedIndexTransport` trait (connect, send request, recv response, close) in a new
-  `src/daemon/ipc.rs`.
-- Implement the Unix-domain-socket arm only (macOS/Linux — today's supported platform).
-- Wire protocol: length-prefixed JSON frames carrying the same request/response shapes `run_mcp`'s
-  stdio loop already uses internally, so the shim is a thin forward, not a re-serialization.
-- Gate: a round-trip integration test, client process ↔ server process over the socket, byte-equal
-  to the in-process tool-call result for the same query (determinism fixture reused).
+## Phase 1 — frames, handshake, transport trait, in-thread round trip
 
-## Phase 2 — spawn-on-demand + idle-exit lifecycle
+RED tests (unit, `ipc.rs`):
+- frame encode/decode round trip; truncated length, truncated body, and a length > 64 MiB each
+  return a typed error (no panic, no allocation of the claimed size).
+- handshake accepts equal `{version, wire_schema_hash, repo_root}`, rejects each field
+  mismatch with a reason; `wire_schema_hash` changes when `mcp_tool_schemas()` output changes.
+- byte-equality: a `tools/call` served through `serve_connection` over a `UnixStream::pair()`
+  equals `handle_tool_call` run in-process on the same index, byte for byte (determinism fixture).
+Implement: `SharedIndexTransport` (connect w/ timeout, send frame, recv frame w/ timeout, close),
+Unix arm, `serve_connection(readiness, snapshot_per_conn, stream)` reusing `snapshot_ready_index`
++ `handle_tool_call` + `mcp_tool_status`; non-Unix stub returns `Unavailable`.
 
-- Exclusive-bind race protocol (ADR-0214 Option C): bind-or-connect at a deterministic per-repo
-  socket path (derived from the canonicalized repo root, matching ADR-0209's absolute-root
-  anchoring).
-- Before bind, validate the socket path's parent directory ownership and permissions (reject a
-  world-writable or not-owned-by-us parent) — a shared path (e.g. `/tmp`) is swappable for a
-  symlink by another local user between path derivation and bind, redirecting the bind elsewhere.
-- Idle-exit timer, default TBD by measurement (candidate starting point: 10 minutes idle, no
-  attached clients) — tune against a realistic multi-session factory workload before fixing it.
-- Gate: a race test — N processes started concurrently against a fresh repo, exactly one becomes
-  the server, the rest connect as clients; kill the server mid-session, confirm every attached
-  client falls back to in-process without hanging.
+## Phase 2 — socket path, dir validation, bind, server loop, idle exit
 
-## Phase 3 — version-skew handshake
+RED tests (`index_server.rs`):
+- path derivation: stable for same (root, version), differs across root and across version;
+  length <= 100 bytes else `PathTooLong`; macOS/Linux run-dir selection (Linux via injected
+  `XDG_RUNTIME_DIR`).
+- parent-dir rejection: not owned (skip-if-root), group-writable, world-writable, symlink,
+  missing-and-uncreatable each yield `UnsafeRunDir`; a 0700 owned dir passes.
+- bind: socket file mode is 0600; second bind on a live path returns `AddrInUse`.
+- idle exit: server with idle 1 s and no clients exits and unlinks the socket; a connected client
+  holds it alive past the timeout; exit only counts after the last disconnect.
+- bounded connections: client N+1 over the cap is refused with a handshake `{"ok":false}`.
+Implement: `ServerConfig`, `run_index_server(repo)` (bind first, then `spawn_mcp_index_build` +
+`spawn_mcp_watcher`, accept loop with one thread per connection, atomic client count, shutdown
+flag joins watcher/build/connection threads, unlink on every exit path).
 
-- Connect-time exchange of cxpak version + wire-schema content hash; mismatch → client falls back,
-  never attaches.
-- Gate: a test harness running two different binaries (build-script-produced fixture binaries, or a
-  stubbed version string) confirms fallback on mismatch and normal operation on match.
+## Phase 3 — client discovery, spawn lock, stale recovery, race
 
-## Phase 4 — fold `run_mcp` onto the shim
+RED tests (`tests/shared_index_server_tests.rs`, real binary, temp repo, short idle):
+- exactly-one: 8 concurrent `ensure_server` calls on a fresh repo -> exactly one server process
+  (pid count via the log/`ps` on the socket's peer, or a pid file written by the server) and all 8
+  connect.
+- stale socket: leave a bound-then-abandoned socket file with no listener -> client unlinks under
+  the lock, spawns, connects.
+- lock contention timeout -> returns `Unavailable` (fallback), does not hang.
+- server is detached: killing the spawning client does not kill the server.
+- spawn failure (current_exe unusable via injected path) -> `Unavailable`.
+Implement: flock'd lock, probe, unlink-if-stale, detached spawn (`process_group(0)`, null stdin,
+log file), poll-connect <= 5 s.
 
-- `run_mcp` tries the transport first (Phase 1-3); on any failure (no server, connect refused,
-  handshake mismatch, request timeout) falls through to today's in-process `build_index` path
-  unchanged. This is the change with the largest blast radius — every `serve --mcp` invocation goes
-  through it — so it lands last, behind the fully-tested transport/lifecycle/handshake layers.
-- Gate: the full existing `warm_start_tests.rs` suite plus the new transport/lifecycle/handshake
-  tests, all green; the acceptance measurement from spec §5 (N concurrent sessions, one resident
-  index, measured `phys_footprint`) run and recorded in `benches/BASELINES.md`.
+## Phase 4 — fold `run_mcp` onto the client; fallback
 
-## Phase 5 — `serve` (HTTP) convergence (optional, separate decision)
+RED tests (integration, real binary speaking stdio):
+- `serve --mcp` with a live server answers a `tools/call` byte-identically to
+  `CXPAK_INDEX_SERVER=off` on the same repo (after ready).
+- tool call while the server is `Building` returns the same `Indexing` status object as in-process.
+- kill -9 the server mid-session: next request returns the `Indexing` status within the connect/IO
+  bound, then the local build completes and later calls match in-process output; the client never
+  hangs (wall-clock asserted <= bound).
+- server with mismatched version/wire hash (test hook env sets a fake hash in the server) ->
+  client falls back, produces correct output, never attaches.
+- `CXPAK_INDEX_SERVER=off`: no socket, no child process created, no lock file.
+- hung server (accepts, never replies; `CXPAK_INDEX_SERVER_REQ_TIMEOUT_SECS=1`) -> fallback.
+- existing `warm_start_tests.rs` and `serve.rs` MCP tests stay green untouched.
+Implement: in `run_mcp`, `IndexServerMode::from_env`; if enabled and `ensure_server` yields a
+connection, run a forwarding loop (a variant of `mcp_stdio_loop_readiness` that forwards
+`tools/call` frames and answers the rest locally); on any transport error flip to the local path
+by starting `spawn_mcp_index_build` + watcher then. Disabled/unavailable -> today's code unchanged.
 
-- Evaluate whether HTTP `serve` becomes a client of the same shared server or keeps its own
-  long-lived index (ADR-0211 Neutral already notes it is the closest existing analog). Not blocking
-  Phase 1-4; write as its own ADR if pursued.
+## Phase 5 — acceptance measurement and docs
 
-## Open items for the next planning pass
+- Create the frozen clone `/tmp/frz-srv/scriptorium` (absent at plan time; clone then freeze HEAD
+  and record the SHA), build release, run N=4 concurrent `serve --mcp` sessions each issuing one
+  `cxpak_context` call and holding open; sample per-process `footprint`/`/usr/bin/time -l` peak
+  footprint (server included); repeat with `CXPAK_INDEX_SERVER=off`. Target: total <= ~1 resident
+  index + N thin clients. Record numbers and the idle-exit observation in `benches/BASELINES.md`.
+- Docs in the same commits as code: `CXPAK_INDEX_SERVER`, `CXPAK_INDEX_SERVER_IDLE_SECS`,
+  `CXPAK_INDEX_SERVER_REQ_TIMEOUT_SECS` documented in the env-var canonical doc; hidden
+  `index-server` subcommand noted as internal; CHANGELOG entry; ADR-0214 status PROPOSED ->
+  ACCEPTED after review.
 
-- Fix the idle-exit default and the socket-path derivation exactly (this plan leaves both as
-  measured-TBD, not guessed).
-- Decide whether the lock/bind-race protocol needs a stale-socket cleanup path (a server that
-  crashed without closing its socket file leaves a dead path other processes could wrongly treat as
-  "someone else is the server").
+## Out of scope
+
+HTTP `serve` convergence (separate ADR if pursued), Windows named-pipe arm, machine-wide registry.

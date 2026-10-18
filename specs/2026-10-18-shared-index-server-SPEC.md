@@ -1,6 +1,6 @@
 ---
 title: A shared per-repo index server behind the stdio MCP shim
-status: DRAFT
+status: READY
 created: 2026-10-18
 updated: 2026-10-18
 target: cxpak 3.6.0 (MINOR — no public API change; MCP wire contract unchanged)
@@ -40,14 +40,14 @@ index, with:
 - `serve` (HTTP) already runs a single long-lived index (ADR-0211 Neutral) — it is the closest
   existing analog to "the server," not a from-scratch design.
 
-## 4. Decisions this spec needs (see ADR-0214)
+## 4. Decisions (resolved in ADR-0214 "Resolved design"; summarized here)
 
 1. **Transport.** Unix domain socket on macOS/Linux (matches the existing non-Windows allocator
    split in `Cargo.toml`); a named pipe on Windows (roadmap platform per CLAUDE.md — the protocol
    must not assume Unix-only, even though Windows ships later).
 2. **Spawn-on-demand + idle exit.** The first `serve --mcp` (or `serve` HTTP) for a repo that finds
-   no live server at the expected socket path starts one (as a detached child or by execing itself
-   in server mode) and becomes its first client; the server exits after an idle timeout with zero
+   no live server at the expected socket path starts one as a DETACHED child of the same binary in
+   a hidden server mode (it must outlive the spawning session) and then connects as a client; the server exits after an idle timeout with zero
    attached clients.
 3. **Crash recovery.** A client that loses its connection (server crash, exit) falls back to its own
    in-process index immediately (never blocks on reconnection) and attempts one re-spawn; this must
@@ -68,6 +68,10 @@ index, with:
 
 ## 5. Acceptance (measured)
 
+- Measurement protocol: N=4 concurrent `serve --mcp` sessions on a frozen clone
+  (`/tmp/frz-srv/scriptorium`), total phys footprint (sum of `footprint -p`/peak footprint from
+  `/usr/bin/time -l` per process, server included) vs 3.5.1 behavior via `CXPAK_INDEX_SERVER=off`.
+  Target: total <= ~1 resident index + N thin clients.
 - N (≥ 3) concurrent `cxpak serve --mcp` sessions on one repo hold **one** resident index: combined
   `phys_footprint` across N sessions ≤ 1 server's single-session footprint × 1.3 (vs today's
   measured N× — 7 servers ≈ 2.4 GB, i.e. roughly N× one server's 174–407 MB).
@@ -85,9 +89,9 @@ index, with:
 
 ## 7. Risks
 
-- Spawn-on-demand races: two clients starting within the same window both believing they must spawn
-  the server. Needs an exclusive-create or lock-file protocol at the socket path (ADR-0214).
-- An idle-exit timeout that is too short thrashes (constant respawn under bursty multi-session use);
-  too long wastes memory when a repo goes untouched. Needs a measured default, tunable.
+- Spawn-on-demand races: two clients starting within the same window both spawning. Closed by an
+  flock'd lock file plus atomic `bind` (ADR-0214 item 3); proven by the N-process race test.
+- Idle-exit default (600 s, `CXPAK_INDEX_SERVER_IDLE_SECS`) is reasoned, not yet measured; record
+  the factory-workload observation in BASELINES.md and revisit.
 - A hung (not crashed) server is harder to detect than a closed socket — the client needs a
   request-level timeout, not just a connection-level one, before falling back.
