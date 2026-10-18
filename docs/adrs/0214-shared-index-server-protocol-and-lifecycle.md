@@ -1,7 +1,7 @@
 ---
 id: '0214'
 title: Shared index server — local-socket protocol, spawn-on-demand lifecycle, version-skew fallback
-status: PROPOSED
+status: ACCEPTED
 date: 2026-10-18
 triggered_by: specs/2026-10-18-shared-index-server-SPEC.md; ADR-0211 (direction already chosen)
 loop: planning
@@ -87,65 +87,99 @@ the problem (F), or adds a secret with no boundary it defends (H).
 Decisions that turn A+C+E+G into buildable code. They refine Option C: the pure "first client binds
 and becomes the server" form is replaced by a detached server process, because a server hosted
 inside the first MCP session dies with that session (stdio EOF) and every other attached client then
-falls back at once. The server must outlive any one session.
+falls back at once. The server must outlive any one session. A validation pass amended items 1-3, 6,
+7 and 10-12 (log symlink, unlink race, build identity, setsid/reaping, env leakage, semver).
 
-1. **Process model.** A `serve --mcp` client that finds no live server spawns a DETACHED child of
-   its own binary (`std::env::current_exe()`) running a hidden subcommand `cxpak index-server
-   <repo>` (`#[command(hide = true)]`, not in `--help`). The child gets its own process group
-   (`CommandExt::process_group(0)`, no `libc` needed), stdin `/dev/null`, stdout/stderr to
-   `<repo>/.cxpak/index-server.log` (truncated per start; `/dev/null` if unwritable). It binds the
-   socket FIRST, then builds/warm-starts the index on a background thread (ADR-0210/0212 path via
-   `spawn_mcp_index_build`) and runs `spawn_mcp_watcher`, so a client attaches in milliseconds and a
-   tool call during `Building` returns today's `Indexing` status. The spawning client then connects
-   like any other. "First session hosts in-process" is rejected: no strong reason found, and it
-   breaks the outlives-the-session requirement.
-2. **Socket path.** Private run dir: macOS `std::env::temp_dir()` (per-user 0700 `/var/folders/.../T/`);
-   Linux `$XDG_RUNTIME_DIR`, else `<user cache dir>/cxpak/run` created 0700. File name
-   `cxpak-<h>.sock` with `h` = first 16 hex of sha256(canonical repo root `\0` cxpak version). The
-   version in the hash gives an upgraded binary its own server, so an old server idles out beside it
-   instead of blocking upgraded clients (bounded: one extra process per repo during an upgrade);
-   the handshake hash stays as defense in depth. Total path must be <= 100 bytes (macOS `sun_path`
-   is 104 incl. NUL); longer -> no server, in-process. Before bind or connect the run dir must be a
-   real directory (not a symlink), owned by the effective uid, and neither group- nor world-writable;
-   otherwise no server, in-process. Socket is chmod 0600 immediately after bind (dir is already 0700).
-3. **Spawn race and stale socket.** `flock` (exclusive, `fs2`, already a dependency) on
-   `cxpak-<h>.lock` in the same dir serializes the decision. Under the lock: connect-probe the
-   socket. Success -> release lock, use it. `ECONNREFUSED`/`ENOENT` -> unlink any stale path, spawn
-   the child, poll-connect (<= 5 s, 50 ms steps), release the lock. The child never takes the
-   lock; its `bind` failing with `AddrInUse` (a stale path or a lost race) makes it exit 0 silently.
-   Guarantee: exactly one server per (repo, version), because only a lock holder unlinks or spawns
-   and `bind` is atomic. Lock contention waits <= 10 s, then falls back in-process.
-4. **Idle exit.** Default 600 s with zero connected clients, timer reset on each disconnect;
-   `CXPAK_INDEX_SERVER_IDLE_SECS` overrides (tests use 1-2 s). Justification: warm start makes a
-   cold rebuild cheap, so a too-long timeout costs more (idle resident index, 174-407 MB) than a
-   too-short one; 10 min covers the gap between factory role sessions and a coffee break, and a
-   respawn after idle is the warm-start fast path, not the 14 s cold path. Revisit with data.
-5. **Wire protocol.** Frames: `u32` big-endian length, then that many bytes of UTF-8 JSON; max frame
-   64 MiB, larger or short read -> protocol error. First frame client->server:
-   `{"version","wire_schema_hash","repo_root"}`; server replies `{"ok":true}` or
-   `{"ok":false,"reason"}` and closes on mismatch. `wire_schema_hash` = sha256 of a const
-   `WIRE_SCHEMA` revision string plus the serialized `mcp_tool_schemas()`, so any tool-surface
-   change flips it. After the handshake each frame is a full JSON-RPC `tools/call` request object
-   (the same `Value` the stdio loop parsed) and the reply frame is the full JSON-RPC response
-   `Value` the stdio loop would have written; the client writes it to stdout unchanged, so output is
-   byte-identical. `initialize`, `ping`, `tools/list`, notifications and parse errors stay in the
-   client (instant, index-free). The server keeps one `SharedSnapshot` per connection (that state is
-   per-session today) and runs the existing `snapshot_ready_index` + `handle_tool_call` against its
-   one `SharedReadiness`.
-6. **Freshness.** The server owns the single watcher; clients run none. Readiness semantics are the
-   server's, identical to in-process: `Building` -> `Indexing` status, `Failed` -> terminal status.
-7. **Fallback.** Connect timeout 2 s, handshake timeout 2 s, per-request read timeout 120 s
-   (`CXPAK_INDEX_SERVER_REQ_TIMEOUT_SECS`), all bounded. Any connect/handshake/IO/timeout/protocol
-   error -> the client starts today's `spawn_mcp_index_build` + `spawn_mcp_watcher` locally and
-   permanently stays in-process for the rest of the session (no reconnect loop; one respawn attempt
-   happens only at the next session start). The request that hit the error is answered with the
-   standard retryable `Indexing` status while the local build runs, exactly today's `Building`
-   behavior. `CXPAK_INDEX_SERVER=off` skips all of the above: code path identical to 3.5.1.
-8. **Scope.** The transport trait `SharedIndexTransport` lives in `src/daemon/ipc.rs`; the Unix
-   socket arm is `#[cfg(unix)]`; on non-Unix the connect function reports `Unavailable`, so Windows
-   is always in-process. HTTP `serve` is unchanged (Phase 5, out of scope).
-9. **Auth.** Option G stands, plus: dir owner/mode check (item 2) closes the swap-the-parent-symlink
-   attack; no peer-credential check (same-uid processes already read the repo and `.cxpak/cache`).
+1. **Process model and no new CLI surface.** `pub enum Commands` is public and not
+   `#[non_exhaustive]`, so a new variant or field would be a semver break. Server mode is therefore
+   the SAME invocation, `cxpak serve --mcp <repo>`, re-exec'd by `std::env::current_exe()` with
+   internal env `CXPAK_INDEX_SERVER_ROLE=server`, `CXPAK_INDEX_SERVER_SOCKET=<exact socket path>` and
+   `CXPAK_INDEX_SERVER_BUILD_ID=<expected build id>`. `run_mcp` checks the role first. The child is
+   detached with `setsid` (`pre_exec`, `SAFETY` comment: only async-signal-safe `setsid` runs between
+   fork and exec), stdin `/dev/null`, stdout/stderr to the private log (item 3). The spawner keeps the
+   `Child` handle on a reaper thread that `wait()`s, so the spawner never leaves a zombie while it
+   lives; after the spawner exits the child is reparented to init. The server binds the socket FIRST,
+   then builds/warm-starts the index on a background thread (`spawn_mcp_index_build`) and runs
+   `spawn_mcp_watcher`, so a client attaches in milliseconds and a tool call during `Building`
+   returns today's `Indexing` status. "First session hosts in-process" is rejected: it breaks the
+   outlives-the-session requirement.
+2. **Identity: root, version, build id.** `build id` = first 16 hex of sha256 of the running
+   executable's CONTENT (streamed, cached per process); a rebuilt dev binary with an unchanged
+   version string therefore never attaches to a stale server. Socket name `cxpak-<h>.sock`, `h` =
+   first 16 hex of sha256(canonical repo root NUL version NUL build id). The same triple is in the
+   handshake (defense in depth). The spawner passes the exact socket path and expected build id to
+   the child; the child recomputes its own build id and EXITS on mismatch (binary replaced between
+   the spawner's read and the exec), so a mid-session upgrade yields fallback, never a mislabelled
+   server. Both sides canonicalize the repo root.
+3. **Private run dir, log, pid file.** Base: `$XDG_RUNTIME_DIR` if set and absolute, else on macOS
+   `std::env::temp_dir()` (per-user 0700 `/var/folders/.../T/`), else `<cache dir>/cxpak`. Under it
+   a subdirectory `cxpak-<uid>` created 0700. Before bind or connect it must be a real directory
+   (`symlink_metadata`, not a symlink), owned by the effective uid, and neither group- nor
+   world-writable; otherwise no server, in-process. Files live ONLY there: `.sock` (chmod 0600
+   after bind), `.lock`, `.pid` (written by the server after bind), `.log`. The log is NOT in the
+   repo (a repo-planted `.cxpak/` symlink plus truncate-on-start could wipe a user file). It is
+   opened `O_NOFOLLOW|O_APPEND`, 0600, never truncated; if it exceeds 256 KiB at spawn time it is
+   rotated by `rename` to `.log.1` (replacing the previous one), inside the private dir. The total
+   socket path must be <= 100 bytes (`sun_path` is 104 on macOS) else no server.
+4. **Spawn race, stale socket, unlink race.** An exclusive `flock` (`fs2`, polled with
+   `try_lock_exclusive`, <= 10 s, then fallback) on `cxpak-<h>.lock` serializes every decision to
+   probe, spawn or unlink. Client under the lock: connect-probe; success -> use it;
+   ECONNREFUSED/ENOENT -> unlink the stale path, spawn, poll-connect (<= 5 s, 50 ms steps), release.
+   The child never takes the lock; `bind` failing AddrInUse (lost race) exits 0 silently. Server
+   exit: take the lock, re-check `clients == 0` (a client that connected after the idle decision
+   aborts the exit), then unlink ONLY if `(dev, ino)` of the path still equals what the server
+   recorded right after its own `bind`; otherwise leave it (a newer server owns the path). Because
+   only a lock holder unlinks or spawns and `bind` is atomic, exactly one server per
+   (repo, version, build id) exists.
+5. **Idle exit.** Default 600 s with zero clients (timer restarts at server start and at every
+   last-disconnect); `CXPAK_INDEX_SERVER_IDLE_SECS` overrides (tests: 1-2 s). Warm start makes a
+   respawn cheap, so too long costs more (idle resident index, 174-407 MB) than too short; 10 min
+   spans the gap between factory role sessions. Revisit with data.
+6. **Wire protocol.** Frames: u32 BE length then UTF-8 JSON; max 64 MiB; larger/short read ->
+   protocol error without allocating the claimed size. First client frame is
+   `{"version","build_id","wire_schema_hash","repo_root","env_fingerprint"}`; the server replies
+   `{"ok":true}` or `{"ok":false,"reason"}` and closes on mismatch or when it already serves 64
+   clients. `wire_schema_hash` = sha256 of a const `WIRE_SCHEMA` revision plus serialized
+   `mcp_tool_schemas()`. After the handshake each frame is a full JSON-RPC `tools/call` request and
+   the reply is the full JSON-RPC response; the client writes it to stdout unchanged. Both the stdio
+   loop and the server call ONE shared function, `dispatch_tools_call`, so output equality holds by
+   construction. `initialize`, `ping`, `tools/list`, notifications and parse errors stay in the
+   client. `SharedSnapshot` is audited: it is written only by the `context` op and read only by the
+   context-diff op, i.e. pure per-session state, so the server holds one per connection. A client
+   that falls back mid-session starts with an empty snapshot (context-diff then reports "no
+   snapshot", the same text a fresh session gives).
+7. **Environment and path leakage.** The server builds the index under the SPAWNER's environment
+   and working directory, so output-affecting inputs are audited and pinned. Audit result (`grep`
+   of `env::var`/`current_dir` in `src/`): `CXPAK_MAX_FILE_BYTES` (index build), `CXPAK_PG_DSN` and
+   `CXPAK_MYSQL_DSN` (schema introspection); the embeddings remote `api_key_env` name is
+   config-driven. The tool handlers read no cwd and no relative paths; the child is started with
+   `current_dir` = canonical repo root and the root is always passed canonical. `env_fingerprint` =
+   sha256 over the sorted `(name, value)` pairs of those variables that are set (hashed, so DSN
+   secrets never cross the socket); a mismatch -> client falls back in-process. The embeddings
+   `api_key_env` value is not fingerprinted (config-driven name; documented risk).
+8. **Failed server.** The server exits (under the lock, with the dev/ino-guarded unlink) 2 s after
+   its readiness becomes `Failed`. Attached clients see EOF on their next request, fall back, and
+   their own local build reports the same terminal `Failed` text, so the "restart the MCP server"
+   advice stays true; a new session spawns a fresh server (a retry of the build).
+9. **Idle-shutdown race.** A handshake that ends in EOF/reset (server exited between probe and
+   accept) triggers exactly one `ensure_server` retry before falling back. A version/build/env
+   rejection never retries.
+10. **Fallback.** Connect timeout 2 s (connect runs on a helper thread so a full backlog cannot
+    block), handshake 2 s, per-request 120 s (`CXPAK_INDEX_SERVER_REQ_TIMEOUT_SECS`). Any
+    connect/handshake/IO/timeout/protocol error -> the client starts today's
+    `spawn_mcp_index_build` + `spawn_mcp_watcher` locally and stays in-process for the session; the
+    failing request is answered with the retryable `Indexing` status while that build runs.
+    `CXPAK_INDEX_SERVER=off|0|false` -> exactly the 3.5.1 path, no socket, lock or child.
+11. **Scope.** `SharedIndexTransport` trait in `src/daemon/ipc.rs`, Unix arm `#[cfg(unix)]`;
+    non-Unix reports `Unavailable` (always in-process). HTTP `serve` unchanged. `libc` becomes a
+    plain `cfg(unix)` dependency (it was optional behind `client`).
+12. **Auth.** Option G stands; the dir owner/mode check closes the parent-swap attack; no
+    peer-credential check (same-uid processes already read the repo and `.cxpak/cache`).
+13. **Test isolation.** Every spawning test sets `XDG_RUNTIME_DIR`, `TMPDIR` and `HOME` to a fresh
+    short directory under `/tmp`, reads the server pid from the `.pid` file, and holds a drop
+    guard that SIGKILLs every pid found, even on panic. The repo's `.cargo/config.toml` `[env]`
+    sets `CXPAK_INDEX_SERVER=off` (overridable) so the pre-existing subprocess suites never spawn
+    servers.
 
 ## Consequences
 

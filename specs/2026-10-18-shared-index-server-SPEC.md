@@ -68,17 +68,15 @@ index, with:
 
 ## 5. Acceptance (measured)
 
-- Measurement protocol: N=4 concurrent `serve --mcp` sessions on a frozen clone
-  (`/tmp/frz-srv/scriptorium`), total phys footprint (sum of `footprint -p`/peak footprint from
-  `/usr/bin/time -l` per process, server included) vs 3.5.1 behavior via `CXPAK_INDEX_SERVER=off`.
-  Target: total <= ~1 resident index + N thin clients.
-- N (≥ 3) concurrent `cxpak serve --mcp` sessions on one repo hold **one** resident index: combined
-  `phys_footprint` across N sessions ≤ 1 server's single-session footprint × 1.3 (vs today's
-  measured N× — 7 servers ≈ 2.4 GB, i.e. roughly N× one server's 174–407 MB).
-  A fallback-triggering failure (server killed mid-session) does not hang a client: time to
-  fallback-ready ≤ the client's own warm-start `index_ready_s` (ADR-0210/0212 baselines).
+- Measurement: N=4 concurrent `serve --mcp` sessions on a frozen clone
+  (`/tmp/frz-srv/scriptorium`), total phys footprint (server + 4 clients, via `footprint -p`) vs
+  `CXPAK_INDEX_SERVER=off`. ONE target: total <= (one 3.5.1 in-process footprint + 4 x thin-client
+  footprint) x 1.2, with the measured numbers reported whatever they are. A server killed
+  mid-session does not hang a client: it answers within the connect/IO bounds and falls back.
 - Byte-identical MCP tool responses whether a client is talking to the shared server or its own
   in-process index (determinism fixture, same as every prior ADR in this chain).
+- No public CLI surface change (no new `Commands` variant or flag); server mode is a re-exec of
+  `serve --mcp` under internal env vars.
 - No change to the MCP wire contract any client-side harness observes.
 
 ## 6. Non-goals

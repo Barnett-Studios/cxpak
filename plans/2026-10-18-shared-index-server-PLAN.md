@@ -16,8 +16,8 @@ its RED test first, watches it fail for the right reason, then implements.
 
 Module layout: `src/daemon/ipc.rs` (frames, handshake, `SharedIndexTransport` trait, Unix arm
 `#[cfg(unix)]`), `src/daemon/index_server.rs` (server loop, idle exit, spawn/lock/path logic),
-hidden `Commands::IndexServer { path }` in `src/cli/mod.rs` dispatched from `src/main.rs`, client
-fold in `run_mcp`. Tests: `tests/shared_index_server_tests.rs` (spawns the real binary via
+server role detected at the top of `run_mcp` from internal env vars (NO new `Commands` variant),
+client fold in `run_mcp`; shared `dispatch_tools_call` extracted from the stdio loop. Tests: `tests/shared_index_server_tests.rs` (spawns the real binary via
 `CARGO_BIN_EXE_cxpak`), unit tests beside each module. All env overrides read in one place
 (`ServerConfig::from_env`) so tests inject values without mutating process env.
 
@@ -61,8 +61,15 @@ RED tests (`tests/shared_index_server_tests.rs`, real binary, temp repo, short i
 - lock contention timeout -> returns `Unavailable` (fallback), does not hang.
 - server is detached: killing the spawning client does not kill the server.
 - spawn failure (current_exe unusable via injected path) -> `Unavailable`.
-Implement: flock'd lock, probe, unlink-if-stale, detached spawn (`process_group(0)`, null stdin,
-log file), poll-connect <= 5 s.
+Implement: flock'd lock, probe, unlink-if-stale, detached spawn (`setsid` via `pre_exec`, null stdin,
+private-dir log, reaper thread), poll-connect <= 5 s.
+
+Additional RED tests (validation findings): log symlink planted in the repo is never followed or
+truncated; old server exit does not unlink a newer server's socket (dev/ino guard, run against two
+overlapping servers); different build id -> different socket and handshake rejection; child refuses
+when its build id differs from the expected one; server exits after `Failed`; handshake EOF during
+idle shutdown retries once; env fingerprint mismatch -> fallback; no zombie after server idle exit
+while the spawner lives; test isolation guard kills every pid.
 
 ## Phase 4 — fold `run_mcp` onto the client; fallback
 
@@ -88,12 +95,11 @@ by starting `spawn_mcp_index_build` + watcher then. Disabled/unavailable -> toda
 - Create the frozen clone `/tmp/frz-srv/scriptorium` (absent at plan time; clone then freeze HEAD
   and record the SHA), build release, run N=4 concurrent `serve --mcp` sessions each issuing one
   `cxpak_context` call and holding open; sample per-process `footprint`/`/usr/bin/time -l` peak
-  footprint (server included); repeat with `CXPAK_INDEX_SERVER=off`. Target: total <= ~1 resident
-  index + N thin clients. Record numbers and the idle-exit observation in `benches/BASELINES.md`.
+  footprint (server included); repeat with `CXPAK_INDEX_SERVER=off`. Target: total <= (one 3.5.1
+  in-process footprint + 4 x thin-client footprint) x 1.2; report the numbers whatever they are. Record numbers and the idle-exit observation in `benches/BASELINES.md`.
 - Docs in the same commits as code: `CXPAK_INDEX_SERVER`, `CXPAK_INDEX_SERVER_IDLE_SECS`,
-  `CXPAK_INDEX_SERVER_REQ_TIMEOUT_SECS` documented in the env-var canonical doc; hidden
-  `index-server` subcommand noted as internal; CHANGELOG entry; ADR-0214 status PROPOSED ->
-  ACCEPTED after review.
+  `CXPAK_INDEX_SERVER_REQ_TIMEOUT_SECS` documented in the env-var canonical doc; internal role env
+  vars noted; CHANGELOG entry; ADR-0214 status ACCEPTED (done in phase 0).
 
 ## Out of scope
 
