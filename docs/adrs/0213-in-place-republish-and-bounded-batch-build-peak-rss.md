@@ -1,7 +1,7 @@
 ---
 id: '0213'
-title: In-place republish via Arc::get_mut, plus bounded-batch build_index, cap full-lifecycle peak RSS with no public API change
-status: PROPOSED
+title: In-place republish via Arc::get_mut and a borrowed derived-cache save, with no public API change (bounded-batch build_index tried and rejected)
+status: ACCEPTED
 date: 2026-10-18
 triggered_by: full-lifecycle measurement (specs/2026-10-18-peak-rss-regression-SPEC.md §1); prior
   revision of this ADR (Arc-wrapping CodebaseIndex's pub fields) rejected on review — core_graph is
@@ -12,7 +12,7 @@ supersedes-decision-of: '0213' (same ADR number; two prior decisions superseded 
   decisions" below)
 ---
 
-# ADR-0213: In-place republish via `Arc::get_mut`, plus bounded-batch `build_index`, cap full-lifecycle peak RSS with no public API change
+# ADR-0213: In-place republish via `Arc::get_mut` and a borrowed derived-cache save, with no public API change (bounded-batch `build_index` tried and rejected)
 
 ## Prior decisions (both superseded)
 
@@ -78,15 +78,15 @@ before falling back to today's clone-and-swap.
 
 ## Decision
 
-**Options A + C together, plus the watcher decision.** The watcher drops its seed and its long-lived `shared` mirror; per batch it takes its base from the readiness cell, publishes the result back, and releases its ref. Scenario C: restructure the background-build closure (serve.rs:2784-2834)
+**Option C plus the watcher decision. Option A was implemented, measured and rejected — see Outcome.** The watcher drops its seed and its long-lived `shared` mirror; per batch it takes its base from the readiness cell, publishes the result back, and releases its ref. Scenario C: restructure the background-build closure (serve.rs:2784-2834)
 to stop holding `ready_base` as a persistent pre-capture; `republish_conventions` fetches its
 fallback value from the cell itself only inside the branches that need one (mining panic, cell not
 `Ready`/`ReadyEnriched`). Inside the retry loop, attempt `Arc::get_mut` on the cell's `Arc` under the
 write lock first; apply the mined conventions/co-changes in place on success; fall back to the
 existing clone-and-compare-and-swap on failure (`get_mut` returning `None`, i.e. `snapshot_ready_index`
 or another reader holds a concurrent clone). Scenario U: bounded-batch fold in `build_index`
-(Option A), unchanged from the first ADR revision — chunk size tuned empirically against the gate,
-not fixed here.
+(Option A) was the original plan; it was rejected on measurement and reverted, so `build_index` is
+unchanged from 3.5.0.
 
 ## Consequences
 
@@ -136,3 +136,9 @@ added 11-16 % to `index_ready_s` (U 0.81 s against 0.73 s; C 3.26-3.38 s against
 Options C (in place, plus the watcher releasing its ref) stays. The measured post-ready peak in the
 mining window led to a follow-up: saving the derived cache through a borrowed view
 (`DerivedCacheRef`) instead of cloning graph, call graph, pagerank and conventions.
+
+Measured result (`/usr/bin/time -l`, scriptorium, n=5 interleaved, medians, `benches/BASELINES.md`):
+peak memory footprint meets the 3.4.0 × 1.10 gate in both scenarios (U 373 MB vs 423 MB; C 648 MB vs
+692 MB). Max RSS meets it in scenario U (385 MB) but **not** in scenario C (570 MB against a 504 MB
+limit). Against 3.5.0 the measured peak is unchanged on both metrics (U 373/385, C 646/568), so this
+ADR's changes are not shown to lower the peak; the scenario-C max-RSS regression remains open.

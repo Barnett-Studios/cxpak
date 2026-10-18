@@ -1,5 +1,5 @@
 ---
-title: cxpak 3.5.1 — in-place republish (Arc::get_mut) + bounded-batch build_index, doc fix for ConventionsStatus
+title: cxpak 3.5.1 — in-place republish (Arc::get_mut), borrowed derived-cache save, doc fix for ConventionsStatus (bounded-batch build_index rejected)
 status: DRAFT
 created: 2026-10-18
 updated: 2026-10-18

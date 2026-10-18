@@ -566,10 +566,15 @@ fn write_derived<T: Serialize>(cache_dir: &Path, value: &T) -> std::io::Result<(
     std::fs::create_dir_all(cache_dir)?;
     let _lock = lock_cache(cache_dir)?;
     let tmp = cache_dir.join("derived.json.tmp");
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-    serde_json::to_writer(&mut out, value)?;
-    out.flush()?;
-    drop(out);
+    let written = (|| {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        serde_json::to_writer(&mut out, value)?;
+        out.flush()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     std::fs::rename(tmp, cache_dir.join("derived.json"))
 }
 
@@ -1127,5 +1132,19 @@ mod tests {
             fingerprint_from_hashes(pairs, "abc123"),
             content_fingerprint(&files, "abc123")
         );
+    }
+
+    #[test]
+    fn write_derived_removes_tmp_on_serialize_error() {
+        struct Boom;
+        impl Serialize for Boom {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("boom"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert!(write_derived(dir.path(), &Boom).is_err());
+        assert!(!dir.path().join("derived.json.tmp").exists());
+        assert!(!dir.path().join("derived.json").exists());
     }
 }
