@@ -89,6 +89,8 @@ try:
             first_answer = time.monotonic() - start
             while index_ready[0] is None and time.monotonic() - start < timeout:
                 time.sleep(0.01)
+            # A client attached to a shared index server (ADR-0214) never logs "MCP index ready".
+            ready_s = f"{index_ready[0]:.2f}" if index_ready[0] is not None else "shared"
             if lifecycle > 0:
                 deadline = index_ready[0] + lifecycle if index_ready[0] is not None else first_answer + lifecycle
                 while time.monotonic() - start < deadline:
@@ -104,12 +106,12 @@ try:
                 overall_peak = max(rss for _, rss in samples) if samples else 0
                 build_t = max((t for t, rss in samples if rss == build_peak and t <= boundary), default=boundary)
                 print(
-                    f"{repo} index_ready_s={index_ready[0]:.2f} first_answer_s={first_answer:.2f} "
+                    f"{repo} index_ready_s={ready_s} first_answer_s={first_answer:.2f} "
                     f"build_peak_mb={build_peak}@{build_t:.2f}s "
                     f"post_ready_peak_mb={post_peak}@{post_t:.2f}s peak_mb={overall_peak}"
                 )
             else:
-                print(f"{repo} index_ready_s={index_ready[0]:.2f} first_answer_s={first_answer:.2f} "
+                print(f"{repo} index_ready_s={ready_s} first_answer_s={first_answer:.2f} "
                       f"peak_rss_mb={max((rss for _, rss in samples), default=0)}")
             break
         i += 1
