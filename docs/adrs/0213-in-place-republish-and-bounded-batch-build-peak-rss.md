@@ -46,10 +46,13 @@ a potential blocker, by grep of `src/commands/serve.rs`:
 - `enrich_ready_with_embeddings` (line 2961) takes `base: &Arc<CodebaseIndex>` — called *after*
   `republish_conventions` returns, using its return value, not a separate hold during the republish
   window itself.
-- The MCP/HTTP freshness watcher (`spawn_mcp_watcher`/`process_watcher_changes`) only *writes* a
-  freshly built `Arc` into the cell; it does not hold a read-side clone across the republish window.
+- The MCP freshness watcher (`spawn_mcp_watcher`) — **does** hold a strong ref. `classify_watcher_wait`
+  returns `WatcherWait::Seed(Arc::clone(idx))` (serve.rs ~3072) and the watcher stores it in its
+  long-lived `shared` cell (~3161) for the whole session. With that ref alive, `Arc::get_mut` would
+  fail right after Ready in practice. An earlier revision of this ADR wrongly claimed the watcher
+  only writes.
 
-So the fix has two parts: (a) stop pre-capturing `ready_base` as a persistent clone before the
+So the fix has three parts: (0) the watcher must not retain a strong `Arc` of the published index between edit batches — it fetches its base from the readiness cell when a batch arrives (readiness stays the single source of truth; ADR-0200 semantics preserved; a watcher edit still lands because the batch-local base is the cell's current value and the result is published back to it); (a) stop pre-capturing `ready_base` as a persistent clone before the
 republish call — fetch it from the cell only in the fallback branches that actually need one; (b)
 inside `republish_conventions`, attempt `Arc::get_mut` on the cell's own `Arc` under the write lock
 before falling back to today's clone-and-swap.
@@ -75,7 +78,7 @@ before falling back to today's clone-and-swap.
 
 ## Decision
 
-**Options A + C together.** Scenario C: restructure the background-build closure (serve.rs:2784-2834)
+**Options A + C together, plus the watcher decision.** The watcher drops its seed and its long-lived `shared` mirror; per batch it takes its base from the readiness cell, publishes the result back, and releases its ref. Scenario C: restructure the background-build closure (serve.rs:2784-2834)
 to stop holding `ready_base` as a persistent pre-capture; `republish_conventions` fetches its
 fallback value from the cell itself only inside the branches that need one (mining panic, cell not
 `Ready`/`ReadyEnriched`). Inside the retry loop, attempt `Arc::get_mut` on the cell's `Arc` under the
