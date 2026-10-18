@@ -129,8 +129,9 @@ falls back at once. The server must outlive any one session. A validation pass a
    exit: try the lock WITHOUT blocking (a probing client holds it while it waits to be accepted, so
    blocking would starve that client; on contention the loop keeps accepting and retries), drain
    the accept backlog once, re-check `clients == 0` (a client that connected after the idle decision
-   aborts the exit), then unlink ONLY if `(dev, ino)` of the path still equals what the server
-   recorded right after its own `bind`; otherwise leave it (a newer server owns the path). Because
+   aborts the exit), then unlink ONLY if `(dev, ino, ctime)` of the path still equals what the
+   server recorded right after its own `bind` (Linux reuses inode numbers at once, so `(dev, ino)`
+   alone is not an identity) AND the pid file still names this server; otherwise leave it (a newer server owns the path). Because
    only a lock holder unlinks or spawns and `bind` is atomic, exactly one server per
    (repo, version, build id) exists.
 5. **Idle exit.** Default 600 s with zero clients (timer restarts at server start and at every
@@ -164,7 +165,7 @@ falls back at once. The server must outlive any one session. A validation pass a
    `config_hash` is a hash of the `.cxpak.json` bytes: the watcher does not rebuild on config
    changes, so a client whose config differs falls back. The in-process fallback canonicalizes the
    repo root exactly as the server does.
-8. **Failed server.** The server exits (under the lock, with the dev/ino-guarded unlink) 2 s after
+8. **Failed server.** The server exits (under the lock, with the identity-guarded unlink) 2 s after
    its readiness becomes `Failed`. Attached clients see EOF on their next request, fall back, and
    their own local build reports the same terminal `Failed` text, so the "restart the MCP server"
    advice stays true; a new session spawns a fresh server (a retry of the build).

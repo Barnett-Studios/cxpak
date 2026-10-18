@@ -181,17 +181,22 @@ fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// `(dev, ino)` of the socket file at `path`.
+/// `(dev, ino, ctime sec, ctime nsec)` of the file at `path`. Linux reuses an inode number as soon
+/// as a file is unlinked, so `(dev, ino)` alone cannot tell a socket from its successor; the
+/// change time (set at creation, and by the server's own chmod before it records this) can.
 #[cfg(unix)]
-fn file_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+type FileIdentity = (u64, u64, i64, i64);
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::symlink_metadata(path)?;
-    Ok((m.dev(), m.ino()))
+    Ok((m.dev(), m.ino(), m.ctime(), m.ctime_nsec()))
 }
 
 /// Remove `sock` only when it is still the file this server bound. A newer server may own the path.
 #[cfg(unix)]
-pub fn unlink_if_ours(sock: &Path, ours: (u64, u64)) -> std::io::Result<bool> {
+pub fn unlink_if_ours(sock: &Path, ours: FileIdentity) -> std::io::Result<bool> {
     match file_identity(sock) {
         Ok(id) if id == ours => std::fs::remove_file(sock).map(|()| true),
         Ok(_) => Ok(false),
@@ -604,12 +609,14 @@ pub fn run_index_server(
         if !failed_due && clients.load(Ordering::SeqCst) != 0 {
             continue;
         }
-        if let Err(e) = unlink_if_ours(&role.sock, ours) {
-            eprintln!("cxpak index-server: cannot remove socket: {e}");
-        }
-        if std::fs::read_to_string(&paths.pid)
-            .is_ok_and(|p| p.trim() == std::process::id().to_string())
-        {
+        // A newer server rewrites the pid file right after it binds; only unlink while the pid
+        // file still names us, which also covers a successor whose socket looks identical.
+        let own_pid = std::fs::read_to_string(&paths.pid)
+            .is_ok_and(|p| p.trim() == std::process::id().to_string());
+        if own_pid {
+            if let Err(e) = unlink_if_ours(&role.sock, ours) {
+                eprintln!("cxpak index-server: cannot remove socket: {e}");
+            }
             let _ = std::fs::remove_file(&paths.pid);
         }
         break;
@@ -767,11 +774,17 @@ mod tests {
         std::fs::write(&sock, "old server").unwrap();
         let old = file_identity(&sock).unwrap();
         // A newer server replaces the path while the old one is still exiting.
+        std::thread::sleep(Duration::from_millis(20));
         std::fs::remove_file(&sock).unwrap();
         std::fs::write(&sock, "new server").unwrap();
         assert!(!unlink_if_ours(&sock, old).unwrap());
         assert!(sock.exists());
         let new = file_identity(&sock).unwrap();
+        // Inode reuse: the old server's identity carries the successor's (dev, ino).
+        let reused = (new.0, new.1, old.2, old.3);
+        assert_ne!(reused, new);
+        assert!(!unlink_if_ours(&sock, reused).unwrap());
+        assert!(sock.exists());
         assert!(unlink_if_ours(&sock, new).unwrap());
         assert!(!sock.exists());
         assert!(!unlink_if_ours(&sock, new).unwrap());
