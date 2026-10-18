@@ -1157,49 +1157,48 @@ fn watcher_edit_after_republish_still_lands() {
     assert!(settled, "the watcher releases its ref after publishing");
 }
 
+/// The borrowed save view writes exactly the bytes `DerivedCache` does, and
+/// the result loads back as the same analysis.
 #[test]
-fn build_index_batched_matches_unbatched() {
-    let dir = warm_repo();
+fn derived_ref_save_matches_owned_serialization() {
+    let dir = history_repo();
     let root = dir.path();
-    for round in 0..2 {
-        let (whole, whole_report, whole_pending) =
-            build_index_pending_batched(root, None, false, None).unwrap();
-        let files = whole.total_files;
-        assert!(files >= 4, "fixture must span several chunks");
-        for batch in [1, 2, files, files + 5] {
-            let (idx, report, pending) =
-                build_index_pending_batched(root, None, false, Some(batch)).unwrap();
-            assert_eq!(
-                snapshot(&idx),
-                snapshot(&whole),
-                "round {round} batch {batch}"
-            );
-            assert_eq!(
-                (
-                    report.artifact_hits,
-                    report.artifact_partial,
-                    report.artifact_misses
-                ),
-                (
-                    whole_report.artifact_hits,
-                    whole_report.artifact_partial,
-                    whole_report.artifact_misses
-                ),
-                "round {round} batch {batch}"
-            );
-            assert_eq!(
-                pending.changed.keys().collect::<Vec<_>>(),
-                whole_pending.changed.keys().collect::<Vec<_>>(),
-                "round {round} batch {batch}"
-            );
-            assert_eq!(pending.dirty, whole_pending.dirty);
-            assert_eq!(
-                report.batches,
-                files.div_ceil(batch),
-                "round {round} batch {batch}"
-            );
-        }
-        // Second round runs warm: the first round's store is on disk.
-        whole_pending.save();
-    }
+    let (idx, _) = build_index_reported(root, None).unwrap();
+    assert!(!idx.co_changes.is_empty(), "fixture must carry co-changes");
+    let fingerprint = "fp".to_string();
+    let base = Some("abc123".to_string());
+
+    let owned = DerivedCache::new(
+        fingerprint.clone(),
+        idx.graph.clone(),
+        idx.call_graph.clone(),
+        idx.pagerank.clone(),
+        idx.conventions.clone(),
+        idx.co_changes.clone(),
+        base.clone(),
+    );
+    let owned_dir = tempfile::TempDir::new().unwrap();
+    owned.save(owned_dir.path()).unwrap();
+
+    let borrowed = crate::cache::DerivedCacheRef::new(
+        &fingerprint,
+        &idx.graph,
+        &idx.call_graph,
+        &idx.pagerank,
+        &idx.conventions,
+        &idx.co_changes,
+        base.as_deref(),
+    );
+    let ref_dir = tempfile::TempDir::new().unwrap();
+    borrowed.save(ref_dir.path()).unwrap();
+
+    assert_eq!(
+        std::fs::read(owned_dir.path().join("derived.json")).unwrap(),
+        std::fs::read(ref_dir.path().join("derived.json")).unwrap(),
+        "byte-identical on disk"
+    );
+    let loaded = DerivedCache::load(ref_dir.path(), &fingerprint).expect("round-trips");
+    assert_eq!(json_of(&loaded.graph), json_of(&idx.graph));
+    assert_eq!(json_of(&loaded.conventions), json_of(&idx.conventions));
+    assert_eq!(loaded.base_commit, base);
 }

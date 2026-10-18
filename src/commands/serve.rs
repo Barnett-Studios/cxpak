@@ -220,8 +220,6 @@ pub(crate) struct BuildReport {
     /// Files computed from scratch.
     pub(crate) artifact_misses: usize,
     pub(crate) derived_hit: bool,
-    /// Per-file batches the build processed.
-    pub(crate) batches: usize,
     /// Whether this build wrote the artifact store.
     pub(crate) store_saved: bool,
     pub(crate) timings: BuildTimings,
@@ -280,14 +278,14 @@ impl PendingConventions {
     pub(crate) fn mine(self, base: &CodebaseIndex) -> MinedConventions {
         let conventions = crate::conventions::build_convention_profile(base, &self.path);
         let co_changes = conventions.git_health.co_changes.clone();
-        let derived = crate::cache::DerivedCache::new(
-            self.fingerprint,
-            base.graph.clone(),
-            base.call_graph.clone(),
-            base.pagerank.clone(),
-            conventions.clone(),
-            co_changes.clone(),
-            self.base_commit,
+        let derived = crate::cache::DerivedCacheRef::new(
+            &self.fingerprint,
+            &base.graph,
+            &base.call_graph,
+            &base.pagerank,
+            &conventions,
+            &co_changes,
+            self.base_commit.as_deref(),
         );
         // Persisting is best-effort; a write failure must not fail the republish.
         let _ = derived.save(&self.cache_dir);
@@ -437,30 +435,6 @@ fn build_index_pending_with(
     workspace: Option<&str>,
     defer_conventions: bool,
 ) -> Result<(CodebaseIndex, BuildReport, PendingStore), Box<dyn std::error::Error>> {
-    build_index_pending_batched(path, workspace, defer_conventions, None)
-}
-
-/// Per-file batch size when the caller does not pin one: one batch per worker
-/// thread, floored so tiny repos stay a single parallel pass and capped so a
-/// huge one still folds incrementally.
-fn default_batch_size(total: usize) -> usize {
-    total
-        .div_ceil(rayon::current_num_threads().max(1))
-        .clamp(BATCH_FLOOR, BATCH_CEILING)
-}
-
-const BATCH_FLOOR: usize = 256;
-const BATCH_CEILING: usize = 4096;
-
-/// The one build implementation. `batch` is the per-file working-set size
-/// (`None` = derived from the file count and core count); tests pin it to
-/// exercise chunk boundaries.
-fn build_index_pending_batched(
-    path: &Path,
-    workspace: Option<&str>,
-    defer_conventions: bool,
-    batch: Option<usize>,
-) -> Result<(CodebaseIndex, BuildReport, PendingStore), Box<dyn std::error::Error>> {
     use rayon::prelude::*;
 
     let started = std::time::Instant::now();
@@ -494,130 +468,117 @@ fn build_index_pending_batched(
 
     let phase = std::time::Instant::now();
     let cap_bytes = crate::index::max_file_bytes();
-    let prepare = |file: &crate::scanner::ScannedFile, stored: Option<ArtifactEntry>| {
-        // An unreadable file leaves no trace: no index entry, no store
-        // entry, no fingerprint input (C4, #40).
-        let settled =
-            crate::index::SettledRead::from_disk(&file.absolute_path, file.size_bytes, cap_bytes)?;
-        let mtime_ns = settled.mtime_ns();
-        let (content, _) = settled.into_parts();
-        let raw_sha = sha256_hex(&content);
-        let body = crate::cache::strip_md_frontmatter(&content);
-        let body_sha = if body.len() == content.len() {
-            raw_sha.clone()
-        } else {
-            sha256_hex(body)
-        };
+    let prepared: Vec<Option<Prepared>> = files
+        .par_iter()
+        .zip(stored.into_par_iter())
+        .map(|(file, stored)| {
+            // An unreadable file leaves no trace: no index entry, no store
+            // entry, no fingerprint input (C4, #40).
+            let settled = crate::index::SettledRead::from_disk(
+                &file.absolute_path,
+                file.size_bytes,
+                cap_bytes,
+            )?;
+            let mtime_ns = settled.mtime_ns();
+            let (content, _) = settled.into_parts();
+            let raw_sha = sha256_hex(&content);
+            let body = crate::cache::strip_md_frontmatter(&content);
+            let body_sha = if body.len() == content.len() {
+                raw_sha.clone()
+            } else {
+                sha256_hex(body)
+            };
 
-        let matching =
-            stored.filter(|e| e.content_sha256 == raw_sha && e.language == file.language);
-        let (artifacts, reuse, fresh, call_sites) = match matching {
-            Some(ArtifactEntry {
-                parse_result,
-                token_count: Some(token_count),
-                term_frequencies: Some(terms),
-                call_sites_by_symbol,
-                ..
-            }) => (
-                crate::index::FileArtifacts {
+            let matching =
+                stored.filter(|e| e.content_sha256 == raw_sha && e.language == file.language);
+            let (artifacts, reuse, fresh, call_sites) = match matching {
+                Some(ArtifactEntry {
                     parse_result,
-                    token_count,
-                    term_frequencies: terms.into_iter().collect(),
-                },
-                Reuse::Hit,
-                None,
-                call_sites_by_symbol,
-            ),
-            Some(entry) => {
-                let artifacts = crate::index::FileArtifacts {
-                    parse_result: entry.parse_result,
-                    token_count: counter.count_or_zero(&content),
-                    term_frequencies: crate::index::compute_term_frequencies(&content),
-                };
-                let call_sites = entry.call_sites_by_symbol;
-                let fresh = store_entry(
-                    raw_sha.clone(),
+                    token_count: Some(token_count),
+                    term_frequencies: Some(terms),
+                    call_sites_by_symbol,
+                    ..
+                }) => (
+                    crate::index::FileArtifacts {
+                        parse_result,
+                        token_count,
+                        term_frequencies: terms.into_iter().collect(),
+                    },
+                    Reuse::Hit,
+                    None,
+                    call_sites_by_symbol,
+                ),
+                Some(entry) => {
+                    let artifacts = crate::index::FileArtifacts {
+                        parse_result: entry.parse_result,
+                        token_count: counter.count_or_zero(&content),
+                        term_frequencies: crate::index::compute_term_frequencies(&content),
+                    };
+                    let call_sites = entry.call_sites_by_symbol;
+                    let fresh = store_entry(
+                        raw_sha.clone(),
+                        mtime_ns,
+                        file,
+                        &artifacts,
+                        call_sites.clone(),
+                    );
+                    (artifacts, Reuse::Partial, Some(fresh), call_sites)
+                }
+                None => {
+                    let artifacts = crate::index::compute_file_artifacts(
+                        &content,
+                        file.language.as_deref(),
+                        &registry,
+                        &counter,
+                    );
+                    let fresh = store_entry(raw_sha.clone(), mtime_ns, file, &artifacts, None);
+                    (artifacts, Reuse::Miss, Some(fresh), None)
+                }
+            };
+            Some(Prepared {
+                file: crate::index::ArtifactFile {
+                    relative_path: file.relative_path.clone(),
+                    language: file.language.clone(),
+                    size_bytes: file.size_bytes,
+                    content,
                     mtime_ns,
-                    file,
-                    &artifacts,
-                    call_sites.clone(),
-                );
-                (artifacts, Reuse::Partial, Some(fresh), call_sites)
-            }
-            None => {
-                let artifacts = crate::index::compute_file_artifacts(
-                    &content,
-                    file.language.as_deref(),
-                    &registry,
-                    &counter,
-                );
-                let fresh = store_entry(raw_sha.clone(), mtime_ns, file, &artifacts, None);
-                (artifacts, Reuse::Miss, Some(fresh), None)
-            }
-        };
-        Some(Prepared {
-            file: crate::index::ArtifactFile {
-                relative_path: file.relative_path.clone(),
-                language: file.language.clone(),
-                size_bytes: file.size_bytes,
-                content,
-                mtime_ns,
-                artifacts,
-                call_sites,
-            },
-            body_sha,
-            raw_sha,
-            reuse,
-            fresh,
+                    artifacts,
+                    call_sites,
+                },
+                body_sha,
+                raw_sha,
+                reuse,
+                fresh,
+            })
         })
-    };
+        .collect();
+    timings.per_file = phase.elapsed();
 
-    // Bounded batches (ADR-0213): each chunk is prepared in parallel, folded
-    // into the accumulators, and its `Prepared` items dropped before the next
-    // chunk starts, so the transient per-file working set is one batch, not the
-    // whole repo. Chunks are contiguous in scanner order and `stored` /
-    // `had_entry` are consumed on the same boundaries, so file order and the
-    // store merge input are unchanged.
-    let batch = batch
-        .unwrap_or_else(|| default_batch_size(files.len()))
-        .max(1);
     let mut report = BuildReport::default();
     let mut changed: BTreeMap<String, ArtifactEntry> = BTreeMap::new();
     let mut scanned: BTreeSet<String> = BTreeSet::new();
-    let mut body_shas: Vec<String> = Vec::with_capacity(files.len());
-    let mut artifact_files = Vec::with_capacity(files.len());
+    let mut body_shas: Vec<String> = Vec::with_capacity(prepared.len());
+    let mut artifact_files = Vec::with_capacity(prepared.len());
     let mut dropped_entry = false;
-    let mut content_shas: HashMap<String, String> = HashMap::with_capacity(files.len());
-    let mut stored = stored.into_iter();
-    let mut had_entry = had_entry.into_iter();
-    for chunk in files.chunks(batch) {
-        let stored_chunk: Vec<Option<ArtifactEntry>> = stored.by_ref().take(chunk.len()).collect();
-        let prepared: Vec<Option<Prepared>> = chunk
-            .par_iter()
-            .zip(stored_chunk.into_par_iter())
-            .map(|(file, stored)| prepare(file, stored))
-            .collect();
-        for (slot, had) in prepared.into_iter().zip(had_entry.by_ref()) {
-            let Some(item) = slot else {
-                dropped_entry |= had;
-                continue;
-            };
-            match item.reuse {
-                Reuse::Hit => report.artifact_hits += 1,
-                Reuse::Partial => report.artifact_partial += 1,
-                Reuse::Miss => report.artifact_misses += 1,
-            }
-            scanned.insert(item.file.relative_path.clone());
-            content_shas.insert(item.file.relative_path.clone(), item.raw_sha);
-            if let Some(entry) = item.fresh {
-                changed.insert(item.file.relative_path.clone(), entry);
-            }
-            body_shas.push(item.body_sha);
-            artifact_files.push(item.file);
+    let mut content_shas: HashMap<String, String> = HashMap::with_capacity(prepared.len());
+    for (slot, had) in prepared.into_iter().zip(had_entry) {
+        let Some(item) = slot else {
+            dropped_entry |= had;
+            continue;
+        };
+        match item.reuse {
+            Reuse::Hit => report.artifact_hits += 1,
+            Reuse::Partial => report.artifact_partial += 1,
+            Reuse::Miss => report.artifact_misses += 1,
         }
-        report.batches += 1;
+        scanned.insert(item.file.relative_path.clone());
+        content_shas.insert(item.file.relative_path.clone(), item.raw_sha);
+        if let Some(entry) = item.fresh {
+            changed.insert(item.file.relative_path.clone(), entry);
+        }
+        body_shas.push(item.body_sha);
+        artifact_files.push(item.file);
     }
-    timings.per_file = phase.elapsed();
 
     // Derived-index cache (ADR-0167): the fingerprint comes from this build's
     // fresh hashes, so a hit means the content really is the content the
@@ -714,14 +675,14 @@ fn build_index_pending_batched(
                 None => {
                     index.conventions = crate::conventions::build_convention_profile(&index, path);
                     index.co_changes = index.conventions.git_health.co_changes.clone();
-                    let derived = crate::cache::DerivedCache::new(
-                        fingerprint,
-                        index.graph.clone(),
-                        index.call_graph.clone(),
-                        index.pagerank.clone(),
-                        index.conventions.clone(),
-                        index.co_changes.clone(),
-                        base_commit,
+                    let derived = crate::cache::DerivedCacheRef::new(
+                        &fingerprint,
+                        &index.graph,
+                        &index.call_graph,
+                        &index.pagerank,
+                        &index.conventions,
+                        &index.co_changes,
+                        base_commit.as_deref(),
                     );
                     // Persisting is best-effort; a write failure must not fail indexing.
                     let _ = derived.save(&cache_dir);

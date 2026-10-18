@@ -507,13 +507,70 @@ impl DerivedCache {
     /// Atomically persist the derived cache (lock + temp-write + rename), mirroring
     /// [`FileCache::save`]. Errors are returned but are non-fatal to the caller.
     pub fn save(&self, cache_dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(cache_dir)?;
-        let _lock = lock_cache(cache_dir)?;
-        let json = serde_json::to_string(self)?;
-        let tmp = cache_dir.join("derived.json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(tmp, cache_dir.join("derived.json"))
+        write_derived(cache_dir, self)
     }
+}
+
+/// Borrowed view of a [`DerivedCache`] for saving without cloning the analysis.
+///
+/// Field names and order match `DerivedCache` exactly, so the bytes written are
+/// identical and [`DerivedCache::load`] reads them back. Saving from a live
+/// `CodebaseIndex` through this view avoids a transient second copy of the
+/// graph, call graph, pagerank and conventions (ADR-0213).
+#[derive(Serialize)]
+pub(crate) struct DerivedCacheRef<'a> {
+    version: u32,
+    grammar_hash: &'static str,
+    fingerprint: &'a str,
+    graph: &'a crate::index::graph::DependencyGraph,
+    call_graph: &'a crate::intelligence::call_graph::CallGraph,
+    pagerank: &'a HashMap<String, f64>,
+    conventions: &'a crate::conventions::ConventionProfile,
+    co_changes: &'a [crate::intelligence::co_change::CoChangeEdge],
+    base_commit: Option<&'a str>,
+}
+
+impl<'a> DerivedCacheRef<'a> {
+    pub(crate) fn new(
+        fingerprint: &'a str,
+        graph: &'a crate::index::graph::DependencyGraph,
+        call_graph: &'a crate::intelligence::call_graph::CallGraph,
+        pagerank: &'a HashMap<String, f64>,
+        conventions: &'a crate::conventions::ConventionProfile,
+        co_changes: &'a [crate::intelligence::co_change::CoChangeEdge],
+        base_commit: Option<&'a str>,
+    ) -> Self {
+        Self {
+            version: CACHE_VERSION,
+            grammar_hash: CURRENT_GRAMMAR_HASH,
+            fingerprint,
+            graph,
+            call_graph,
+            pagerank,
+            conventions,
+            co_changes,
+            base_commit,
+        }
+    }
+
+    /// Atomically persist, like [`DerivedCache::save`].
+    pub(crate) fn save(&self, cache_dir: &Path) -> std::io::Result<()> {
+        write_derived(cache_dir, self)
+    }
+}
+
+/// Lock, stream `value` to a temp file, rename into place. Streaming avoids
+/// holding the whole JSON document in memory next to the analysis.
+fn write_derived<T: Serialize>(cache_dir: &Path, value: &T) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(cache_dir)?;
+    let _lock = lock_cache(cache_dir)?;
+    let tmp = cache_dir.join("derived.json.tmp");
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    serde_json::to_writer(&mut out, value)?;
+    out.flush()?;
+    drop(out);
+    std::fs::rename(tmp, cache_dir.join("derived.json"))
 }
 
 #[cfg(test)]

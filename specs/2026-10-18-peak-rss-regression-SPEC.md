@@ -135,3 +135,8 @@ See ADR-0213 for the chosen design (two independent, no-API-change fixes):
 - The small-n (n=2) numbers in §1 are triage evidence from the pre-fix binary, not the gate
   measurement; §4's n ≥ 5 interleaved run, on both the idle and concurrent-traffic workloads, is
   required before claiming the gate is met.
+
+## Outcome note (2026-10-18)
+
+The bounded-batch build change (scenario U) was implemented and rejected on measurement: U peak
+374 MB against 3.5.0's 364 MB, and +11-16 % `index_ready_s`. See ADR-0213 "Outcome".

@@ -125,3 +125,14 @@ not fixed here.
 - The 1.10× full-lifecycle gate is not met on scenario U at any `build_index` batch size that also
   holds the +10% time gate — same fallback as the first revision: Option C from that revision
   (drop `content` from `Prepared`), a separate ADR given its wider blast radius.
+
+## Outcome: bounded-batch fold tried and rejected (2026-10-18)
+
+Option A was implemented and measured (`scripts/mcp-ready.py --lifecycle 20`, scriptorium, n=5,
+interleaved). It did not lower the build-phase peak (scenario U: 374 MB against 3.5.0's 364 MB) and
+added 11-16 % to `index_ready_s` (U 0.81 s against 0.73 s; C 3.26-3.38 s against 2.90 s). The
+`artifact_files` content is resident for the whole build regardless, so chunking the transient
+`Prepared` set saved nothing measurable. It was reverted; `build_index` is unchanged from 3.5.0.
+Options C (in place, plus the watcher releasing its ref) stays. The measured post-ready peak in the
+mining window led to a follow-up: saving the derived cache through a borrowed view
+(`DerivedCacheRef`) instead of cloning graph, call graph, pagerank and conventions.

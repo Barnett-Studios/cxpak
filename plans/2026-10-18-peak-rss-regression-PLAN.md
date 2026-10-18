@@ -77,6 +77,7 @@ Node `pin-watcher-does-not-pin-index` (local: false). Two tests in `warm_start_t
     },
     {
       "id": "pin-batch-size-seam",
+      "status": "REJECTED (ADR-0213 outcome: no measured benefit, +11-16 % ready time)",
       "files": ["src/commands/serve.rs", "src/commands/warm_start_tests.rs"],
       "change": "Author-committed RED first (local: false). Add build_index_pending_batched(path, workspace, defer_conventions, batch: Option<usize>) as the single implementation behind build_index_pending_with (which passes None), and BuildReport.batches (pub(crate), Default 0). RED test build_index_batched_matches_unbatched builds the warm fixture cold and warm with batch None and Some(1)/Some(2), asserting snapshot() parity, equal hit/partial/miss counts, equal `changed` key sets, and report.batches == ceil(files / batch). Against the pre-fix body (batch ignored, batches == 1) the batches assertion fails: that is the RED signal. State chunks are contiguous in scanner order; `stored` and `had_entry` are consumed in the same chunk boundaries as `files`, so file order and merge_store_entries input are unchanged.",
       "accept": "set -o pipefail; cargo test --lib warm_start_tests::build_index_batched_matches_unbatched 2>&1 | grep -E 'test result: FAILED'",
@@ -86,6 +87,7 @@ Node `pin-watcher-does-not-pin-index` (local: false). Two tests in `warm_start_t
     },
     {
       "id": "bounded-batch-fold",
+      "status": "REJECTED (ADR-0213 outcome: no measured benefit, +11-16 % ready time)",
       "files": ["src/commands/serve.rs"],
       "change": "Replace build_index_pending_with's single files.par_iter().zip(stored.into_par_iter()).map(..).collect() (lines ~471-554) with a loop over fixed-size chunks of (files, stored) pairs: run the existing per-file closure unchanged within each chunk via par_iter/collect, then fold that chunk's Vec<Option<Prepared>> into the running report/changed/scanned/content_shas/artifact_files/body_shas accumulators (the loop body at lines ~564-581) before processing the next chunk. Chunk size: files.len() / num_cpus().max(1), clamped to a sane floor/ceiling, overridable through the `batch` parameter of build_index_pending_batched (pin-batch-size-seam), not a cfg(test) branch. Per-file logic and merge_store_entries semantics must not change.",
       "accept": "set -o pipefail; cargo test --lib warm_start_tests::build_index_batched_matches_unbatched 2>&1 | grep -E 'test result: ok\\. 1'",
@@ -127,3 +129,9 @@ shows the gate failing because `get_mut` rarely succeeds in practice, that is AD
 Bump `Cargo.toml` to 3.5.1, update `CHANGELOG`/release notes per repo convention. No public-API or
 source-compat note is needed (no field type changed). Confirm `docs-with-code` (no public-surface
 doc needs updating beyond the `conventions.rs` comment already in the manifest).
+
+## Outcome (2026-10-18)
+
+`pin-batch-size-seam` and `bounded-batch-fold` were implemented, measured and reverted (ADR-0213
+"Outcome"). Added instead: `DerivedCacheRef`, a borrowed serialization view, used by every derived
+save path so no graph/call-graph/pagerank/conventions clone is made to write the cache.
