@@ -165,6 +165,35 @@ Resident set size alone: U met (384.9 vs 434.8); C **not met** (569.5 vs 504.2).
 3.5.1 is indistinguishable from 3.5.0 on both metrics here: in this series the footprint was already
 below 3.4.0's, and the in-place republish and borrowed save did not change it measurably.
 
+### 3.5.1 max RSS re-measurement and phase attribution (ADR-0215) — `/usr/bin/time -l`
+
+Method: as round 2, on a fresh clone of scriptorium at `/tmp/frz/scriptorium` (HEAD 48d39208), n=5
+interleaved, each measured run preceded by an untimed U priming run of the same binary (C: empty commit
+between prime and run). 3.4.0 is a v3.4.0 source build, 3.5.1 is `/opt/homebrew/bin/cxpak`. The machine
+was shared and loaded: 1-min load average 8-38 across the series (18 logged-in users). Medians
+`[min-max]`, MB.
+
+| Scenario | Binary | peak memory footprint | maximum resident set size |
+|---|---|---|---|
+| U | 3.4.0 | 429.6 [335.0-429.8] | 252.9 [251.3-263.4] |
+| U | 3.5.1 | 376.7 [376.5-377.4] | 314.3 [292.6-346.5] |
+| C | 3.4.0 | 689.0 [220.5-694.5] | 306.8 [257.8-316.8] |
+| C | 3.5.1 | 650.7 [645.6-654.8] | 350.2 [338.5-388.2] |
+
+- Footprint (stable run to run): 3.5.1 below 3.4.0 in both scenarios.
+- Max RSS did not reproduce round 2's 570 MB for C: 3.5.1 C is 350 MB here (338-388), under the fixed
+  504 MB limit; 3.4.0 measured 253 / 307 MB, so 3.5.1 sits above 3.4.0 x 1.10 (U 278, C 337) on this
+  metric. The 3.4.0 RSS values are 40-45 % lower than round 2's (395 / 458) on the same binary,
+  so max RSS on this host depends on memory pressure (macOS compresses pages, which `ps` and
+  `ru_maxrss` stop counting) and is not a stable gate metric under load.
+- Phase attribution (`scripts/mcp-ready.py --lifecycle 20`, 3.5.1, scenario C, 2 runs):
+  build peak 334 / 329 MB at 0.6-0.9 s; post-ready peak 339 / 254 MB. The build phase sets the
+  maximum; mining and republish do not. A temporary RSS trace (not kept) showed the per-file stage
+  (store load + all file contents + artifacts) at 211-303 MB and `assemble` at 164-373 MB, with
+  differences of 100+ MB between identical runs.
+- jemalloc decay tuning via `_RJEM_MALLOC_CONF` (`dirty_decay_ms:1000` / `:0`, `muzzy_decay_ms:0`,
+  `narenas:2`) showed no reduction (C 335-352 vs 343-388 base; U 372-385 vs 329-346).
+
 ## Shared index server, N=4 concurrent sessions (ADR-0214, 2026-10-18)
 
 Method: `/tmp/frz-srv/measure.py` starts 4 `serve --mcp /tmp/frz-srv/scriptorium` sessions (frozen
