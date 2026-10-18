@@ -440,6 +440,18 @@ fn build_index_pending_with(
     build_index_pending_batched(path, workspace, defer_conventions, None)
 }
 
+/// Per-file batch size when the caller does not pin one: one batch per worker
+/// thread, floored so tiny repos stay a single parallel pass and capped so a
+/// huge one still folds incrementally.
+fn default_batch_size(total: usize) -> usize {
+    total
+        .div_ceil(rayon::current_num_threads().max(1))
+        .clamp(BATCH_FLOOR, BATCH_CEILING)
+}
+
+const BATCH_FLOOR: usize = 256;
+const BATCH_CEILING: usize = 4096;
+
 /// The one build implementation. `batch` is the per-file working-set size
 /// (`None` = derived from the file count and core count); tests pin it to
 /// exercise chunk boundaries.
@@ -449,7 +461,6 @@ fn build_index_pending_batched(
     defer_conventions: bool,
     batch: Option<usize>,
 ) -> Result<(CodebaseIndex, BuildReport, PendingStore), Box<dyn std::error::Error>> {
-    let _ = batch;
     use rayon::prelude::*;
 
     let started = std::time::Instant::now();
@@ -483,120 +494,130 @@ fn build_index_pending_batched(
 
     let phase = std::time::Instant::now();
     let cap_bytes = crate::index::max_file_bytes();
-    let prepared: Vec<Option<Prepared>> = files
-        .par_iter()
-        .zip(stored.into_par_iter())
-        .map(|(file, stored)| {
-            // An unreadable file leaves no trace: no index entry, no store
-            // entry, no fingerprint input (C4, #40).
-            let settled = crate::index::SettledRead::from_disk(
-                &file.absolute_path,
-                file.size_bytes,
-                cap_bytes,
-            )?;
-            let mtime_ns = settled.mtime_ns();
-            let (content, _) = settled.into_parts();
-            let raw_sha = sha256_hex(&content);
-            let body = crate::cache::strip_md_frontmatter(&content);
-            let body_sha = if body.len() == content.len() {
-                raw_sha.clone()
-            } else {
-                sha256_hex(body)
-            };
+    let prepare = |file: &crate::scanner::ScannedFile, stored: Option<ArtifactEntry>| {
+        // An unreadable file leaves no trace: no index entry, no store
+        // entry, no fingerprint input (C4, #40).
+        let settled =
+            crate::index::SettledRead::from_disk(&file.absolute_path, file.size_bytes, cap_bytes)?;
+        let mtime_ns = settled.mtime_ns();
+        let (content, _) = settled.into_parts();
+        let raw_sha = sha256_hex(&content);
+        let body = crate::cache::strip_md_frontmatter(&content);
+        let body_sha = if body.len() == content.len() {
+            raw_sha.clone()
+        } else {
+            sha256_hex(body)
+        };
 
-            let matching =
-                stored.filter(|e| e.content_sha256 == raw_sha && e.language == file.language);
-            let (artifacts, reuse, fresh, call_sites) = match matching {
-                Some(ArtifactEntry {
+        let matching =
+            stored.filter(|e| e.content_sha256 == raw_sha && e.language == file.language);
+        let (artifacts, reuse, fresh, call_sites) = match matching {
+            Some(ArtifactEntry {
+                parse_result,
+                token_count: Some(token_count),
+                term_frequencies: Some(terms),
+                call_sites_by_symbol,
+                ..
+            }) => (
+                crate::index::FileArtifacts {
                     parse_result,
-                    token_count: Some(token_count),
-                    term_frequencies: Some(terms),
-                    call_sites_by_symbol,
-                    ..
-                }) => (
-                    crate::index::FileArtifacts {
-                        parse_result,
-                        token_count,
-                        term_frequencies: terms.into_iter().collect(),
-                    },
-                    Reuse::Hit,
-                    None,
-                    call_sites_by_symbol,
-                ),
-                Some(entry) => {
-                    let artifacts = crate::index::FileArtifacts {
-                        parse_result: entry.parse_result,
-                        token_count: counter.count_or_zero(&content),
-                        term_frequencies: crate::index::compute_term_frequencies(&content),
-                    };
-                    let call_sites = entry.call_sites_by_symbol;
-                    let fresh = store_entry(
-                        raw_sha.clone(),
-                        mtime_ns,
-                        file,
-                        &artifacts,
-                        call_sites.clone(),
-                    );
-                    (artifacts, Reuse::Partial, Some(fresh), call_sites)
-                }
-                None => {
-                    let artifacts = crate::index::compute_file_artifacts(
-                        &content,
-                        file.language.as_deref(),
-                        &registry,
-                        &counter,
-                    );
-                    let fresh = store_entry(raw_sha.clone(), mtime_ns, file, &artifacts, None);
-                    (artifacts, Reuse::Miss, Some(fresh), None)
-                }
-            };
-            Some(Prepared {
-                file: crate::index::ArtifactFile {
-                    relative_path: file.relative_path.clone(),
-                    language: file.language.clone(),
-                    size_bytes: file.size_bytes,
-                    content,
-                    mtime_ns,
-                    artifacts,
-                    call_sites,
+                    token_count,
+                    term_frequencies: terms.into_iter().collect(),
                 },
-                body_sha,
-                raw_sha,
-                reuse,
-                fresh,
-            })
+                Reuse::Hit,
+                None,
+                call_sites_by_symbol,
+            ),
+            Some(entry) => {
+                let artifacts = crate::index::FileArtifacts {
+                    parse_result: entry.parse_result,
+                    token_count: counter.count_or_zero(&content),
+                    term_frequencies: crate::index::compute_term_frequencies(&content),
+                };
+                let call_sites = entry.call_sites_by_symbol;
+                let fresh = store_entry(
+                    raw_sha.clone(),
+                    mtime_ns,
+                    file,
+                    &artifacts,
+                    call_sites.clone(),
+                );
+                (artifacts, Reuse::Partial, Some(fresh), call_sites)
+            }
+            None => {
+                let artifacts = crate::index::compute_file_artifacts(
+                    &content,
+                    file.language.as_deref(),
+                    &registry,
+                    &counter,
+                );
+                let fresh = store_entry(raw_sha.clone(), mtime_ns, file, &artifacts, None);
+                (artifacts, Reuse::Miss, Some(fresh), None)
+            }
+        };
+        Some(Prepared {
+            file: crate::index::ArtifactFile {
+                relative_path: file.relative_path.clone(),
+                language: file.language.clone(),
+                size_bytes: file.size_bytes,
+                content,
+                mtime_ns,
+                artifacts,
+                call_sites,
+            },
+            body_sha,
+            raw_sha,
+            reuse,
+            fresh,
         })
-        .collect();
-    timings.per_file = phase.elapsed();
-
-    let mut report = BuildReport {
-        batches: 1,
-        ..BuildReport::default()
     };
+
+    // Bounded batches (ADR-0213): each chunk is prepared in parallel, folded
+    // into the accumulators, and its `Prepared` items dropped before the next
+    // chunk starts, so the transient per-file working set is one batch, not the
+    // whole repo. Chunks are contiguous in scanner order and `stored` /
+    // `had_entry` are consumed on the same boundaries, so file order and the
+    // store merge input are unchanged.
+    let batch = batch
+        .unwrap_or_else(|| default_batch_size(files.len()))
+        .max(1);
+    let mut report = BuildReport::default();
     let mut changed: BTreeMap<String, ArtifactEntry> = BTreeMap::new();
     let mut scanned: BTreeSet<String> = BTreeSet::new();
-    let mut body_shas: Vec<String> = Vec::with_capacity(prepared.len());
-    let mut artifact_files = Vec::with_capacity(prepared.len());
+    let mut body_shas: Vec<String> = Vec::with_capacity(files.len());
+    let mut artifact_files = Vec::with_capacity(files.len());
     let mut dropped_entry = false;
-    let mut content_shas: HashMap<String, String> = HashMap::with_capacity(prepared.len());
-    for (slot, had) in prepared.into_iter().zip(had_entry) {
-        let Some(item) = slot else {
-            dropped_entry |= had;
-            continue;
-        };
-        match item.reuse {
-            Reuse::Hit => report.artifact_hits += 1,
-            Reuse::Partial => report.artifact_partial += 1,
-            Reuse::Miss => report.artifact_misses += 1,
+    let mut content_shas: HashMap<String, String> = HashMap::with_capacity(files.len());
+    let mut stored = stored.into_iter();
+    let mut had_entry = had_entry.into_iter();
+    for chunk in files.chunks(batch) {
+        let stored_chunk: Vec<Option<ArtifactEntry>> = stored.by_ref().take(chunk.len()).collect();
+        let prepared: Vec<Option<Prepared>> = chunk
+            .par_iter()
+            .zip(stored_chunk.into_par_iter())
+            .map(|(file, stored)| prepare(file, stored))
+            .collect();
+        for (slot, had) in prepared.into_iter().zip(had_entry.by_ref()) {
+            let Some(item) = slot else {
+                dropped_entry |= had;
+                continue;
+            };
+            match item.reuse {
+                Reuse::Hit => report.artifact_hits += 1,
+                Reuse::Partial => report.artifact_partial += 1,
+                Reuse::Miss => report.artifact_misses += 1,
+            }
+            scanned.insert(item.file.relative_path.clone());
+            content_shas.insert(item.file.relative_path.clone(), item.raw_sha);
+            if let Some(entry) = item.fresh {
+                changed.insert(item.file.relative_path.clone(), entry);
+            }
+            body_shas.push(item.body_sha);
+            artifact_files.push(item.file);
         }
-        scanned.insert(item.file.relative_path.clone());
-        content_shas.insert(item.file.relative_path.clone(), item.raw_sha);
-        if let Some(entry) = item.fresh {
-            changed.insert(item.file.relative_path.clone(), entry);
-        }
-        body_shas.push(item.body_sha);
-        artifact_files.push(item.file);
+        report.batches += 1;
     }
+    timings.per_file = phase.elapsed();
 
     // Derived-index cache (ADR-0167): the fingerprint comes from this build's
     // fresh hashes, so a hit means the content really is the content the
@@ -2855,6 +2876,19 @@ fn ready_base_of(readiness: &SharedReadiness) -> Option<Arc<CodebaseIndex>> {
     }
 }
 
+/// The `Ready` or `ReadyEnriched` index the cell holds right now, as a fresh
+/// strong ref; `None` while `Building` or `Failed`.
+fn queryable_index_of(readiness: &SharedReadiness) -> Option<Arc<CodebaseIndex>> {
+    let guard = match readiness.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match &*guard {
+        IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => Some(Arc::clone(idx)),
+        _ => None,
+    }
+}
+
 /// Mine the conventions a `StalePending` base deferred and publish them into
 /// the readiness cell (ADR-0212). Returns the index the cell now holds, or
 /// `None` when nothing was published (mining panicked, or the cell is not
@@ -2912,6 +2946,15 @@ fn republish_conventions_with(
             Err(poisoned) => *poisoned.into_inner() = ConventionsStatus::Fresh,
         }
     };
+    // In place first (ADR-0213): when the cell holds the only strong ref, no
+    // reader can observe the mutation and the deep clone below is skipped.
+    let mut unapplied = Some(mined);
+    if let Some(published) = republish_in_place(readiness, status, &mut unapplied) {
+        eprintln!("cxpak: conventions republished in place");
+        return Some(published);
+    }
+    // In place declined: `unapplied` was left untouched for the clone path.
+    let mined = unapplied?;
     for _ in 0..ATTEMPTS {
         let current = match readiness.read() {
             Ok(g) => g.clone(),
@@ -2945,6 +2988,7 @@ fn republish_conventions_with(
         };
         if unchanged {
             publish_fresh(&mut guard, &next, enriched);
+            eprintln!("cxpak: conventions republished by clone");
             return Some(next);
         }
     }
@@ -2962,7 +3006,44 @@ fn republish_conventions_with(
     mined.apply_to(&mut next);
     let next = Arc::new(next);
     publish_fresh(&mut guard, &next, enriched);
+    eprintln!("cxpak: conventions republished by clone (watcher won every swap)");
     Some(next)
+}
+
+/// Apply `mined` to the cell's index without cloning it, when the cell holds
+/// the only strong ref (`Arc::get_mut`). Leaves `mined` in its slot, untouched,
+/// when that is not possible (a reader holds the index, the cell is not ready, or
+/// the conventions are already fresh) so the caller falls back to
+/// clone-and-swap. The status flips to `Fresh` under the same write lock, as
+/// in the clone path.
+fn republish_in_place(
+    readiness: &SharedReadiness,
+    status: &RwLock<ConventionsStatus>,
+    mined: &mut Option<MinedConventions>,
+) -> Option<Arc<CodebaseIndex>> {
+    let mut guard = match readiness.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let already_fresh = match status.read() {
+        Ok(s) => *s == ConventionsStatus::Fresh,
+        Err(poisoned) => *poisoned.into_inner() == ConventionsStatus::Fresh,
+    };
+    if already_fresh {
+        return None;
+    }
+    let cur = match &mut *guard {
+        IndexReadiness::Ready(cur) | IndexReadiness::ReadyEnriched(cur) => cur,
+        _ => return None,
+    };
+    let index = Arc::get_mut(cur)?;
+    mined.take()?.apply_to(index);
+    let published = Arc::clone(cur);
+    match status.write() {
+        Ok(mut s) => *s = ConventionsStatus::Fresh,
+        Err(poisoned) => *poisoned.into_inner() = ConventionsStatus::Fresh,
+    }
+    Some(published)
 }
 
 /// Phase 2 of the MCP background build (R-E1, ADR-0186): build the embedding
@@ -3076,7 +3157,7 @@ impl NotReady {
 }
 
 /// Outcome of checking the readiness cell during the watcher's pre-`Ready`
-/// wait (Task #18, ADR-0200): `Seed` once a queryable base exists — `Ready`
+/// wait (Task #18, ADR-0200): `Queryable` once a queryable base exists — `Ready`
 /// and `ReadyEnriched` both qualify, and the watcher mirrors whichever landed
 /// first — `Pending` while still `Building` (keep polling), and `Abort` on
 /// `Failed` (the one-shot build never became queryable; nothing to watch
@@ -3085,16 +3166,14 @@ impl NotReady {
 /// Extracted as a pure function over `&IndexReadiness` so the classification
 /// is unit-testable without spawning a thread or a real `FileWatcher`.
 enum WatcherWait {
-    Seed(Arc<CodebaseIndex>),
+    Queryable,
     Pending,
     Abort,
 }
 
 fn classify_watcher_wait(state: &IndexReadiness) -> WatcherWait {
     match state {
-        IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => {
-            WatcherWait::Seed(Arc::clone(idx))
-        }
+        IndexReadiness::Ready(_) | IndexReadiness::ReadyEnriched(_) => WatcherWait::Queryable,
         IndexReadiness::Building => WatcherWait::Pending,
         IndexReadiness::Failed(_) => WatcherWait::Abort,
     }
@@ -3118,9 +3197,10 @@ const WATCHER_WAIT_POLL: Duration = Duration::from_millis(100);
 ///    every poll so a stdin EOF during the initial build joins promptly
 ///    rather than riding out the full 13–34s build. Aborts without installing
 ///    a watcher if the build resolves `Failed`.
-/// 2. Seeds a `SharedIndex` mirror from that base and runs the same debounced
-///    `FileWatcher` + `process_watcher_changes` loop HTTP `run` uses — but
-///    terminable: `shutdown` is checked at each `recv_timeout(1s)` poll, not
+/// 2. Runs the same debounced `FileWatcher` + `process_watcher_changes` loop
+///    HTTP `run` uses — but with no long-lived mirror: each batch takes its base
+///    from the readiness cell and releases it after publishing (ADR-0213). It is
+///    also terminable: `shutdown` is checked at each `recv_timeout(1s)` poll, not
 ///    just at process exit.
 /// 3. Each rebuild clears `embedding_index` before the swap (inside
 ///    [`process_watcher_changes`], issue #47 / ADR-0205) and publishes the
@@ -3160,7 +3240,7 @@ pub fn spawn_mcp_watcher(
             }
         };
 
-        let seed = loop {
+        loop {
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
@@ -3169,7 +3249,7 @@ pub fn spawn_mcp_watcher(
                 Err(poisoned) => classify_watcher_wait(&poisoned.into_inner()),
             };
             match wait {
-                WatcherWait::Seed(idx) => break idx,
+                WatcherWait::Queryable => break,
                 WatcherWait::Abort => {
                     eprintln!(
                         "cxpak: MCP watcher aborting — background build failed, \
@@ -3179,9 +3259,7 @@ pub fn spawn_mcp_watcher(
                 }
                 WatcherWait::Pending => std::thread::sleep(WATCHER_WAIT_POLL),
             }
-        };
-
-        let shared: SharedIndex = Arc::new(RwLock::new(seed));
+        }
 
         let watcher = match FileWatcher::new(&path) {
             Ok(w) => w,
@@ -3206,11 +3284,13 @@ pub fn spawn_mcp_watcher(
                     "cxpak: MCP watcher event buffer overflowed — \
                      delta may be stale; triggering full rebuild"
                 );
-                // Release BOTH strong references to the current index *before*
-                // building its replacement. Building first and swapping after
-                // keeps two full indexes live at once, and this path fires
-                // precisely during an event storm — the moment the process can
-                // least afford to double its largest allocation.
+                // Release the current index *before* building its replacement.
+                // Building first and swapping after keeps two full indexes live
+                // at once, and this path fires precisely during an event storm
+                // — the moment the process can least afford to double its
+                // largest allocation. The readiness cell holds the only
+                // long-lived strong ref (the watcher keeps none between
+                // batches), so this swap frees it once in-flight readers finish.
                 //
                 // The trade is availability for memory, and it is the right way
                 // round here: overflow means events were dropped, so we have
@@ -3224,19 +3304,10 @@ pub fn spawn_mcp_watcher(
                     Ok(mut g) => *g = IndexReadiness::Building,
                     Err(p) => *p.into_inner() = IndexReadiness::Building,
                 }
-                let placeholder = Arc::new(CodebaseIndex::empty());
-                match shared.write() {
-                    Ok(mut g) => *g = placeholder,
-                    Err(p) => *p.into_inner() = placeholder,
-                }
 
                 match build_index(&path) {
                     Ok(fresh) => {
                         let new_arc = Arc::new(fresh);
-                        match shared.write() {
-                            Ok(mut g) => *g = Arc::clone(&new_arc),
-                            Err(p) => *p.into_inner() = Arc::clone(&new_arc),
-                        }
                         match readiness.write() {
                             Ok(mut g) => *g = IndexReadiness::Ready(new_arc),
                             Err(p) => *p.into_inner() = IndexReadiness::Ready(new_arc),
@@ -3265,7 +3336,20 @@ pub fn spawn_mcp_watcher(
             // Publish the exact `Arc` the rebuild swapped into `shared` (already
             // embeddings-free per ADR-0200). `None` = nothing relevant changed,
             // so the prior `readiness` cell stands (issue #47 / ADR-0205).
-            if let Some(republished) = process_watcher_changes(&changes, &path, &shared) {
+            //
+            // The base comes from the readiness cell at batch time and the
+            // batch-local mirror is dropped before publishing, so no strong ref
+            // outlives the batch (ADR-0213): the cell stays the single source
+            // of truth and a later in-place republish can take `Arc::get_mut`.
+            // A cell that is not queryable (`Building`/`Failed`) has no base to
+            // edit; the batch is skipped rather than resurrecting a stale one.
+            let Some(base) = queryable_index_of(&readiness) else {
+                continue;
+            };
+            let shared: SharedIndex = Arc::new(RwLock::new(base));
+            let republished = process_watcher_changes(&changes, &path, &shared);
+            drop(shared);
+            if let Some(republished) = republished {
                 match readiness.write() {
                     Ok(mut g) => *g = IndexReadiness::Ready(republished),
                     Err(poisoned) => *poisoned.into_inner() = IndexReadiness::Ready(republished),
@@ -5709,12 +5793,13 @@ mod tests {
     /// the watcher's wait behavior deterministically — no thread, no real
     /// `FileWatcher`, no timing dependence.
     #[test]
-    fn classify_watcher_wait_seeds_from_ready() {
+    fn classify_watcher_wait_queryable_on_ready() {
         let idx = Arc::new(make_test_index());
-        match classify_watcher_wait(&IndexReadiness::Ready(Arc::clone(&idx))) {
-            WatcherWait::Seed(got) => assert!(Arc::ptr_eq(&got, &idx)),
-            _ => panic!("Ready must yield Seed"),
-        }
+        assert!(matches!(
+            classify_watcher_wait(&IndexReadiness::Ready(Arc::clone(&idx))),
+            WatcherWait::Queryable
+        ));
+        assert_eq!(Arc::strong_count(&idx), 1, "classification retains nothing");
     }
 
     /// finding MAJOR-2: a session where the base was already enriched before
@@ -5724,10 +5809,13 @@ mod tests {
     #[test]
     fn mcp_watcher_seeds_from_ready_enriched() {
         let idx = Arc::new(make_test_index());
-        match classify_watcher_wait(&IndexReadiness::ReadyEnriched(Arc::clone(&idx))) {
-            WatcherWait::Seed(got) => assert!(Arc::ptr_eq(&got, &idx)),
-            _ => panic!("ReadyEnriched must be treated as a valid seed, not Pending/Abort"),
-        }
+        assert!(
+            matches!(
+                classify_watcher_wait(&IndexReadiness::ReadyEnriched(Arc::clone(&idx))),
+                WatcherWait::Queryable
+            ),
+            "ReadyEnriched must be treated as queryable, not Pending/Abort"
+        );
     }
 
     #[test]

@@ -79,8 +79,9 @@ pub struct FileContribution {
 /// index was built at (ADR-0212).
 ///
 /// An MCP start publishes `Ready` with the previous derived snapshot's
-/// conventions while the current commit's are mined in the background; the
-/// window is visible here instead of silently stale.
+/// conventions while the current commit's are mined in the background. The
+/// status is tracked internally (`commands::serve`) for that background
+/// refresh and is not currently exposed in any MCP, HTTP or LSP tool response.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConventionsStatus {
     /// Mined at (or incrementally kept current for) this index's content.
