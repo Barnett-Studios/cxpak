@@ -99,3 +99,68 @@ with a derived hit; the first post-commit start after that took 5.4 s with the m
 average, before the 5-run series above). The unchanged-repo figure is lower than Phase 1's 1.85 s because the machine
 was less loaded; it shows no regression, not a speedup. `artifacts.json` grew from 55 MB to 59.8 MB
 with the call sites (2,390 of 4,384 entries have an extractor for their language).
+
+## 3.5.1 peak RSS (in-place republish, bounded batches) — gate NOT met
+
+`scripts/mcp-ready.py --lifecycle 20` on `/tmp/frz/scriptorium` (4,384 files), idle (no tool calls after
+the first answer), n=5, binaries interleaved, each run preceded by an untimed priming run of the same
+binary (C: empty commit between prime and measured run). The machine was shared and heavily loaded
+(load average 5 to 60 during the series), so 3.4.0 `index_ready_s` and RSS vary widely; ranges are
+shown, medians first.
+
+Scenario U (warm, unchanged):
+
+| Binary | peak_mb (full lifecycle) | build_peak_mb | post_ready_peak_mb | index_ready_s |
+|---|---|---|---|---|
+| 3.4.0 | 324 [292-367] | 324 [292-367] | 262 [213-316] | 14.68 [14.34-14.70] |
+| 3.5.0 (separate series, same day) | 364 [364-365] | 364 [364-365] | 329 [328-330] | 0.73 [0.71-0.73] |
+| 3.5.1 (this branch) | 374 [365-380] | 374 [365-380] | 329 [329-330] | 0.81 [0.78-0.83] |
+
+Scenario C (empty commit before each run), two interleaved series:
+
+| Series | Binary | peak_mb | build_peak_mb | post_ready_peak_mb | index_ready_s |
+|---|---|---|---|---|---|
+| 3.4.0 vs 3.5.1 | 3.4.0 | 476 [284-574] | 476 [284-574] | 229 [151-300] | 20.57 [20.49-21.56] |
+| 3.4.0 vs 3.5.1 | 3.5.1 | 565 [359-587] | 380 [359-404] | 565 [322-587] | 3.26 [3.21-3.37] |
+| 3.4.0, 3.5.0, 3.5.1 | 3.4.0 | 267 [236-352] | 267 [236-352] | 148 [139-155] | 23.62 [22.36-90.18] |
+| 3.4.0, 3.5.0, 3.5.1 | 3.5.0 | 392 [308-457] | 329 [301-399] | 392 [229-457] | 4.06 [2.96-17.63] |
+| 3.4.0, 3.5.0, 3.5.1 | 3.5.1 | 372 [317-565] | 372 [317-377] | 323 [227-565] | 3.38 [3.35-16.76] |
+
+Republish path taken (stderr `conventions republished ...`): in place in 9 of 9 C runs that republished
+(the tenth run's derived cache was not stale); the clone fallback was never taken.
+
+Gate (full-lifecycle peak <= 3.4.0 x 1.10 in U and C; `index_ready_s` <= 3.5.0 + 10 %):
+- U: **not met** (374 vs 324 x 1.10 = 356 MB). The bounded batch did not lower the build peak
+  (374 vs 3.5.0's 364).
+- C: **not met** (3-way series: 372 vs 267 x 1.10 = 294 MB; 2-way series: 565 vs 476 x 1.10 = 524 MB).
+  The post-ready peak is lower than 3.5.0's in the 3-way series (323 vs 392) but 4 of 5 runs in the
+  2-way series and 1 of 5 in the 3-way series peaked at 553-587 MB around t=9.3-9.9 s even though the
+  republish was in place, so the clone is not the only post-ready contributor (conventions mining and
+  its derived-cache save run in the same window). Not explained by this series.
+- `index_ready_s`: U 0.81 vs 0.73 (+11 %); C 3.26-3.38 vs 2.90 (+12-16 %) against 3.5.0 in the same-day
+  series; against the spec's reference figures (U 0.85, C 2.86) U passes and C is at +14-18 %.
+
+### 3.5.1 peak RSS, round 2 (batching reverted; borrowed derived-cache save) — `/usr/bin/time -l`
+
+The bounded-batch change in the section above was reverted (no benefit, +11-16 % ready time). This
+round adds `DerivedCacheRef` (derived cache saved by reference and streamed to disk) to the in-place
+republish and watcher release.
+
+Method: `/usr/bin/time -l <bin> serve --mcp /tmp/frz/scriptorium < <(sleep N)`, alive about 20 s past
+ready, n=5 interleaved, each run preceded by an untimed priming run of the same binary (C: empty commit
+between prime and measured run). 3.5.0 is the v3.5.0 release binary. Load average (1 min) during the
+series: 2.6-5.8. Medians with `[min-max]`, in MB. `peak memory footprint` is the gate metric.
+
+| Scenario | Binary | peak memory footprint | maximum resident set size |
+|---|---|---|---|
+| U | 3.4.0 | 422.8 [388.2-424.4] | 395.3 [355.6-456.0] |
+| U | 3.5.0 | 372.8 [372.5-373.6] | 385.0 [384.6-385.7] |
+| U | 3.5.1 | 372.8 [372.5-373.3] | 384.9 [384.7-385.4] |
+| C | 3.4.0 | 692.1 [688.9-694.9] | 458.4 [447.1-601.0] |
+| C | 3.5.0 | 646.2 [621.8-649.0] | 568.0 [498.4-600.4] |
+| C | 3.5.1 | 647.7 [643.5-650.4] | 569.5 [502.6-592.6] |
+
+In place on all 5 C runs. Gate (footprint <= 3.4.0 x 1.10): **met** (U 372.8 vs 465.1; C 647.7 vs 761.3).
+Resident set size alone: U met (384.9 vs 434.8); C **not met** (569.5 vs 504.2).
+3.5.1 is indistinguishable from 3.5.0 on both metrics here: in this series the footprint was already
+below 3.4.0's, and the in-place republish and borrowed save did not change it measurably.

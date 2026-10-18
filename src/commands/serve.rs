@@ -278,14 +278,14 @@ impl PendingConventions {
     pub(crate) fn mine(self, base: &CodebaseIndex) -> MinedConventions {
         let conventions = crate::conventions::build_convention_profile(base, &self.path);
         let co_changes = conventions.git_health.co_changes.clone();
-        let derived = crate::cache::DerivedCache::new(
-            self.fingerprint,
-            base.graph.clone(),
-            base.call_graph.clone(),
-            base.pagerank.clone(),
-            conventions.clone(),
-            co_changes.clone(),
-            self.base_commit,
+        let derived = crate::cache::DerivedCacheRef::new(
+            &self.fingerprint,
+            &base.graph,
+            &base.call_graph,
+            &base.pagerank,
+            &conventions,
+            &co_changes,
+            self.base_commit.as_deref(),
         );
         // Persisting is best-effort; a write failure must not fail the republish.
         let _ = derived.save(&self.cache_dir);
@@ -675,14 +675,14 @@ fn build_index_pending_with(
                 None => {
                     index.conventions = crate::conventions::build_convention_profile(&index, path);
                     index.co_changes = index.conventions.git_health.co_changes.clone();
-                    let derived = crate::cache::DerivedCache::new(
-                        fingerprint,
-                        index.graph.clone(),
-                        index.call_graph.clone(),
-                        index.pagerank.clone(),
-                        index.conventions.clone(),
-                        index.co_changes.clone(),
-                        base_commit,
+                    let derived = crate::cache::DerivedCacheRef::new(
+                        &fingerprint,
+                        &index.graph,
+                        &index.call_graph,
+                        &index.pagerank,
+                        &index.conventions,
+                        &index.co_changes,
+                        base_commit.as_deref(),
                     );
                     // Persisting is best-effort; a write failure must not fail indexing.
                     let _ = derived.save(&cache_dir);
@@ -2779,12 +2779,6 @@ pub fn spawn_mcp_index_build(
             })
         });
         let next = classify_reported_outcome(&path, outcome);
-        // Capture the ready base *before* the move-consuming publish so phase 2
-        // can enrich it without re-reading the cell. Only `Ready` is enrichable.
-        let ready_base = match &next {
-            IndexReadiness::Ready(idx) => Some(Arc::clone(idx)),
-            _ => None,
-        };
         // Brief write lock: `next` is already built, so this is an O(1) swap.
         // Recover from a poisoned lock (a reader panicked) and still publish, so
         // tool calls stop reporting "Building" once the build has completed.
@@ -2804,17 +2798,11 @@ pub fn spawn_mcp_index_build(
         let deferred = pending_store
             .as_mut()
             .and_then(PendingStore::take_conventions);
-        let ready_base = match (deferred, ready_base) {
-            (Some(pending), Some(base)) => Some(republish_conventions(
-                &readiness,
-                &conventions_status,
-                &base,
-                pending,
-            )),
-            (_, base) => base,
-        };
-        #[cfg(not(feature = "embeddings"))]
-        let _ = ready_base;
+        if let (Some(pending), Some(base)) = (deferred, ready_base_of(&readiness)) {
+            // `base` is moved in: republish drops it after mining, so no strong
+            // ref held here can defeat its in-place `Arc::get_mut` (ADR-0213).
+            let _ = republish_conventions(&readiness, &conventions_status, base, pending);
+        }
         // The artifact store is written only now: readiness never waits on it.
         // A panic in the save must not skip the enrichment phase below.
         if let Some(pending) = pending_store {
@@ -2829,16 +2817,43 @@ pub fn spawn_mcp_index_build(
         // and strictly non-fatal: any failure or panic leaves the already-ready
         // base untouched (6-signal), never `Failed`, never a hang.
         #[cfg(feature = "embeddings")]
-        if let Some(base) = ready_base {
+        if let Some(base) = ready_base_of(&readiness) {
             enrich_ready_with_embeddings(&readiness, &base, &path);
         }
     })
 }
 
+/// The `Ready` index the cell holds right now, as a fresh strong ref. Taken at
+/// the point of use rather than pre-captured, so no long-lived clone of the
+/// published index exists between phases (ADR-0213).
+fn ready_base_of(readiness: &SharedReadiness) -> Option<Arc<CodebaseIndex>> {
+    let guard = match readiness.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match &*guard {
+        IndexReadiness::Ready(idx) => Some(Arc::clone(idx)),
+        _ => None,
+    }
+}
+
+/// The `Ready` or `ReadyEnriched` index the cell holds right now, as a fresh
+/// strong ref; `None` while `Building` or `Failed`.
+fn queryable_index_of(readiness: &SharedReadiness) -> Option<Arc<CodebaseIndex>> {
+    let guard = match readiness.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match &*guard {
+        IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => Some(Arc::clone(idx)),
+        _ => None,
+    }
+}
+
 /// Mine the conventions a `StalePending` base deferred and publish them into
-/// the readiness cell (ADR-0212). Returns the index the cell now holds (the
-/// republished one, or `base` when nothing was published) so the embeddings
-/// phase compare-and-swaps against the right `Arc`.
+/// the readiness cell (ADR-0212). Returns the index the cell now holds, or
+/// `None` when nothing was published (mining panicked, or the cell is not
+/// `Ready`/`ReadyEnriched`). `base` is taken by value and dropped after mining.
 ///
 /// `status` is the serve-internal conventions status; it flips to `Fresh`
 /// while the readiness write lock is held, so no reader sees fresh conventions
@@ -2854,9 +2869,9 @@ pub fn spawn_mcp_index_build(
 fn republish_conventions(
     readiness: &SharedReadiness,
     status: &RwLock<ConventionsStatus>,
-    base: &Arc<CodebaseIndex>,
+    base: Arc<CodebaseIndex>,
     pending: PendingConventions,
-) -> Arc<CodebaseIndex> {
+) -> Option<Arc<CodebaseIndex>> {
     republish_conventions_with(readiness, status, base, pending, &mut || {})
 }
 
@@ -2865,19 +2880,22 @@ fn republish_conventions(
 fn republish_conventions_with(
     readiness: &SharedReadiness,
     status: &RwLock<ConventionsStatus>,
-    base: &Arc<CodebaseIndex>,
+    base: Arc<CodebaseIndex>,
     pending: PendingConventions,
     before_swap: &mut dyn FnMut(),
-) -> Arc<CodebaseIndex> {
+) -> Option<Arc<CodebaseIndex>> {
     const ATTEMPTS: usize = 3;
-    let mined = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.mine(base)))
+    let mined = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.mine(&base)))
     {
         Ok(mined) => mined,
         Err(_) => {
             eprintln!("cxpak: conventions mining panicked — serving the previous snapshot's");
-            return Arc::clone(base);
+            return None;
         }
     };
+    // Mining is done: release this strong ref before touching the cell so it
+    // cannot be the reason an in-place update fails.
+    drop(base);
     let publish_fresh = |guard: &mut IndexReadiness, next: &Arc<CodebaseIndex>, enriched: bool| {
         *guard = if enriched {
             IndexReadiness::ReadyEnriched(Arc::clone(next))
@@ -2889,6 +2907,15 @@ fn republish_conventions_with(
             Err(poisoned) => *poisoned.into_inner() = ConventionsStatus::Fresh,
         }
     };
+    // In place first (ADR-0213): when the cell holds the only strong ref, no
+    // reader can observe the mutation and the deep clone below is skipped.
+    let mut unapplied = Some(mined);
+    if let Some(published) = republish_in_place(readiness, status, &mut unapplied) {
+        eprintln!("cxpak: conventions republished in place");
+        return Some(published);
+    }
+    // In place declined: `unapplied` was left untouched for the clone path.
+    let mined = unapplied?;
     for _ in 0..ATTEMPTS {
         let current = match readiness.read() {
             Ok(g) => g.clone(),
@@ -2897,14 +2924,14 @@ fn republish_conventions_with(
         let (cur, enriched) = match &current {
             IndexReadiness::Ready(cur) => (cur, false),
             IndexReadiness::ReadyEnriched(cur) => (cur, true),
-            _ => return Arc::clone(base),
+            _ => return None,
         };
         let already_fresh = match status.read() {
             Ok(s) => *s == ConventionsStatus::Fresh,
             Err(poisoned) => *poisoned.into_inner() == ConventionsStatus::Fresh,
         };
         if already_fresh {
-            return Arc::clone(cur);
+            return Some(Arc::clone(cur));
         }
         let mut next = (**cur).clone();
         mined.clone().apply_to(&mut next);
@@ -2922,7 +2949,8 @@ fn republish_conventions_with(
         };
         if unchanged {
             publish_fresh(&mut guard, &next, enriched);
-            return next;
+            eprintln!("cxpak: conventions republished by clone");
+            return Some(next);
         }
     }
     // Every attempt lost the race: apply to the current value under one lock.
@@ -2933,13 +2961,50 @@ fn republish_conventions_with(
     let (cur, enriched) = match &*guard {
         IndexReadiness::Ready(cur) => (Arc::clone(cur), false),
         IndexReadiness::ReadyEnriched(cur) => (Arc::clone(cur), true),
-        _ => return Arc::clone(base),
+        _ => return None,
     };
     let mut next = (*cur).clone();
     mined.apply_to(&mut next);
     let next = Arc::new(next);
     publish_fresh(&mut guard, &next, enriched);
-    next
+    eprintln!("cxpak: conventions republished by clone (watcher won every swap)");
+    Some(next)
+}
+
+/// Apply `mined` to the cell's index without cloning it, when the cell holds
+/// the only strong ref (`Arc::get_mut`). Leaves `mined` in its slot, untouched,
+/// when that is not possible (a reader holds the index, the cell is not ready, or
+/// the conventions are already fresh) so the caller falls back to
+/// clone-and-swap. The status flips to `Fresh` under the same write lock, as
+/// in the clone path.
+fn republish_in_place(
+    readiness: &SharedReadiness,
+    status: &RwLock<ConventionsStatus>,
+    mined: &mut Option<MinedConventions>,
+) -> Option<Arc<CodebaseIndex>> {
+    let mut guard = match readiness.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let already_fresh = match status.read() {
+        Ok(s) => *s == ConventionsStatus::Fresh,
+        Err(poisoned) => *poisoned.into_inner() == ConventionsStatus::Fresh,
+    };
+    if already_fresh {
+        return None;
+    }
+    let cur = match &mut *guard {
+        IndexReadiness::Ready(cur) | IndexReadiness::ReadyEnriched(cur) => cur,
+        _ => return None,
+    };
+    let index = Arc::get_mut(cur)?;
+    mined.take()?.apply_to(index);
+    let published = Arc::clone(cur);
+    match status.write() {
+        Ok(mut s) => *s = ConventionsStatus::Fresh,
+        Err(poisoned) => *poisoned.into_inner() = ConventionsStatus::Fresh,
+    }
+    Some(published)
 }
 
 /// Phase 2 of the MCP background build (R-E1, ADR-0186): build the embedding
@@ -3053,7 +3118,7 @@ impl NotReady {
 }
 
 /// Outcome of checking the readiness cell during the watcher's pre-`Ready`
-/// wait (Task #18, ADR-0200): `Seed` once a queryable base exists — `Ready`
+/// wait (Task #18, ADR-0200): `Queryable` once a queryable base exists — `Ready`
 /// and `ReadyEnriched` both qualify, and the watcher mirrors whichever landed
 /// first — `Pending` while still `Building` (keep polling), and `Abort` on
 /// `Failed` (the one-shot build never became queryable; nothing to watch
@@ -3062,16 +3127,14 @@ impl NotReady {
 /// Extracted as a pure function over `&IndexReadiness` so the classification
 /// is unit-testable without spawning a thread or a real `FileWatcher`.
 enum WatcherWait {
-    Seed(Arc<CodebaseIndex>),
+    Queryable,
     Pending,
     Abort,
 }
 
 fn classify_watcher_wait(state: &IndexReadiness) -> WatcherWait {
     match state {
-        IndexReadiness::Ready(idx) | IndexReadiness::ReadyEnriched(idx) => {
-            WatcherWait::Seed(Arc::clone(idx))
-        }
+        IndexReadiness::Ready(_) | IndexReadiness::ReadyEnriched(_) => WatcherWait::Queryable,
         IndexReadiness::Building => WatcherWait::Pending,
         IndexReadiness::Failed(_) => WatcherWait::Abort,
     }
@@ -3095,9 +3158,10 @@ const WATCHER_WAIT_POLL: Duration = Duration::from_millis(100);
 ///    every poll so a stdin EOF during the initial build joins promptly
 ///    rather than riding out the full 13–34s build. Aborts without installing
 ///    a watcher if the build resolves `Failed`.
-/// 2. Seeds a `SharedIndex` mirror from that base and runs the same debounced
-///    `FileWatcher` + `process_watcher_changes` loop HTTP `run` uses — but
-///    terminable: `shutdown` is checked at each `recv_timeout(1s)` poll, not
+/// 2. Runs the same debounced `FileWatcher` + `process_watcher_changes` loop
+///    HTTP `run` uses — but with no long-lived mirror: each batch takes its base
+///    from the readiness cell and releases it after publishing (ADR-0213). It is
+///    also terminable: `shutdown` is checked at each `recv_timeout(1s)` poll, not
 ///    just at process exit.
 /// 3. Each rebuild clears `embedding_index` before the swap (inside
 ///    [`process_watcher_changes`], issue #47 / ADR-0205) and publishes the
@@ -3137,7 +3201,7 @@ pub fn spawn_mcp_watcher(
             }
         };
 
-        let seed = loop {
+        loop {
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
@@ -3146,7 +3210,7 @@ pub fn spawn_mcp_watcher(
                 Err(poisoned) => classify_watcher_wait(&poisoned.into_inner()),
             };
             match wait {
-                WatcherWait::Seed(idx) => break idx,
+                WatcherWait::Queryable => break,
                 WatcherWait::Abort => {
                     eprintln!(
                         "cxpak: MCP watcher aborting — background build failed, \
@@ -3156,9 +3220,7 @@ pub fn spawn_mcp_watcher(
                 }
                 WatcherWait::Pending => std::thread::sleep(WATCHER_WAIT_POLL),
             }
-        };
-
-        let shared: SharedIndex = Arc::new(RwLock::new(seed));
+        }
 
         let watcher = match FileWatcher::new(&path) {
             Ok(w) => w,
@@ -3183,11 +3245,13 @@ pub fn spawn_mcp_watcher(
                     "cxpak: MCP watcher event buffer overflowed — \
                      delta may be stale; triggering full rebuild"
                 );
-                // Release BOTH strong references to the current index *before*
-                // building its replacement. Building first and swapping after
-                // keeps two full indexes live at once, and this path fires
-                // precisely during an event storm — the moment the process can
-                // least afford to double its largest allocation.
+                // Release the current index *before* building its replacement.
+                // Building first and swapping after keeps two full indexes live
+                // at once, and this path fires precisely during an event storm
+                // — the moment the process can least afford to double its
+                // largest allocation. The readiness cell holds the only
+                // long-lived strong ref (the watcher keeps none between
+                // batches), so this swap frees it once in-flight readers finish.
                 //
                 // The trade is availability for memory, and it is the right way
                 // round here: overflow means events were dropped, so we have
@@ -3201,19 +3265,10 @@ pub fn spawn_mcp_watcher(
                     Ok(mut g) => *g = IndexReadiness::Building,
                     Err(p) => *p.into_inner() = IndexReadiness::Building,
                 }
-                let placeholder = Arc::new(CodebaseIndex::empty());
-                match shared.write() {
-                    Ok(mut g) => *g = placeholder,
-                    Err(p) => *p.into_inner() = placeholder,
-                }
 
                 match build_index(&path) {
                     Ok(fresh) => {
                         let new_arc = Arc::new(fresh);
-                        match shared.write() {
-                            Ok(mut g) => *g = Arc::clone(&new_arc),
-                            Err(p) => *p.into_inner() = Arc::clone(&new_arc),
-                        }
                         match readiness.write() {
                             Ok(mut g) => *g = IndexReadiness::Ready(new_arc),
                             Err(p) => *p.into_inner() = IndexReadiness::Ready(new_arc),
@@ -3242,7 +3297,20 @@ pub fn spawn_mcp_watcher(
             // Publish the exact `Arc` the rebuild swapped into `shared` (already
             // embeddings-free per ADR-0200). `None` = nothing relevant changed,
             // so the prior `readiness` cell stands (issue #47 / ADR-0205).
-            if let Some(republished) = process_watcher_changes(&changes, &path, &shared) {
+            //
+            // The base comes from the readiness cell at batch time and the
+            // batch-local mirror is dropped before publishing, so no strong ref
+            // outlives the batch (ADR-0213): the cell stays the single source
+            // of truth and a later in-place republish can take `Arc::get_mut`.
+            // A cell that is not queryable (`Building`/`Failed`) has no base to
+            // edit; the batch is skipped rather than resurrecting a stale one.
+            let Some(base) = queryable_index_of(&readiness) else {
+                continue;
+            };
+            let shared: SharedIndex = Arc::new(RwLock::new(base));
+            let republished = process_watcher_changes(&changes, &path, &shared);
+            drop(shared);
+            if let Some(republished) = republished {
                 match readiness.write() {
                     Ok(mut g) => *g = IndexReadiness::Ready(republished),
                     Err(poisoned) => *poisoned.into_inner() = IndexReadiness::Ready(republished),
@@ -5686,12 +5754,13 @@ mod tests {
     /// the watcher's wait behavior deterministically — no thread, no real
     /// `FileWatcher`, no timing dependence.
     #[test]
-    fn classify_watcher_wait_seeds_from_ready() {
+    fn classify_watcher_wait_queryable_on_ready() {
         let idx = Arc::new(make_test_index());
-        match classify_watcher_wait(&IndexReadiness::Ready(Arc::clone(&idx))) {
-            WatcherWait::Seed(got) => assert!(Arc::ptr_eq(&got, &idx)),
-            _ => panic!("Ready must yield Seed"),
-        }
+        assert!(matches!(
+            classify_watcher_wait(&IndexReadiness::Ready(Arc::clone(&idx))),
+            WatcherWait::Queryable
+        ));
+        assert_eq!(Arc::strong_count(&idx), 1, "classification retains nothing");
     }
 
     /// finding MAJOR-2: a session where the base was already enriched before
@@ -5701,10 +5770,13 @@ mod tests {
     #[test]
     fn mcp_watcher_seeds_from_ready_enriched() {
         let idx = Arc::new(make_test_index());
-        match classify_watcher_wait(&IndexReadiness::ReadyEnriched(Arc::clone(&idx))) {
-            WatcherWait::Seed(got) => assert!(Arc::ptr_eq(&got, &idx)),
-            _ => panic!("ReadyEnriched must be treated as a valid seed, not Pending/Abort"),
-        }
+        assert!(
+            matches!(
+                classify_watcher_wait(&IndexReadiness::ReadyEnriched(Arc::clone(&idx))),
+                WatcherWait::Queryable
+            ),
+            "ReadyEnriched must be treated as queryable, not Pending/Abort"
+        );
     }
 
     #[test]

@@ -320,14 +320,14 @@ fn persist_derived_cache(repo_path: &Path, cache_dir: &Path, index: &mut Codebas
         }
     };
 
-    let derived = crate::cache::DerivedCache::new(
-        fingerprint,
-        index.graph.clone(),
-        index.call_graph.clone(),
-        index.pagerank.clone(),
-        index.conventions.clone(),
-        index.co_changes.clone(),
-        base_commit,
+    let derived = crate::cache::DerivedCacheRef::new(
+        &fingerprint,
+        &index.graph,
+        &index.call_graph,
+        &index.pagerank,
+        &index.conventions,
+        &index.co_changes,
+        base_commit.as_deref(),
     );
     let _ = derived.save(cache_dir);
 }

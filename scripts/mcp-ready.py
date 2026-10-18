@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """Time from `cxpak serve --mcp <repo>` spawn until a tool call returns a ready answer.
 
-Usage: mcp_ready.py <cxpak-binary> <repo> [timeout_s]
-Prints: <repo> ready_s=<float> peak_rss_mb=<int>
+Usage: mcp_ready.py <cxpak-binary> <repo> [timeout_s] [--lifecycle SECONDS]
+Prints (no --lifecycle): <repo> index_ready_s=<float> first_answer_s=<float> peak_rss_mb=<int>
+Prints (--lifecycle N):  <repo> index_ready_s=<float> first_answer_s=<float>
+    build_peak_mb=<int>@<float>s post_ready_peak_mb=<int>@<float>s peak_mb=<int>
+
+`--lifecycle SECONDS` keeps the RSS sampler running for SECONDS after "MCP index ready" instead
+of exiting at Ready. cxpak's background phase (conventions republish, store save, embeddings) runs
+after Ready and after this script's original exit point, so without `--lifecycle` a second, later
+RSS peak in that phase is invisible to the gate that reads this script's output.
 """
 import json
 import subprocess
@@ -10,8 +17,15 @@ import sys
 import threading
 import time
 
-binary, repo = sys.argv[1], sys.argv[2]
-timeout = float(sys.argv[3]) if len(sys.argv) > 3 else 300.0
+args = sys.argv[1:]
+lifecycle = 0.0
+if "--lifecycle" in args:
+    i = args.index("--lifecycle")
+    lifecycle = float(args[i + 1])
+    del args[i : i + 2]
+
+binary, repo = args[0], args[1]
+timeout = float(args[2]) if len(args) > 2 else 300.0
 
 proc = subprocess.Popen(
     [binary, "serve", "--mcp", repo],
@@ -21,7 +35,7 @@ proc = subprocess.Popen(
     text=True,
     bufsize=1,
 )
-peak = [0]
+samples = []  # list of (t_s, rss_mb)
 stop = threading.Event()
 
 
@@ -29,7 +43,7 @@ def sample_rss():
     while not stop.is_set():
         out = subprocess.run(["ps", "-o", "rss=", "-p", str(proc.pid)], capture_output=True, text=True).stdout.strip()
         if out:
-            peak[0] = max(peak[0], int(out))
+            samples.append((time.monotonic() - start, int(out) // 1024))
         time.sleep(0.1)
 
 
@@ -75,7 +89,28 @@ try:
             first_answer = time.monotonic() - start
             while index_ready[0] is None and time.monotonic() - start < timeout:
                 time.sleep(0.01)
-            print(f"{repo} index_ready_s={index_ready[0]:.2f} first_answer_s={first_answer:.2f} peak_rss_mb={peak[0] // 1024}")
+            if lifecycle > 0:
+                deadline = index_ready[0] + lifecycle if index_ready[0] is not None else first_answer + lifecycle
+                while time.monotonic() - start < deadline:
+                    time.sleep(0.05)
+                boundary = index_ready[0] if index_ready[0] is not None else first_answer
+                build = [rss for t, rss in samples if t <= boundary]
+                post = [(t, rss) for t, rss in samples if t > boundary]
+                build_peak = max(build) if build else 0
+                if post:
+                    post_t, post_peak = max(post, key=lambda p: p[1])
+                else:
+                    post_t, post_peak = boundary, 0
+                overall_peak = max(rss for _, rss in samples) if samples else 0
+                build_t = max((t for t, rss in samples if rss == build_peak and t <= boundary), default=boundary)
+                print(
+                    f"{repo} index_ready_s={index_ready[0]:.2f} first_answer_s={first_answer:.2f} "
+                    f"build_peak_mb={build_peak}@{build_t:.2f}s "
+                    f"post_ready_peak_mb={post_peak}@{post_t:.2f}s peak_mb={overall_peak}"
+                )
+            else:
+                print(f"{repo} index_ready_s={index_ready[0]:.2f} first_answer_s={first_answer:.2f} "
+                      f"peak_rss_mb={max((rss for _, rss in samples), default=0)}")
             break
         i += 1
         time.sleep(0.1)
