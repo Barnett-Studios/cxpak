@@ -79,3 +79,35 @@ Decision stands for any future attempt: attribute on `footprint` (stable) and a 
 cutting. The remaining build-phase candidate, not tried, is the resident artifact store (57.6 MB JSON
 loaded whole as `BTreeMap` entries at `serve.rs:~455`, ahead of the per-file stage); it needs streaming
 parse and its own ADR.
+
+## Option: consume the artifact store during the build (traced, not implemented)
+
+Proposal: take the loaded store by value and move entries out as each file is prepared, so the store's
+copy is freed before the index peaks. Trace of the current code (`src/commands/serve.rs`):
+
+- `ArtifactStore::load` (`serve.rs:454`) streams the JSON (`src/cache/artifacts.rs:~58`), so no text copy
+  sits next to the parsed form.
+- Entries are already moved out, never cloned, into `stored: Vec<Option<ArtifactEntry>>`
+  (`store.entries.remove`, `serve.rs:~457`) and the map is dropped (`drop(store)`, `serve.rs:~466`).
+  `stored.into_par_iter()` then consumes each entry by value; on a hit its `parse_result` is moved and its
+  `term_frequencies` rebuilt as the index-shaped `HashMap`, and the entry is freed at the end of that
+  file's closure. `Prepared.fresh` and `changed` are empty on warm runs.
+- The save path (`PendingStore::save`, `serve.rs:~324`) returns early when nothing is dirty, so scenarios
+  U and C never reload the store. When dirty it reloads the store next to the live index and then
+  serializes with `to_string` (`artifacts.rs:~76`, a second full-size text copy); that affects cold and
+  changed builds only and was not measured.
+
+So the proposed consumption is already how the build works; a structural RED test ("the store map no
+longer holds moved-out entries after prepare") passes on today's code and cannot be written as a RED.
+The store's entries are alive until their file is prepared, which is the bulk of the per-file stage, but
+that is inherent: each entry's data turns into the index's data and the footprint is the sum. No code
+was changed and nothing was measured for this option, because there is no change to measure.
+
+## Gate decision
+
+Peak memory footprint is the gate: it is stable run to run (3.5.1 U 376.5-377.4, C 645.6-654.8) and it
+passes against 3.4.0 x 1.10 in both scenarios (U 376.7 vs 429.6; C 650.7 vs 689.0 measured the same day).
+Max RSS is reported but not gated: it is not reproducible under macOS compressed-memory accounting (the
+same 3.4.0 binary read 40-45 % lower than in the ADR-0213 series; identical runs differ by 100+ MB).
+Any future build-phase attempt needs a new design (for example a streamed, incrementally-consumed store
+format, which is an on-disk format change) and its own ADR.
