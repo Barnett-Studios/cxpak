@@ -13,3 +13,9 @@
 # #[cfg(dev_maintenance)] code so the cfg is inert there.
 [build]
 rustflags = ["--cfg=dev_maintenance"]
+
+# Subprocess tests drive `serve --mcp` directly; with the shared index server on (the shipped
+# default) each would spawn a detached server. Opt out here; the shared-server tests override it
+# per child process.
+[env]
+CXPAK_INDEX_SERVER = { value = "off", force = false }

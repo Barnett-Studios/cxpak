@@ -78,7 +78,6 @@ tokio = { version = "1", features = ["full"], optional = true }
 rmcp = { version = "2", features = ["client", "transport-child-process"], optional = true }
 async-trait = { version = "0.1", optional = true }
 # client.rs reaps a hung child by PID (SIGKILL) rather than leaking it; unix-only path.
-libc = { version = "0.2", optional = true }
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
@@ -112,6 +111,10 @@ mysql_async = { version = "0.37", optional = true, default-features = false, fea
 # `muzzy_decay_ms`, see `malloc_conf` in `src/main.rs`) purges those pages back
 # to the OS, capping steady-state RSS near the live set. jemalloc does not build
 # on MSVC, so the dep and the `#[global_allocator]` are both `cfg`-gated off it.
+[target.'cfg(unix)'.dependencies]
+# setsid/geteuid for the shared index server (src/daemon/index_server.rs) and the client reaper.
+libc = "0.2"
+
 [target.'cfg(all(not(target_env = "msvc"), target_os = "linux"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "background_threads"] }
 
@@ -218,7 +221,7 @@ e2e-browser = []
 # cxpak#57: NON-default by design. cxpak had zero rmcp before this; #32 already records
 # the default feature set as a kitchen sink, so the client must not ride into
 # `cargo install cxpak`. tests/client_feature_boundary.rs is empty without it.
-client = ["dep:rmcp", "dep:async-trait", "dep:tokio", "dep:libc"]
+client = ["dep:rmcp", "dep:async-trait", "dep:tokio"]
 plugins = ["dep:wasmtime"]
 # Test-only helpers (`cxpak::test_support`). Off by default → never compiled
 # into a release binary. Integration tests receive it through the self
