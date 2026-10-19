@@ -87,7 +87,10 @@ try:
         reply = json.dumps(recv(i))
         if '"indexing"' not in reply:
             first_answer = time.monotonic() - start
-            while index_ready[0] is None and time.monotonic() - start < timeout:
+            # In-process, the ready line is logged before the first non-indexing answer; a client
+            # of a shared index server (ADR-0214) never logs it, so wait briefly, not to timeout.
+            grace = time.monotonic() + 2.0
+            while index_ready[0] is None and time.monotonic() < grace:
                 time.sleep(0.01)
             # A client attached to a shared index server (ADR-0214) never logs "MCP index ready".
             ready_s = f"{index_ready[0]:.2f}" if index_ready[0] is not None else "shared"
