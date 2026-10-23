@@ -323,7 +323,7 @@ fn render_metadata(index: &CodebaseIndex, token_budget: usize, pack_mode: bool) 
     if !index.language_stats.is_empty() {
         out.push_str("- **Languages:**\n");
         let mut langs: Vec<_> = index.language_stats.iter().collect();
-        langs.sort_by(|a, b| b.1.file_count.cmp(&a.1.file_count));
+        langs.sort_by_key(|a| std::cmp::Reverse(a.1.file_count));
         for (lang, stats) in &langs {
             let pct = if index.total_files > 0 {
                 (stats.file_count as f64 / index.total_files as f64 * 100.0) as usize

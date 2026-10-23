@@ -378,7 +378,8 @@ fn resolve_lua_instance_path(
         let (step, tail) = if let Some(r) = rest.strip_prefix('.') {
             let end = r.find(['.', ':']).unwrap_or(r.len());
             (&r[..end], &r[end..])
-        } else if let Some(r) = rest.strip_prefix(':') {
+        } else {
+            let r = rest.strip_prefix(':')?;
             let open = r.find("(\"")?;
             if !matches!(&r[..open], "WaitForChild" | "FindFirstChild") {
                 return None;
@@ -386,8 +387,6 @@ fn resolve_lua_instance_path(
             let args = &r[open + 2..];
             let close = args.find("\")")?;
             (&args[..close], &args[close + 2..])
-        } else {
-            return None;
         };
         match step {
             "" => return None,

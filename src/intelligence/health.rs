@@ -362,10 +362,7 @@ fn tarjan_sccs_count(graph: &DependencyGraph) -> usize {
                 }
                 if lowlinks[v] == indices[v] {
                     let mut scc_size = 0;
-                    loop {
-                        let Some(w) = scc_stack.pop() else {
-                            break;
-                        };
+                    while let Some(w) = scc_stack.pop() {
                         on_stack[w] = false;
                         scc_size += 1;
                         if w == v {

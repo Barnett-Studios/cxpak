@@ -619,10 +619,9 @@ fn try_alembic_migrations(
             // Try to read revision from content
             let sequence = if let Some(cap) = RE_ALEMBIC_REVISION.captures(&f.content) {
                 cap[1].to_string()
-            } else if let Some(cap) = RE_ALEMBIC_FNAME.captures(fname) {
-                cap[1].to_string()
             } else {
-                return None;
+                let cap = RE_ALEMBIC_FNAME.captures(fname)?;
+                cap[1].to_string()
             };
             // Name is the part after the first underscore in filename
             let stem = fname.trim_end_matches(".py");

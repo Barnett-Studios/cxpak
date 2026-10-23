@@ -1281,11 +1281,7 @@ async fn v1_risks_handler(
     axum::extract::State(index): axum::extract::State<SharedIndex>,
     axum::Json(params): axum::Json<V1FocusParams>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
-    let focus = match params
-        .focus
-        .as_deref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
+    let focus = match params.focus.as_deref().filter(|&s| !s.is_empty()) {
         Some(f) => Some(normalize_path_param(f)?),
         None => None,
     };
@@ -1310,11 +1306,7 @@ async fn v1_architecture_handler(
     axum::extract::State(index): axum::extract::State<SharedIndex>,
     axum::Json(params): axum::Json<V1FocusParams>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
-    let focus = match params
-        .focus
-        .as_deref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
+    let focus = match params.focus.as_deref().filter(|&s| !s.is_empty()) {
         Some(f) => Some(normalize_path_param(f)?),
         None => None,
     };
@@ -1341,19 +1333,11 @@ async fn v1_call_graph_handler(
     axum::extract::State(index): axum::extract::State<SharedIndex>,
     axum::Json(params): axum::Json<V1CallGraphParams>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
-    let target = match params
-        .target
-        .as_deref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
+    let target = match params.target.as_deref().filter(|&s| !s.is_empty()) {
         Some(t) => Some(normalize_path_param(t)?),
         None => None,
     };
-    let focus = match params
-        .focus
-        .as_deref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
+    let focus = match params.focus.as_deref().filter(|&s| !s.is_empty()) {
         Some(f) => Some(normalize_path_param(f)?),
         None => None,
     };
@@ -1399,11 +1383,7 @@ async fn v1_dead_code_handler(
     axum::extract::State(index): axum::extract::State<SharedIndex>,
     axum::Json(params): axum::Json<V1FocusParams>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
-    let focus = match params
-        .focus
-        .as_deref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
+    let focus = match params.focus.as_deref().filter(|&s| !s.is_empty()) {
         Some(f) => Some(normalize_path_param(f)?),
         None => None,
     };
@@ -1554,11 +1534,7 @@ async fn v1_drift_handler(
     axum::extract::Extension(repo): axum::extract::Extension<SharedPath>,
     axum::Json(params): axum::Json<V1FocusParams>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
-    let focus = match params
-        .focus
-        .as_deref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
+    let focus = match params.focus.as_deref().filter(|&s| !s.is_empty()) {
         Some(f) => Some(normalize_path_param(f)?),
         None => None,
     };
@@ -1587,15 +1563,10 @@ async fn v1_security_surface_handler(
     axum::extract::State(index): axum::extract::State<SharedIndex>,
     axum::Json(params): axum::Json<V1FocusParams>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
-    let focus_owned =
-        match params
-            .focus
-            .as_deref()
-            .and_then(|s| if s.is_empty() { None } else { Some(s) })
-        {
-            Some(f) => Some(normalize_path_param(f)?),
-            None => None,
-        };
+    let focus_owned = match params.focus.as_deref().filter(|&s| !s.is_empty()) {
+        Some(f) => Some(normalize_path_param(f)?),
+        None => None,
+    };
     if let Some(ws) = params.workspace.as_deref().filter(|s| !s.is_empty()) {
         normalize_path_param(ws)?;
     }
@@ -1664,11 +1635,7 @@ async fn v1_cross_lang_handler(
     axum::extract::State(index): axum::extract::State<SharedIndex>,
     axum::Json(params): axum::Json<V1FocusParams>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
-    let focus = match params
-        .focus
-        .as_deref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
+    let focus = match params.focus.as_deref().filter(|&s| !s.is_empty()) {
         Some(f) => Some(normalize_path_param(f)?),
         None => None,
     };
