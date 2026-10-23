@@ -2,7 +2,7 @@
 name = "cxpak"
 version = "3.6.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.96"
 description = "Spends CPU cycles so you don't spend tokens. The LLM gets a briefing packet instead of a flashlight in a dark room."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Barnett-Studios/cxpak"
@@ -27,7 +27,7 @@ tree-sitter-go = { version = "0.23", optional = true }
 tree-sitter-c = { version = "0.24", optional = true }
 tree-sitter-cpp = { version = "0.23", optional = true }
 tiktoken-rs = "0.6"
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21", default-features = false }
 ignore = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -71,16 +71,16 @@ tree-sitter-prisma-io = { version = "1.6", optional = true }
 unicode-normalization = "0.1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
-notify = { version = "7", optional = true }
+notify = { version = "8", optional = true }
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 # cxpak#57: the official Rust client. Optional — see the `client` feature.
 rmcp = { version = "2", features = ["client", "transport-child-process"], optional = true }
 async-trait = { version = "0.1", optional = true }
 # client.rs reaps a hung child by PID (SIGKILL) rather than leaking it; unix-only path.
-candle-core = { version = "0.9", optional = true }
-candle-nn = { version = "0.9", optional = true }
-candle-transformers = { version = "0.9", optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"], optional = true }
 bincode = { version = "1", optional = true }
@@ -93,10 +93,10 @@ fs2 = "0.4"
 sha2 = "0.10"
 subtle = "2"
 toml = { version = "0.8", optional = true }
-resvg = { version = "0.47", optional = true }
+resvg = { version = "0.48", optional = true }
 petgraph = { version = "0.6", optional = true }
 thiserror = { version = "2", optional = true }
-wasmtime = { version = "43", optional = true }
+wasmtime = { version = "49.0.4", optional = true }
 # Live DB introspection (feature `data-introspect`, off by default).  All TLS is
 # rustls — NO native-tls/openssl anywhere in the tree (ADR-0163, ADR-0173).
 tokio-postgres = { version = "0.7", optional = true }

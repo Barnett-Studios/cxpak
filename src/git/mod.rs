@@ -143,7 +143,7 @@ pub fn extract_git_context(
         let commit = repo.find_commit(oid)?;
 
         let hash = format!("{:.7}", commit.id());
-        let message = commit.summary().unwrap_or("").to_string();
+        let message = commit.summary().ok().flatten().unwrap_or("").to_string();
         let author = commit.author().name().unwrap_or("Unknown").to_string();
         let date = format_date(commit.time().seconds());
 

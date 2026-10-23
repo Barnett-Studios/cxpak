@@ -136,7 +136,7 @@ pub fn extract_git_health(repo_path: &Path) -> GitHealthProfile {
                     git2::Oid::from_str(m.as_str())
                         .ok()
                         .and_then(|oid| repo.find_commit(oid).ok())
-                        .and_then(|c| c.message().map(|s| s.trim().to_string()))
+                        .and_then(|c| c.message().ok().map(|s| s.trim().to_string()))
                 });
 
             reverts.push(RevertEntry {
