@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "cxpak"
-version = "3.6.0"
+version = "3.7.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
