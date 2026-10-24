@@ -51,6 +51,10 @@ impl PluginLoader {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
         config.consume_fuel(false);
+        // wasmtime 47+/49 enable these proposals by default; plugins don't need
+        // them, so keep the untrusted-module surface at the pre-upgrade level.
+        config.wasm_gc(false);
+        config.wasm_wide_arithmetic(false);
         let engine = wasmtime::Engine::new(&config)?;
 
         // Spawn a background thread that increments the epoch every 100 ms.
@@ -281,5 +285,39 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("checksum mismatch"), "got: {msg}");
+    }
+
+    /// Load a WAT module through the full loader path and return the error text.
+    fn load_wat_err(wat: &str) -> String {
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(wat.as_bytes()).expect("write");
+        tmp.flush().expect("flush");
+        let loader = PluginLoader::new().expect("engine init");
+        let result = loader.load(tmp.path(), &sha256_hex(wat.as_bytes()));
+        result.err().expect("load must fail").to_string()
+    }
+
+    /// wasmtime 47+ enables the GC proposal by default. Untrusted plugins must
+    /// not get it: a module declaring a GC struct type is rejected at compile.
+    #[test]
+    fn load_rejects_gc_proposal_module() {
+        let msg = load_wat_err("(module (type $s (struct (field i32))))");
+        assert!(
+            msg.contains("failed to compile"),
+            "GC module must be rejected at compile, got: {msg}"
+        );
+    }
+
+    /// wasmtime 49 enables wide-arithmetic by default; plugins must not get it.
+    #[test]
+    fn load_rejects_wide_arithmetic_module() {
+        let msg = load_wat_err(
+            "(module (func (param i64 i64 i64 i64) (result i64 i64)
+               local.get 0 local.get 1 local.get 2 local.get 3 i64.add128))",
+        );
+        assert!(
+            msg.contains("failed to compile"),
+            "wide-arithmetic module must be rejected at compile, got: {msg}"
+        );
     }
 }

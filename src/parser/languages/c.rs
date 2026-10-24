@@ -105,11 +105,9 @@ impl CLanguage {
                         return true;
                     }
                 }
-                "type_qualifier" => {
-                    // "static" may sometimes appear as type_qualifier in some grammars
-                    if Self::node_text(&child, source) == "static" {
-                        return true;
-                    }
+                // "static" may sometimes appear as type_qualifier in some grammars
+                "type_qualifier" if Self::node_text(&child, source) == "static" => {
+                    return true;
                 }
                 _ => {}
             }

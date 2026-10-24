@@ -26,7 +26,7 @@ cxpak is a standard Cargo project. You need a Rust toolchain at or above the
 project's MSRV.
 
 ```bash
-# Rust — MSRV is 1.91 (declared as rust-version in Cargo.toml)
+# Rust — MSRV is 1.96 (declared as rust-version in Cargo.toml)
 rustup toolchain install stable
 rustup component add rustfmt clippy
 
@@ -53,7 +53,7 @@ Every PR has to pass the same gates CI enforces. Run them locally before pushing
 | Lint | `cargo clippy --all-targets -- -D warnings` | zero warnings |
 | Tests | `cargo test` | all pass |
 | Coverage | tarpaulin (CI) | **≥ 90%** |
-| MSRV | build on 1.91 | compiles |
+| MSRV | build on 1.96 | compiles |
 | Bench gate | `cargo test --features bench --test bench_gate` | recall gate holds |
 
 Tests are authored **together with** the code they cover — a feature PR without

@@ -56,7 +56,8 @@ impl LuaLanguage {
         }
 
         // Try to extract the module path from the require call
-        let path = if let Some(start) = text.find("require") {
+        let path = {
+            let start = text.find("require")?;
             let after_require = &text[start + 7..];
             let trimmed = after_require
                 .trim()
@@ -66,8 +67,6 @@ impl LuaLanguage {
                 .trim_matches('\'');
             let end = trimmed.find(['"', '\'', ')']).unwrap_or(trimmed.len());
             trimmed[..end].to_string()
-        } else {
-            return None;
         };
 
         if path.is_empty() {
