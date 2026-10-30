@@ -34,6 +34,7 @@ pub fn extract_call_sites_from_source(
         "cpp" => extract_cpp_calls(source, symbol_name),
         "ruby" => extract_ruby_calls(source, symbol_name),
         "csharp" => extract_csharp_calls(source, symbol_name),
+        "clojure" => extract_clojure_calls(source, symbol_name),
         _ => extract_regex_calls_from_function(source, symbol_name),
     }
 }
@@ -589,6 +590,254 @@ fn extract_csharp_calls(source: &str, symbol_name: &str) -> Vec<String> {
     extract_regex_calls_from_function(source, symbol_name)
 }
 
+// ---------------------------------------------------------------------------
+// Clojure call-site extraction
+// ---------------------------------------------------------------------------
+
+/// Per-symbol lookup over the one-pass Clojure map (see
+/// [`extract_clojure_calls_by_symbol`]). The map keys and values are both
+/// qualified `ns/name` strings — the same form the parser stores in
+/// `Symbol.name` — so callers can look `symbol.name` up directly.
+#[cfg(feature = "lang-clojure")]
+fn extract_clojure_calls(source: &str, symbol_name: &str) -> Vec<String> {
+    let mut calls = extract_clojure_calls_by_symbol(source)
+        .and_then(|m| m.get(symbol_name).cloned())
+        .unwrap_or_default();
+    calls.retain(|c| c != symbol_name);
+    calls.sort();
+    calls.dedup();
+    calls
+}
+
+#[cfg(not(feature = "lang-clojure"))]
+fn extract_clojure_calls(source: &str, symbol_name: &str) -> Vec<String> {
+    extract_regex_calls_from_function(source, symbol_name)
+}
+
+/// One-pass call-site map for Clojure.
+///
+/// The generic [`extract_call_sites_from_source`] regex fallback can never
+/// see a Lisp call: `(callee arg)` puts the open paren before the name, and
+/// `(defn name [args] …)` puts `[` — not `(` — after the name, so neither
+/// half of the C-shaped `def name(` / `ident(` patterns matches. Here a
+/// call site is the first `sym_lit` child of each `list_lit`, collected per
+/// enclosing top-level `def*` form.
+///
+/// Values are emitted in the qualified `ns/name` form the symbol index
+/// stores, resolved against the file's own `(ns … :require …)`:
+/// - `alias/f` → `required.ns/f` through the `:as` alias map (left as-is
+///   when the alias is unknown — fully-qualified `real.ns/f` already has the
+///   stored form);
+/// - bare `f` → `this.ns/f` when `f` is a top-level def in this file, plus
+///   `required.ns/f` for every require that `:refer`s it;
+/// - bare `f` that is neither local nor referred (clojure.core, special
+///   forms, interop) is dropped — emitting `this.ns/f` for it would flood
+///   `unresolved` with one miss per core call.
+///
+/// `quote`/`comment`/`quo_lit` subtrees are skipped: their lists are data,
+/// not calls.
+#[cfg(feature = "lang-clojure")]
+fn extract_clojure_calls_by_symbol(
+    source: &str,
+) -> Option<std::collections::HashMap<String, Vec<String>>> {
+    use crate::parser::languages::clojure::ClojureLanguage as Clj;
+
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_clojure::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    let source_bytes = source.as_bytes();
+    let root = tree.root_node();
+
+    // This file's namespace plus its :require alias / :refer maps.
+    let mut ns = String::new();
+    let mut aliases: std::collections::HashMap<String, String> = Default::default();
+    let mut refers: std::collections::HashMap<String, String> = Default::default();
+    {
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() == "list_lit" && Clj::list_head_text(&child, source_bytes) == "ns" {
+                let (name, _) = Clj::list_name_text(&child, source_bytes);
+                ns = name;
+                clojure_require_specs(&child, source_bytes, &mut aliases, &mut refers);
+                break;
+            }
+        }
+    }
+
+    // Top-level def forms: both the map keys and the local-name set.
+    const DEF_HEADS: &[&str] = &[
+        "defn",
+        "defn-",
+        "defmacro",
+        "def",
+        "defonce",
+        "defmulti",
+        "defprotocol",
+        "defrecord",
+        "deftype",
+    ];
+    let mut cursor = root.walk();
+    let defs: Vec<tree_sitter::Node> = root
+        .children(&mut cursor)
+        .filter(|c| {
+            c.kind() == "list_lit"
+                && DEF_HEADS.contains(&Clj::list_head_text(c, source_bytes).as_str())
+        })
+        .collect();
+    let locals: std::collections::HashSet<String> = defs
+        .iter()
+        .filter_map(|n| {
+            let (name, _) = Clj::list_name_text(n, source_bytes);
+            (!name.is_empty()).then_some(name)
+        })
+        .collect();
+
+    let mut map = std::collections::HashMap::new();
+    for def in &defs {
+        let (name, _) = Clj::list_name_text(def, source_bytes);
+        if name.is_empty() {
+            continue;
+        }
+        let mut calls = Vec::new();
+        collect_clojure_call_heads(
+            def,
+            source_bytes,
+            &ns,
+            &aliases,
+            &refers,
+            &locals,
+            &mut calls,
+        );
+        map.entry(Clj::qualify(&ns, &name))
+            .or_insert_with(Vec::new)
+            .extend(calls);
+    }
+    Some(map)
+}
+
+/// Read the `(:require …)` / `(:use …)` clauses of an `(ns …)` form into the
+/// alias (`[ns :as alias]`) and refer (`[ns :refer [f g]]`) maps. `:refer
+/// :all` names no vars, so it contributes nothing — bare calls relying on it
+/// stay unresolved, same as a require the resolver cannot find.
+#[cfg(feature = "lang-clojure")]
+fn clojure_require_specs(
+    ns_node: &tree_sitter::Node,
+    source: &[u8],
+    aliases: &mut std::collections::HashMap<String, String>,
+    refers: &mut std::collections::HashMap<String, String>,
+) {
+    use crate::parser::languages::clojure::ClojureLanguage as Clj;
+
+    for clause in Clj::named_children(ns_node).into_iter().skip(2) {
+        if clause.kind() != "list_lit" {
+            continue;
+        }
+        let parts = Clj::named_children(&clause);
+        let head = parts
+            .first()
+            .map(|c| Clj::node_text(c, source))
+            .unwrap_or("");
+        if head != ":require" && head != ":use" {
+            continue;
+        }
+        for spec in parts.iter().skip(1) {
+            if spec.kind() != "vec_lit" {
+                continue;
+            }
+            let fields = Clj::named_children(spec);
+            let Some(ns_sym) = fields.first() else {
+                continue;
+            };
+            let req_ns = Clj::node_text(ns_sym, source).to_string();
+            if req_ns.is_empty() || req_ns.starts_with(':') {
+                continue;
+            }
+            let mut i = 1;
+            while i < fields.len() {
+                match Clj::node_text(&fields[i], source) {
+                    ":as" => {
+                        if let Some(alias) = fields.get(i + 1) {
+                            let alias = Clj::node_text(alias, source).to_string();
+                            if !alias.is_empty() {
+                                aliases.insert(alias, req_ns.clone());
+                            }
+                        }
+                        i += 2;
+                    }
+                    ":refer" => {
+                        if let Some(v) = fields.get(i + 1) {
+                            if v.kind() == "vec_lit" {
+                                for r in Clj::named_children(v) {
+                                    let name = Clj::node_text(&r, source);
+                                    if !name.is_empty() && !name.starts_with(':') {
+                                        refers.insert(name.to_string(), req_ns.clone());
+                                    }
+                                }
+                            }
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+    }
+}
+
+/// Recursively collect the callee name of every `list_lit` under `node`,
+/// qualified to `ns/name` form (see [`extract_clojure_calls_by_symbol`] for
+/// the resolution rules).
+#[cfg(feature = "lang-clojure")]
+fn collect_clojure_call_heads(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    ns: &str,
+    aliases: &std::collections::HashMap<String, String>,
+    refers: &std::collections::HashMap<String, String>,
+    locals: &std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    use crate::parser::languages::clojure::ClojureLanguage as Clj;
+
+    // Quoted forms are data, not calls.
+    if matches!(node.kind(), "quo_lit" | "syn_quo_lit") {
+        return;
+    }
+    if node.kind() == "list_lit" {
+        let head = Clj::list_head_text(node, source);
+        if head == "quote" || head == "comment" {
+            return;
+        }
+        let children = Clj::named_children(node);
+        if let Some(head_node) = children.first() {
+            if head_node.kind() == "sym_lit" {
+                let head = Clj::node_text(head_node, source);
+                if let Some((alias, name)) = head.split_once('/') {
+                    if !name.is_empty() {
+                        match aliases.get(alias) {
+                            Some(req_ns) => out.push(format!("{req_ns}/{name}")),
+                            None => out.push(head.to_string()),
+                        }
+                    }
+                } else {
+                    if locals.contains(head) {
+                        out.push(Clj::qualify(ns, head));
+                    }
+                    if let Some(req_ns) = refers.get(head) {
+                        out.push(format!("{req_ns}/{head}"));
+                    }
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_clojure_call_heads(&child, source, ns, aliases, refers, locals, out);
+    }
+}
+
 /// Parse `source` **once** and map every function/method name to the call-site
 /// names in its body — the one-pass equivalent of calling
 /// [`extract_call_sites_from_source`] once per symbol.
@@ -608,6 +857,10 @@ fn extract_calls_by_symbol(
     source: &str,
     language: &str,
 ) -> Option<std::collections::HashMap<String, Vec<String>>> {
+    #[cfg(feature = "lang-clojure")]
+    if language == "clojure" {
+        return extract_clojure_calls_by_symbol(source);
+    }
     let (lang, func_kinds, call_kinds): (tree_sitter::Language, &[&str], &[&str]) = match language {
         #[cfg(feature = "lang-rust")]
         "rust" => (
@@ -1566,6 +1819,114 @@ fn helper(_y: i32) -> i32 { 0 }
                 .iter()
                 .any(|e| e.caller_symbol == "factorial" && e.callee_symbol == "factorial"),
             "a recursive self-call must not produce a self-referencing edge: {:?}",
+            cg.edges
+        );
+    }
+
+    // ─── Clojure call-graph regression tests ─────────────────────────────
+    //
+    // Deployment evidence (2026-10-30): a 4k-file corpus indexed cleanly,
+    // yet `/call_graph` returned zero edges for every Clojure symbol and
+    // `/blast_radius` returned `total_affected: 0` for a `.clj` file with
+    // known dependents. Lisp call syntax `(callee …)` puts the paren before
+    // the name, so the generic `ident(` regex fallback extracts nothing.
+
+    /// Two-file index built through the real pipeline: real tree-sitter
+    /// parse of `.clj` sources → `build_with_content` → `build_call_graph`.
+    #[cfg(feature = "lang-clojure")]
+    fn clojure_index(files: &[(&str, &str)]) -> crate::index::CodebaseIndex {
+        use crate::parser::language::LanguageSupport;
+        use crate::parser::languages::clojure::ClojureLanguage;
+        use crate::scanner::ScannedFile;
+        use std::collections::HashMap;
+
+        let counter = crate::budget::counter::TokenCounter::new();
+        let parse = |src: &str| {
+            let lang = ClojureLanguage;
+            let mut p = tree_sitter::Parser::new();
+            p.set_language(&lang.ts_language())
+                .expect("clojure grammar");
+            let tree = p.parse(src, None).expect("clojure parse");
+            lang.extract(src, &tree)
+        };
+
+        let mut scanned = Vec::new();
+        let mut parse_results = HashMap::new();
+        let mut content = HashMap::new();
+        for (rel, src) in files {
+            scanned.push(ScannedFile {
+                relative_path: (*rel).into(),
+                absolute_path: format!("/tmp/{rel}").into(),
+                language: Some("clojure".into()),
+                size_bytes: src.len() as u64,
+            });
+            parse_results.insert((*rel).to_string(), parse(src));
+            content.insert((*rel).to_string(), (*src).to_string());
+        }
+        crate::index::CodebaseIndex::build_with_content(scanned, parse_results, &counter, content)
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_alias_qualified_call_produces_edge() {
+        let index = clojure_index(&[
+            (
+                "src/ui/version.clj",
+                "(ns ui.version)\n\n(defn server-build-id []\n  (str \"v\" 1))\n",
+            ),
+            (
+                "src/ui/attach.clj",
+                "(ns ui.attach\n  (:require [ui.version :as version]))\n\n(defn mount []\n  (version/server-build-id))\n",
+            ),
+        ]);
+
+        let cg = build_call_graph(&index);
+        assert!(
+            cg.edges.iter().any(|e| {
+                e.caller_file == "src/ui/attach.clj"
+                    && e.caller_symbol == "ui.attach/mount"
+                    && e.callee_file == "src/ui/version.clj"
+                    && e.callee_symbol == "ui.version/server-build-id"
+            }),
+            "expected attach/mount → version/server-build-id edge, got: {:?}",
+            cg.edges
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_local_and_referred_calls_resolve() {
+        let index = clojure_index(&[
+            (
+                "src/ui/version.clj",
+                "(ns ui.version)\n\n(defn- fmt [v]\n  (str \"v\" v))\n\n(defn server-build-id []\n  (fmt 1))\n",
+            ),
+            (
+                "src/ui/attach.clj",
+                "(ns ui.attach\n  (:require [ui.version :refer [server-build-id]]))\n\n(defn mount []\n  (server-build-id))\n",
+            ),
+        ]);
+
+        let cg = build_call_graph(&index);
+        // Intra-file: public defn calls its private helper.
+        assert!(
+            cg.edges.iter().any(|e| {
+                e.caller_file == "src/ui/version.clj"
+                    && e.caller_symbol == "ui.version/server-build-id"
+                    && e.callee_file == "src/ui/version.clj"
+                    && e.callee_symbol == "ui.version/fmt"
+            }),
+            "expected intra-file edge to private helper, got: {:?}",
+            cg.edges
+        );
+        // Cross-file via :refer (bare call head).
+        assert!(
+            cg.edges.iter().any(|e| {
+                e.caller_file == "src/ui/attach.clj"
+                    && e.callee_file == "src/ui/version.clj"
+                    && e.callee_symbol == "ui.version/server-build-id"
+            }),
+            "expected :refer-resolved edge, got: {:?}",
             cg.edges
         );
     }

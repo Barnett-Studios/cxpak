@@ -458,6 +458,23 @@ fn resolve_lua_import(
     try_candidates(&lua_candidates(&import_source.replace('.', "/")), all_paths)
 }
 
+/// Resolve a Clojure namespace to an actual file path present in `all_paths`.
+///
+/// Clojure maps the namespace `some.name-space` to `some/name_space.clj`:
+/// dots become directory separators and hyphens become underscores. The
+/// conventional source roots (`src/`, `test/`, `src/clj/`, `src/main/`) are
+/// tried beside the repo root, with `.clj`, `.cljc` and `.cljs` extensions.
+fn resolve_clojure_import(import_source: &str, all_paths: &HashSet<&str>) -> Option<String> {
+    let base = import_source.replace('.', "/").replace('-', "_");
+    let mut candidates = Vec::with_capacity(18);
+    for prefix in ["", "src/", "test/", "src/clj/", "src/cljs/", "src/main/"] {
+        for ext in ["clj", "cljc", "cljs"] {
+            candidates.push(format!("{prefix}{base}.{ext}"));
+        }
+    }
+    try_candidates(&candidates, all_paths)
+}
+
 /// Legacy best-effort resolver for languages without a dedicated resolver.
 ///
 /// Converts `::` and `.` separators to `/` and tries common extensions.
@@ -499,6 +516,7 @@ fn resolve_import(
             resolve_ts_import(source_path, import_source, all_paths)
         }
         "lua" | "luau" => resolve_lua_import(source_path, import_source, all_paths),
+        "clj" | "cljc" | "cljs" => resolve_clojure_import(import_source, all_paths),
         _ => resolve_legacy(import_source, all_paths),
     }
 }
@@ -1009,6 +1027,46 @@ mod tests {
             mtime_ns: None,
         });
         assert_eq!(detect_crate_name(&[cargo_toml]), Some("cxpak".to_string()));
+    }
+
+    // ─── Clojure resolver ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_clojure_src_root_and_hyphen_underscore() {
+        let all: HashSet<&str> = ["src/ui/version.clj", "src/my_app/core.clj"]
+            .iter()
+            .copied()
+            .collect();
+        // Dotted ns under a conventional source root.
+        assert_eq!(
+            resolve_import("src/ui/attach.clj", "ui.version", &all, None),
+            Some("src/ui/version.clj".to_string())
+        );
+        // Hyphens in the namespace become underscores on disk.
+        assert_eq!(
+            resolve_import("src/ui/attach.clj", "my-app.core", &all, None),
+            Some("src/my_app/core.clj".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_clojure_cljc_and_test_root() {
+        let all: HashSet<&str> = ["src/shared/util.cljc", "test/ui/version_test.clj"]
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            resolve_import("src/ui/attach.clj", "shared.util", &all, None),
+            Some("src/shared/util.cljc".to_string())
+        );
+        assert_eq!(
+            resolve_import("src/ui/attach.clj", "ui.version-test", &all, None),
+            Some("test/ui/version_test.clj".to_string())
+        );
+        assert_eq!(
+            resolve_import("src/ui/attach.clj", "missing.ns", &all, None),
+            None
+        );
     }
 
     // ─── Python resolver ──────────────────────────────────────────────────────
