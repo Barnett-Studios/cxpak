@@ -136,24 +136,33 @@ fn stat_fingerprint(path: &std::path::Path) -> Option<(Option<u64>, u64)> {
 /// old, so no wait happens and the same-tick race remains.
 const MTIME_TICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Nanoseconds to wait so that `now_ns` is at least `window_ns` past
+/// `mtime_ns`. An mtime more than one window ahead of `now_ns` (gross clock
+/// skew, tarball extraction) is not waited on: an edit stamps `now`, which is
+/// earlier than that mtime, so the pre/post comparison already catches it.
+/// A mtime at most one window ahead (small skew: fine-grained stamp vs the
+/// coarse clock, an NFS server slightly ahead, an NTP step) can share a tick
+/// with a later edit, so it is waited out, capped at `2 * window_ns`.
+fn mtime_tick_wait(mtime_ns: u64, now_ns: u64, window_ns: u64) -> u64 {
+    if mtime_ns > now_ns.saturating_add(window_ns) {
+        return 0;
+    }
+    mtime_ns.saturating_add(window_ns).saturating_sub(now_ns)
+}
+
 /// Sleep until at least [`MTIME_TICK_WINDOW`] has passed since `mtime_ns`,
 /// so that any later write to the file gets a strictly later mtime. Returns
-/// whether it slept. A file stamped in the future (clock skew) is not waited
-/// on: an edit stamps `now`, which is earlier than that mtime, so the
-/// pre/post comparison already catches it.
+/// whether it slept.
 fn wait_out_mtime_tick(mtime_ns: u64) -> bool {
     let window_ns = MTIME_TICK_WINDOW.as_nanos() as u64;
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
-    if mtime_ns > now_ns {
+    let wait_ns = mtime_tick_wait(mtime_ns, now_ns, window_ns);
+    if wait_ns == 0 {
         return false;
     }
-    let remaining_ns = mtime_ns.saturating_add(window_ns).saturating_sub(now_ns);
-    if remaining_ns == 0 {
-        return false;
-    }
-    std::thread::sleep(std::time::Duration::from_nanos(remaining_ns));
+    std::thread::sleep(std::time::Duration::from_nanos(wait_ns));
     true
 }
 
@@ -1976,30 +1985,39 @@ mod tests {
         );
     }
 
+    const W: u64 = 50_000_000;
+    const NOW: u64 = 1_000_000_000_000;
+
     #[test]
-    fn test_wait_out_mtime_tick_skips_future_dated_files() {
-        // An edit to a future-dated file is stamped with `now`, which is
-        // earlier than the file's mtime, so the pre/post comparison already
-        // catches it; sleeping a full window per file would only slow the
-        // index build under clock skew.
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        let future_ns = now_ns + 3_600 * 1_000_000_000;
-        assert!(!wait_out_mtime_tick(future_ns));
+    fn test_mtime_tick_wait_skips_far_future() {
+        assert_eq!(mtime_tick_wait(NOW + W + 1, NOW, W), 0);
+        assert_eq!(mtime_tick_wait(NOW + 3_600_000_000_000, NOW, W), 0);
+        assert_eq!(mtime_tick_wait(u64::MAX, NOW, W), 0);
     }
 
     #[test]
-    fn test_wait_out_mtime_tick_skips_files_older_than_window() {
+    fn test_mtime_tick_wait_waits_on_small_future_skew() {
+        let wait = mtime_tick_wait(NOW + 1_000_000, NOW, W);
+        assert!(wait > 0 && wait <= 2 * W, "wait={wait}");
+        assert_eq!(wait, 1_000_000 + W);
+        assert_eq!(mtime_tick_wait(NOW + W, NOW, W), 2 * W);
+    }
+
+    #[test]
+    fn test_mtime_tick_wait_fresh_file_waits_full_window() {
+        assert_eq!(mtime_tick_wait(NOW, NOW, W), W);
+    }
+
+    #[test]
+    fn test_mtime_tick_wait_mid_window() {
+        assert_eq!(mtime_tick_wait(NOW - 20_000_000, NOW, W), 30_000_000);
+    }
+
+    #[test]
+    fn test_mtime_tick_wait_skips_files_older_than_window() {
+        assert_eq!(mtime_tick_wait(NOW - W - 1, NOW, W), 0);
+        assert_eq!(mtime_tick_wait(NOW - W, NOW, W), 0);
         assert!(!wait_out_mtime_tick(0));
-    }
-
-    #[test]
-    fn test_wait_out_mtime_tick_waits_for_fresh_file() {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        assert!(wait_out_mtime_tick(now_ns));
     }
 
     #[test]
