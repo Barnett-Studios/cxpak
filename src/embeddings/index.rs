@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// File magic for the on-disk cache. Bincode-era caches had no header, so they
+/// never match and load as stale.
+const CACHE_MAGIC: &[u8; 4] = b"CXEI";
+/// Bump when the serialized layout of `EmbeddingIndex` changes.
+const CACHE_VERSION: u8 = 1;
+
 /// Flat-matrix vector index. Vectors are stored contiguously:
 /// `vectors[i * dims .. (i + 1) * dims]` is the embedding for `paths[i]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,22 +103,47 @@ impl EmbeddingIndex {
         self.paths.is_empty()
     }
 
-    /// Serialize to `path` using bincode 1.x.
+    /// Serialize to `path` as `CACHE_MAGIC`, `CACHE_VERSION`, then a postcard body.
     ///
     /// Uses a write-to-temp + rename pattern so a concurrent reader never
     /// observes a partially-written file.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let bytes =
-            bincode::serialize(self).map_err(|e| format!("bincode serialize error: {e}"))?;
+        let mut bytes = Vec::with_capacity(CACHE_MAGIC.len() + 1);
+        bytes.extend_from_slice(CACHE_MAGIC);
+        bytes.push(CACHE_VERSION);
+        let bytes = postcard::to_extend(self, bytes)
+            .map_err(|e| format!("postcard serialize error: {e}"))?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &bytes).map_err(|e| format!("write error: {e}"))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("rename error: {e}"))
     }
 
-    /// Deserialize from `path` using bincode 1.x.
-    pub fn load(path: &Path) -> Result<Self, String> {
+    /// Load the index from `path`.
+    ///
+    /// `Ok(None)` means the file is stale and the caller should rebuild: wrong
+    /// magic (including a pre-header bincode cache), another format version, or
+    /// a truncated/corrupt body. `Err` is reserved for I/O failures.
+    pub fn load(path: &Path) -> Result<Option<Self>, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("read error: {e}"))?;
-        bincode::deserialize(&bytes).map_err(|e| format!("bincode deserialize error: {e}"))
+        let Some(body) = bytes
+            .strip_prefix(CACHE_MAGIC)
+            .and_then(|rest| rest.split_first())
+            .and_then(|(&ver, body)| (ver == CACHE_VERSION).then_some(body))
+        else {
+            return Ok(None);
+        };
+        Ok(postcard::from_bytes(body).ok().filter(Self::is_consistent))
+    }
+
+    /// Structural invariants a decoded body must satisfy before it is trusted.
+    fn is_consistent(&self) -> bool {
+        self.vectors.len() == self.paths.len() * self.dims
+            && self.path_index.len() == self.paths.len()
+            && self
+                .paths
+                .iter()
+                .enumerate()
+                .all(|(i, p)| self.path_index.get(p) == Some(&i))
     }
 
     /// Cosine similarity of the stored vector for `path` against `query`.
@@ -220,7 +251,9 @@ mod tests {
         idx.add("beta.rs", vec![0.0, 0.5, 0.5]);
 
         idx.save(&path).expect("save should succeed");
-        let loaded = EmbeddingIndex::load(&path).expect("load should succeed");
+        let loaded = EmbeddingIndex::load(&path)
+            .expect("load should succeed")
+            .expect("cache should be current");
 
         assert_eq!(loaded.len(), 2);
         let sim = loaded
@@ -247,7 +280,9 @@ mod tests {
 
         // The destination file must exist and round-trip cleanly.
         assert!(path.exists(), "index.bin must exist after save");
-        let loaded = EmbeddingIndex::load(&path).expect("load should succeed");
+        let loaded = EmbeddingIndex::load(&path)
+            .expect("load should succeed")
+            .expect("cache should be current");
         assert_eq!(loaded.len(), 10, "all 10 entries must survive round-trip");
 
         // Verify a specific entry's vector is preserved.
@@ -305,5 +340,81 @@ mod tests {
             Some(0.0),
             "dim mismatch should return Some(0.0), got {result:?}"
         );
+    }
+
+    /// Bytes of an `EmbeddingIndex` (dims 2, one path "a.rs") as written by
+    /// bincode 1.x: fixed-int little-endian, u64 length prefixes, no header.
+    fn legacy_bincode_bytes() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(1u64.to_le_bytes()); // paths.len
+        b.extend(4u64.to_le_bytes()); // "a.rs".len
+        b.extend(b"a.rs");
+        b.extend(1u64.to_le_bytes()); // path_index.len
+        b.extend(4u64.to_le_bytes());
+        b.extend(b"a.rs");
+        b.extend(0u64.to_le_bytes()); // index value
+        b.extend(2u64.to_le_bytes()); // vectors.len
+        b.extend(1.0f32.to_le_bytes());
+        b.extend(0.0f32.to_le_bytes());
+        b.extend(2u64.to_le_bytes()); // dims
+        b
+    }
+
+    #[test]
+    fn legacy_bincode_cache_is_stale_not_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.bin");
+        std::fs::write(&path, legacy_bincode_bytes()).unwrap();
+        assert!(matches!(EmbeddingIndex::load(&path), Ok(None)));
+    }
+
+    #[test]
+    fn garbage_and_truncated_cache_is_stale() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.bin");
+        for bytes in [&b""[..], &b"CX"[..], &[0xff; 64][..]] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(matches!(EmbeddingIndex::load(&path), Ok(None)));
+        }
+        let mut idx = EmbeddingIndex::new(2);
+        idx.add("a.rs", vec![1.0, 0.0]);
+        idx.save(&path).unwrap();
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() - 3]).unwrap();
+        assert!(matches!(EmbeddingIndex::load(&path), Ok(None)));
+    }
+
+    #[test]
+    fn other_cache_version_is_stale() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.bin");
+        let mut idx = EmbeddingIndex::new(2);
+        idx.add("a.rs", vec![1.0, 0.0]);
+        idx.save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[CACHE_MAGIC.len()] = CACHE_VERSION.wrapping_add(1);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(EmbeddingIndex::load(&path), Ok(None)));
+    }
+
+    #[test]
+    fn missing_file_is_io_error() {
+        let dir = TempDir::new().unwrap();
+        assert!(EmbeddingIndex::load(&dir.path().join("nope.bin")).is_err());
+    }
+
+    #[test]
+    fn round_trip_preserves_every_field() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.bin");
+        let mut idx = EmbeddingIndex::new(3);
+        idx.add("a.rs", vec![1.0, 2.0, 3.0]);
+        idx.add("b.rs", vec![-1.0, 0.5, 0.0]);
+        idx.save(&path).unwrap();
+        let loaded = EmbeddingIndex::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.paths, idx.paths);
+        assert_eq!(loaded.path_index, idx.path_index);
+        assert_eq!(loaded.vectors, idx.vectors);
+        assert_eq!(loaded.dims, idx.dims);
     }
 }

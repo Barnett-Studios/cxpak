@@ -83,7 +83,7 @@ candle-nn = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"], optional = true }
-bincode = { version = "1", optional = true }
+postcard = { version = "1", default-features = false, features = ["use-std"], optional = true }
 tower-lsp = { version = "0.20", optional = true }
 # Only needed to implement a `tower::Service` middleware around the LSP
 # backend (see `lsp::ExitWatch`, #114) — gated with `tower-lsp` behind the
@@ -214,7 +214,7 @@ daemon = ["dep:notify", "dep:axum", "dep:tokio"]
 lsp = ["dep:tower-lsp", "dep:tower", "daemon"]
 embeddings = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-transformers",
-    "dep:tokenizers", "dep:reqwest", "dep:bincode",
+    "dep:tokenizers", "dep:reqwest", "dep:postcard",
 ]
 visual = ["dep:resvg", "dep:petgraph", "dep:thiserror"]
 e2e-browser = []
