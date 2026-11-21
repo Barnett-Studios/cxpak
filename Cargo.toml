@@ -75,7 +75,7 @@ notify = { version = "8", optional = true }
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 # cxpak#57: the official Rust client. Optional — see the `client` feature.
-rmcp = { version = "2", features = ["client", "transport-child-process"], optional = true }
+rmcp = { version = "3", features = ["client", "transport-child-process"], optional = true }
 async-trait = { version = "0.1", optional = true }
 # client.rs reaps a hung child by PID (SIGKILL) rather than leaking it; unix-only path.
 candle-core = { version = "0.11", optional = true }
