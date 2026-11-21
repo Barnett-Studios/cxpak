@@ -26,8 +26,16 @@ async fn rmcp_client_round_trips_a_tool_call_against_the_real_server() {
 
     let git = |args: &[&str]| {
         std::process::Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
             .args(args)
             .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")

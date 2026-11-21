@@ -137,7 +137,7 @@ impl EmbeddingIndex {
 
     /// Structural invariants a decoded body must satisfy before it is trusted.
     fn is_consistent(&self) -> bool {
-        self.vectors.len() == self.paths.len() * self.dims
+        self.paths.len().checked_mul(self.dims) == Some(self.vectors.len())
             && self.path_index.len() == self.paths.len()
             && self
                 .paths
@@ -416,5 +416,19 @@ mod tests {
         assert_eq!(loaded.path_index, idx.path_index);
         assert_eq!(loaded.vectors, idx.vectors);
         assert_eq!(loaded.dims, idx.dims);
+    }
+
+    #[test]
+    fn test_is_consistent_rejects_overflowing_dims() {
+        // A crafted cache can carry any `dims`. 2 * (usize::MAX / 2 + 1) overflows:
+        // it panics in debug and wraps to 0 in release, where it would match an
+        // empty vector table and pass as consistent.
+        let idx = EmbeddingIndex {
+            paths: vec!["a".to_string(), "b".to_string()],
+            path_index: HashMap::from([("a".to_string(), 0), ("b".to_string(), 1)]),
+            vectors: Vec::new(),
+            dims: usize::MAX / 2 + 1,
+        };
+        assert!(!idx.is_consistent());
     }
 }
