@@ -651,16 +651,15 @@ fn extract_clojure_calls_by_symbol(
     let root = tree.root_node();
 
     // This file's namespace plus its :require alias / :refer maps.
-    let mut ns = String::new();
-    let mut aliases: std::collections::HashMap<String, String> = Default::default();
-    let mut refers: std::collections::HashMap<String, String> = Default::default();
+    let mut scope = ClojureScope::default();
     {
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
             if child.kind() == "list_lit" && Clj::list_head_text(&child, source_bytes) == "ns" {
                 let (name, _) = Clj::list_name_text(&child, source_bytes);
-                ns = name;
-                clojure_require_specs(&child, source_bytes, &mut aliases, &mut refers);
+                scope.namespaces.insert(name.clone());
+                scope.ns = name;
+                clojure_require_specs(&child, source_bytes, &mut scope);
                 break;
             }
         }
@@ -686,7 +685,7 @@ fn extract_clojure_calls_by_symbol(
                 && DEF_HEADS.contains(&Clj::list_head_text(c, source_bytes).as_str())
         })
         .collect();
-    let locals: std::collections::HashSet<String> = defs
+    scope.locals = defs
         .iter()
         .filter_map(|n| {
             let (name, _) = Clj::list_name_text(n, source_bytes);
@@ -704,30 +703,40 @@ fn extract_clojure_calls_by_symbol(
         collect_clojure_call_heads(
             def,
             source_bytes,
-            &ns,
-            &aliases,
-            &refers,
-            &locals,
+            &scope,
+            &std::collections::HashSet::new(),
             &mut calls,
         );
-        map.entry(Clj::qualify(&ns, &name))
+        map.entry(Clj::qualify(&scope.ns, &name))
             .or_insert_with(Vec::new)
             .extend(calls);
     }
     Some(map)
 }
 
-/// Read the `(:require …)` / `(:use …)` clauses of an `(ns …)` form into the
-/// alias (`[ns :as alias]`) and refer (`[ns :refer [f g]]`) maps. `:refer
-/// :all` names no vars, so it contributes nothing — bare calls relying on it
-/// stay unresolved, same as a require the resolver cannot find.
+/// Names a Clojure file's `(ns …)` form brings into scope, plus its own defs.
 #[cfg(feature = "lang-clojure")]
-fn clojure_require_specs(
-    ns_node: &tree_sitter::Node,
-    source: &[u8],
-    aliases: &mut std::collections::HashMap<String, String>,
-    refers: &mut std::collections::HashMap<String, String>,
-) {
+#[derive(Default)]
+struct ClojureScope {
+    /// The file's own namespace.
+    ns: String,
+    /// `:as` alias -> required namespace.
+    aliases: std::collections::HashMap<String, String>,
+    /// Every required namespace (and the file's own) usable as a full prefix.
+    namespaces: std::collections::HashSet<String>,
+    /// Referred bare name (after `:rename`) -> qualified `ns/name`.
+    refers: std::collections::HashMap<String, String>,
+    /// Top-level def names in this file.
+    locals: std::collections::HashSet<String>,
+}
+
+/// Read the `(:require …)` / `(:use …)` clauses of an `(ns …)` form into the
+/// scope. Handles `[ns :as a]`, `[ns :refer [f]]` / `[ns :only [f]]`,
+/// `:rename {f g}`, bare `ns` symbols and prefix lists
+/// `[a [b :as x] [c :refer [f]]]` (→ `a.b`, `a.c`). `:refer :all` names no
+/// vars, so it contributes nothing.
+#[cfg(feature = "lang-clojure")]
+fn clojure_require_specs(ns_node: &tree_sitter::Node, source: &[u8], scope: &mut ClojureScope) {
     use crate::parser::languages::clojure::ClojureLanguage as Clj;
 
     for clause in Clj::named_children(ns_node).into_iter().skip(2) {
@@ -743,98 +752,405 @@ fn clojure_require_specs(
             continue;
         }
         for spec in parts.iter().skip(1) {
-            if spec.kind() != "vec_lit" {
-                continue;
-            }
-            let fields = Clj::named_children(spec);
-            let Some(ns_sym) = fields.first() else {
-                continue;
-            };
-            let req_ns = Clj::node_text(ns_sym, source).to_string();
-            if req_ns.is_empty() || req_ns.starts_with(':') {
-                continue;
-            }
-            let mut i = 1;
-            while i < fields.len() {
-                match Clj::node_text(&fields[i], source) {
-                    ":as" => {
-                        if let Some(alias) = fields.get(i + 1) {
-                            let alias = Clj::node_text(alias, source).to_string();
-                            if !alias.is_empty() {
-                                aliases.insert(alias, req_ns.clone());
-                            }
-                        }
-                        i += 2;
-                    }
-                    ":refer" => {
-                        if let Some(v) = fields.get(i + 1) {
-                            if v.kind() == "vec_lit" {
-                                for r in Clj::named_children(v) {
-                                    let name = Clj::node_text(&r, source);
-                                    if !name.is_empty() && !name.starts_with(':') {
-                                        refers.insert(name.to_string(), req_ns.clone());
-                                    }
-                                }
-                            }
-                        }
-                        i += 2;
-                    }
-                    _ => i += 1,
-                }
-            }
+            clojure_require_spec(spec, source, "", scope);
         }
+    }
+}
+
+/// One require spec: a bare symbol, a `[ns opts…]` vector or a prefix list.
+#[cfg(feature = "lang-clojure")]
+fn clojure_require_spec(
+    spec: &tree_sitter::Node,
+    source: &[u8],
+    prefix: &str,
+    scope: &mut ClojureScope,
+) {
+    use crate::parser::languages::clojure::ClojureLanguage as Clj;
+
+    let join = |name: &str| {
+        if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}.{name}")
+        }
+    };
+    if spec.kind() == "sym_lit" {
+        let name = Clj::node_text(spec, source);
+        if !name.is_empty() {
+            scope.namespaces.insert(join(name));
+        }
+        return;
+    }
+    if !matches!(spec.kind(), "vec_lit" | "list_lit") {
+        return;
+    }
+    let fields = Clj::named_children(spec);
+    let Some(ns_sym) = fields.first() else {
+        return;
+    };
+    let ns_text = Clj::node_text(ns_sym, source);
+    if ns_text.is_empty() || ns_text.starts_with(':') {
+        return;
+    }
+    let req_ns = join(ns_text);
+    // `[a [b …] c]`: the second element is a spec, not an option keyword.
+    if fields
+        .get(1)
+        .is_some_and(|f| f.kind() != "kwd_lit" && !f.kind().ends_with("meta_lit"))
+    {
+        for sub in fields.iter().skip(1) {
+            clojure_require_spec(sub, source, &req_ns, scope);
+        }
+        return;
+    }
+    scope.namespaces.insert(req_ns.clone());
+    let mut renames: Vec<(String, String)> = Vec::new();
+    let mut i = 1;
+    while i < fields.len() {
+        let value = fields.get(i + 1);
+        match Clj::node_text(&fields[i], source) {
+            ":as" => {
+                if let Some(alias) = value.map(|v| Clj::node_text(v, source)) {
+                    if !alias.is_empty() {
+                        scope.aliases.insert(alias.to_string(), req_ns.clone());
+                    }
+                }
+                i += 2;
+            }
+            ":refer" | ":only" => {
+                if let Some(v) = value.filter(|v| v.kind() == "vec_lit") {
+                    for r in Clj::named_children(v) {
+                        let name = Clj::node_text(&r, source);
+                        if !name.is_empty() && !name.starts_with(':') {
+                            scope
+                                .refers
+                                .insert(name.to_string(), format!("{req_ns}/{name}"));
+                        }
+                    }
+                }
+                i += 2;
+            }
+            ":rename" => {
+                if let Some(v) = value.filter(|v| v.kind() == "map_lit") {
+                    for pair in Clj::named_children(v).chunks(2).filter(|p| p.len() == 2) {
+                        renames.push((
+                            Clj::node_text(&pair[0], source).to_string(),
+                            Clj::node_text(&pair[1], source).to_string(),
+                        ));
+                    }
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    for (orig, new) in renames {
+        let qualified = format!("{req_ns}/{orig}");
+        if scope.refers.get(&orig) == Some(&qualified) {
+            scope.refers.remove(&orig);
+        }
+        scope.refers.insert(new, format!("{req_ns}/{orig}"));
+    }
+}
+
+/// Bare name of a `sym_lit` (without `^meta` annotations).
+#[cfg(feature = "lang-clojure")]
+fn clojure_sym_name(node: &tree_sitter::Node, source: &[u8]) -> String {
+    use crate::parser::languages::clojure::ClojureLanguage as Clj;
+
+    Clj::named_children(node)
+        .iter()
+        .find(|c| c.kind() == "sym_name")
+        .map(|c| Clj::node_text(c, source))
+        .unwrap_or_else(|| Clj::node_text(node, source))
+        .to_string()
+}
+
+/// Add every symbol under a binding target (plain, destructuring vector/map)
+/// to `bound`.
+#[cfg(feature = "lang-clojure")]
+fn clojure_bind_symbols(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    bound: &mut std::collections::HashSet<String>,
+) {
+    use crate::parser::languages::clojure::ClojureLanguage as Clj;
+
+    if node.kind() == "sym_lit" {
+        bound.insert(clojure_sym_name(node, source));
+    } else {
+        for c in Clj::named_children(node) {
+            clojure_bind_symbols(&c, source, bound);
+        }
+    }
+}
+
+/// Heads whose bodies are scanned with a `[name expr …]` binding vector.
+#[cfg(feature = "lang-clojure")]
+const CLJ_LET_HEADS: &[&str] = &[
+    "let",
+    "loop",
+    "when-let",
+    "if-let",
+    "when-some",
+    "if-some",
+    "with-open",
+    "for",
+    "doseq",
+    "dotimes",
+];
+
+/// Heads whose direct vector children are parameter vectors.
+#[cfg(feature = "lang-clojure")]
+const CLJ_FN_HEADS: &[&str] = &["fn", "fn*", "defn", "defn-", "defmacro"];
+
+/// Forms whose direct list children are method signatures/impls, not calls.
+#[cfg(feature = "lang-clojure")]
+const CLJ_IMPL_HEADS: &[&str] = &[
+    "defrecord",
+    "deftype",
+    "reify",
+    "extend-type",
+    "extend-protocol",
+    "defprotocol",
+    "letfn",
+];
+
+/// Visit a `[target expr …]` binding vector in order: each expr is scanned
+/// with the bindings made so far, then its target joins `bound`. `:let`
+/// modifiers recurse; other keyword modifiers (`:when`, `:while`) carry a
+/// plain expression.
+#[cfg(feature = "lang-clojure")]
+fn collect_clojure_bindings(
+    vec: &tree_sitter::Node,
+    source: &[u8],
+    scope: &ClojureScope,
+    bound: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    use crate::parser::languages::clojure::ClojureLanguage as Clj;
+
+    for pair in Clj::named_children(vec).chunks(2) {
+        let target = &pair[0];
+        let Some(value) = pair.get(1) else {
+            break;
+        };
+        if target.kind() == "kwd_lit" {
+            if Clj::node_text(target, source) == ":let" && value.kind() == "vec_lit" {
+                collect_clojure_bindings(value, source, scope, bound, out);
+            } else {
+                collect_clojure_call_heads(value, source, scope, bound, out);
+            }
+            continue;
+        }
+        collect_clojure_call_heads(value, source, scope, bound, out);
+        clojure_bind_symbols(target, source, bound);
+    }
+}
+
+/// Scan `body` nodes with `params` (a vector literal) shadowing local names.
+#[cfg(feature = "lang-clojure")]
+fn collect_clojure_with_params(
+    params: &tree_sitter::Node,
+    body: &[tree_sitter::Node],
+    source: &[u8],
+    scope: &ClojureScope,
+    shadow: &std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    let mut inner = shadow.clone();
+    clojure_bind_symbols(params, source, &mut inner);
+    for n in body {
+        collect_clojure_call_heads(n, source, scope, &inner, out);
     }
 }
 
 /// Recursively collect the callee name of every `list_lit` under `node`,
 /// qualified to `ns/name` form (see [`extract_clojure_calls_by_symbol`] for
-/// the resolution rules).
+/// the resolution rules). `shadow` holds names bound by an enclosing
+/// parameter vector or `let`-style binding: a head in it is a local value,
+/// not the top-level def or referred var of the same name.
 #[cfg(feature = "lang-clojure")]
 fn collect_clojure_call_heads(
     node: &tree_sitter::Node,
     source: &[u8],
-    ns: &str,
-    aliases: &std::collections::HashMap<String, String>,
-    refers: &std::collections::HashMap<String, String>,
-    locals: &std::collections::HashSet<String>,
+    scope: &ClojureScope,
+    shadow: &std::collections::HashSet<String>,
     out: &mut Vec<String>,
 ) {
     use crate::parser::languages::clojure::ClojureLanguage as Clj;
 
-    // Quoted forms are data, not calls.
-    if matches!(node.kind(), "quo_lit" | "syn_quo_lit") {
-        return;
-    }
-    if node.kind() == "list_lit" {
-        let head = Clj::list_head_text(node, source);
-        if head == "quote" || head == "comment" {
-            return;
-        }
-        let children = Clj::named_children(node);
-        if let Some(head_node) = children.first() {
-            if head_node.kind() == "sym_lit" {
-                let head = Clj::node_text(head_node, source);
-                if let Some((alias, name)) = head.split_once('/') {
-                    if !name.is_empty() {
-                        match aliases.get(alias) {
-                            Some(req_ns) => out.push(format!("{req_ns}/{name}")),
-                            None => out.push(head.to_string()),
-                        }
+    match node.kind() {
+        // Quoted forms are data, not calls.
+        "quoting_lit" => return,
+        // Syntax-quote is data too, except what is unquoted inside it.
+        "syn_quoting_lit" => {
+            let mut stack = Clj::named_children(node);
+            while let Some(n) = stack.pop() {
+                if matches!(n.kind(), "unquoting_lit" | "unquote_splicing_lit") {
+                    for c in Clj::named_children(&n) {
+                        collect_clojure_call_heads(&c, source, scope, shadow, out);
                     }
                 } else {
-                    if locals.contains(head) {
-                        out.push(Clj::qualify(ns, head));
-                    }
-                    if let Some(req_ns) = refers.get(head) {
-                        out.push(format!("{req_ns}/{head}"));
-                    }
+                    stack.extend(Clj::named_children(&n));
                 }
+            }
+            return;
+        }
+        "list_lit" => {}
+        _ => {
+            for c in Clj::named_children(node) {
+                collect_clojure_call_heads(&c, source, scope, shadow, out);
+            }
+            return;
+        }
+    }
+
+    let children = Clj::named_children(node);
+    let Some(head_node) = children.first() else {
+        return;
+    };
+    // `([params] body…)`: one arity clause of a multi-arity fn or method.
+    if head_node.kind() == "vec_lit" {
+        collect_clojure_with_params(head_node, &children[1..], source, scope, shadow, out);
+        return;
+    }
+    let head = if head_node.kind() == "sym_lit" {
+        Clj::node_text(head_node, source)
+    } else {
+        ""
+    };
+    match head {
+        "quote" | "comment" => return,
+        "case" => {
+            // Test constants are data; only the dispatch expr, the results
+            // and the trailing default are code.
+            for (i, c) in children.iter().enumerate().skip(1) {
+                let is_test = i >= 2 && i % 2 == 0 && i + 1 < children.len();
+                if !is_test {
+                    collect_clojure_call_heads(c, source, scope, shadow, out);
+                }
+            }
+            return;
+        }
+        h if CLJ_LET_HEADS.contains(&h) => {
+            let mut bound = shadow.clone();
+            let mut rest = children.iter().skip(1);
+            if let Some(bindings) = rest.next().filter(|b| b.kind() == "vec_lit") {
+                collect_clojure_bindings(bindings, source, scope, &mut bound, out);
+                for n in rest {
+                    collect_clojure_call_heads(n, source, scope, &bound, out);
+                }
+                return;
+            }
+        }
+        h if CLJ_FN_HEADS.contains(&h) => {
+            if let Some(i) = children.iter().position(|c| c.kind() == "vec_lit") {
+                for n in &children[1..i] {
+                    collect_clojure_call_heads(n, source, scope, shadow, out);
+                }
+                collect_clojure_with_params(
+                    &children[i],
+                    &children[i + 1..],
+                    source,
+                    scope,
+                    shadow,
+                    out,
+                );
+                return;
+            }
+            // Multi-arity: arity-clause lists carry their own params.
+            for n in &children[1..] {
+                collect_clojure_call_heads(n, source, scope, shadow, out);
+            }
+            return;
+        }
+        h if CLJ_IMPL_HEADS.contains(&h) => {
+            let mut inner = shadow.clone();
+            if h == "letfn" {
+                if let Some(fns) = children.get(1).filter(|c| c.kind() == "vec_lit") {
+                    for f in Clj::named_children(fns) {
+                        if let Some(name) = Clj::named_children(&f).first() {
+                            inner.insert(clojure_sym_name(name, source));
+                        }
+                    }
+                    for f in Clj::named_children(fns) {
+                        collect_clojure_method_body(&f, source, scope, &inner, out);
+                    }
+                    for n in &children[2..] {
+                        collect_clojure_call_heads(n, source, scope, &inner, out);
+                    }
+                    return;
+                }
+            }
+            for n in &children[1..] {
+                if n.kind() == "list_lit" {
+                    collect_clojure_method_body(n, source, scope, &inner, out);
+                } else {
+                    collect_clojure_call_heads(n, source, scope, &inner, out);
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    if head_node.kind() == "sym_lit" {
+        if let Some((alias, name)) = head.split_once('/') {
+            if !name.is_empty() {
+                if let Some(req_ns) = scope.aliases.get(alias) {
+                    out.push(format!("{req_ns}/{name}"));
+                } else if scope.namespaces.contains(alias) {
+                    out.push(head.to_string());
+                }
+            }
+        } else if !shadow.contains(head) {
+            if scope.locals.contains(head) {
+                out.push(Clj::qualify(&scope.ns, head));
+            }
+            if let Some(qualified) = scope.refers.get(head) {
+                out.push(qualified.clone());
             }
         }
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_clojure_call_heads(&child, source, ns, aliases, refers, locals, out);
+    for c in &children {
+        collect_clojure_call_heads(c, source, scope, shadow, out);
+    }
+}
+
+/// A method signature or impl inside a protocol/record form:
+/// `(name [params] body…)` or `(name ([params] body…) …)`. The name is not a
+/// call; the params shadow locals in the body.
+#[cfg(feature = "lang-clojure")]
+fn collect_clojure_method_body(
+    method: &tree_sitter::Node,
+    source: &[u8],
+    scope: &ClojureScope,
+    shadow: &std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    use crate::parser::languages::clojure::ClojureLanguage as Clj;
+
+    let children = Clj::named_children(method);
+    let is_signature = method.kind() == "list_lit"
+        && children.first().is_some_and(|h| h.kind() == "sym_lit")
+        && children.get(1).is_some_and(|c| {
+            c.kind() == "vec_lit"
+                || (c.kind() == "list_lit"
+                    && Clj::named_children(c)
+                        .first()
+                        .is_some_and(|f| f.kind() == "vec_lit"))
+        });
+    if !is_signature {
+        collect_clojure_call_heads(method, source, scope, shadow, out);
+        return;
+    }
+    for c in &children[1..] {
+        if c.kind() == "vec_lit" {
+            collect_clojure_with_params(c, &children[2..], source, scope, shadow, out);
+            return;
+        }
+        collect_clojure_call_heads(c, source, scope, shadow, out);
     }
 }
 
@@ -1929,5 +2245,69 @@ fn helper(_y: i32) -> i32 { 0 }
             "expected :refer-resolved edge, got: {:?}",
             cg.edges
         );
+    }
+
+    /// Calls the one-pass Clojure extractor attributes to `ns/sym`.
+    #[cfg(feature = "lang-clojure")]
+    fn clj_calls(source: &str, sym: &str) -> Vec<String> {
+        extract_clojure_calls(source, sym)
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_param_and_let_shadowing_is_not_a_call() {
+        let src = "(ns a)\n(defn fmt [x] x)\n(defn f [fmt] (fmt 1))\n(defn g [] (let [fmt inc] (fmt 1)))\n(defn h [] (fmt 1))\n";
+        assert!(clj_calls(src, "a/f").is_empty(), "param shadow");
+        assert!(clj_calls(src, "a/g").is_empty(), "let shadow");
+        assert_eq!(clj_calls(src, "a/h"), vec!["a/fmt"], "unshadowed stays");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_case_clause_list_is_not_a_call() {
+        let src = "(ns a)\n(defn fmt [x] x)\n(defn f [k] (case k (fmt x) 1 2))\n";
+        assert!(clj_calls(src, "a/f").is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_protocol_impl_method_head_is_not_a_call() {
+        let src = "(ns a)\n(defn fmt [x] x)\n(defrecord R []\n  P\n  (fmt [this] 1))\n(defn f [] (reify P (fmt [this] 1)))\n(defn g [] (extend-type T P (fmt [this] 1)))\n";
+        assert!(clj_calls(src, "a/R").is_empty(), "defrecord");
+        assert!(clj_calls(src, "a/f").is_empty(), "reify");
+        assert!(clj_calls(src, "a/g").is_empty(), "extend-type");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_unknown_interop_prefix_is_dropped() {
+        let src = "(ns a (:require [b.c :as bc]))\n(defn f [] (Math/abs 1) (System/getenv \"X\") (Thread/sleep 1) (bc/g) (b.c/h) (a/k))\n";
+        assert_eq!(clj_calls(src, "a/f"), vec!["a/k", "b.c/g", "b.c/h"]);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_quote_skipped_but_unquote_descended() {
+        let src = "(ns a)\n(defn foo [] 1)\n(defn bar [] 1)\n(defn baz [] 1)\n(defn f [x] `(foo ~(bar x) ~@(baz x)))\n(defn g [] '(foo (bar)))\n";
+        assert_eq!(clj_calls(src, "a/f"), vec!["a/bar", "a/baz"]);
+        assert!(clj_calls(src, "a/g").is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_require_forms() {
+        let src = "(ns a (:require [p [q :as x] [r :refer [k]]] s.t) (:use [u :only [h]]) (:require [v :refer [f] :rename {f g}]))\n(defn z [] (x/m) (k) (h) (g) (t/n))\n";
+        let got = clj_calls(src, "a/z");
+        for want in ["p.q/m", "p.r/k", "u/h", "v/f"] {
+            assert!(got.iter().any(|c| c == want), "missing {want}: {got:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_bare_require_and_multi_arity_scoping() {
+        let src = "(ns a (:require s.t))\n(defn fmt [x] x)\n(defn f ([] (s.t/n) (fmt 1)) ([fmt] (fmt 2)))\n(defn g [] (let [y (fmt 1) fmt inc] (fmt y)))\n";
+        assert_eq!(clj_calls(src, "a/f"), vec!["a/fmt", "s.t/n"]);
+        assert_eq!(clj_calls(src, "a/g"), vec!["a/fmt"]);
     }
 }
