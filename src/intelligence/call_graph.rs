@@ -878,6 +878,26 @@ fn clojure_sym_name(node: &tree_sitter::Node, source: &[u8]) -> String {
         .to_string()
 }
 
+/// `:keys`/`:strs`/`:syms`, optionally namespaced (`:foo/keys`).
+#[cfg(feature = "lang-clojure")]
+fn clojure_is_binding_vector_key(key: &str) -> bool {
+    let name = key.strip_prefix(':').unwrap_or(key);
+    let name = name.rsplit_once('/').map_or(name, |(_, n)| n);
+    matches!(name, "keys" | "strs" | "syms") && key.starts_with(':')
+}
+
+/// A dotted prefix names a namespace when its last segment starts lowercase
+/// (`foo.bar`); a capitalised last segment is a Java class (`java.util.UUID`).
+#[cfg(feature = "lang-clojure")]
+fn clojure_is_namespace_shaped(alias: &str) -> bool {
+    alias.contains('.')
+        && alias
+            .rsplit('.')
+            .next()
+            .and_then(|seg| seg.chars().next())
+            .is_some_and(char::is_lowercase)
+}
+
 /// Add every name a binding target introduces to `bound`. Map targets bind
 /// their plain keys, `:keys`/`:strs`/`:syms` vectors and `:as`; `:or`
 /// defaults are expressions and are scanned for calls instead.
@@ -898,13 +918,14 @@ fn clojure_bind_symbols(
         "map_lit" => {
             for pair in clojure_forms(node).chunks(2).filter(|p| p.len() == 2) {
                 let (key, value) = (&pair[0], &pair[1]);
-                match Clj::node_text(key, source) {
+                let key_text = Clj::node_text(key, source);
+                match key_text {
                     ":or" => {
                         for default in clojure_forms(value).iter().skip(1).step_by(2) {
                             collect_clojure_call_heads(default, source, scope, bound, out);
                         }
                     }
-                    ":keys" | ":strs" | ":syms" => {
+                    _ if clojure_is_binding_vector_key(key_text) => {
                         clojure_bind_symbols(value, source, scope, bound, out)
                     }
                     ":as" => clojure_bind_symbols(value, source, scope, bound, out),
@@ -1157,7 +1178,7 @@ fn collect_clojure_call_heads(
             if !name.is_empty() {
                 if let Some(req_ns) = scope.aliases.get(alias) {
                     out.push(format!("{req_ns}/{name}"));
-                } else if scope.namespaces.contains(alias) || alias.contains('.') {
+                } else if scope.namespaces.contains(alias) || clojure_is_namespace_shaped(alias) {
                     out.push(head.to_string());
                 }
             }
@@ -2405,5 +2426,21 @@ fn helper(_y: i32) -> i32 { 0 }
     fn test_clojure_fully_qualified_dotted_prefix_kept_without_require() {
         let src = "(ns a)\n(require '[foo.bar :as fb])\n(defn f [] (fb/x) (foo.bar/y))\n";
         assert_eq!(clj_calls(src, "a/f"), vec!["foo.bar/y"]);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_class_shaped_dotted_prefixes_dropped() {
+        let src = "(ns a)\n(defn f [] (java.util.UUID/randomUUID) (java.time.Instant/now) (clojure.lang.RT/count 1) (foo.bar/y))\n";
+        assert_eq!(clj_calls(src, "a/f"), vec!["foo.bar/y"]);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_namespaced_destructuring_keys_bind() {
+        for kind in ["keys", "strs", "syms"] {
+            let src = format!("(ns a)\n(defn g [] 1)\n(defn f [{{:foo/{kind} [g]}}] (g))\n");
+            assert!(clj_calls(&src, "a/f").is_empty(), ":foo/{kind} must bind");
+        }
     }
 }
