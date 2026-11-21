@@ -131,23 +131,29 @@ fn stat_fingerprint(path: &std::path::Path) -> Option<(Option<u64>, u64)> {
 /// read of it. It must cover the filesystem's mtime granularity plus the lag
 /// between the kernel's coarse timestamp clock and `SystemTime::now()` (up
 /// to one scheduler tick each, 10 ms at HZ=100). Filesystems with coarser
-/// mtimes (FAT's 2 s, some network mounts) are not covered.
+/// mtimes (FAT's 2 s, some network mounts) are not covered, nor are network
+/// mounts whose server clock runs behind local time: a fresh file there looks
+/// old, so no wait happens and the same-tick race remains.
 const MTIME_TICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Sleep until at least [`MTIME_TICK_WINDOW`] has passed since `mtime_ns`,
 /// so that any later write to the file gets a strictly later mtime. Returns
-/// whether it slept. The sleep is capped at one window, so a file stamped in
-/// the future (clock skew) costs one window instead of blocking.
+/// whether it slept. A file stamped in the future (clock skew) is not waited
+/// on: an edit stamps `now`, which is earlier than that mtime, so the
+/// pre/post comparison already catches it.
 fn wait_out_mtime_tick(mtime_ns: u64) -> bool {
     let window_ns = MTIME_TICK_WINDOW.as_nanos() as u64;
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
+    if mtime_ns > now_ns {
+        return false;
+    }
     let remaining_ns = mtime_ns.saturating_add(window_ns).saturating_sub(now_ns);
     if remaining_ns == 0 {
         return false;
     }
-    std::thread::sleep(std::time::Duration::from_nanos(remaining_ns.min(window_ns)));
+    std::thread::sleep(std::time::Duration::from_nanos(remaining_ns));
     true
 }
 
@@ -1968,6 +1974,32 @@ mod tests {
             result, None,
             "a file that changes between the pre- and post-read stat must not be cached"
         );
+    }
+
+    #[test]
+    fn test_wait_out_mtime_tick_skips_future_dated_files() {
+        // An edit to a future-dated file is stamped with `now`, which is
+        // earlier than the file's mtime, so the pre/post comparison already
+        // catches it; sleeping a full window per file would only slow the
+        // index build under clock skew.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        let future_ns = now_ns + 3_600 * 1_000_000_000;
+        assert!(!wait_out_mtime_tick(future_ns));
+    }
+
+    #[test]
+    fn test_wait_out_mtime_tick_skips_files_older_than_window() {
+        assert!(!wait_out_mtime_tick(0));
+    }
+
+    #[test]
+    fn test_wait_out_mtime_tick_waits_for_fresh_file() {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        assert!(wait_out_mtime_tick(now_ns));
     }
 
     #[test]
