@@ -6,7 +6,7 @@ use tree_sitter::Language as TsLanguage;
 pub struct ClojureLanguage;
 
 impl ClojureLanguage {
-    fn node_text<'a>(node: &tree_sitter::Node, source: &'a [u8]) -> &'a str {
+    pub(crate) fn node_text<'a>(node: &tree_sitter::Node, source: &'a [u8]) -> &'a str {
         node.utf8_text(source).unwrap_or("")
     }
 
@@ -17,14 +17,14 @@ impl ClojureLanguage {
 
     /// Collect the direct named children of a node, skipping anonymous
     /// punctuation nodes (`(`, `)`, `[`, `]`, etc.).
-    fn named_children<'a>(node: &tree_sitter::Node<'a>) -> Vec<tree_sitter::Node<'a>> {
+    pub(crate) fn named_children<'a>(node: &tree_sitter::Node<'a>) -> Vec<tree_sitter::Node<'a>> {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).collect()
     }
 
     /// Return the text of the first named child of a list_lit.
     /// This is the "head" of the form — e.g. "defn", "ns", "def".
-    fn list_head_text(node: &tree_sitter::Node, source: &[u8]) -> String {
+    pub(crate) fn list_head_text(node: &tree_sitter::Node, source: &[u8]) -> String {
         let children = Self::named_children(node);
         children
             .first()
@@ -40,7 +40,7 @@ impl ClojureLanguage {
     /// text therefore includes the annotation prefix (`"^:private secret"`), so
     /// we must extract the `sym_name` sub-child for the bare name, and inspect
     /// the `meta_lit` children to detect `:private`.
-    fn list_name_text(node: &tree_sitter::Node, source: &[u8]) -> (String, bool) {
+    pub(crate) fn list_name_text(node: &tree_sitter::Node, source: &[u8]) -> (String, bool) {
         let children = Self::named_children(node);
         let name_node = match children.get(1) {
             Some(n) => n,
@@ -76,7 +76,7 @@ impl ClojureLanguage {
 
     /// Qualify `name` with `ns`, producing `ns/name`.  When `ns` is empty
     /// (file has no `ns` form) the bare `name` is returned unchanged.
-    fn qualify(ns: &str, name: &str) -> String {
+    pub(crate) fn qualify(ns: &str, name: &str) -> String {
         if ns.is_empty() {
             name.to_string()
         } else {

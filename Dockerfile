@@ -8,10 +8,10 @@
 # podman ships no `unqualified-search-registries` by default, so the same line
 # fails to resolve there.  Overriding the ARG lets such a host pass a fully
 # qualified name without editing this file:
-#   podman build --build-arg RUST_IMAGE=docker.io/library/rust:1.91-slim-bookworm ...
+#   podman build --build-arg RUST_IMAGE=docker.io/library/rust:1.96-slim-bookworm ...
 # The digests pin what the defaults resolve to; an override replaces both name
 # and digest, so a caller who overrides takes on the pinning.
-ARG RUST_IMAGE=rust:1.91-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65
+ARG RUST_IMAGE=rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3
 ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
 
 # ── Builder ───────────────────────────────────────────────────────────────────
@@ -31,10 +31,14 @@ WORKDIR /build
 # assets/ must be present because src/ embeds it via include_str! at compile time.
 # vendor/ carries the patched grammars named by [patch.crates-io] in Cargo.toml;
 # without it `cargo build` cannot resolve the manifest.
+# benches/ is needed only to PARSE the manifest: the [[bench]] block names
+# indexing.rs explicitly, and a manifest that names a missing file fails before
+# a line of code is compiled. `cargo build --release` never compiles it.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY assets/ ./assets/
 COPY vendor/ ./vendor/
 COPY src/ ./src/
+COPY benches/ ./benches/
 
 # Dependency caching is a cache mount rather than the usual stub-main.rs stage.
 # That stage builds the dependencies once and the real stage builds again, and
