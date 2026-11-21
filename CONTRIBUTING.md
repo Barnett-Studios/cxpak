@@ -130,9 +130,14 @@ under the same four rules — maintainers included:
 
 1. **Change via PR.** All changes land through a pull request against `main`; no direct pushes.
 2. **Green CI.** A PR merges only when every required CI check passes.
-3. **A review.** A PR merges only with at least one approving review.
-4. **Reviewer ≠ author.** The approving review must come from someone other than the PR's author —
-   no self-approval, no self-merge.
+3. **A review.** A PR merges only after a review that passes it. An outside contributor's PR is
+   reviewed by a maintainer on GitHub. A maintainer's own PR is reviewed by a separate review
+   session working under its own charter. That session records its verdict as a PR comment, not as a
+   GitHub review object, so the merge uses an admin override of the branch-protection review
+   requirement. The override waives nothing else: CI must still be green, and no unresolved
+   blocking or important finding may stand.
+4. **Reviewer ≠ author.** The review that passes a PR never comes from whoever wrote it, and the
+   role that wrote a change never merges it: no self-approval, no self-merge.
 
 ## Pull requests
 
