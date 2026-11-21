@@ -1,0 +1,8 @@
+# cargo-deny configuration — see .github/workflows/security.yml.
+# CI runs only `cargo deny check advisories`, so only this section is consulted.
+[advisories]
+version = 2
+# Fail on security vulnerabilities (the default). Yanked crates warn only.
+yanked = "warn"
+# Accept a specific advisory by adding its id here WITH a note explaining why.
+ignore = []
