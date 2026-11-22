@@ -2199,7 +2199,9 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(!dead.is_empty());
         assert!(
-            elapsed < std::time::Duration::from_secs(15),
+            // 60 s, not tighter: under coverage instrumentation the single pass takes
+            // ~20 s, while the per-symbol scans it replaced took over 780 s here.
+            elapsed < std::time::Duration::from_secs(60),
             "detect_dead_code took {elapsed:?} for {} methods over {} files",
             GENERATED_FILES * METHODS_PER_FILE,
             GENERATED_FILES
