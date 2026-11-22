@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "cxpak"
-version = "3.8.0"
+version = "3.8.1"
 dependencies = [
  "aho-corasick",
  "assert_cmd",
