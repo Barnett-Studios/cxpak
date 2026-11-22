@@ -2116,6 +2116,14 @@ mod tests {
                 &[("Same", "zqself")],
                 "same::zqself;\nq.zqself();\n",
             ),
+            // A receiver call at byte 0, and a qualified reference ending exactly at
+            // end of content: the two edges where the boundary rules use defaults.
+            ("src/start.rs".into(), ".zqquit(".into(), Vec::new()),
+            (
+                "src/end.rs".into(),
+                "x\napp::run::zqstop".into(),
+                Vec::new(),
+            ),
         ]
     }
 
@@ -2150,6 +2158,8 @@ mod tests {
         assert!(refs.receiver("src/net/mod.rs", "zqshut"));
         assert!(!refs.receiver("src/app/run.rs", "zqboot"));
         assert!(!refs.receiver("src/same.rs", "zqself"));
+        assert!(refs.receiver("src/use.rs", "zqquit"));
+        assert!(refs.qualified("src/app/run.rs", "zqstop"));
     }
 
     fn generated_fixture(files: usize, filler_bytes: usize) -> Vec<Fixture> {
