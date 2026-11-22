@@ -70,6 +70,7 @@ tree-sitter-sequel = { version = "0.3", optional = true }
 tree-sitter-prisma-io = { version = "1.6", optional = true }
 unicode-normalization = "0.1"
 regex = "1"
+aho-corasick = "1.1"
 chrono = { version = "0.4", features = ["serde"] }
 notify = { version = "8", optional = true }
 axum = { version = "0.8", optional = true }

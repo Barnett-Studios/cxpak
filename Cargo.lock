@@ -1038,6 +1038,7 @@ dependencies = [
 name = "cxpak"
 version = "3.8.0"
 dependencies = [
+ "aho-corasick",
  "assert_cmd",
  "async-trait",
  "axum",

@@ -1,7 +1,8 @@
 use crate::core_graph::CodebaseIndex;
 use crate::core_graph::IndexedFile;
 use crate::intelligence::api_surface::detect_routes;
-use crate::parser::language::{SymbolKind, Visibility};
+use crate::parser::language::{Symbol, SymbolKind, Visibility};
+use aho_corasick::AhoCorasick;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -182,6 +183,7 @@ fn has_string_references(
     false
 }
 
+#[cfg(test)]
 /// Returns true when the symbol is referenced via receiver syntax
 /// (`variable.method_name(`) in another file. Captures the common Rust
 /// idiom that the name-based call-graph extractor cannot resolve without
@@ -239,6 +241,7 @@ fn has_receiver_method_reference(
     false
 }
 
+#[cfg(test)]
 /// Returns true when a module-qualified reference to the symbol appears in
 /// any file other than its defining file. For `src/commands/overview.rs::run`,
 /// this searches for the qualified substrings `overview::run` and
@@ -562,6 +565,185 @@ fn has_test_attribute_above(content: &str, start_line: usize) -> bool {
     false
 }
 
+/// Up to two distinct files (by relative path) with a qualifying occurrence of a
+/// needle. Two suffice to answer "is there a file other than X?".
+#[derive(Default)]
+struct PatternHits<'a> {
+    files: [Option<&'a str>; 2],
+}
+
+impl<'a> PatternHits<'a> {
+    fn record(&mut self, path: &'a str) {
+        match self.files {
+            [None, _] => self.files[0] = Some(path),
+            [Some(first), None] if first != path => self.files[1] = Some(path),
+            _ => {}
+        }
+    }
+
+    fn in_other_file_than(&self, path: &str) -> bool {
+        self.files.iter().flatten().any(|p| *p != path)
+    }
+}
+
+/// The occurrences of one needle, split by the boundary rule each cross-file
+/// check applies to a match.
+#[derive(Default)]
+struct NeedleHits<'a> {
+    /// Any occurrence: the inherent `Type::method` check.
+    any: PatternHits<'a>,
+    /// Followed by a non-identifier byte: the module-qualified check.
+    bounded: PatternHits<'a>,
+    /// Not preceded by `.`: the receiver-call check (`..method(` is not a call).
+    receiver: PatternHits<'a>,
+}
+
+impl<'a> NeedleHits<'a> {
+    fn record(&mut self, path: &'a str, bytes: &[u8], start: usize, end: usize) {
+        self.any.record(path);
+        let next = bytes.get(end).copied().unwrap_or(b' ');
+        if !(next.is_ascii_alphanumeric() || next == b'_') {
+            self.bounded.record(path);
+        }
+        let prev = if start > 0 { bytes[start - 1] } else { b'\n' };
+        if prev != b'.' {
+            self.receiver.record(path);
+        }
+    }
+}
+
+/// The `Type::method` needle of a symbol, when it is a method of an inherent impl.
+fn inherent_pattern(file: &IndexedFile, symbol: &Symbol) -> Option<String> {
+    if symbol.kind != SymbolKind::Method {
+        return None;
+    }
+    match enclosing_impl(&file.content, symbol.start_line)? {
+        (false, Some(ty)) => Some(format!("{ty}::{}", symbol.name)),
+        _ => None,
+    }
+}
+
+/// The module-qualified needles for a symbol: `stem::name`, and
+/// `parent::stem::name` when the parent directory differs from the stem.
+/// `mod.rs` takes its directory's name as the stem.
+fn qualified_needles(file_path: &str, symbol_name: &str) -> Vec<String> {
+    let path = std::path::Path::new(file_path);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let effective_stem = if stem == "mod" {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or(stem)
+    } else {
+        stem
+    };
+    if effective_stem.is_empty() {
+        return Vec::new();
+    }
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let mut needles = vec![format!("{effective_stem}::{symbol_name}")];
+    if !parent.is_empty() && parent != effective_stem {
+        needles.push(format!("{parent}::{effective_stem}::{symbol_name}"));
+    }
+    needles
+}
+
+/// The receiver-call needle `.name(`, for names long enough to be meaningful.
+fn receiver_needle(symbol_name: &str) -> Option<String> {
+    (symbol_name.len() >= 5).then(|| format!(".{symbol_name}("))
+}
+
+/// Cross-file reference evidence for every symbol `detect_dead_code` examines,
+/// gathered in ONE pass over all file contents (#189). The per-symbol checks it
+/// replaced each rescanned every file, which is O(symbols x bytes).
+struct ReferenceIndex<'a> {
+    hits: HashMap<String, NeedleHits<'a>>,
+}
+
+impl<'a> ReferenceIndex<'a> {
+    fn build(index: &'a CodebaseIndex, focus: Option<&str>) -> Self {
+        let mut wanted: HashSet<String> = HashSet::new();
+        for file in index
+            .files
+            .iter()
+            .filter(|f| focus.is_none_or(|prefix| f.relative_path.starts_with(prefix)))
+            .filter(|f| !is_test_file(&f.relative_path))
+        {
+            let Some(pr) = &file.parse_result else {
+                continue;
+            };
+            for symbol in pr.symbols.iter().filter(|s| is_callable_kind(&s.kind)) {
+                wanted.extend(inherent_pattern(file, symbol));
+                wanted.extend(qualified_needles(&file.relative_path, &symbol.name));
+                if symbol.kind == SymbolKind::Method {
+                    wanted.extend(receiver_needle(&symbol.name));
+                }
+            }
+        }
+        let needles: Vec<String> = wanted.into_iter().collect();
+        let mut hits: Vec<NeedleHits<'a>> = needles.iter().map(|_| NeedleHits::default()).collect();
+        match AhoCorasick::new(&needles) {
+            Ok(automaton) => {
+                for file in &index.files {
+                    let bytes = file.content.as_bytes();
+                    for m in automaton.find_overlapping_iter(bytes) {
+                        hits[m.pattern().as_usize()].record(
+                            &file.relative_path,
+                            bytes,
+                            m.start(),
+                            m.end(),
+                        );
+                    }
+                }
+            }
+            // Construction fails only past the automaton's size limit. Fall back to
+            // one scan per needle: slow, but the same answer, never a missing one.
+            Err(_) => {
+                for (needle, hit) in needles.iter().zip(hits.iter_mut()) {
+                    let n = needle.as_bytes();
+                    for file in &index.files {
+                        let bytes = file.content.as_bytes();
+                        for start in (0..bytes.len().saturating_sub(n.len()) + 1)
+                            .filter(|&i| bytes.len() >= n.len() && &bytes[i..i + n.len()] == n)
+                        {
+                            hit.record(&file.relative_path, bytes, start, start + n.len());
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            hits: needles.into_iter().zip(hits).collect(),
+        }
+    }
+
+    fn inherent(&self, pattern: &str, file_path: &str) -> bool {
+        self.hits
+            .get(pattern)
+            .is_some_and(|h| h.any.in_other_file_than(file_path))
+    }
+
+    fn qualified(&self, file_path: &str, symbol_name: &str) -> bool {
+        qualified_needles(file_path, symbol_name).iter().any(|n| {
+            self.hits
+                .get(n)
+                .is_some_and(|h| h.bounded.in_other_file_than(file_path))
+        })
+    }
+
+    fn receiver(&self, file_path: &str, symbol_name: &str) -> bool {
+        receiver_needle(symbol_name).is_some_and(|n| {
+            self.hits
+                .get(&n)
+                .is_some_and(|h| h.receiver.in_other_file_than(file_path))
+        })
+    }
+}
+
 /// Detect dead symbols across the codebase.
 ///
 /// A symbol is dead when ALL of:
@@ -595,6 +777,8 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
             route_cache.insert(file.relative_path.clone(), !routes.is_empty());
         }
     }
+
+    let refs = ReferenceIndex::build(index, focus);
 
     let mut dead: Vec<DeadSymbol> = Vec::new();
 
@@ -654,16 +838,9 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
                         // and same-file/qualified-ref fallbacks (the method may still
                         // be alive via `Self::method` calls in the same file or via a
                         // call-graph-tracked invocation).
-                        let inherent_type_ref = inherent_type
-                            .as_ref()
-                            .map(|ty| {
-                                let pat = format!("{ty}::{}", symbol.name);
-                                index.files.iter().any(|f| {
-                                    f.relative_path != file.relative_path
-                                        && f.content.contains(&pat)
-                                })
-                            })
-                            .unwrap_or(false);
+                        let inherent_type_ref = inherent_type.as_ref().is_some_and(|ty| {
+                            refs.inherent(&format!("{ty}::{}", symbol.name), &file.relative_path)
+                        });
                         if inherent_type_ref {
                             true
                         } else {
@@ -692,11 +869,8 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
                                 };
                                 let is_same_file_ref =
                                     same_file_string_reference(&symbol.name, &file.content);
-                                let is_qualified_ref = has_qualified_reference(
-                                    &file.relative_path,
-                                    &symbol.name,
-                                    &index.files,
-                                );
+                                let is_qualified_ref =
+                                    refs.qualified(&file.relative_path, &symbol.name);
                                 // Fallback 3: receiver-syntax method call
                                 // `x.method_name(...)`. Captures idiomatic Rust /
                                 // Python / JS method calls that the name-based
@@ -704,11 +878,7 @@ pub fn detect_dead_code(index: &CodebaseIndex, focus: Option<&str>) -> Vec<DeadS
                                 // type tracking. Only meaningful for Method
                                 // symbols — free functions don't have receivers.
                                 let is_receiver_ref = symbol.kind == SymbolKind::Method
-                                    && has_receiver_method_reference(
-                                        &file.relative_path,
-                                        &symbol.name,
-                                        &index.files,
-                                    );
+                                    && refs.receiver(&file.relative_path, &symbol.name);
                                 is_ep
                                     || is_test_ref
                                     || is_same_file_ref
@@ -1766,6 +1936,275 @@ mod tests {
         assert!(
             !dead.iter().any(|d| d.symbol == "Status"),
             "serde-Deserialize-derived enum with zero references must be alive"
+        );
+    }
+
+    // ---- single-pass inherent-reference tests (issue #189) ----
+
+    /// A fixture file: path, content, and `(method name, 1-based start line)` pairs.
+    type Fixture = (String, String, Vec<(String, usize)>);
+
+    fn index_from_fixture(fixture: Vec<Fixture>) -> (CodebaseIndex, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut files = Vec::new();
+        let mut parse_results = HashMap::new();
+        for (path, content, methods) in fixture {
+            let fp = dir.path().join(path.replace('/', "_"));
+            std::fs::write(&fp, &content).unwrap();
+            files.push(ScannedFile {
+                relative_path: path.clone(),
+                absolute_path: fp,
+                language: Some("rust".into()),
+                size_bytes: content.len() as u64,
+            });
+            let symbols = methods
+                .into_iter()
+                .map(|(name, line)| Symbol {
+                    signature: format!("fn {name}()"),
+                    name,
+                    kind: SymbolKind::Method,
+                    visibility: Visibility::Private,
+                    body: "{}".into(),
+                    start_line: line,
+                    end_line: line,
+                })
+                .collect();
+            parse_results.insert(
+                path,
+                ParseResult {
+                    symbols,
+                    imports: vec![],
+                    exports: vec![],
+                },
+            );
+        }
+        let index = CodebaseIndex::build(files, parse_results, &TokenCounter::new());
+        (index, dir)
+    }
+
+    /// `impl <ty> { fn <name>() {} }` blocks, one per `(ty, name)`, with the method
+    /// start lines, followed by `tail`.
+    fn impl_file(path: &str, impls: &[(&str, &str)], tail: &str) -> Fixture {
+        let mut content = String::new();
+        let mut methods = Vec::new();
+        for (ty, name) in impls {
+            content.push_str(&format!("impl {ty} {{\n"));
+            methods.push((name.to_string(), content.lines().count() + 1));
+            content.push_str(&format!("    fn {name}() {{}}\n}}\n"));
+        }
+        content.push_str(tail);
+        (path.into(), content, methods)
+    }
+
+    /// The pre-#189 rule, kept verbatim as an oracle: an inherent method is alive
+    /// when any OTHER file contains `Type::method`.
+    fn oracle_inherent_ref(index: &CodebaseIndex, file: &IndexedFile, symbol: &Symbol) -> bool {
+        let Some((false, Some(ty))) = enclosing_impl(&file.content, symbol.start_line) else {
+            return false;
+        };
+        let pat = format!("{ty}::{}", symbol.name);
+        index
+            .files
+            .iter()
+            .any(|f| f.relative_path != file.relative_path && f.content.contains(&pat))
+    }
+
+    /// Every inherent method the oracle finds no cross-file reference for. The
+    /// fixtures use unique method names, so no other liveness rule can fire and
+    /// these are exactly the symbols `detect_dead_code` must report.
+    fn oracle_dead(index: &CodebaseIndex) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = index
+            .files
+            .iter()
+            .flat_map(|f| {
+                f.parse_result
+                    .iter()
+                    .flat_map(|pr| pr.symbols.iter())
+                    .filter(|s| !oracle_inherent_ref(index, f, s))
+                    .map(|s| (f.relative_path.clone(), s.name.clone()))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn reported_dead(index: &CodebaseIndex) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = detect_dead_code(index, None)
+            .into_iter()
+            .map(|d| (d.file, d.symbol))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn adversarial_fixture() -> Vec<Fixture> {
+        vec![
+            impl_file(
+                "a.rs",
+                &[
+                    ("Foo", "zqbar"),
+                    ("Foo", "zqnone"),
+                    ("Foo", "zqb"),
+                    ("XA", "zqov"),
+                    ("Self_", "zqsame"),
+                    ("Two", "zqtwo"),
+                    ("Hay", "zqhay"),
+                ],
+                // Contains `Self_::zqsame` as a substring, but only in its own file.
+                "// Self_::zqsamex\n",
+            ),
+            // `MyFoo::zqbarx` contains `Foo::zqbar` and `Foo::zqb` as substrings.
+            impl_file(
+                "b.rs",
+                &[],
+                "MyFoo::zqbarx();\nXA::zqov();\nTwo::zqtwo();\n",
+            ),
+            impl_file("c.rs", &[], "Two::zqtwo();\nxHay::zqhay();\n"),
+            // A reference inside the defining file never counts.
+            impl_file("d.rs", &[("Solo", "zqsolo")], "Solo::zqsolox();\n"),
+            // `XA::zqov` in b.rs hits both `XA::zqov` (a.rs) and `A::zqov` (this file).
+            impl_file("e.rs", &[("A", "zqov")], ""),
+        ]
+    }
+
+    #[test]
+    fn single_pass_matches_per_method_oracle_on_adversarial_cases() {
+        let (index, _dir) = index_from_fixture(adversarial_fixture());
+        let expected = oracle_dead(&index);
+        // Sanity: the fixture really mixes alive and dead methods.
+        assert!(expected.contains(&("a.rs".into(), "zqnone".into())));
+        assert!(expected.contains(&("a.rs".into(), "zqsame".into())));
+        assert!(expected.contains(&("d.rs".into(), "zqsolo".into())));
+        assert!(!expected.contains(&("a.rs".into(), "zqbar".into())));
+        assert!(!expected.contains(&("a.rs".into(), "zqb".into())));
+        assert!(!expected.contains(&("a.rs".into(), "zqov".into())));
+        assert!(!expected.contains(&("e.rs".into(), "zqov".into())));
+        assert!(!expected.contains(&("a.rs".into(), "zqtwo".into())));
+        assert_eq!(reported_dead(&index), expected);
+    }
+
+    const GENERATED_FILES: usize = 300;
+    const METHODS_PER_FILE: usize = 10;
+
+    /// Files whose contents probe the boundary rules of the qualified and
+    /// receiver checks: identifier continuation, `..` ranges, `mod.rs` stems,
+    /// parent-qualified paths, overlapping needles and same-file-only hits.
+    fn boundary_fixture() -> Vec<Fixture> {
+        vec![
+            impl_file(
+                "src/net/mod.rs",
+                &[("Conn", "zqopen"), ("Conn", "zqshut")],
+                "",
+            ),
+            impl_file(
+                "src/net/tcp.rs",
+                &[("Tcp", "zqdial"), ("Tcp", "zqbind")],
+                "net::zqopen;\n",
+            ),
+            impl_file(
+                "src/app/run.rs",
+                &[("App", "zqboot"), ("App", "zqstop")],
+                "x.zqstop();\n",
+            ),
+            impl_file(
+                "src/use.rs",
+                &[("User", "zqquit")],
+                "tcp::zqdial_other();\nnet::tcp::zqbind;\n..zqboot(\nrun::zqboot2;\ny\n.zqshut(\n",
+            ),
+            impl_file(
+                "src/same.rs",
+                &[("Same", "zqself")],
+                "same::zqself;\nq.zqself();\n",
+            ),
+            // A receiver call at byte 0, and a qualified reference ending exactly at
+            // end of content: the two edges where the boundary rules use defaults.
+            ("src/start.rs".into(), ".zqquit(".into(), Vec::new()),
+            (
+                "src/end.rs".into(),
+                "x\napp::run::zqstop".into(),
+                Vec::new(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn single_pass_qualified_and_receiver_match_the_per_symbol_scanners() {
+        let (index, _dir) = index_from_fixture(boundary_fixture());
+        let refs = ReferenceIndex::build(&index, None);
+        let mut checked = 0;
+        for file in &index.files {
+            for symbol in &file.parse_result.as_ref().unwrap().symbols {
+                let (path, name) = (&file.relative_path, &symbol.name);
+                assert_eq!(
+                    refs.qualified(path, name),
+                    has_qualified_reference(path, name, &index.files),
+                    "qualified check diverged for {path}::{name}"
+                );
+                assert_eq!(
+                    refs.receiver(path, name),
+                    has_receiver_method_reference(path, name, &index.files),
+                    "receiver check diverged for {path}::{name}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 8);
+        // The fixture must exercise both outcomes of both checks.
+        assert!(refs.qualified("src/net/mod.rs", "zqopen"));
+        assert!(refs.qualified("src/net/tcp.rs", "zqbind"));
+        assert!(!refs.qualified("src/net/tcp.rs", "zqdial"));
+        assert!(!refs.qualified("src/same.rs", "zqself"));
+        assert!(!refs.receiver("src/app/run.rs", "zqstop"));
+        assert!(refs.receiver("src/net/mod.rs", "zqshut"));
+        assert!(!refs.receiver("src/app/run.rs", "zqboot"));
+        assert!(!refs.receiver("src/same.rs", "zqself"));
+        assert!(refs.receiver("src/use.rs", "zqquit"));
+        assert!(refs.qualified("src/app/run.rs", "zqstop"));
+    }
+
+    fn generated_fixture(files: usize, filler_bytes: usize) -> Vec<Fixture> {
+        let filler =
+            "// filler text that never mentions a qualified path\n".repeat(filler_bytes / 52);
+        (0..files)
+            .map(|f| {
+                let types: Vec<(String, String)> = (0..METHODS_PER_FILE)
+                    .map(|m| (format!("T{f}x{m}"), format!("zqm{f}x{m}")))
+                    .collect();
+                let impls: Vec<(&str, &str)> = types
+                    .iter()
+                    .map(|(t, n)| (t.as_str(), n.as_str()))
+                    .collect();
+                // Every third file references a method of the next file.
+                let tail = if f % 3 == 0 {
+                    format!("{filler}T{}x0::zqm{}x0();\n", f + 1, f + 1)
+                } else {
+                    filler.clone()
+                };
+                impl_file(&format!("src/f{f}.rs"), &impls, &tail)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_pass_matches_per_method_oracle_on_generated_repo() {
+        let (index, _dir) = index_from_fixture(generated_fixture(40, 2_000));
+        assert_eq!(reported_dead(&index), oracle_dead(&index));
+    }
+
+    #[test]
+    fn detect_dead_code_scales_with_total_bytes_not_methods_times_bytes() {
+        let (index, _dir) = index_from_fixture(generated_fixture(GENERATED_FILES, 10_000));
+        let started = std::time::Instant::now();
+        let dead = detect_dead_code(&index, None);
+        let elapsed = started.elapsed();
+        assert!(!dead.is_empty());
+        assert!(
+            // 60 s, not tighter: under coverage instrumentation the single pass takes
+            // ~20 s, while the per-symbol scans it replaced took over 780 s here.
+            elapsed < std::time::Duration::from_secs(60),
+            "detect_dead_code took {elapsed:?} for {} methods over {} files",
+            GENERATED_FILES * METHODS_PER_FILE,
+            GENERATED_FILES
         );
     }
 }
